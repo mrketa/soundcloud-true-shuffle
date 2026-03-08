@@ -33,7 +33,7 @@ SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happ
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser
-2. Click **[Install from Greasy Fork]([YOUR GREASYFORK LINK HERE])**
+2. Click **[Install from Greasy Fork]([https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle])**
 3. Done
 
 > Works on Chrome, Brave, Firefox, Edge and Safari
