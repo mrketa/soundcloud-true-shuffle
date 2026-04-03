@@ -9,7 +9,7 @@
 
 <br/>
 
-![Version](https://img.shields.io/badge/version-3.0.0-ff5500?style=flat-square)
+![Version](https://img.shields.io/badge/version-4.0.0-ff5500?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
 ![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-install-brightgreen?style=flat-square&logo=tampermonkey)
 ![Works in background](https://img.shields.io/badge/background%20tab-✓-ff5500?style=flat-square)
