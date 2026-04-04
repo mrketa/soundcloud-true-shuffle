@@ -1,11 +1,8 @@
-// ── Sidebar ───────────────────────────────────────────────────────────────────
-// Slide-in queue panel. Toggled exclusively via the hub.
-// Contains only the queue list and search — playback is controlled from the hub.
+// Slide-in queue panel — toggled via the hub. No playback controls here.
 
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;
 
-  // Sidebar panel.
   const sidebar = document.createElement('div');
   sidebar.id = 'tss-sidebar';
   sidebar.style.cssText = `
@@ -39,7 +36,6 @@ function mkSidebar() {
   document.getElementById('tss-search').onclick  = e => e.stopPropagation();
 }
 
-// Toggle the sidebar open/closed and keep the hub in sync.
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
   const s = document.getElementById('tss-sidebar');

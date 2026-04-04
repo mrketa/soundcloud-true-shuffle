@@ -1,21 +1,11 @@
-// ── Watcher ───────────────────────────────────────────────────────────────────
-// Polls every 300 ms via a Web Worker. Detects title changes (external song
-// or SC auto-advance) and fires next() when a track nears its end.
-
-function startWatcher(status) {
-  if (state.worker) {
-    state.worker.terminate();
-    state.worker = null;
-  }
-  if (state._workerInterval) {
-    clearInterval(state._workerInterval);
-    state._workerInterval = null;
-  }
+function startWatcher() {
+  if (state.worker) { state.worker.terminate(); state.worker = null; }
+  if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
 
   state.lastTitle = playerTitle();
-  let lastTitle   = state.lastTitle;
-  let titleTicks  = 0;   // consecutive ticks where title differs (debounce)
-  let nearEnd     = false;
+  let lastTitle  = state.lastTitle;
+  let titleTicks = 0;
+  let nearEnd    = false;
 
   const tick = async () => {
     if (!state.active || state.busy) return;
@@ -23,38 +13,29 @@ function startWatcher(status) {
     const title = playerTitle();
     const p     = progress();
 
-    // ── Suspended mode ────────────────────────────────────────────────────────
-    // An external (non-queue) track is playing. Let it play freely; resume
-    // the queue when it ends.
     if (state.suspended) {
       if (p >= 0.99 && !nearEnd && !paused()) {
         nearEnd = true;
         pause();
         await wait(150);
 
-        const anyAlive = state.els.some(e => e && document.body.contains(e));
-        if (anyAlive) {
-          // Still on the playlist page — resume immediately.
+        if (state.els.some(e => e && document.body.contains(e))) {
           state.suspended = false;
           try {
-            await next(status, true);
+            await next(true);
           } finally {
             lastTitle = playerTitle();
             nearEnd   = false;
           }
         } else {
-          // Playlist DOM is gone — save the queue and navigate back.
+          // Playlist DOM gone — cache queue and navigate back.
           nearEnd = false;
           const worker = state.worker;
           state.worker = null;
           if (worker) worker.terminate();
-          if (state._workerInterval) {
-            clearInterval(state._workerInterval);
-            state._workerInterval = null;
-          }
+          if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
 
           try {
-            const metaKeys = state.meta.map(m => trackId(m) || '');
             sessionStorage.setItem('tss_queue_cache', JSON.stringify({
               queue:       state.queue.slice(),
               pos:         state.pos,
@@ -62,12 +43,10 @@ function startWatcher(status) {
               priority:    { ...state.priority },
               playlistUrl: state.playlistUrl,
               ts:          Date.now(),
-              metaKeys,
+              metaKeys:    state.meta.map(m => trackId(m) || ''),
             }));
           } catch (_) {}
 
-          // Set inactive before navigating so onNav() on the new page always
-          // takes the inactive fallthrough path and reads the cache.
           state.active    = false;
           state.busy      = false;
           state.suspended = false;
@@ -88,11 +67,7 @@ function startWatcher(status) {
       return;
     }
 
-    // Title changed to a track we didn't queue — either the user clicked
-    // something manually or SC auto-advanced past our controls.
-    // Enter suspended mode so the song plays fully, then resume.
-    // Two consecutive ticks debounce brief flashes during our own playAt().
-    // manualAction exempts intentional control actions (jumpTo, prevTrack).
+    // Unrecognised title change — debounce 2 ticks before entering suspended mode.
     if (title && lastTitle && title !== lastTitle) {
       if (++titleTicks >= 2) {
         titleTicks = 0;
@@ -109,14 +84,12 @@ function startWatcher(status) {
     }
     titleTicks = 0;
 
-    // Track is within 1 % of its end and currently playing.
-    // Pause before SC can auto-advance, then pick our own next track.
     if (p >= 0.99 && !nearEnd && !paused()) {
       nearEnd = true;
       pause();
       await wait(150);
       try {
-        await next(status, true);
+        await next(true);
       } finally {
         lastTitle = playerTitle();
         nearEnd   = false;
@@ -124,7 +97,6 @@ function startWatcher(status) {
       return;
     }
 
-    // Reset nearEnd if the track looped back (progress jumped backward).
     if (state.lastProgress > 0.5 && p < 0.1) nearEnd = false;
     state.lastProgress = p;
     if (title) lastTitle = title;
@@ -139,8 +111,6 @@ function startWatcher(status) {
     state.worker.onmessage = tick;
     state.worker.postMessage('start');
   } else {
-    // Blob Worker blocked (e.g. CSP) — fall back to setInterval.
-    // Background-tab throttling may apply, but this is better than no polling.
     state._workerInterval = setInterval(tick, 300);
   }
 }

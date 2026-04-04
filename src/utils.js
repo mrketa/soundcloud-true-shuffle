@@ -1,6 +1,3 @@
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-// Fisher-Yates in-place shuffle — returns a new array.
 function fisherYates(arr) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -12,15 +9,11 @@ function fisherYates(arr) {
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// ── DOM helpers ───────────────────────────────────────────────────────────────
-
-// Returns the title currently shown in SoundCloud's playback bar.
-// Prefers the `title` attribute over textContent — SC's textContent includes
-// an accessibility prefix ("Current track: …") that we don't want to display.
 function playerTitle() {
   for (const s of ['.playbackSoundBadge__titleLink', '.playbackSoundBadge a[title]', '.playerTrackName']) {
     const el = document.querySelector(s);
     if (!el) continue;
+    // SC's textContent includes an accessibility prefix we don't want
     const t = (el.getAttribute('title') || el.textContent)
       .trim()
       .replace(/^current\s+track:\s*/i, '');
@@ -29,7 +22,6 @@ function playerTitle() {
   return '';
 }
 
-// Returns current playback progress as a ratio 0–1, or 0 if unavailable.
 function progress() {
   const passed = document.querySelector('.playbackTimeline__timePassed');
   const total  = document.querySelector('.playbackTimeline__duration');
@@ -42,7 +34,6 @@ function progress() {
   return d ? toSec(passed) / d : 0;
 }
 
-// Returns how many seconds into the current track the playhead is.
 function currentSec() {
   const el = document.querySelector('.playbackTimeline__timePassed');
   if (!el) return 0;
@@ -50,7 +41,6 @@ function currentSec() {
   return m ? +m[1] * 60 + +m[2] : 0;
 }
 
-// True when the native player is paused (or the play button shows "Play").
 function paused() {
   const btn = document.querySelector('.playControls__play');
   if (!btn) return false;
@@ -68,7 +58,6 @@ function toggle() {
   setTimeout(refreshPlayBtn, 150);
 }
 
-// Seek to a ratio (0–1) by simulating mouse events on SC's progress bar.
 function seekTo(ratio) {
   ratio = Math.max(0, Math.min(1, ratio));
   const bar = document.querySelector('.playControls .playbackTimeline__progressWrapper');
@@ -82,21 +71,16 @@ function seekTo(ratio) {
   bar.dispatchEvent(new MouseEvent('mouseup',   opts));
 }
 
-// Sync the play/pause icon on the hub controls.
 function refreshPlayBtn() {
   const p = document.getElementById('tss-hub-play');
   if (p) p.textContent = paused() ? '▶' : '⏸';
 }
 
-// Sync the hub progress bar.
 function updateProgressBar() {
   const p = document.getElementById('tss-hub-prog');
   if (p) p.style.width = `${Math.min(100, progress() * 100).toFixed(1)}%`;
 }
 
-// ── Track metadata extraction ─────────────────────────────────────────────────
-
-// Resolves the best-available artwork URL from a track list element.
 function artwork(el) {
   const span = el.querySelector('span.image__full, span.sc-artwork');
   if (span?.style.backgroundImage) {
@@ -108,30 +92,23 @@ function artwork(el) {
   return null;
 }
 
-// Returns the canonical SoundCloud URL for a track element.
-// Covers both trackList (sets/likes) and soundList (profile pages) layouts.
 function getLink(el) {
-  const a = el.querySelector(
-    '.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary'
-  );
+  const a = el.querySelector('.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary');
   if (!a) return null;
   const href = a.getAttribute('href');
   if (!href) return null;
   return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
 }
 
-// Stable identity string for a track, used to survive page reloads.
-// Prefers the permalink URL (a href attribute, always set by React immediately)
-// over the display text which can vary by render state / truncation / locale.
+// Stable identity for a track across page reloads — prefers permalink URL.
 function trackId(m) {
   if (!m) return null;
-  if (m.link) return m.link;                          // best: unique, stable
+  if (m.link) return m.link;
   const t = m.title, a = m.artist;
   if ((t && t !== '—') || (a && a !== '—')) return `${t}|||${a}`;
   return null;
 }
 
-// Extracts { title, artist, artwork, link } from a track list DOM element.
 function getMeta(el) {
   return {
     title:   el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.textContent.trim() || '—',
@@ -141,9 +118,6 @@ function getMeta(el) {
   };
 }
 
-// ── Security helper ───────────────────────────────────────────────────────────
-
-// Escapes a string for safe insertion into innerHTML.
 function esc(str) {
   return String(str ?? '')
     .replace(/&/g, '&amp;')
