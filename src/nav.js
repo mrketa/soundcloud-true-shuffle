@@ -28,7 +28,7 @@ async function onNav() {
         // Navigated to a non-playlist page while shuffle is running.
         // Keep the queue alive but suspend so the external track plays freely.
         state.suspended = true;
-        updateMiniPlayer();
+        updateHub();
         return;
       }
 
@@ -69,10 +69,6 @@ async function onNav() {
 
       // Navigated to a DIFFERENT valid playlist page — full stop.
       stop();
-      const mini = document.getElementById('tss-mini');
-      const tab  = document.getElementById('tss-mini-tab');
-      if (mini) mini.style.display = 'none';
-      if (tab)  tab.style.display  = 'none';
     }
     await wait(1500); // give SoundCloud time to render the new page
     if (validPage()) {

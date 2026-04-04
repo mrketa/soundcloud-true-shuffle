@@ -43,7 +43,7 @@ async function playAt(idx) {
     if (!anyAlive) {
       state.suspended = true;
       state.busy      = false;
-      updateMiniPlayer();
+      updateHub();
       return;
     }
 
@@ -74,7 +74,7 @@ async function playAt(idx) {
   state.lastTitle    = playerTitle();
   state.lastProgress = 0;
   if (titleChanged) trackPlayed(idx);
-  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateMiniPlayer(); }, 300);
+  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 300);
 }
 
 // Advance to the next track in the queue.
@@ -85,7 +85,7 @@ async function next(status, fromWatcher = false) {
 
   if (!state.els.some(e => e && document.body.contains(e))) {
     state.suspended = true;
-    updateMiniPlayer();
+    updateHub();
     return;
   }
 
@@ -244,8 +244,6 @@ async function start(btn, status) {
     btn.dataset.state = 'idle';
     if (status) status.textContent = '';
     renderList();
-    const mini = document.getElementById('tss-mini');
-    if (mini) mini.style.display = 'none';
     return;
   }
 
@@ -363,11 +361,7 @@ async function start(btn, status) {
   renderList();
   if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   startWatcher(status);
-
-  const mini = document.getElementById('tss-mini');
-  if (mini) mini.style.display = 'flex';
-  else mkMiniPlayer();
-  updateMiniPlayer();
+  updateHub();
 }
 
 function stop() {
