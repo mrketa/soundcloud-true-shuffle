@@ -193,6 +193,7 @@ async function prevTrack(status) {
 
 // Jump directly to a specific position in the queue.
 async function jumpTo(qi, ti, status) {
+  if (!state.active) return;
   if (state.busy) return;
   state.busy         = true;
   state.manualAction = true;

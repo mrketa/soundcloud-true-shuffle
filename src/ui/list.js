@@ -87,7 +87,8 @@ function renderList(filter = '') {
 
   // Auto-scroll the current track into view (when not searching).
   if (!q) {
-    const offset = state.playNext.length ? state.playNext.length + 2 : 0;
+    let offset = state.playNext.length ? state.playNext.length + 2 : 0;
+    if (state.suspended) offset++; // account for the suspended banner prepended above
     list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
