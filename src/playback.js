@@ -48,7 +48,7 @@ async function playAt(idx) {
     }
 
     state.busy = false;
-    await next(document.getElementById('tss-status'), false);
+    await next(null, false);
     return;
   }
 
@@ -145,9 +145,6 @@ async function next(status, fromWatcher = false) {
   if (state.pos >= state.queue.length) {
     stop();
     renderList();
-    if (status) status.textContent = '';
-    const btn = document.getElementById('tss-btn');
-    if (btn) { btn.textContent = '🔀 True Shuffle'; btn.dataset.state = 'idle'; }
     state.busy = false;
     return;
   }
@@ -236,27 +233,21 @@ function removeFromQueue(qi) {
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
-async function start(btn, status) {
+async function start() {
   // Toggle off if already running.
   if (state.active) {
     stop();
-    btn.textContent   = '🔀 True Shuffle';
-    btn.dataset.state = 'idle';
-    if (status) status.textContent = '';
     renderList();
     return;
   }
 
-  btn.disabled      = true;
-  btn.textContent   = '⏳ loading…';
-  btn.dataset.state = 'loading';
+  state.loading = true;
+  updateHub();
 
-  const els = await loadTracks(status);
+  const els = await loadTracks(null);
   if (!els.length) {
-    if (status) status.textContent = '❌ no tracks found';
-    btn.textContent   = '🔀 True Shuffle';
-    btn.dataset.state = 'idle';
-    btn.disabled      = false;
+    state.loading = false;
+    updateHub();
     return;
   }
 
@@ -338,10 +329,11 @@ async function start(btn, status) {
   }
   state.playNext     = [];
   state.active       = true;
+  state.loading      = false;
   state.suspended    = false;
   state.busy         = false;
-  state.manualAction    = false;
-  state.playlistUrl     = location.href.split(/[?#]/)[0];
+  state.manualAction = false;
+  state.playlistUrl  = location.href.split(/[?#]/)[0];
 
   // Restore session stats if the user restarted within 10 minutes.
   const prev = state._savedStats;
@@ -352,21 +344,17 @@ async function start(btn, status) {
   }
   state._savedStats = null;
 
-  btn.textContent   = '⏹ Stop';
-  btn.dataset.state = 'active';
-  btn.disabled      = false;
-
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
-  startWatcher(status);
+  startWatcher(null);
   updateHub();
 }
 
 function stop() {
-  state.active = false;
-  state.busy   = false;
+  state.active  = false;
+  state.busy    = false;
+  state.loading = false;
   state.worker?.postMessage('stop');
   state.worker?.terminate();
   state.worker = null;

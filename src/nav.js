@@ -45,7 +45,6 @@ async function onNav() {
         state.suspended = false;
         await wait(1500);
         inject();
-        const status = document.getElementById('tss-status');
         // Pause the watcher while updating state.els to avoid a race where
         // next() fires mid-update and reads a partially-refreshed element array.
         // Handle both the Worker path and the setInterval fallback.
@@ -54,7 +53,7 @@ async function onNav() {
           clearInterval(state._workerInterval);
           state._workerInterval = null;
         }
-        const freshEls = await loadTracks(status);
+        const freshEls = await loadTracks(null);
         if (freshEls.length > 0) {
           state.els  = freshEls;
           state.meta = freshEls.map(getMeta);
@@ -62,7 +61,7 @@ async function onNav() {
         if (state.worker) {
           state.worker.postMessage('start');
         } else {
-          startWatcher(status);
+          startWatcher(null);
         }
         return;
       }
@@ -80,9 +79,7 @@ async function onNav() {
           const c = JSON.parse(raw);
           if (Date.now() - (c.ts || 0) < 30 * 60 * 1000
               && playlistBase(location.href) === playlistBase(c.playlistUrl || '')) {
-            const btn    = document.getElementById('tss-btn');
-            const status = document.getElementById('tss-status');
-            if (btn && status) await start(btn, status);
+            await start();
           }
         }
       } catch (_) {}

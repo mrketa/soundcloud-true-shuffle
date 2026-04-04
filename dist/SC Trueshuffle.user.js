@@ -29,6 +29,7 @@ const state = {
   meta:         [],      // { title, artist, artwork, link } per track (index = ti)
   worker:       null,    // Web Worker used for background polling
   busy:         false,   // guard: prevents re-entrant playback calls
+  loading:      false,   // true while loadTracks() is running
   lastTitle:    '',      // title of the last confirmed playing track
   lastProgress: 0,       // last known playback progress ratio (0–1)
   sidebarOpen:  false,   // is the sidebar panel visible?
@@ -283,7 +284,7 @@ async function playAt(idx) {
     }
 
     state.busy = false;
-    await next(document.getElementById('tss-status'), false);
+    await next(null, false);
     return;
   }
 
@@ -380,9 +381,6 @@ async function next(status, fromWatcher = false) {
   if (state.pos >= state.queue.length) {
     stop();
     renderList();
-    if (status) status.textContent = '';
-    const btn = document.getElementById('tss-btn');
-    if (btn) { btn.textContent = '🔀 True Shuffle'; btn.dataset.state = 'idle'; }
     state.busy = false;
     return;
   }
@@ -471,27 +469,21 @@ function removeFromQueue(qi) {
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
-async function start(btn, status) {
+async function start() {
   // Toggle off if already running.
   if (state.active) {
     stop();
-    btn.textContent   = '🔀 True Shuffle';
-    btn.dataset.state = 'idle';
-    if (status) status.textContent = '';
     renderList();
     return;
   }
 
-  btn.disabled      = true;
-  btn.textContent   = '⏳ loading…';
-  btn.dataset.state = 'loading';
+  state.loading = true;
+  updateHub();
 
-  const els = await loadTracks(status);
+  const els = await loadTracks(null);
   if (!els.length) {
-    if (status) status.textContent = '❌ no tracks found';
-    btn.textContent   = '🔀 True Shuffle';
-    btn.dataset.state = 'idle';
-    btn.disabled      = false;
+    state.loading = false;
+    updateHub();
     return;
   }
 
@@ -573,10 +565,11 @@ async function start(btn, status) {
   }
   state.playNext     = [];
   state.active       = true;
+  state.loading      = false;
   state.suspended    = false;
   state.busy         = false;
-  state.manualAction    = false;
-  state.playlistUrl     = location.href.split(/[?#]/)[0];
+  state.manualAction = false;
+  state.playlistUrl  = location.href.split(/[?#]/)[0];
 
   // Restore session stats if the user restarted within 10 minutes.
   const prev = state._savedStats;
@@ -587,21 +580,17 @@ async function start(btn, status) {
   }
   state._savedStats = null;
 
-  btn.textContent   = '⏹ Stop';
-  btn.dataset.state = 'active';
-  btn.disabled      = false;
-
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
-  startWatcher(status);
+  startWatcher(null);
   updateHub();
 }
 
 function stop() {
-  state.active = false;
-  state.busy   = false;
+  state.active  = false;
+  state.busy    = false;
+  state.loading = false;
   state.worker?.postMessage('stop');
   state.worker?.terminate();
   state.worker = null;
@@ -987,13 +976,16 @@ function mkHub() {
         animation:tss-pulse 1.2s ease-in-out infinite;
       }
       #tss-hub-qico {
-        font-size:11px; color:#333; cursor:pointer;
-        padding:2px 5px; border-radius:3px;
-        transition:color 0.15s, background 0.15s;
-        line-height:1; flex-shrink:0;
+        font-size:10px; color:#555; cursor:pointer;
+        padding:2px 7px; border-radius:3px;
+        background:#1a1a1a; border:1px solid #2a2a2a;
+        transition:color 0.15s, background 0.15s, border-color 0.15s;
+        line-height:1.6; flex-shrink:0;
       }
-      #tss-hub-qico:hover { color:#888; background:rgba(255,255,255,0.05); }
-      #tss-hub-qico[data-open="true"] { color:#f50; }
+      #tss-hub-qico:hover { color:#bbb; border-color:#444; }
+      #tss-hub-qico[data-open="true"] {
+        color:#f50; background:rgba(255,85,0,0.08); border-color:rgba(255,85,0,0.35);
+      }
     `;
     document.head.appendChild(s);
   }
@@ -1092,12 +1084,10 @@ function mkHub() {
 
   document.body.appendChild(hub);
 
-  const st = () => document.getElementById('tss-status');
-
   // ── Controls ──────────────────────────────────────────────────────────────
   document.getElementById('tss-hub-play').onclick  = toggle;
-  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(st());
-  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(st()); };
+  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(null);
+  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(null); };
   document.getElementById('tss-hub-stats').onclick = showStats;
   document.getElementById('tss-hub-seekbar').onclick = e => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1115,10 +1105,9 @@ function mkHub() {
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // ── Start button proxies the real tss-btn so all start() logic runs ───────
+  // ── Start / stop ──────────────────────────────────────────────────────────
   document.getElementById('tss-hub-start').onclick = () => {
-    const btn = document.getElementById('tss-btn');
-    if (btn && !btn.disabled) btn.click();
+    if (!state.loading) start();
   };
 
   // ── Collapse entire hub ───────────────────────────────────────────────────
@@ -1174,8 +1163,7 @@ function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
   const active  = state.active;
-  const tssBtn  = document.getElementById('tss-btn');
-  const loading = !active && !!tssBtn?.disabled;
+  const loading = state.loading;
 
   // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
@@ -1404,7 +1392,7 @@ function renderList(filter = '') {
       renderList(filter);
     };
 
-    row.onclick       = () => jumpTo(qi, ti, document.getElementById('tss-status'));
+    row.onclick       = () => jumpTo(qi, ti, null);
     row.oncontextmenu = e => showCtxMenu(e, qi, ti);
     list.appendChild(row);
   });
@@ -1553,90 +1541,12 @@ function showCtxMenu(e, qi, ti) {
 // ── src/ui/inject.js ──────────────────────────────────────────────────────────
 
 // ── Main UI injection ─────────────────────────────────────────────────────────
+// Injects the hub and sidebar into the page on valid playlist pages.
+// The old inject-button UI has been removed — the hub is the sole control point.
 
-function mkUI() {
-  // Inject button styles once. All state changes are driven by data-state and
-  // :disabled so no inline style overrides are needed anywhere else.
-  if (!document.getElementById('tss-style')) {
-    const s = document.createElement('style');
-    s.id = 'tss-style';
-    s.textContent = `
-      #tss-btn {
-        background: #111;
-        color: #f50;
-        border: 1px solid rgba(255,85,0,0.35);
-        border-radius: 8px;
-        padding: 8px 18px;
-        font-size: 13px;
-        font-weight: 600;
-        font-family: -apple-system,sans-serif;
-        cursor: pointer;
-        transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.5);
-        letter-spacing: 0.01em;
-        outline: none;
-      }
-      #tss-btn:not(:disabled):not([data-state="active"]):hover {
-        background: rgba(255,85,0,0.1);
-        border-color: #f50;
-        box-shadow: 0 0 16px rgba(255,85,0,0.2);
-      }
-      #tss-btn[data-state="active"] {
-        background: #f50;
-        color: #fff;
-        border-color: transparent;
-        box-shadow: 0 2px 14px rgba(255,85,0,0.4), 0 0 0 1px rgba(255,85,0,0.15);
-      }
-      #tss-btn[data-state="active"]:not(:disabled):hover {
-        background: #e64a00;
-        box-shadow: 0 2px 18px rgba(255,85,0,0.5);
-      }
-      #tss-btn:disabled {
-        color: #3a3a3a;
-        border-color: #1e1e1e;
-        background: #111;
-        cursor: not-allowed;
-        box-shadow: none;
-        animation: tss-pulse 1.2s ease-in-out infinite;
-      }
-      @keyframes tss-pulse {
-        0%, 100% { opacity: 1; }
-        50%       { opacity: 0.4; }
-      }
-    `;
-    document.head.appendChild(s);
-  }
-
-  const wrap = document.createElement('div');
-  wrap.id = 'tss-wrapper';
-  wrap.style.cssText = 'display:flex;align-items:center;gap:10px;margin:8px 0;flex-wrap:wrap;';
-
-  const btn = document.createElement('button');
-  btn.id            = 'tss-btn';
-  btn.textContent   = state.active ? '⏹ Stop' : '🔀 True Shuffle';
-  btn.dataset.state = state.active ? 'active'  : 'idle';
-
-  const label = document.createElement('label');
-  label.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#555;cursor:pointer;-webkit-user-select:none;user-select:none;font-family:-apple-system,sans-serif;';
-  const cb = document.createElement('input');
-  cb.type          = 'checkbox';
-  cb.checked       = state.autoRepeat;
-  cb.style.accentColor = '#f50';
-  cb.onchange      = () => { state.autoRepeat = cb.checked; };
-  label.append(cb, document.createTextNode('repeat'));
-
-  const status = document.createElement('span');
-  status.id = 'tss-status';
-  status.style.cssText = 'font-size:12px;color:#555;font-family:-apple-system,sans-serif;';
-
-  btn.onclick = () => start(btn, status);
-  wrap.append(btn, label, status);
-  return wrap;
-}
-
-// Find a suitable container in the SoundCloud DOM and prepend the UI into it.
+// Find a suitable container in the SoundCloud DOM and attach the hub + sidebar.
 async function inject() {
-  if (document.getElementById('tss-wrapper')) return;
+  if (document.getElementById('tss-hub')) return;
 
   const sels = [
     '.sc-list-actions',
@@ -1653,7 +1563,6 @@ async function inject() {
   const container = sels.reduce((found, s) => found || document.querySelector(s), null);
   if (!container) return;
 
-  container.prepend(mkUI());
   mkSidebar();
   mkHub();
 }
@@ -1707,7 +1616,6 @@ async function onNav() {
         state.suspended = false;
         await wait(1500);
         inject();
-        const status = document.getElementById('tss-status');
         // Pause the watcher while updating state.els to avoid a race where
         // next() fires mid-update and reads a partially-refreshed element array.
         // Handle both the Worker path and the setInterval fallback.
@@ -1716,7 +1624,7 @@ async function onNav() {
           clearInterval(state._workerInterval);
           state._workerInterval = null;
         }
-        const freshEls = await loadTracks(status);
+        const freshEls = await loadTracks(null);
         if (freshEls.length > 0) {
           state.els  = freshEls;
           state.meta = freshEls.map(getMeta);
@@ -1724,7 +1632,7 @@ async function onNav() {
         if (state.worker) {
           state.worker.postMessage('start');
         } else {
-          startWatcher(status);
+          startWatcher(null);
         }
         return;
       }
@@ -1742,9 +1650,7 @@ async function onNav() {
           const c = JSON.parse(raw);
           if (Date.now() - (c.ts || 0) < 30 * 60 * 1000
               && playlistBase(location.href) === playlistBase(c.playlistUrl || '')) {
-            const btn    = document.getElementById('tss-btn');
-            const status = document.getElementById('tss-status');
-            if (btn && status) await start(btn, status);
+            await start();
           }
         }
       } catch (_) {}
