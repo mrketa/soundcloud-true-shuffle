@@ -18,22 +18,28 @@ function mkHub() {
     s.textContent = `
       .tss-hub-sh {
         display:flex; align-items:center; justify-content:space-between;
-        padding:4px 12px; cursor:pointer;
+        padding:6px 12px; cursor:pointer;
         font-size:9px; color:#444;
         text-transform:uppercase; letter-spacing:0.07em;
-        border-top:1px solid #1a1a1a;
+        border-bottom:1px solid #1a1a1a;
       }
       .tss-hub-sh:hover { background:rgba(255,255,255,0.02); }
       .tss-hub-arr { font-size:9px; color:#333; transition:transform 0.15s; }
+      .tss-hub-sec { border-top:1px solid #1a1a1a; }
       #tss-hub-start { transition:background 0.2s, color 0.2s, border-color 0.2s; }
       #tss-hub-start[data-active="true"] {
         background:#f50 !important; color:#fff !important;
         border-color:transparent !important;
       }
       #tss-hub-start[data-active="true"]:hover { background:#e64a00 !important; }
-      #tss-hub-start:not([data-active="true"]):hover {
+      #tss-hub-start:not([data-active="true"]):not([data-loading="true"]):hover {
         background:rgba(255,85,0,0.1) !important;
         border-color:#f50 !important;
+      }
+      #tss-hub-start[data-loading="true"] {
+        color:#555 !important; border-color:#1e1e1e !important;
+        cursor:not-allowed !important;
+        animation:tss-pulse 1.2s ease-in-out infinite;
       }
     `;
     document.head.appendChild(s);
@@ -53,23 +59,23 @@ function mkHub() {
   `;
 
   hub.innerHTML = `
-    <div id="tss-hub-hdr" style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;background:#0d0d0d;cursor:move;border-bottom:1px solid #1a1a1a;">
-      <span style="color:#f50;font-size:12px;font-weight:700;letter-spacing:0.02em;">🔀 True Shuffle</span>
+    <div id="tss-hub-hdr" style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#0d0d0d;cursor:move;">
+      <span style="color:#f50;font-size:12px;font-weight:700;letter-spacing:0.02em;">♫ True Shuffle</span>
       <span id="tss-hub-col" style="color:#555;cursor:pointer;font-size:15px;line-height:1;padding:2px 4px;" title="collapse">−</span>
     </div>
 
     <div id="tss-hub-body">
 
-      <div id="tss-hub-s-np" style="display:none;">
+      <div id="tss-hub-s-np" class="tss-hub-sec" style="display:none;">
         <div class="tss-hub-sh" data-body="tss-hub-s-np-b">
           <span>now playing</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-np-b" style="padding:8px 12px 10px;">
-          <div style="display:flex;gap:9px;align-items:center;margin-bottom:7px;">
-            <div id="tss-hub-art" style="width:38px;height:38px;border-radius:5px;background:#1a1a1a;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:18px;color:#333;">♪</div>
+        <div id="tss-hub-s-np-b" style="padding:10px 12px 12px;">
+          <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">
+            <div id="tss-hub-art" style="width:40px;height:40px;border-radius:5px;background:#1a1a1a;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:18px;color:#333;">♪</div>
             <div style="overflow:hidden;flex:1;min-width:0;">
-              <div id="tss-hub-title"  style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;">—</div>
-              <div id="tss-hub-artist" style="color:#555;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;line-height:1.3;">—</div>
+              <div id="tss-hub-title"  style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">—</div>
+              <div id="tss-hub-artist" style="color:#555;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;line-height:1.4;">—</div>
             </div>
           </div>
           <div id="tss-hub-seekbar" style="height:4px;background:#1a1a1a;border-radius:2px;overflow:hidden;cursor:pointer;" title="seek">
@@ -78,11 +84,11 @@ function mkHub() {
         </div>
       </div>
 
-      <div id="tss-hub-s-ctrl" style="display:none;">
+      <div id="tss-hub-s-ctrl" class="tss-hub-sec" style="display:none;">
         <div class="tss-hub-sh" data-body="tss-hub-s-ctrl-b">
           <span>controls</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-ctrl-b" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:8px 12px 10px;">
+        <div id="tss-hub-s-ctrl-b" style="display:flex;align-items:center;justify-content:center;gap:10px;padding:10px 12px 12px;">
           <button id="tss-hub-prev"  style="background:#1a1a1a;border:none;color:#aaa;width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:13px;">⏮</button>
           <button id="tss-hub-play"  style="background:#f50;border:none;color:#fff;width:38px;height:38px;border-radius:50%;cursor:pointer;font-size:16px;">⏸</button>
           <button id="tss-hub-next"  style="background:#1a1a1a;border:none;color:#aaa;width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:13px;">⏭</button>
@@ -90,11 +96,11 @@ function mkHub() {
         </div>
       </div>
 
-      <div id="tss-hub-s-queue" style="display:none;">
+      <div id="tss-hub-s-queue" class="tss-hub-sec" style="display:none;">
         <div class="tss-hub-sh" data-body="tss-hub-s-queue-b">
           <span>queue</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-queue-b" style="padding:8px 12px 10px;display:flex;flex-direction:column;gap:5px;">
+        <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="color:#555;font-size:10px;">played</span>
             <span id="tss-hub-qpos" style="color:#bbb;font-size:10px;">—</span>
@@ -106,18 +112,18 @@ function mkHub() {
         </div>
       </div>
 
-      <div id="tss-hub-s-shuffle">
+      <div id="tss-hub-s-shuffle" class="tss-hub-sec">
         <div class="tss-hub-sh" data-body="tss-hub-s-shuffle-b">
           <span>shuffle</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-shuffle-b" style="padding:8px 12px 10px;display:flex;flex-direction:column;gap:7px;">
-          <button id="tss-hub-start" data-active="false" style="
+        <div id="tss-hub-s-shuffle-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
+          <button id="tss-hub-start" data-active="false" data-loading="false" style="
             background:#111; color:#f50;
             border:1px solid rgba(255,85,0,0.35); border-radius:6px;
-            padding:6px 10px; font-size:11px; font-weight:600;
+            padding:7px 10px; font-size:11px; font-weight:600;
             font-family:-apple-system,sans-serif; cursor:pointer; width:100%;
-          ">🔀 True Shuffle</button>
-          <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:#555;cursor:pointer;">
+          ">True Shuffle</button>
+          <label style="display:flex;align-items:center;gap:6px;font-size:10px;color:#555;cursor:pointer;">
             <input id="tss-hub-repeat" type="checkbox" style="accent-color:#f50;">
             repeat
           </label>
@@ -147,7 +153,8 @@ function mkHub() {
 
   // Start button proxies the real tss-btn so all existing start() logic runs.
   document.getElementById('tss-hub-start').onclick = () => {
-    document.getElementById('tss-btn')?.click();
+    const btn = document.getElementById('tss-btn');
+    if (btn && !btn.disabled) btn.click();
   };
 
   // ── Collapse entire hub ───────────────────────────────────────────────────
@@ -198,30 +205,48 @@ function mkHub() {
 }
 
 // Sync all hub elements with current playback state.
-// Called from updateMiniPlayer() and stop() so it always stays in sync.
+// Called from updateMiniPlayer() (every watcher tick) and stop().
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
-  const active = state.active;
+  const active  = state.active;
+  const tssBtn  = document.getElementById('tss-btn');
+  const loading = !active && !!tssBtn?.disabled;
 
-  // Show/hide the three playback-only sections.
+  // Show/hide the three playback-only section wrappers.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = active ? '' : 'none';
   });
 
-  // Start button label + style.
+  // Start button: three states — idle, loading, active.
   const startBtn = document.getElementById('tss-hub-start');
   if (startBtn) {
-    startBtn.textContent    = active ? '⏹ Stop Shuffle' : '🔀 True Shuffle';
-    startBtn.dataset.active = String(active);
+    if (loading) {
+      startBtn.textContent        = '⏳ loading…';
+      startBtn.dataset.active     = 'false';
+      startBtn.dataset.loading    = 'true';
+    } else if (active) {
+      startBtn.textContent        = '⏹ Stop Shuffle';
+      startBtn.dataset.active     = 'true';
+      startBtn.dataset.loading    = 'false';
+    } else {
+      startBtn.textContent        = 'True Shuffle';
+      startBtn.dataset.active     = 'false';
+      startBtn.dataset.loading    = 'false';
+    }
   }
 
-  // Keep repeat checkbox in sync (user may change it via the sidebar too).
+  // Keep repeat checkbox in sync (may be changed via sidebar).
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
 
-  if (!active) return;
+  if (!active) {
+    // Clear stale progress bar.
+    const prog = document.getElementById('tss-hub-prog');
+    if (prog) prog.style.width = '0%';
+    return;
+  }
 
   const art = document.getElementById('tss-hub-art');
   const pb  = document.getElementById('tss-hub-play');
@@ -237,8 +262,8 @@ function updateHub() {
     return;
   }
 
-  // Normal mode.
-  const m  = state.meta[state.queue?.[state.pos]];
+  // Normal mode — update all fields.
+  const m   = state.meta[state.queue?.[state.pos]];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');
   if (tEl) tEl.textContent = playerTitle() || m?.title  || '—';
