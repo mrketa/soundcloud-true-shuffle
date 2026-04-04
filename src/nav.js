@@ -45,12 +45,16 @@ async function onNav() {
         state.suspended = false;
         await wait(1500);
         inject();
-        const status   = document.getElementById('tss-status');
+        const status = document.getElementById('tss-status');
+        // Pause the watcher while updating state.els to avoid a race where
+        // next() fires mid-update and reads a partially-refreshed element array.
+        state.worker?.postMessage('stop');
         const freshEls = await loadTracks(status);
         if (freshEls.length > 0) {
           state.els  = freshEls;
           state.meta = freshEls.map(getMeta);
         }
+        state.worker?.postMessage('start');
         return;
       }
 
