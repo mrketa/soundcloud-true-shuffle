@@ -24,7 +24,8 @@ function badges() {
       `margin-right:5px`,
       `vertical-align:middle`,
     ].join(';');
-    b.textContent = cur ? `▶ ${qi + 1}` : `${qi + 1}`;
+    const n       = state.stats.played + (qi - state.pos);
+    b.textContent = cur ? `▶ ${n}` : `${n}`;
 
     const t = el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
     if (t) t.parentNode.insertBefore(b, t);

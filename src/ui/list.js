@@ -125,7 +125,8 @@ function mkRow(m, qi, ti, cur, past) {
   // Position number / playing indicator.
   const num = document.createElement('div');
   num.style.cssText = `font-size:10px;color:${cur ? '#f50' : '#444'};font-weight:${cur ? '700' : '400'};min-width:18px;text-align:center;flex-shrink:0;`;
-  num.textContent   = cur ? '▶' : (qi >= 0 ? qi + 1 : '↑');
+  const displayNum  = qi >= 0 ? state.stats.played + (qi - state.pos) : '↑';
+  num.textContent   = cur ? '▶' : displayNum;
 
   // Title + artist text block — esc() prevents XSS from track metadata.
   const txt = document.createElement('div');
