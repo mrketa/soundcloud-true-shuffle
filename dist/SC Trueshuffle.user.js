@@ -234,11 +234,8 @@ function esc(str) {
 // ── src/worker.js ─────────────────────────────────────────────────────────────
 
 // ── Web Worker factory ────────────────────────────────────────────────────────
-// The worker fires a message every 300 ms so the watcher can poll playback
-// state independently of whether the tab is in the foreground.
-//
-// Fix (bug 7): the Blob URL is revoked immediately after the Worker is
-// constructed — previously it was leaked on every shuffle start.
+// Fires a message every 300 ms so the watcher can poll playback state even
+// when the tab is in the background.
 
 function mkWorker() {
   const src = `
@@ -255,7 +252,7 @@ function mkWorker() {
   `;
   const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
   const w   = new Worker(url);
-  URL.revokeObjectURL(url); // release the Blob URL immediately — Worker keeps its own reference
+  URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
   return w;
 }
 
@@ -295,9 +292,6 @@ async function loadTracks(status) {
 
 // Click the play button for track at index `idx` and wait for the title to change.
 async function playAt(idx) {
-  // Guard: if shuffle was stopped while we were awaiting (e.g. the user navigated
-  // away mid-transition), abort immediately so the stale async chain doesn't keep
-  // running and corrupting queue / pos / history state.
   if (!state.active) return;
 
   const el = state.els[idx];
@@ -305,8 +299,6 @@ async function playAt(idx) {
     // Track removed from the playlist mid-session, or we've navigated away.
     state.els[idx] = null;
 
-    // If no tracks remain in the DOM at all (e.g. we're on a different page),
-    // re-enter suspended mode rather than spinning through the whole queue.
     const anyAlive = state.els.some(e => e && document.body.contains(e));
     if (!anyAlive) {
       state.suspended = true;
@@ -331,11 +323,11 @@ async function playAt(idx) {
   if (btn) btn.click();
   else el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.click();
 
-  // Wait up to ~2.25 s for the player title to change, confirming the new track started.
   const prev = state.lastTitle;
   for (let i = 0; i < 15; i++) {
     await wait(150);
-    if (playerTitle() && playerTitle() !== prev) break;
+    const t = playerTitle();
+    if (t && t !== prev) break;
   }
 
   state.lastTitle    = playerTitle();
@@ -345,31 +337,11 @@ async function playAt(idx) {
 }
 
 // Advance to the next track in the queue.
-//
-// Fixes applied:
-//   Bug 1 – Priority weight formula was broken for weight > 1 (high priority).
-//            minOffset went negative, causing splice() to insert from the end
-//            of the array via a negative index, with no lower-bound guard.
-//            New formula maps each weight tier to a correct insertion window.
-//   Bug 4 – The _goingBack flag was set in prevTrack() but never read here.
-//            It has been removed entirely.
-//   Bonus  – playNext items were inserted at pos+1 (skipping the natural next
-//            track). They are now inserted at pos so the natural next track
-//            is preserved immediately after the playNext item.
 async function next(status, fromWatcher = false) {
-  // Guard: stop stale async chains that outlive a stop() call (e.g. a playAt()
-  // that was mid-await when the user navigated away).  Without this, every
-  // element in state.els is found to be detached from the DOM, triggering a
-  // rapid next()→playAt()→next() loop that corrupts state before the next
-  // shuffle session even starts.
   if (!state.active) return;
   if (state.busy) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
 
-  // If no playlist tracks are in the DOM (we navigated to an external page),
-  // do NOT touch the queue — just re-suspend and wait for the user to return.
-  // Without this guard, next() would move the queue pointer and then playAt()
-  // would fail silently, causing every press to "skip" without playing anything.
   if (!state.els.some(e => e && document.body.contains(e))) {
     state.suspended = true;
     updateMiniPlayer();
@@ -379,95 +351,72 @@ async function next(status, fromWatcher = false) {
   state.suspended = false;
   state.busy      = true;
 
-  // Record the just-played track in history for prevTrack() support.
   const justPlayed = state.queue[state.pos];
   if (justPlayed !== undefined) {
     state.history.push(justPlayed);
     if (state.history.length > 50) state.history.shift();
   }
 
-  // Remove the just-played track from its current position, then reinsert it
-  // into the future portion of the queue at a position biased by its priority:
-  //
-  //   weight 0.25 (low)    → last ~25 % of the remaining queue
-  //   weight 1.0  (normal) → anywhere in the remaining queue
-  //   weight 2.0  (high)   → first ~50 % of the remaining queue
   if (justPlayed !== undefined) {
     state.queue.splice(state.pos, 1);
-    const remaining = state.queue.length - state.pos;
 
-    if (remaining > 0) {
-      const weight = state.priority[justPlayed] ?? 1.0;
-
-      // For weight ≥ 1 the window starts at the front (rangeStart = 0).
-      // For weight < 1 the window starts further back.
-      const rangeStart = weight >= 1.0
-        ? 0
-        : Math.floor(remaining * (1 - weight));
-
-      // For weight ≤ 1 the window reaches the very end.
-      // For weight > 1 the window is restricted to the front portion.
-      const rangeEnd = weight <= 1.0
-        ? remaining
-        : Math.ceil(remaining / weight);
-
-      const span    = Math.max(1, rangeEnd - rangeStart);
-      const insertAt = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
-      state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
-    } else {
-      // Nothing left after current — push to end so it can be reshuffled.
-      state.queue.push(justPlayed);
+    if (state.autoRepeat) {
+      // Reinsert the played track into the future portion of the queue,
+      // biased by priority:
+      //   0.25 (low)    → last ~25 % of remaining
+      //   1.0  (normal) → anywhere in remaining
+      //   2.0  (high)   → first ~50 % of remaining
+      const remaining = state.queue.length - state.pos;
+      if (remaining > 0) {
+        const weight     = state.priority[justPlayed] ?? 1.0;
+        const rangeStart = weight >= 1.0 ? 0 : Math.floor(remaining * (1 - weight));
+        const rangeEnd   = weight <= 1.0 ? remaining : Math.ceil(remaining / weight);
+        const span       = Math.max(1, rangeEnd - rangeStart);
+        const insertAt   = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
+        state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
+      } else {
+        // Last track in the queue — start a fresh shuffled cycle.
+        state.queue = fisherYates([...Array(state.meta.length).keys()]);
+        state.pos   = 0;
+      }
     }
+    // autoRepeat=false: track is not reinserted; queue shrinks by one each play.
   }
 
-  // If the user queued a "play next" track, insert it at the current position
-  // (which now points to the natural next track after the splice above).
-  // This means the playNext item plays immediately and the natural next track
-  // follows right after — previously the natural next track was skipped.
+  // Insert a "play next" track at the current position.
+  // Remove any existing copy first so the queue doesn't gain a duplicate.
   if (state.playNext.length > 0) {
-    const ti = state.playNext.shift();
+    const ti  = state.playNext.shift();
+    const dup = state.queue.indexOf(ti);
+    if (dup !== -1) {
+      state.queue.splice(dup, 1);
+      if (dup < state.pos) state.pos--;
+    }
     state.queue.splice(state.pos, 0, ti);
-    // pos is unchanged; queue[pos] is now the playNext track.
   }
 
-  // End of queue — reshuffle or stop.
+  // Queue exhausted — only reachable when autoRepeat=false.
   if (state.pos >= state.queue.length) {
-    if (!state.autoRepeat) {
-      stop();
-      if (status) status.textContent = '';
-      const btn = document.getElementById('tss-btn');
-      if (btn) btn.textContent = '🔀 True Shuffle';
-      state.busy = false;
-      return;
-    }
-    state.queue = fisherYates(state.queue);
-    state.pos   = 0;
+    stop();
+    if (status) status.textContent = '';
+    const btn = document.getElementById('tss-btn');
+    if (btn) btn.textContent = '🔀 True Shuffle';
+    state.busy = false;
+    return;
   }
 
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
 // Go back to the previously played track.
-//
-// Fix (bug 3): The original code did state.queue.splice(pos, 0, prevTi) which
-// inserted without ever removing, so the queue grew by one entry on every
-// press. Now we first remove prevTi from its future slot (where next() had
-// re-inserted it) before inserting it at the current position, keeping the
-// queue length stable.
-//
-// Fix (bug 4): The _goingBack flag (which was set but never consumed by next())
-// has been removed.
 async function prevTrack(status) {
   if (state.busy) return;
 
-  // Spotify-style two-phase behaviour:
-  //   > 3 s into the track → restart the current track (seekTo 0)
-  //   ≤ 3 s into the track → go back to the previous track in history
-  //                          (or restart if there is no history)
+  // > 3 s in → restart current track.  ≤ 3 s → go to previous in history.
   if (currentSec() > 3 || !state.history.length) {
     seekTo(0);
     return;
@@ -478,17 +427,19 @@ async function prevTrack(status) {
 
   const prevTi = state.history.pop();
 
-  // Remove prevTi from its future slot to prevent a duplicate entry.
-  const futureIdx = state.queue.indexOf(prevTi, state.pos);
-  if (futureIdx !== -1) state.queue.splice(futureIdx, 1);
-
-  // Insert at the current position so queue[pos] === prevTi.
+  // Search the full queue (not just the future portion) so a track that was
+  // dragged before state.pos is still found and removed before reinserting.
+  const existingIdx = state.queue.indexOf(prevTi);
+  if (existingIdx !== -1) {
+    state.queue.splice(existingIdx, 1);
+    if (existingIdx < state.pos) state.pos--;
+  }
   state.queue.splice(state.pos, 0, prevTi);
 
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
@@ -497,12 +448,20 @@ async function jumpTo(qi, ti, status) {
   if (state.busy) return;
   state.busy         = true;
   state.manualAction = true;
-  state.suspended    = false;   // resume shuffle when user picks a queued track
-  state.pos          = qi;
+  state.suspended    = false;
+
+  // Record what was playing so prevTrack() can return to it.
+  const current = state.queue[state.pos];
+  if (current !== undefined) {
+    state.history.push(current);
+    if (state.history.length > 50) state.history.shift();
+  }
+
+  state.pos = qi;
   await playAt(ti);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${qi + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
@@ -554,9 +513,9 @@ async function start(btn, status) {
   state.els  = els;
   state.meta = els.map(getMeta);
 
-  // Check for a queue cached before an external-track navigation.
-  // We identify tracks by permalink URL (metaKeys) so indices remain
-  // correct even when SC re-renders the DOM with different element counts.
+  // Restore a queue cached before an external-track navigation.
+  // Tracks are identified by permalink URL so indices stay correct even if
+  // SC re-renders the DOM in a different order.
   let _cached = null;
   try {
     const _raw = sessionStorage.getItem('tss_queue_cache');
@@ -567,8 +526,7 @@ async function start(btn, status) {
           && Array.isArray(_c.queue) && _c.queue.length > 0
           && Array.isArray(_c.metaKeys)) {
 
-        // Build id → newTi lookup using trackId() (permalink URL preferred).
-        // state.meta is already populated above (els.map(getMeta)).
+        // Build id → newTi lookup so we can remap old indices to new ones.
         const idToNew = {};
         state.meta.forEach((m, ti) => {
           const id = trackId(m);
@@ -583,20 +541,17 @@ async function start(btn, status) {
         };
         const remappedQueue = _c.queue.map(remapOld).filter(ti => ti !== null);
 
-        // Any tracks that didn't remap (link/title changed, or lazy-rendered
-        // on this load) are shuffled and appended to the end so the full
-        // playlist is always covered — no tracks are silently dropped.
+        // Tracks that didn't remap (new, renamed, or lazy-rendered) are
+        // shuffled and appended so the full playlist is always covered.
         const inQueue   = new Set(remappedQueue);
         const extras    = fisherYates(
           [...Array(state.meta.length).keys()].filter(ti => !inQueue.has(ti))
         );
         const finalQueue = remappedQueue.concat(extras);
 
-        // Restore as long as at least one track remapped by identity.
-        // An all-zero remap means we have no stable identity info at all
-        // (e.g. completely different playlist), so treat as a fresh start.
+        // Only restore if at least one track remapped; otherwise it's a
+        // completely different playlist and a fresh shuffle makes more sense.
         if (remappedQueue.length > 0) {
-          // Find new pos for the track that was playing when cache was written.
           const cachedPos = typeof _c.pos === 'number' ? _c.pos : 0;
           const posId     = mk[_c.queue[cachedPos]] || '';
           let   newPos    = finalQueue.findIndex(
@@ -604,7 +559,6 @@ async function start(btn, status) {
           );
           if (newPos === -1) newPos = 0;
 
-          // Remap history and priority.
           const newHistory = (Array.isArray(_c.history) ? _c.history : [])
             .map(remapOld).filter(ti => ti !== null);
           const newPriority = {};
@@ -613,7 +567,6 @@ async function start(btn, status) {
             if (nti !== null) newPriority[nti] = w;
           }
 
-          // Only remove from sessionStorage once we know restoration succeeded.
           sessionStorage.removeItem('tss_queue_cache');
           _cached = { queue: finalQueue, pos: newPos,
                       history: newHistory, priority: newPriority };
@@ -652,21 +605,10 @@ async function start(btn, status) {
   btn.textContent = '⏹ Stop';
   btn.disabled    = false;
 
-  if (_cached) {
-    // Restored queue — replay the interrupted track from the start.
-    // Setting manualAction prevents the watcher's title-change handler from
-    // treating this programmatic play as an external (non-queue) song.
-    state.manualAction = true;
-    await playAt(state.queue[state.pos]);
-    badges();
-    renderList();
-    if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
-  } else {
-    await playAt(state.queue[0]);
-    badges();
-    renderList();
-    if (status) status.textContent = `▶ 1 / ${state.queue.length}`;
-  }
+  await playAt(state.queue[state.pos]);
+  badges();
+  renderList();
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   startWatcher(status);
 
   const mini = document.getElementById('tss-mini');
@@ -689,11 +631,8 @@ function stop() {
 // ── src/watcher.js ────────────────────────────────────────────────────────────
 
 // ── Watcher ───────────────────────────────────────────────────────────────────
-// A Web Worker fires every 300 ms. Each tick we check:
-//   1. Did SoundCloud auto-advance to a different track? → trigger next().
-//   2. Is the track within 1 % of its end and still playing? → pause then
-//      trigger next() so our queue controls the transition, not SC's native
-//      auto-play logic.
+// Polls every 300 ms via a Web Worker. Detects title changes (external song
+// or SC auto-advance) and fires next() when a track nears its end.
 
 function startWatcher(status) {
   if (state.worker) {
@@ -715,35 +654,27 @@ function startWatcher(status) {
     const p     = progress();
 
     // ── Suspended mode ────────────────────────────────────────────────────────
-    // An external (non-queue) track is playing. Keep the UI in sync but do not
-    // fight the native player. When the external track finishes, resume shuffle.
+    // An external (non-queue) track is playing. Let it play freely; resume
+    // the queue when it ends.
     if (state.suspended) {
       if (p >= 0.99 && !nearEnd && !paused()) {
         nearEnd = true;
-        pause(); // prevent SC from auto-advancing to related tracks
+        pause();
         await wait(150);
 
-        // Only resume shuffle if playlist tracks are still in the DOM
-        // (i.e. we're on the same page or a page that contains the list).
-        // If the DOM elements are gone, mark for auto-resume when the user
-        // navigates back and leave the queue untouched.
         const anyAlive = state.els.some(e => e && document.body.contains(e));
         if (anyAlive) {
-          // Playlist elements still in DOM — resume immediately.
+          // Still on the playlist page — resume immediately.
           state.suspended = false;
           await next(status, true);
           lastTitle = playerTitle();
           nearEnd   = false;
         } else {
-          // DOM elements are gone — we're on a different page.
-          // Kill the watcher so it doesn't fire stale ticks during recovery.
+          // Playlist DOM is gone — save the queue and navigate back.
           const worker = state.worker;
           state.worker = null;
           if (worker) worker.terminate();
 
-          // Persist the full shuffled queue to sessionStorage BEFORE touching
-          // state.  metaKeys[ti] = permalink URL so start() can remap indices
-          // to the new DOM after SC re-renders (element order may shift).
           try {
             const metaKeys = state.meta.map(m => trackId(m) || '');
             sessionStorage.setItem('tss_queue_cache', JSON.stringify({
@@ -757,18 +688,12 @@ function startWatcher(status) {
             }));
           } catch (_) {}
 
-          // Mark the session as inactive BEFORE navigating.  This is the key
-          // fix: onNav() checks state.active first.  By setting it to false
-          // here, onNav() on the new page (SPA or full reload — SC's router
-          // may reject synthetic clicks with isTrusted=false) always lands in
-          // the inactive fallthrough branch where it reads the cache and calls
-          // start().  The old _resumeOnReturn path only worked for SPA nav and
-          // was silently bypassed on full reloads.
+          // Set inactive before navigating so onNav() on the new page always
+          // takes the inactive fallthrough path and reads the cache.
           state.active    = false;
           state.busy      = false;
           state.suspended = false;
 
-          // Navigate back to the playlist.
           const a = document.createElement('a');
           a.href = state.playlistUrl;
           document.body.appendChild(a);
@@ -776,7 +701,6 @@ function startWatcher(status) {
           setTimeout(() => { if (a.parentNode) a.remove(); }, 2000);
         }
       } else {
-        // Update title tracking so the next non-suspended tick is correct.
         if (title && title !== lastTitle) lastTitle = title;
         titleTicks = 0;
         refreshPlayBtn();
@@ -786,33 +710,19 @@ function startWatcher(status) {
       return;
     }
 
-    // The playing track changed to something we didn't queue.
-    // This happens when:
-    //   (a) the user manually clicks any song from within the page, or
-    //   (b) SC auto-advanced past our controls (rare timing edge case).
-    //
-    // In both cases we want to LET THAT SONG PLAY FULLY and then resume
-    // the shuffled queue — exactly what suspended mode does.  We do NOT
-    // call next() here; the near-end handler below will fire when the
-    // song reaches 99 % and will call next() (or navigate back if the
-    // playlist DOM is gone).
-    //
-    // Exception: our own jumpTo() / prevTrack() controls set
-    // state.manualAction so we know the title change was intentional and
-    // the new track IS already the correct queued track — no need to suspend.
-    //
-    // Two consecutive ticks confirm the change (debounce for brief flashes
-    // during our own playAt() transitions, which also change the title).
+    // Title changed to a track we didn't queue — either the user clicked
+    // something manually or SC auto-advanced past our controls.
+    // Enter suspended mode so the song plays fully, then resume.
+    // Two consecutive ticks debounce brief flashes during our own playAt().
+    // manualAction exempts intentional control actions (jumpTo, prevTrack).
     if (title && lastTitle && title !== lastTitle) {
       if (++titleTicks >= 2) {
         titleTicks = 0;
         nearEnd    = false;
         lastTitle  = title;
         if (state.manualAction) {
-          // Our own control triggered this — just sync and continue.
           state.manualAction = false;
         } else {
-          // External selection: suspend and let the song play through.
           state.suspended = true;
           updateMiniPlayer();
         }
@@ -993,8 +903,6 @@ function showStats() {
 
   document.getElementById('tss-stats-close').onclick = () => overlay.remove();
 
-  // Fix (bug 5): The original button restored a saved stats snapshot instead
-  // of clearing. It now unconditionally resets stats to zero.
   document.getElementById('tss-stats-reset').onclick = () => {
     state.stats       = { played: 0, playCounts: {}, elapsed: 0 };
     state._savedStats = null;
@@ -1087,8 +995,6 @@ function mkMiniPlayer() {
   document.getElementById('tss-mini-prev').onclick  = () => prevTrack(st());
   document.getElementById('tss-mini-stats').onclick = showStats;
 
-  // Fix (bug 2): seekbar was rendered with cursor:pointer and title="seek" but
-  // had no event handler — seekTo() was unreachable from the UI. Wired here.
   document.getElementById('tss-mini-seekbar').onclick = e => {
     const rect = e.currentTarget.getBoundingClientRect();
     seekTo((e.clientX - rect.left) / rect.width);
@@ -1260,11 +1166,7 @@ function updateMiniPlayer() {
 
 // Shift the mini-player left when the sidebar opens so they don't overlap;
 // restore its anchored position when the sidebar closes.
-//
-// Fix (bug 6): shiftMiniPlayer was only ever called with sidebarOpen=true
-// (on open) so the player was never restored when the sidebar closed.
-// It is now also called on close, and uses a data-autoShifted flag to
-// distinguish elements we moved from ones the user positioned manually.
+// Uses data-autoShifted to distinguish auto-moved elements from user-dragged ones.
 function shiftMiniPlayer(sidebarOpen) {
   const mini = document.getElementById('tss-mini');
   const tab  = document.getElementById('tss-mini-tab');
@@ -1362,7 +1264,6 @@ function mkSidebar() {
   document.getElementById('tss-ctrl-prev').onclick = () => prevTrack(st());
   document.getElementById('tss-stats-btn').onclick = showStats;
 
-  // Fix (bug 2): sidebar seekbar also had no event handler.
   document.getElementById('tss-sidebar-seekbar').onclick = e => {
     const rect = e.currentTarget.getBoundingClientRect();
     seekTo((e.clientX - rect.left) / rect.width);
@@ -1379,8 +1280,6 @@ function toggleSidebar() {
   const t = document.getElementById('tss-sidebar-tab');
   if (s) s.style.right = state.sidebarOpen ? '0'      : '-320px';
   if (t) t.style.right = state.sidebarOpen ? '300px'  : '0';
-  // Fix (bug 6): shiftMiniPlayer is now called on both open AND close so the
-  // mini-player is restored to its original anchored position on close.
   shiftMiniPlayer(state.sidebarOpen);
 }
 
@@ -1403,7 +1302,7 @@ function renderList(filter = '') {
   }
 
   const q = filter.toLowerCase();
-  if (count) count.textContent = `${state.pos + 1} / ${state.queue.length}`;
+  if (count) count.textContent = `${state.stats.played} / ${state.queue.length}`;
 
   // Suspended banner — shown when an external track is playing.
   if (state.suspended && !q) {
@@ -1483,8 +1382,6 @@ function renderList(filter = '') {
 }
 
 // Build a single queue row element.
-// Fix (bug 8): track title and artist are now escaped before innerHTML
-// insertion to prevent XSS from maliciously named tracks.
 function mkRow(m, qi, ti, cur, past) {
   const row = document.createElement('div');
   row.style.cssText = `
@@ -1748,7 +1645,7 @@ async function onNav() {
         const raw = sessionStorage.getItem('tss_queue_cache');
         if (raw) {
           const c = JSON.parse(raw);
-          if (Date.now() - (c.ts || 0) < 10 * 60 * 1000
+          if (Date.now() - (c.ts || 0) < 30 * 60 * 1000
               && playlistBase(location.href) === playlistBase(c.playlistUrl || '')) {
             const btn    = document.getElementById('tss-btn');
             const status = document.getElementById('tss-status');
