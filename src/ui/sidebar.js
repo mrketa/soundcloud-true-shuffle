@@ -1,26 +1,9 @@
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-// Slide-in queue panel. Toggled via the hub or the persistent edge tab.
+// Slide-in queue panel. Toggled exclusively via the hub.
 // Contains only the queue list and search — playback is controlled from the hub.
 
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;
-
-  // Edge tab — always visible, click to open/close.
-  const tab = document.createElement('div');
-  tab.id = 'tss-sidebar-tab';
-  tab.textContent = '≡';
-  tab.style.cssText = `
-    position:fixed; right:0; top:50%; transform:translateY(-50%);
-    background:#f50; color:#fff;
-    width:28px; height:60px;
-    display:flex; align-items:center; justify-content:center;
-    border-radius:6px 0 0 6px;
-    cursor:pointer; z-index:99998; font-size:18px;
-    box-shadow:-2px 0 8px rgba(0,0,0,0.4); transition:right 0.25s;
-  `;
-  tab.onmouseenter = () => { tab.style.background = '#e64a00'; };
-  tab.onmouseleave = () => { tab.style.background = '#f50'; };
-  tab.onclick = toggleSidebar;
 
   // Sidebar panel.
   const sidebar = document.createElement('div');
@@ -49,7 +32,6 @@ function mkSidebar() {
     <div id="tss-sidebar-list" style="overflow-y:auto;flex:1;padding:4px 0;scrollbar-width:thin;scrollbar-color:#222 transparent;"></div>
   `;
 
-  document.body.appendChild(tab);
   document.body.appendChild(sidebar);
 
   document.getElementById('tss-stats-btn').onclick = showStats;
@@ -57,12 +39,10 @@ function mkSidebar() {
   document.getElementById('tss-search').onclick  = e => e.stopPropagation();
 }
 
-// Toggle the sidebar open/closed and keep the hub button in sync.
+// Toggle the sidebar open/closed and keep the hub in sync.
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
   const s = document.getElementById('tss-sidebar');
-  const t = document.getElementById('tss-sidebar-tab');
-  if (s) s.style.right = state.sidebarOpen ? '0'     : '-320px';
-  if (t) t.style.right = state.sidebarOpen ? '300px' : '0';
+  if (s) s.style.right = state.sidebarOpen ? '0' : '-320px';
   updateHub();
 }

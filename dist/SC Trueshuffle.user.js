@@ -986,17 +986,14 @@ function mkHub() {
         cursor:not-allowed !important;
         animation:tss-pulse 1.2s ease-in-out infinite;
       }
-      #tss-hub-qtoggle {
-        width:100%; background:none;
-        border:1px solid #2a2a2a; border-radius:4px;
-        color:#555; font-size:10px; padding:5px 8px;
-        cursor:pointer; font-family:-apple-system,sans-serif;
-        transition:color 0.15s, border-color 0.15s; text-align:left;
+      #tss-hub-qico {
+        font-size:11px; color:#333; cursor:pointer;
+        padding:2px 5px; border-radius:3px;
+        transition:color 0.15s, background 0.15s;
+        line-height:1; flex-shrink:0;
       }
-      #tss-hub-qtoggle:hover { color:#bbb; border-color:#444; }
-      #tss-hub-qtoggle[data-open="true"] {
-        color:#f50; border-color:rgba(255,85,0,0.4);
-      }
+      #tss-hub-qico:hover { color:#888; background:rgba(255,255,255,0.05); }
+      #tss-hub-qico[data-open="true"] { color:#f50; }
     `;
     document.head.appendChild(s);
   }
@@ -1054,7 +1051,11 @@ function mkHub() {
 
       <div id="tss-hub-s-queue" class="tss-hub-sec" style="display:none;">
         <div class="tss-hub-sh" data-body="tss-hub-s-queue-b">
-          <span>queue</span><span class="tss-hub-arr">▾</span>
+          <span>queue</span>
+          <div style="display:flex;align-items:center;gap:4px;">
+            <span id="tss-hub-qico" data-open="false" title="toggle queue panel">→</span>
+            <span class="tss-hub-arr">▾</span>
+          </div>
         </div>
         <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -1065,7 +1066,6 @@ function mkHub() {
             <span style="color:#555;font-size:10px;flex-shrink:0;">next</span>
             <span id="tss-hub-nextup" style="color:#bbb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;text-align:right;min-width:0;">—</span>
           </div>
-          <button id="tss-hub-qtoggle" data-open="false">show queue ↗</button>
         </div>
       </div>
 
@@ -1104,8 +1104,11 @@ function mkHub() {
     seekTo((e.clientX - r.left) / r.width);
   };
 
-  // ── Queue toggle ──────────────────────────────────────────────────────────
-  document.getElementById('tss-hub-qtoggle').onclick = () => toggleSidebar();
+  // ── Queue toggle — icon in the section header, doesn't collapse the section
+  document.getElementById('tss-hub-qico').onclick = e => {
+    e.stopPropagation();
+    toggleSidebar();
+  };
 
   // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
@@ -1202,12 +1205,13 @@ function updateHub() {
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
 
-  // Sync queue toggle button label with sidebar state.
-  const qt = document.getElementById('tss-hub-qtoggle');
-  if (qt) {
-    const open       = state.sidebarOpen;
-    qt.dataset.open  = open ? 'true' : 'false';
-    qt.textContent   = open ? 'hide queue ✕' : 'show queue ↗';
+  // Sync the queue-panel toggle icon with sidebar state.
+  const qi = document.getElementById('tss-hub-qico');
+  if (qi) {
+    const open      = state.sidebarOpen;
+    qi.dataset.open = open ? 'true' : 'false';
+    qi.textContent  = open ? '←' : '→';
+    qi.title        = open ? 'close queue panel' : 'open queue panel';
   }
 
   if (!active) {
@@ -1268,28 +1272,11 @@ function updateHub() {
 // ── src/ui/sidebar.js ─────────────────────────────────────────────────────────
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-// Slide-in queue panel. Toggled via the hub or the persistent edge tab.
+// Slide-in queue panel. Toggled exclusively via the hub.
 // Contains only the queue list and search — playback is controlled from the hub.
 
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;
-
-  // Edge tab — always visible, click to open/close.
-  const tab = document.createElement('div');
-  tab.id = 'tss-sidebar-tab';
-  tab.textContent = '≡';
-  tab.style.cssText = `
-    position:fixed; right:0; top:50%; transform:translateY(-50%);
-    background:#f50; color:#fff;
-    width:28px; height:60px;
-    display:flex; align-items:center; justify-content:center;
-    border-radius:6px 0 0 6px;
-    cursor:pointer; z-index:99998; font-size:18px;
-    box-shadow:-2px 0 8px rgba(0,0,0,0.4); transition:right 0.25s;
-  `;
-  tab.onmouseenter = () => { tab.style.background = '#e64a00'; };
-  tab.onmouseleave = () => { tab.style.background = '#f50'; };
-  tab.onclick = toggleSidebar;
 
   // Sidebar panel.
   const sidebar = document.createElement('div');
@@ -1318,7 +1305,6 @@ function mkSidebar() {
     <div id="tss-sidebar-list" style="overflow-y:auto;flex:1;padding:4px 0;scrollbar-width:thin;scrollbar-color:#222 transparent;"></div>
   `;
 
-  document.body.appendChild(tab);
   document.body.appendChild(sidebar);
 
   document.getElementById('tss-stats-btn').onclick = showStats;
@@ -1326,13 +1312,11 @@ function mkSidebar() {
   document.getElementById('tss-search').onclick  = e => e.stopPropagation();
 }
 
-// Toggle the sidebar open/closed and keep the hub button in sync.
+// Toggle the sidebar open/closed and keep the hub in sync.
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
   const s = document.getElementById('tss-sidebar');
-  const t = document.getElementById('tss-sidebar-tab');
-  if (s) s.style.right = state.sidebarOpen ? '0'     : '-320px';
-  if (t) t.style.right = state.sidebarOpen ? '300px' : '0';
+  if (s) s.style.right = state.sidebarOpen ? '0' : '-320px';
   updateHub();
 }
 
