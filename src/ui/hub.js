@@ -1,12 +1,5 @@
-// ── Hub ───────────────────────────────────────────────────────────────────────
-// Central floating panel: now playing + seekbar, playback controls, queue info,
-// and shuffle settings. Draggable. The queue sidebar is toggled from here.
-//
-// ── How to remove ─────────────────────────────────────────────────────────────
-// 1. Delete this file
-// 2. Remove 'src/ui/hub.js' from FILES in build.py
-// 3. Remove mkHub() from inject.js                    (1 line)
-// 4. Remove updateHub() calls from playback.js / watcher.js / stop()
+// Hub — central floating panel. Draggable, collapsible sections.
+// Remove: delete file, remove mkHub() from inject.js, remove updateHub() call sites.
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
@@ -27,13 +20,11 @@ function mkHub() {
       .tss-hub-sec { border-top:1px solid #1a1a1a; }
       #tss-hub-start { transition:background 0.2s, color 0.2s, border-color 0.2s; }
       #tss-hub-start[data-active="true"] {
-        background:#f50 !important; color:#fff !important;
-        border-color:transparent !important;
+        background:#f50 !important; color:#fff !important; border-color:transparent !important;
       }
       #tss-hub-start[data-active="true"]:hover { background:#e64a00 !important; }
       #tss-hub-start:not([data-active="true"]):not([data-loading="true"]):hover {
-        background:rgba(255,85,0,0.1) !important;
-        border-color:#f50 !important;
+        background:rgba(255,85,0,0.1) !important; border-color:#f50 !important;
       }
       #tss-hub-start[data-loading="true"] {
         color:#555 !important; border-color:#1e1e1e !important;
@@ -58,14 +49,11 @@ function mkHub() {
   const hub = document.createElement('div');
   hub.id = 'tss-hub';
   hub.style.cssText = `
-    position:fixed; bottom:60px; left:20px;
-    width:230px;
+    position:fixed; bottom:60px; left:20px; width:230px;
     background:#111; border:1px solid #222; border-radius:10px;
-    z-index:99994;
-    font-family:-apple-system,sans-serif;
+    z-index:99994; font-family:-apple-system,sans-serif;
     box-shadow:0 4px 20px rgba(0,0,0,0.7);
-    overflow:hidden;
-    -webkit-user-select:none; user-select:none;
+    overflow:hidden; -webkit-user-select:none; user-select:none;
   `;
 
   hub.innerHTML = `
@@ -149,33 +137,23 @@ function mkHub() {
 
   document.body.appendChild(hub);
 
-  // ── Controls ──────────────────────────────────────────────────────────────
   document.getElementById('tss-hub-play').onclick  = toggle;
-  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(null);
-  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(null); };
+  document.getElementById('tss-hub-prev').onclick  = () => prevTrack();
+  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(); };
   document.getElementById('tss-hub-stats').onclick = showStats;
   document.getElementById('tss-hub-seekbar').onclick = e => {
     const r = e.currentTarget.getBoundingClientRect();
     seekTo((e.clientX - r.left) / r.width);
   };
 
-  // ── Queue toggle — icon in the section header, doesn't collapse the section
-  document.getElementById('tss-hub-qico').onclick = e => {
-    e.stopPropagation();
-    toggleSidebar();
-  };
+  document.getElementById('tss-hub-qico').onclick = e => { e.stopPropagation(); toggleSidebar(); };
 
-  // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // ── Start / stop ──────────────────────────────────────────────────────────
-  document.getElementById('tss-hub-start').onclick = () => {
-    if (!state.loading) start();
-  };
+  document.getElementById('tss-hub-start').onclick = () => { if (!state.loading) start(); };
 
-  // ── Collapse entire hub ───────────────────────────────────────────────────
   const colBtn  = document.getElementById('tss-hub-col');
   const hubBody = document.getElementById('tss-hub-body');
   colBtn.onclick = () => {
@@ -184,7 +162,6 @@ function mkHub() {
     colBtn.textContent    = open ? '+' : '−';
   };
 
-  // ── Per-section collapse ──────────────────────────────────────────────────
   hub.querySelectorAll('.tss-hub-sh').forEach(sh => {
     sh.onclick = () => {
       const b   = document.getElementById(sh.dataset.body);
@@ -196,7 +173,6 @@ function mkHub() {
     };
   });
 
-  // ── Drag ──────────────────────────────────────────────────────────────────
   const hubHdr = document.getElementById('tss-hub-hdr');
   hubHdr.onmousedown = e => {
     if (e.target.id === 'tss-hub-col') return;
@@ -211,10 +187,7 @@ function mkHub() {
       hub.style.left = Math.max(0, Math.min(window.innerWidth  - hub.offsetWidth,  ev.clientX - ox)) + 'px';
       hub.style.top  = Math.max(0, Math.min(window.innerHeight - hub.offsetHeight, ev.clientY - oy)) + 'px';
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup',   up);
-    };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup',   up);
   };
@@ -222,21 +195,17 @@ function mkHub() {
   updateHub();
 }
 
-// Sync all hub elements with current playback state.
-// Called from playback.js, watcher.js, and stop().
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
   const active  = state.active;
   const loading = state.loading;
 
-  // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = active ? '' : 'none';
   });
 
-  // Start button: idle / loading / active.
   const startBtn = document.getElementById('tss-hub-start');
   if (startBtn) {
     if (loading) {
@@ -254,21 +223,17 @@ function updateHub() {
     }
   }
 
-  // Keep repeat checkbox in sync (may be changed via the inject UI).
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
 
-  // Sync the queue-panel toggle icon with sidebar state.
   const qi = document.getElementById('tss-hub-qico');
   if (qi) {
-    const open      = state.sidebarOpen;
-    qi.dataset.open = open ? 'true' : 'false';
-    qi.textContent  = open ? '←' : '→';
-    qi.title        = open ? 'close queue panel' : 'open queue panel';
+    qi.dataset.open = state.sidebarOpen ? 'true' : 'false';
+    qi.textContent  = state.sidebarOpen ? '←' : '→';
+    qi.title        = state.sidebarOpen ? 'close queue panel' : 'open queue panel';
   }
 
   if (!active) {
-    // Clear stale progress bar.
     const prog = document.getElementById('tss-hub-prog');
     if (prog) prog.style.width = '0%';
     return;
@@ -277,7 +242,6 @@ function updateHub() {
   const pb = document.getElementById('tss-hub-play');
   if (pb) pb.textContent = paused() ? '▶' : '⏸';
 
-  // Suspended mode — an external (non-queue) track is playing.
   if (state.suspended) {
     const tEl = document.getElementById('tss-hub-title');
     const aEl = document.getElementById('tss-hub-artist');
@@ -288,7 +252,6 @@ function updateHub() {
     return;
   }
 
-  // Normal mode — update all fields.
   const m   = state.meta[state.queue?.[state.pos]];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');

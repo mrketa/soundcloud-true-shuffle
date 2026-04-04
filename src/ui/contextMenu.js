@@ -1,6 +1,3 @@
-// ── Context menu ──────────────────────────────────────────────────────────────
-// Right-click a queue row to get quick track actions.
-
 function showCtxMenu(e, qi, ti) {
   e.preventDefault();
   e.stopPropagation();
@@ -19,10 +16,7 @@ function showCtxMenu(e, qi, ti) {
   `;
 
   const items = [
-    {
-      label:    '⏭ play next',
-      action:   () => queueNext(ti),
-    },
+    { label: '⏭ play next',  action: () => queueNext(ti) },
     {
       label:    '↑ move up',
       disabled: qi <= state.pos + 1,
@@ -31,8 +25,7 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos--;
         else if (state.pos === qi - 1) state.pos++;
-        badges();
-        renderList();
+        badges(); renderList();
       },
     },
     {
@@ -43,19 +36,11 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi + 1]] = [state.queue[qi + 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos++;
         else if (state.pos === qi + 1) state.pos--;
-        badges();
-        renderList();
+        badges(); renderList();
       },
     },
-    {
-      label:  '🔗 copy link',
-      action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); },
-    },
-    {
-      label:    '✕ remove',
-      disabled: qi === state.pos,
-      action:   () => removeFromQueue(qi),
-    },
+    { label: '🔗 copy link', action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); } },
+    { label: '✕ remove',    disabled: qi === state.pos, action: () => removeFromQueue(qi) },
   ];
 
   items.forEach(({ label, action, disabled }) => {
@@ -76,6 +61,5 @@ function showCtxMenu(e, qi, ti) {
   });
 
   document.body.appendChild(menu);
-  // Dismiss on the next click anywhere.
   setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 0);
 }

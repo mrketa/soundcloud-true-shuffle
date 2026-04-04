@@ -1,6 +1,3 @@
-// ── Session stats ─────────────────────────────────────────────────────────────
-
-// Increment elapsed-time counter once per second while shuffle is active.
 function tickPlayTime() {
   if (state.active && !state.suspended && !paused()) {
     state.stats.elapsed = (state.stats.elapsed || 0) + 1;
@@ -8,8 +5,6 @@ function tickPlayTime() {
 }
 setInterval(tickPlayTime, 1000);
 
-// Re-render the stats overlay contents (called on a 1-second interval and
-// after user interaction with priority buttons).
 function renderStats() {
   const overlay = document.getElementById('tss-stats-overlay');
   if (!overlay) return;
@@ -20,9 +15,7 @@ function renderStats() {
   const s        = elapsed % 60;
   const duration = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 
-  const top = Object.entries(state.stats.playCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5);
+  const top = Object.entries(state.stats.playCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
   const tp = overlay.querySelector('#tss-stats-played');
   const tt = overlay.querySelector('#tss-stats-time');
@@ -45,7 +38,6 @@ function renderStats() {
       </div>`;
   }).join('');
 
-  // Priority toggle buttons — cycle: normal → low → high → normal.
   list.querySelectorAll('[data-ti]').forEach(btn => {
     btn.onclick = e => {
       e.stopPropagation();
@@ -63,7 +55,6 @@ function renderStats() {
 }
 setInterval(renderStats, 1000);
 
-// Build and show the stats modal; toggle it off if already open.
 function showStats() {
   const existing = document.getElementById('tss-stats-overlay');
   if (existing) { existing.remove(); return; }
@@ -107,14 +98,12 @@ function showStats() {
   renderStats();
 
   document.getElementById('tss-stats-close').onclick = () => overlay.remove();
-
   document.getElementById('tss-stats-reset').onclick = () => {
     state.stats       = { played: 0, playCounts: {}, elapsed: 0 };
     state._savedStats = null;
     renderStats();
   };
 
-  // Draggable via the header bar.
   const header = document.getElementById('tss-stats-header');
   header.onmousedown = e => {
     if (e.target.id === 'tss-stats-close') return;
@@ -129,10 +118,7 @@ function showStats() {
       overlay.style.left = Math.max(0, Math.min(window.innerWidth  - overlay.offsetWidth,  origL + (ev.clientX - startX))) + 'px';
       overlay.style.top  = Math.max(0, Math.min(window.innerHeight - overlay.offsetHeight, origT + (ev.clientY - startY))) + 'px';
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup',   up);
-    };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup',   up);
   };

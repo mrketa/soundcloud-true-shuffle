@@ -15,43 +15,36 @@
 
 // ── src/state.js ──────────────────────────────────────────────────────────────
 
-// ── Shared state ─────────────────────────────────────────────────────────────
-// Single source of truth for all runtime data. Every module reads/writes this
-// object directly — no copies, no getters.
-
 const state = {
-  active:       false,   // is shuffle running?
-  autoRepeat:   true,    // reshuffle and loop when queue exhausted
-  queue:        [],      // shuffled array of track indices (into state.els / state.meta)
-  playNext:     [],      // priority queue: play these ti values before continuing
-  pos:          0,       // current position in state.queue
-  els:          [],      // DOM elements for each track (index = ti)
-  meta:         [],      // { title, artist, artwork, link } per track (index = ti)
-  worker:       null,    // Web Worker used for background polling
-  busy:         false,   // guard: prevents re-entrant playback calls
-  loading:      false,   // true while loadTracks() is running
-  lastTitle:    '',      // title of the last confirmed playing track
-  lastProgress: 0,       // last known playback progress ratio (0–1)
-  sidebarOpen:  false,   // is the sidebar panel visible?
-  manualAction: false,   // true when user manually triggered next/prev
-  dragSrc:      null,    // queue index being dragged (for reorder)
-  history:      [],      // stack of previously played ti values (max 50)
-  priority:     {},      // ti → weight: 0.25 = low, 1.0 = normal, 2.0 = high
-  suspended:    false,   // true while an external (non-queue) track is playing
-  playlistUrl:  '',      // href when shuffle was started (detect navigation away)
-  _savedStats:  null,    // snapshot saved on stop() for restore-on-restart
+  active:       false,
+  autoRepeat:   true,
+  queue:        [],
+  playNext:     [],
+  pos:          0,
+  els:          [],
+  meta:         [],
+  worker:       null,
+  busy:         false,
+  loading:      false,
+  lastTitle:    '',
+  lastProgress: 0,
+  sidebarOpen:  false,
+  manualAction: false,
+  dragSrc:      null,
+  history:      [],
+  priority:     {},    // ti → weight: 0.25 low, 1.0 normal, 2.0 high
+  suspended:    false,
+  playlistUrl:  '',
+  _savedStats:  null,
   stats: {
-    played:     0,       // total tracks played this session
-    playCounts: {},      // ti → number of times played
-    elapsed:    0,       // seconds of actual playback time
+    played:     0,
+    playCounts: {},
+    elapsed:    0,
   },
 };
 
 // ── src/utils.js ──────────────────────────────────────────────────────────────
 
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-// Fisher-Yates in-place shuffle — returns a new array.
 function fisherYates(arr) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -63,15 +56,11 @@ function fisherYates(arr) {
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// ── DOM helpers ───────────────────────────────────────────────────────────────
-
-// Returns the title currently shown in SoundCloud's playback bar.
-// Prefers the `title` attribute over textContent — SC's textContent includes
-// an accessibility prefix ("Current track: …") that we don't want to display.
 function playerTitle() {
   for (const s of ['.playbackSoundBadge__titleLink', '.playbackSoundBadge a[title]', '.playerTrackName']) {
     const el = document.querySelector(s);
     if (!el) continue;
+    // SC's textContent includes an accessibility prefix we don't want
     const t = (el.getAttribute('title') || el.textContent)
       .trim()
       .replace(/^current\s+track:\s*/i, '');
@@ -80,7 +69,6 @@ function playerTitle() {
   return '';
 }
 
-// Returns current playback progress as a ratio 0–1, or 0 if unavailable.
 function progress() {
   const passed = document.querySelector('.playbackTimeline__timePassed');
   const total  = document.querySelector('.playbackTimeline__duration');
@@ -93,7 +81,6 @@ function progress() {
   return d ? toSec(passed) / d : 0;
 }
 
-// Returns how many seconds into the current track the playhead is.
 function currentSec() {
   const el = document.querySelector('.playbackTimeline__timePassed');
   if (!el) return 0;
@@ -101,7 +88,6 @@ function currentSec() {
   return m ? +m[1] * 60 + +m[2] : 0;
 }
 
-// True when the native player is paused (or the play button shows "Play").
 function paused() {
   const btn = document.querySelector('.playControls__play');
   if (!btn) return false;
@@ -119,7 +105,6 @@ function toggle() {
   setTimeout(refreshPlayBtn, 150);
 }
 
-// Seek to a ratio (0–1) by simulating mouse events on SC's progress bar.
 function seekTo(ratio) {
   ratio = Math.max(0, Math.min(1, ratio));
   const bar = document.querySelector('.playControls .playbackTimeline__progressWrapper');
@@ -133,21 +118,16 @@ function seekTo(ratio) {
   bar.dispatchEvent(new MouseEvent('mouseup',   opts));
 }
 
-// Sync the play/pause icon on the hub controls.
 function refreshPlayBtn() {
   const p = document.getElementById('tss-hub-play');
   if (p) p.textContent = paused() ? '▶' : '⏸';
 }
 
-// Sync the hub progress bar.
 function updateProgressBar() {
   const p = document.getElementById('tss-hub-prog');
   if (p) p.style.width = `${Math.min(100, progress() * 100).toFixed(1)}%`;
 }
 
-// ── Track metadata extraction ─────────────────────────────────────────────────
-
-// Resolves the best-available artwork URL from a track list element.
 function artwork(el) {
   const span = el.querySelector('span.image__full, span.sc-artwork');
   if (span?.style.backgroundImage) {
@@ -159,30 +139,23 @@ function artwork(el) {
   return null;
 }
 
-// Returns the canonical SoundCloud URL for a track element.
-// Covers both trackList (sets/likes) and soundList (profile pages) layouts.
 function getLink(el) {
-  const a = el.querySelector(
-    '.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary'
-  );
+  const a = el.querySelector('.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary');
   if (!a) return null;
   const href = a.getAttribute('href');
   if (!href) return null;
   return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
 }
 
-// Stable identity string for a track, used to survive page reloads.
-// Prefers the permalink URL (a href attribute, always set by React immediately)
-// over the display text which can vary by render state / truncation / locale.
+// Stable identity for a track across page reloads — prefers permalink URL.
 function trackId(m) {
   if (!m) return null;
-  if (m.link) return m.link;                          // best: unique, stable
+  if (m.link) return m.link;
   const t = m.title, a = m.artist;
   if ((t && t !== '—') || (a && a !== '—')) return `${t}|||${a}`;
   return null;
 }
 
-// Extracts { title, artist, artwork, link } from a track list DOM element.
 function getMeta(el) {
   return {
     title:   el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.textContent.trim() || '—',
@@ -192,9 +165,6 @@ function getMeta(el) {
   };
 }
 
-// ── Security helper ───────────────────────────────────────────────────────────
-
-// Escapes a string for safe insertion into innerHTML.
 function esc(str) {
   return String(str ?? '')
     .replace(/&/g, '&amp;')
@@ -205,77 +175,58 @@ function esc(str) {
 
 // ── src/worker.js ─────────────────────────────────────────────────────────────
 
-// ── Web Worker factory ────────────────────────────────────────────────────────
-// Fires a message every 300 ms so the watcher can poll playback state even
-// when the tab is in the background.
-
+// Fires a message every 300 ms so the watcher polls even in background tabs.
 function mkWorker() {
   try {
     const src = `
       let t = null;
       self.onmessage = e => {
-        if (e.data === 'start') {
-          clearInterval(t);
-          t = setInterval(() => self.postMessage(0), 300);
-        } else {
-          clearInterval(t);
-          t = null;
-        }
+        if (e.data === 'start') { clearInterval(t); t = setInterval(() => self.postMessage(0), 300); }
+        else                    { clearInterval(t); t = null; }
       };
     `;
     const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
     const w   = new Worker(url);
-    URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
+    URL.revokeObjectURL(url);
     return w;
   } catch (_) {
-    return null; // CSP or browser restriction — caller falls back to setInterval
+    return null; // CSP blocked — caller falls back to setInterval
   }
 }
 
 // ── src/playback.js ───────────────────────────────────────────────────────────
 
-// ── Playback ──────────────────────────────────────────────────────────────────
-
-// Record a play in the session stats.
 function trackPlayed(ti) {
   state.stats.played++;
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
 }
 
 // Scroll the page until the track list stops growing, then return all elements.
-async function loadTracks(status) {
-  // Wait up to 10 s for at least one track element to appear before scrolling.
-  // Without this, last=0 and n=0 on the first tick are equal, so stable
-  // immediately increments to 3 and we return an empty array on pages that
-  // haven't rendered their track list yet.
+async function loadTracks() {
+  const sel = '.trackList__item, .soundList__item, li.sc-list-item';
+  // Wait up to 10 s for at least one track to appear before scrolling.
   for (let i = 0; i < 20; i++) {
-    if (document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item').length > 0) break;
-    if (status) status.textContent = `⏳ waiting for tracks…`;
+    if (document.querySelectorAll(sel).length > 0) break;
     await wait(500);
   }
   let last = 0, stable = 0;
-  while (stable < 3) {
+  while (stable < 2) {
     window.scrollTo(0, document.body.scrollHeight);
-    await wait(1200);
-    const n = document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item').length;
-    if (status) status.textContent = `⏳ loading… (${n})`;
+    await wait(900);
+    const n = document.querySelectorAll(sel).length;
     n === last ? stable++ : (stable = 0, last = n);
   }
   window.scrollTo(0, 0);
-  await wait(400);
-  return [...document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item')];
+  return [...document.querySelectorAll(sel)];
 }
 
-// Click the play button for track at index `idx` and wait for the title to change.
-// Pass countPlay=false when going back (prevTrack) so the played counter isn't bumped.
+// countPlay=false when going back (prevTrack) so the played counter isn't bumped.
 async function playAt(idx, countPlay = true) {
   if (!state.active) return;
 
   const el = state.els[idx];
   if (!el || !document.body.contains(el)) {
-    // Track removed from the playlist mid-session, or we've navigated away.
     state.els[idx] = null;
-
     const anyAlive = state.els.some(e => e && document.body.contains(e));
     if (!anyAlive) {
       state.suspended = true;
@@ -283,18 +234,15 @@ async function playAt(idx, countPlay = true) {
       updateHub();
       return;
     }
-
     state.busy = false;
-    await next(null, false);
+    await next(false);
     return;
   }
 
   pause();
-  await wait(50);
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  await wait(100);
   el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-  await wait(50);
+  await wait(80);
 
   const btn = el.querySelector('button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt');
   if (btn) btn.click();
@@ -314,8 +262,7 @@ async function playAt(idx, countPlay = true) {
   setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 300);
 }
 
-// Advance to the next track in the queue.
-async function next(status, fromWatcher = false) {
+async function next(fromWatcher = false) {
   if (!state.active) return;
   if (state.busy) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
@@ -339,11 +286,6 @@ async function next(status, fromWatcher = false) {
     state.queue.splice(state.pos, 1);
 
     if (state.autoRepeat) {
-      // Reinsert the played track into the future portion of the queue,
-      // biased by priority:
-      //   0.25 (low)    → last ~25 % of remaining
-      //   1.0  (normal) → anywhere in remaining
-      //   2.0  (high)   → first ~50 % of remaining
       const remaining = state.queue.length - state.pos;
       if (remaining > 0) {
         const weight     = state.priority[justPlayed] ?? 1.0;
@@ -353,21 +295,17 @@ async function next(status, fromWatcher = false) {
         const insertAt   = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
         state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
       } else {
-        // Last track in the queue — start a fresh shuffled cycle.
+        // End of queue — start a fresh cycle, avoid immediate repeat.
         state.queue = fisherYates([...Array(state.meta.length).keys()]);
         state.pos   = 0;
-        // Ensure the just-played track doesn't immediately repeat at position 0.
         if (state.queue[0] === justPlayed && state.queue.length > 1) {
           const swap = 1 + Math.floor(Math.random() * (state.queue.length - 1));
           [state.queue[0], state.queue[swap]] = [state.queue[swap], state.queue[0]];
         }
       }
     }
-    // autoRepeat=false: track is not reinserted; queue shrinks by one each play.
   }
 
-  // Insert a "play next" track at the current position.
-  // Remove any existing copy first so the queue doesn't gain a duplicate.
   if (state.playNext.length > 0) {
     const ti  = state.playNext.shift();
     const dup = state.queue.indexOf(ti);
@@ -378,7 +316,6 @@ async function next(status, fromWatcher = false) {
     state.queue.splice(state.pos, 0, ti);
   }
 
-  // Queue exhausted — only reachable when autoRepeat=false.
   if (state.pos >= state.queue.length) {
     stop();
     renderList();
@@ -389,16 +326,14 @@ async function next(status, fromWatcher = false) {
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
-// Go back to the previously played track.
-async function prevTrack(status) {
+async function prevTrack() {
   if (!state.active) return;
   if (state.busy) return;
 
-  // > 3 s in → restart current track.  ≤ 3 s → go to previous in history.
+  // > 3 s into current track → restart it; otherwise go back in history.
   if (currentSec() > 3 || !state.history.length) {
     seekTo(0);
     return;
@@ -408,9 +343,6 @@ async function prevTrack(status) {
   state.manualAction = true;
 
   const prevTi = state.history.pop();
-
-  // Search the full queue (not just the future portion) so a track that was
-  // dragged before state.pos is still found and removed before reinserting.
   const existingIdx = state.queue.indexOf(prevTi);
   if (existingIdx !== -1) {
     state.queue.splice(existingIdx, 1);
@@ -421,19 +353,16 @@ async function prevTrack(status) {
   await playAt(state.queue[state.pos], false);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
-// Jump directly to a specific position in the queue.
-async function jumpTo(qi, ti, status) {
+async function jumpTo(qi, ti) {
   if (!state.active) return;
   if (state.busy) return;
   state.busy         = true;
   state.manualAction = true;
   state.suspended    = false;
 
-  // Record what was playing so prevTrack() can return to it.
   const current = state.queue[state.pos];
   if (current !== undefined) {
     state.history.push(current);
@@ -444,12 +373,9 @@ async function jumpTo(qi, ti, status) {
   await playAt(ti);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
-// Add a track to the front of the playNext priority queue.
-// A short debounce prevents double-fires from rapid clicks.
 function queueNext(ti) {
   if (state._qnd) return;
   state._qnd = true;
@@ -458,8 +384,6 @@ function queueNext(ti) {
   renderList();
 }
 
-// Remove a track from the queue by its queue index.
-// The currently playing track cannot be removed.
 function removeFromQueue(qi) {
   if (qi === state.pos) return;
   state.queue.splice(qi, 1);
@@ -468,10 +392,7 @@ function removeFromQueue(qi) {
   renderList();
 }
 
-// ── Start / Stop ──────────────────────────────────────────────────────────────
-
 async function start() {
-  // Toggle off if already running.
   if (state.active) {
     stop();
     renderList();
@@ -481,7 +402,7 @@ async function start() {
   state.loading = true;
   updateHub();
 
-  const els = await loadTracks(null);
+  const els = await loadTracks();
   if (!els.length) {
     state.loading = false;
     updateHub();
@@ -491,54 +412,34 @@ async function start() {
   state.els  = els;
   state.meta = els.map(getMeta);
 
-  // Restore a queue cached before an external-track navigation.
-  // Tracks are identified by permalink URL so indices stay correct even if
-  // SC re-renders the DOM in a different order.
   let _cached = null;
   try {
     const _raw = sessionStorage.getItem('tss_queue_cache');
     if (_raw) {
       const _c = JSON.parse(_raw);
-      if (Date.now() - (_c.ts || 0) < 30 * 60 * 1000          // 30-min window
+      if (Date.now() - (_c.ts || 0) < 30 * 60 * 1000
           && playlistBase(location.href) === playlistBase(_c.playlistUrl || '')
           && Array.isArray(_c.queue) && _c.queue.length > 0
           && Array.isArray(_c.metaKeys)) {
 
-        // Build id → newTi lookup so we can remap old indices to new ones.
         const idToNew = {};
-        state.meta.forEach((m, ti) => {
-          const id = trackId(m);
-          if (id) idToNew[id] = ti;
-        });
+        state.meta.forEach((m, ti) => { const id = trackId(m); if (id) idToNew[id] = ti; });
 
-        // Remap cached queue: old ti → cached id → new ti.
-        const mk = _c.metaKeys;  // mk[oldTi] = stable id string
-        const remapOld = oldTi => {
-          const id = mk[oldTi];
-          return (id && idToNew[id] !== undefined) ? idToNew[id] : null;
-        };
+        const mk       = _c.metaKeys;
+        const remapOld = oldTi => { const id = mk[oldTi]; return (id && idToNew[id] !== undefined) ? idToNew[id] : null; };
+
         const remappedQueue = _c.queue.map(remapOld).filter(ti => ti !== null);
+        const inQueue       = new Set(remappedQueue);
+        const extras        = fisherYates([...Array(state.meta.length).keys()].filter(ti => !inQueue.has(ti)));
+        const finalQueue    = remappedQueue.concat(extras);
 
-        // Tracks that didn't remap (new, renamed, or lazy-rendered) are
-        // shuffled and appended so the full playlist is always covered.
-        const inQueue   = new Set(remappedQueue);
-        const extras    = fisherYates(
-          [...Array(state.meta.length).keys()].filter(ti => !inQueue.has(ti))
-        );
-        const finalQueue = remappedQueue.concat(extras);
-
-        // Only restore if at least one track remapped; otherwise it's a
-        // completely different playlist and a fresh shuffle makes more sense.
         if (remappedQueue.length > 0) {
           const cachedPos = typeof _c.pos === 'number' ? _c.pos : 0;
           const posId     = mk[_c.queue[cachedPos]] || '';
-          let   newPos    = finalQueue.findIndex(
-            newTi => trackId(state.meta[newTi]) === posId
-          );
+          let   newPos    = finalQueue.findIndex(newTi => trackId(state.meta[newTi]) === posId);
           if (newPos === -1) newPos = 0;
 
-          const newHistory = (Array.isArray(_c.history) ? _c.history : [])
-            .map(remapOld).filter(ti => ti !== null);
+          const newHistory  = (Array.isArray(_c.history) ? _c.history : []).map(remapOld).filter(ti => ti !== null);
           const newPriority = {};
           for (const [k, w] of Object.entries(_c.priority || {})) {
             const nti = remapOld(+k);
@@ -546,8 +447,7 @@ async function start() {
           }
 
           sessionStorage.removeItem('tss_queue_cache');
-          _cached = { queue: finalQueue, pos: newPos,
-                      history: newHistory, priority: newPriority };
+          _cached = { queue: finalQueue, pos: newPos, history: newHistory, priority: newPriority };
         }
       }
     }
@@ -564,6 +464,7 @@ async function start() {
     state.history  = [];
     state.priority = {};
   }
+
   state.playNext     = [];
   state.active       = true;
   state.loading      = false;
@@ -572,7 +473,6 @@ async function start() {
   state.manualAction = false;
   state.playlistUrl  = location.href.split(/[?#]/)[0];
 
-  // Restore session stats if the user restarted within 10 minutes.
   const prev = state._savedStats;
   if (prev && (Date.now() - (prev._ts || 0)) < 600_000) {
     state.stats = { ...prev };
@@ -584,7 +484,7 @@ async function start() {
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  startWatcher(null);
+  startWatcher();
   updateHub();
 }
 
@@ -600,31 +500,20 @@ function stop() {
     state._workerInterval = null;
   }
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
-  // Snapshot stats so they survive a quick restart.
   state._savedStats = { ...state.stats, _ts: Date.now() };
   updateHub();
 }
 
 // ── src/watcher.js ────────────────────────────────────────────────────────────
 
-// ── Watcher ───────────────────────────────────────────────────────────────────
-// Polls every 300 ms via a Web Worker. Detects title changes (external song
-// or SC auto-advance) and fires next() when a track nears its end.
-
-function startWatcher(status) {
-  if (state.worker) {
-    state.worker.terminate();
-    state.worker = null;
-  }
-  if (state._workerInterval) {
-    clearInterval(state._workerInterval);
-    state._workerInterval = null;
-  }
+function startWatcher() {
+  if (state.worker) { state.worker.terminate(); state.worker = null; }
+  if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
 
   state.lastTitle = playerTitle();
-  let lastTitle   = state.lastTitle;
-  let titleTicks  = 0;   // consecutive ticks where title differs (debounce)
-  let nearEnd     = false;
+  let lastTitle  = state.lastTitle;
+  let titleTicks = 0;
+  let nearEnd    = false;
 
   const tick = async () => {
     if (!state.active || state.busy) return;
@@ -632,38 +521,29 @@ function startWatcher(status) {
     const title = playerTitle();
     const p     = progress();
 
-    // ── Suspended mode ────────────────────────────────────────────────────────
-    // An external (non-queue) track is playing. Let it play freely; resume
-    // the queue when it ends.
     if (state.suspended) {
       if (p >= 0.99 && !nearEnd && !paused()) {
         nearEnd = true;
         pause();
         await wait(150);
 
-        const anyAlive = state.els.some(e => e && document.body.contains(e));
-        if (anyAlive) {
-          // Still on the playlist page — resume immediately.
+        if (state.els.some(e => e && document.body.contains(e))) {
           state.suspended = false;
           try {
-            await next(status, true);
+            await next(true);
           } finally {
             lastTitle = playerTitle();
             nearEnd   = false;
           }
         } else {
-          // Playlist DOM is gone — save the queue and navigate back.
+          // Playlist DOM gone — cache queue and navigate back.
           nearEnd = false;
           const worker = state.worker;
           state.worker = null;
           if (worker) worker.terminate();
-          if (state._workerInterval) {
-            clearInterval(state._workerInterval);
-            state._workerInterval = null;
-          }
+          if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
 
           try {
-            const metaKeys = state.meta.map(m => trackId(m) || '');
             sessionStorage.setItem('tss_queue_cache', JSON.stringify({
               queue:       state.queue.slice(),
               pos:         state.pos,
@@ -671,12 +551,10 @@ function startWatcher(status) {
               priority:    { ...state.priority },
               playlistUrl: state.playlistUrl,
               ts:          Date.now(),
-              metaKeys,
+              metaKeys:    state.meta.map(m => trackId(m) || ''),
             }));
           } catch (_) {}
 
-          // Set inactive before navigating so onNav() on the new page always
-          // takes the inactive fallthrough path and reads the cache.
           state.active    = false;
           state.busy      = false;
           state.suspended = false;
@@ -697,11 +575,7 @@ function startWatcher(status) {
       return;
     }
 
-    // Title changed to a track we didn't queue — either the user clicked
-    // something manually or SC auto-advanced past our controls.
-    // Enter suspended mode so the song plays fully, then resume.
-    // Two consecutive ticks debounce brief flashes during our own playAt().
-    // manualAction exempts intentional control actions (jumpTo, prevTrack).
+    // Unrecognised title change — debounce 2 ticks before entering suspended mode.
     if (title && lastTitle && title !== lastTitle) {
       if (++titleTicks >= 2) {
         titleTicks = 0;
@@ -718,14 +592,12 @@ function startWatcher(status) {
     }
     titleTicks = 0;
 
-    // Track is within 1 % of its end and currently playing.
-    // Pause before SC can auto-advance, then pick our own next track.
     if (p >= 0.99 && !nearEnd && !paused()) {
       nearEnd = true;
       pause();
       await wait(150);
       try {
-        await next(status, true);
+        await next(true);
       } finally {
         lastTitle = playerTitle();
         nearEnd   = false;
@@ -733,7 +605,6 @@ function startWatcher(status) {
       return;
     }
 
-    // Reset nearEnd if the track looped back (progress jumped backward).
     if (state.lastProgress > 0.5 && p < 0.1) nearEnd = false;
     state.lastProgress = p;
     if (title) lastTitle = title;
@@ -748,17 +619,11 @@ function startWatcher(status) {
     state.worker.onmessage = tick;
     state.worker.postMessage('start');
   } else {
-    // Blob Worker blocked (e.g. CSP) — fall back to setInterval.
-    // Background-tab throttling may apply, but this is better than no polling.
     state._workerInterval = setInterval(tick, 300);
   }
 }
 
 // ── src/ui/badges.js ──────────────────────────────────────────────────────────
-
-// ── Queue badges ──────────────────────────────────────────────────────────────
-// Small numbered chips injected next to each track title in the native
-// SoundCloud list, showing the upcoming queue order.
 
 function badges() {
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
@@ -769,18 +634,18 @@ function badges() {
 
     const cur = qi === state.pos;
     const b   = document.createElement('span');
-    b.className  = 'tss-badge';
+    b.className    = 'tss-badge';
     b.style.cssText = [
-      `display:inline-block`,
+      'display:inline-block',
       `background:${cur ? '#f50' : '#2a2a2a'}`,
       `color:${cur ? '#fff' : '#888'}`,
       `border:1px solid ${cur ? '#f50' : '#444'}`,
-      `border-radius:3px`,
-      `font-size:10px`,
-      `font-weight:bold`,
-      `padding:1px 5px`,
-      `margin-right:5px`,
-      `vertical-align:middle`,
+      'border-radius:3px',
+      'font-size:10px',
+      'font-weight:bold',
+      'padding:1px 5px',
+      'margin-right:5px',
+      'vertical-align:middle',
     ].join(';');
     const n       = state.stats.played + (qi - state.pos);
     b.textContent = cur ? `▶ ${n}` : `${n}`;
@@ -792,9 +657,6 @@ function badges() {
 
 // ── src/ui/stats.js ───────────────────────────────────────────────────────────
 
-// ── Session stats ─────────────────────────────────────────────────────────────
-
-// Increment elapsed-time counter once per second while shuffle is active.
 function tickPlayTime() {
   if (state.active && !state.suspended && !paused()) {
     state.stats.elapsed = (state.stats.elapsed || 0) + 1;
@@ -802,8 +664,6 @@ function tickPlayTime() {
 }
 setInterval(tickPlayTime, 1000);
 
-// Re-render the stats overlay contents (called on a 1-second interval and
-// after user interaction with priority buttons).
 function renderStats() {
   const overlay = document.getElementById('tss-stats-overlay');
   if (!overlay) return;
@@ -814,9 +674,7 @@ function renderStats() {
   const s        = elapsed % 60;
   const duration = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 
-  const top = Object.entries(state.stats.playCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5);
+  const top = Object.entries(state.stats.playCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
   const tp = overlay.querySelector('#tss-stats-played');
   const tt = overlay.querySelector('#tss-stats-time');
@@ -839,7 +697,6 @@ function renderStats() {
       </div>`;
   }).join('');
 
-  // Priority toggle buttons — cycle: normal → low → high → normal.
   list.querySelectorAll('[data-ti]').forEach(btn => {
     btn.onclick = e => {
       e.stopPropagation();
@@ -857,7 +714,6 @@ function renderStats() {
 }
 setInterval(renderStats, 1000);
 
-// Build and show the stats modal; toggle it off if already open.
 function showStats() {
   const existing = document.getElementById('tss-stats-overlay');
   if (existing) { existing.remove(); return; }
@@ -901,14 +757,12 @@ function showStats() {
   renderStats();
 
   document.getElementById('tss-stats-close').onclick = () => overlay.remove();
-
   document.getElementById('tss-stats-reset').onclick = () => {
     state.stats       = { played: 0, playCounts: {}, elapsed: 0 };
     state._savedStats = null;
     renderStats();
   };
 
-  // Draggable via the header bar.
   const header = document.getElementById('tss-stats-header');
   header.onmousedown = e => {
     if (e.target.id === 'tss-stats-close') return;
@@ -923,10 +777,7 @@ function showStats() {
       overlay.style.left = Math.max(0, Math.min(window.innerWidth  - overlay.offsetWidth,  origL + (ev.clientX - startX))) + 'px';
       overlay.style.top  = Math.max(0, Math.min(window.innerHeight - overlay.offsetHeight, origT + (ev.clientY - startY))) + 'px';
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup',   up);
-    };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup',   up);
   };
@@ -934,15 +785,8 @@ function showStats() {
 
 // ── src/ui/hub.js ─────────────────────────────────────────────────────────────
 
-// ── Hub ───────────────────────────────────────────────────────────────────────
-// Central floating panel: now playing + seekbar, playback controls, queue info,
-// and shuffle settings. Draggable. The queue sidebar is toggled from here.
-//
-// ── How to remove ─────────────────────────────────────────────────────────────
-// 1. Delete this file
-// 2. Remove 'src/ui/hub.js' from FILES in build.py
-// 3. Remove mkHub() from inject.js                    (1 line)
-// 4. Remove updateHub() calls from playback.js / watcher.js / stop()
+// Hub — central floating panel. Draggable, collapsible sections.
+// Remove: delete file, remove mkHub() from inject.js, remove updateHub() call sites.
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
@@ -963,13 +807,11 @@ function mkHub() {
       .tss-hub-sec { border-top:1px solid #1a1a1a; }
       #tss-hub-start { transition:background 0.2s, color 0.2s, border-color 0.2s; }
       #tss-hub-start[data-active="true"] {
-        background:#f50 !important; color:#fff !important;
-        border-color:transparent !important;
+        background:#f50 !important; color:#fff !important; border-color:transparent !important;
       }
       #tss-hub-start[data-active="true"]:hover { background:#e64a00 !important; }
       #tss-hub-start:not([data-active="true"]):not([data-loading="true"]):hover {
-        background:rgba(255,85,0,0.1) !important;
-        border-color:#f50 !important;
+        background:rgba(255,85,0,0.1) !important; border-color:#f50 !important;
       }
       #tss-hub-start[data-loading="true"] {
         color:#555 !important; border-color:#1e1e1e !important;
@@ -994,14 +836,11 @@ function mkHub() {
   const hub = document.createElement('div');
   hub.id = 'tss-hub';
   hub.style.cssText = `
-    position:fixed; bottom:60px; left:20px;
-    width:230px;
+    position:fixed; bottom:60px; left:20px; width:230px;
     background:#111; border:1px solid #222; border-radius:10px;
-    z-index:99994;
-    font-family:-apple-system,sans-serif;
+    z-index:99994; font-family:-apple-system,sans-serif;
     box-shadow:0 4px 20px rgba(0,0,0,0.7);
-    overflow:hidden;
-    -webkit-user-select:none; user-select:none;
+    overflow:hidden; -webkit-user-select:none; user-select:none;
   `;
 
   hub.innerHTML = `
@@ -1085,33 +924,23 @@ function mkHub() {
 
   document.body.appendChild(hub);
 
-  // ── Controls ──────────────────────────────────────────────────────────────
   document.getElementById('tss-hub-play').onclick  = toggle;
-  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(null);
-  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(null); };
+  document.getElementById('tss-hub-prev').onclick  = () => prevTrack();
+  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(); };
   document.getElementById('tss-hub-stats').onclick = showStats;
   document.getElementById('tss-hub-seekbar').onclick = e => {
     const r = e.currentTarget.getBoundingClientRect();
     seekTo((e.clientX - r.left) / r.width);
   };
 
-  // ── Queue toggle — icon in the section header, doesn't collapse the section
-  document.getElementById('tss-hub-qico').onclick = e => {
-    e.stopPropagation();
-    toggleSidebar();
-  };
+  document.getElementById('tss-hub-qico').onclick = e => { e.stopPropagation(); toggleSidebar(); };
 
-  // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // ── Start / stop ──────────────────────────────────────────────────────────
-  document.getElementById('tss-hub-start').onclick = () => {
-    if (!state.loading) start();
-  };
+  document.getElementById('tss-hub-start').onclick = () => { if (!state.loading) start(); };
 
-  // ── Collapse entire hub ───────────────────────────────────────────────────
   const colBtn  = document.getElementById('tss-hub-col');
   const hubBody = document.getElementById('tss-hub-body');
   colBtn.onclick = () => {
@@ -1120,7 +949,6 @@ function mkHub() {
     colBtn.textContent    = open ? '+' : '−';
   };
 
-  // ── Per-section collapse ──────────────────────────────────────────────────
   hub.querySelectorAll('.tss-hub-sh').forEach(sh => {
     sh.onclick = () => {
       const b   = document.getElementById(sh.dataset.body);
@@ -1132,7 +960,6 @@ function mkHub() {
     };
   });
 
-  // ── Drag ──────────────────────────────────────────────────────────────────
   const hubHdr = document.getElementById('tss-hub-hdr');
   hubHdr.onmousedown = e => {
     if (e.target.id === 'tss-hub-col') return;
@@ -1147,10 +974,7 @@ function mkHub() {
       hub.style.left = Math.max(0, Math.min(window.innerWidth  - hub.offsetWidth,  ev.clientX - ox)) + 'px';
       hub.style.top  = Math.max(0, Math.min(window.innerHeight - hub.offsetHeight, ev.clientY - oy)) + 'px';
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup',   up);
-    };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup',   up);
   };
@@ -1158,21 +982,17 @@ function mkHub() {
   updateHub();
 }
 
-// Sync all hub elements with current playback state.
-// Called from playback.js, watcher.js, and stop().
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
   const active  = state.active;
   const loading = state.loading;
 
-  // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = active ? '' : 'none';
   });
 
-  // Start button: idle / loading / active.
   const startBtn = document.getElementById('tss-hub-start');
   if (startBtn) {
     if (loading) {
@@ -1190,21 +1010,17 @@ function updateHub() {
     }
   }
 
-  // Keep repeat checkbox in sync (may be changed via the inject UI).
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
 
-  // Sync the queue-panel toggle icon with sidebar state.
   const qi = document.getElementById('tss-hub-qico');
   if (qi) {
-    const open      = state.sidebarOpen;
-    qi.dataset.open = open ? 'true' : 'false';
-    qi.textContent  = open ? '←' : '→';
-    qi.title        = open ? 'close queue panel' : 'open queue panel';
+    qi.dataset.open = state.sidebarOpen ? 'true' : 'false';
+    qi.textContent  = state.sidebarOpen ? '←' : '→';
+    qi.title        = state.sidebarOpen ? 'close queue panel' : 'open queue panel';
   }
 
   if (!active) {
-    // Clear stale progress bar.
     const prog = document.getElementById('tss-hub-prog');
     if (prog) prog.style.width = '0%';
     return;
@@ -1213,7 +1029,6 @@ function updateHub() {
   const pb = document.getElementById('tss-hub-play');
   if (pb) pb.textContent = paused() ? '▶' : '⏸';
 
-  // Suspended mode — an external (non-queue) track is playing.
   if (state.suspended) {
     const tEl = document.getElementById('tss-hub-title');
     const aEl = document.getElementById('tss-hub-artist');
@@ -1224,7 +1039,6 @@ function updateHub() {
     return;
   }
 
-  // Normal mode — update all fields.
   const m   = state.meta[state.queue?.[state.pos]];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');
@@ -1260,14 +1074,11 @@ function updateHub() {
 
 // ── src/ui/sidebar.js ─────────────────────────────────────────────────────────
 
-// ── Sidebar ───────────────────────────────────────────────────────────────────
-// Slide-in queue panel. Toggled exclusively via the hub.
-// Contains only the queue list and search — playback is controlled from the hub.
+// Slide-in queue panel — toggled via the hub. No playback controls here.
 
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;
 
-  // Sidebar panel.
   const sidebar = document.createElement('div');
   sidebar.id = 'tss-sidebar';
   sidebar.style.cssText = `
@@ -1301,7 +1112,6 @@ function mkSidebar() {
   document.getElementById('tss-search').onclick  = e => e.stopPropagation();
 }
 
-// Toggle the sidebar open/closed and keep the hub in sync.
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
   const s = document.getElementById('tss-sidebar');
@@ -1311,9 +1121,6 @@ function toggleSidebar() {
 
 // ── src/ui/list.js ────────────────────────────────────────────────────────────
 
-// ── Queue list renderer ───────────────────────────────────────────────────────
-
-// Render the queue inside the sidebar list, optionally filtered by `filter`.
 function renderList(filter = '') {
   const list  = document.getElementById('tss-sidebar-list');
   const count = document.getElementById('tss-sidebar-count');
@@ -1330,7 +1137,6 @@ function renderList(filter = '') {
   const q = filter.toLowerCase();
   if (count) count.textContent = `${state.stats.played} / ${state.queue.length}`;
 
-  // Suspended banner — shown when an external track is playing.
   if (state.suspended && !q) {
     const banner = document.createElement('div');
     banner.style.cssText = 'padding:6px 12px;font-size:10px;color:#f50;background:rgba(255,85,0,0.07);border-bottom:1px solid #1a1a1a;';
@@ -1338,7 +1144,6 @@ function renderList(filter = '') {
     list.appendChild(banner);
   }
 
-  // "Play next" section — shown above the queue when there are pending tracks.
   if (state.playNext.length && !q) {
     const header = document.createElement('div');
     header.style.cssText = 'padding:4px 12px 2px;font-size:10px;color:#555;text-transform:uppercase;letter-spacing:0.05em;';
@@ -1350,7 +1155,6 @@ function renderList(filter = '') {
       const row = mkRow(m, -1, ti, false, false);
       row.style.opacity    = '0.7';
       row.style.borderLeft = '3px solid #333';
-      // Right-click a playNext item to remove it.
       row.oncontextmenu = e => { e.preventDefault(); state.playNext.splice(i, 1); renderList(); };
       list.appendChild(row);
     });
@@ -1360,7 +1164,6 @@ function renderList(filter = '') {
     list.appendChild(divider);
   }
 
-  // Main queue rows.
   state.queue.forEach((ti, qi) => {
     const m = state.meta[ti] || { title: '—', artist: '—', artwork: null };
     if (q && !m.title.toLowerCase().includes(q) && !m.artist.toLowerCase().includes(q)) return;
@@ -1369,7 +1172,6 @@ function renderList(filter = '') {
     const past = qi <  state.pos;
     const row  = mkRow(m, qi, ti, cur, past);
 
-    // Drag-to-reorder.
     row.draggable   = true;
     row.ondragstart = e => {
       state.dragSrc = qi;
@@ -1385,30 +1187,28 @@ function renderList(filter = '') {
       const src     = state.dragSrc;
       const [moved] = state.queue.splice(src, 1);
       state.queue.splice(qi, 0, moved);
-      if      (state.pos === src)                          state.pos = qi;
-      else if (src < state.pos && qi >= state.pos)         state.pos--;
-      else if (src > state.pos && qi <= state.pos)         state.pos++;
+      if      (state.pos === src)                  state.pos = qi;
+      else if (src < state.pos && qi >= state.pos) state.pos--;
+      else if (src > state.pos && qi <= state.pos) state.pos++;
       state.dragSrc = null;
       badges();
       renderList(filter);
     };
 
-    row.onclick       = () => jumpTo(qi, ti, null);
+    row.onclick       = () => jumpTo(qi, ti);
     row.oncontextmenu = e => showCtxMenu(e, qi, ti);
     list.appendChild(row);
   });
 
-  // Auto-scroll the current track into view (when not searching).
   if (!q) {
     let offset = state.playNext.length ? state.playNext.length + 2 : 0;
-    if (state.suspended) offset++; // account for the suspended banner prepended above
+    if (state.suspended) offset++;
     list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
   refreshPlayBtn();
 }
 
-// Build a single queue row element.
 function mkRow(m, qi, ti, cur, past) {
   const row = document.createElement('div');
   row.style.cssText = `
@@ -1418,13 +1218,11 @@ function mkRow(m, qi, ti, cur, past) {
     border-left:3px solid ${cur ? '#f50' : 'transparent'};
     transition:background 0.15s;
     opacity:${past ? '0.3' : '1'};
-    -webkit-user-select:none;
-    user-select:none;
+    -webkit-user-select:none; user-select:none;
   `;
   row.onmouseenter = () => { if (!cur) row.style.background = 'rgba(255,255,255,0.03)'; };
   row.onmouseleave = () => { if (!cur) row.style.background = 'transparent'; };
 
-  // Artwork thumbnail.
   const art = document.createElement('div');
   art.style.cssText = 'width:38px;height:38px;border-radius:4px;flex-shrink:0;background:#1a1a1a;overflow:hidden;display:flex;align-items:center;justify-content:center;';
   if (m.artwork) {
@@ -1437,13 +1235,11 @@ function mkRow(m, qi, ti, cur, past) {
     art.innerHTML = '<span style="font-size:16px;color:#333;">♪</span>';
   }
 
-  // Position number / playing indicator.
   const num = document.createElement('div');
   num.style.cssText = `font-size:10px;color:${cur ? '#f50' : '#444'};font-weight:${cur ? '700' : '400'};min-width:18px;text-align:center;flex-shrink:0;`;
   const displayNum  = qi >= 0 ? state.stats.played + (qi - state.pos) : '↑';
   num.textContent   = cur ? '▶' : displayNum;
 
-  // Title + artist text block — esc() prevents XSS from track metadata.
   const txt = document.createElement('div');
   txt.style.cssText = 'overflow:hidden;flex:1;';
   txt.innerHTML = `
@@ -1456,9 +1252,6 @@ function mkRow(m, qi, ti, cur, past) {
 }
 
 // ── src/ui/contextMenu.js ─────────────────────────────────────────────────────
-
-// ── Context menu ──────────────────────────────────────────────────────────────
-// Right-click a queue row to get quick track actions.
 
 function showCtxMenu(e, qi, ti) {
   e.preventDefault();
@@ -1478,10 +1271,7 @@ function showCtxMenu(e, qi, ti) {
   `;
 
   const items = [
-    {
-      label:    '⏭ play next',
-      action:   () => queueNext(ti),
-    },
+    { label: '⏭ play next',  action: () => queueNext(ti) },
     {
       label:    '↑ move up',
       disabled: qi <= state.pos + 1,
@@ -1490,8 +1280,7 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos--;
         else if (state.pos === qi - 1) state.pos++;
-        badges();
-        renderList();
+        badges(); renderList();
       },
     },
     {
@@ -1502,19 +1291,11 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi + 1]] = [state.queue[qi + 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos++;
         else if (state.pos === qi + 1) state.pos--;
-        badges();
-        renderList();
+        badges(); renderList();
       },
     },
-    {
-      label:  '🔗 copy link',
-      action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); },
-    },
-    {
-      label:    '✕ remove',
-      disabled: qi === state.pos,
-      action:   () => removeFromQueue(qi),
-    },
+    { label: '🔗 copy link', action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); } },
+    { label: '✕ remove',    disabled: qi === state.pos, action: () => removeFromQueue(qi) },
   ];
 
   items.forEach(({ label, action, disabled }) => {
@@ -1535,17 +1316,11 @@ function showCtxMenu(e, qi, ti) {
   });
 
   document.body.appendChild(menu);
-  // Dismiss on the next click anywhere.
   setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 0);
 }
 
 // ── src/ui/inject.js ──────────────────────────────────────────────────────────
 
-// ── Main UI injection ─────────────────────────────────────────────────────────
-// Injects the hub and sidebar into the page on valid playlist pages.
-// The old inject-button UI has been removed — the hub is the sole control point.
-
-// Find a suitable container in the SoundCloud DOM and attach the hub + sidebar.
 async function inject() {
   if (document.getElementById('tss-hub')) return;
 
@@ -1561,8 +1336,7 @@ async function inject() {
     '.soundList',
     '.trackList',
   ];
-  const container = sels.reduce((found, s) => found || document.querySelector(s), null);
-  if (!container) return;
+  if (!sels.some(s => document.querySelector(s))) return;
 
   mkSidebar();
   mkHub();
@@ -1570,26 +1344,9 @@ async function inject() {
 
 // ── src/nav.js ────────────────────────────────────────────────────────────────
 
-// ── Navigation ────────────────────────────────────────────────────────────────
-// SoundCloud is a SPA — we watch for URL changes via a MutationObserver on the
-// document root and reinitialise the UI on every navigation.
-
-// Returns true only on pages that have a shuffle-able track list.
-const validPage = () =>
-  /soundcloud\.com\/[^/]+\/(sets\/|likes|tracks|reposts)/.test(location.href);
-
-// Strip query params and hash so we can compare playlist identity robustly.
-// SoundCloud sometimes appends ?si=… tracking params or #anchor fragments
-// when doing SPA navigation, which would break an exact href comparison.
-// Normalize a URL to just origin+path for playlist identity comparison.
-// Strips query params, hash fragments, AND trailing slashes so that
-// "soundcloud.com/u/sets/p" and "soundcloud.com/u/sets/p/" compare equal.
+const validPage    = () => /soundcloud\.com\/[^/]+\/(sets\/|likes|tracks|reposts)/.test(location.href);
 const playlistBase = url => url.split(/[?#]/)[0].replace(/\/+$/, '');
 
-// Called on every navigation (and on first load).
-// The navLock prevents a second concurrent execution if the MutationObserver
-// fires multiple times during a single navigation (e.g. SC changes the URL
-// then React re-renders cause more mutations).
 let navLock = false;
 async function onNav() {
   if (navLock) return;
@@ -1597,54 +1354,30 @@ async function onNav() {
   try {
     if (state.active) {
       if (!validPage()) {
-        // Navigated to a non-playlist page while shuffle is running.
-        // Keep the queue alive but suspend so the external track plays freely.
         state.suspended = true;
         updateHub();
         return;
       }
 
-      // Returned after an external track ended.
-      // state.queue / state.pos / state.meta are intact in memory — we just
-      // need fresh DOM references because SC's SPA destroyed the old ones.
-      // We remap queue indices via track permalink URLs (trackId) so the
-      // shuffle order is preserved even if SC renders elements in a
-      // different order or with a different element count this time.
       if (playlistBase(location.href) === playlistBase(state.playlistUrl)) {
-        // Normal SPA re-navigation to the same playlist while shuffle is active
-        // (e.g. the user clicked the playlist link manually).
-        // Re-sync DOM elements in case SC re-rendered the list.
+        // Same playlist re-navigation — refresh DOM references.
         state.suspended = false;
         await wait(1500);
         inject();
-        // Pause the watcher while updating state.els to avoid a race where
-        // next() fires mid-update and reads a partially-refreshed element array.
-        // Handle both the Worker path and the setInterval fallback.
         state.worker?.postMessage('stop');
-        if (state._workerInterval) {
-          clearInterval(state._workerInterval);
-          state._workerInterval = null;
-        }
-        const freshEls = await loadTracks(null);
-        if (freshEls.length > 0) {
-          state.els  = freshEls;
-          state.meta = freshEls.map(getMeta);
-        }
-        if (state.worker) {
-          state.worker.postMessage('start');
-        } else {
-          startWatcher(null);
-        }
+        if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
+        const freshEls = await loadTracks();
+        if (freshEls.length > 0) { state.els = freshEls; state.meta = freshEls.map(getMeta); }
+        if (state.worker) { state.worker.postMessage('start'); } else { startWatcher(); }
         return;
       }
 
-      // Navigated to a DIFFERENT valid playlist page — full stop.
       stop();
     }
-    await wait(1500); // give SoundCloud time to render the new page
+
+    await wait(1500);
     if (validPage()) {
       inject();
-      // Auto-resume a suspended queue if we just returned to the playlist.
       try {
         const raw = sessionStorage.getItem('tss_queue_cache');
         if (raw) {
@@ -1662,12 +1395,8 @@ async function onNav() {
 }
 
 let lastUrl = location.href;
-
 new MutationObserver(() => {
-  if (location.href !== lastUrl) {
-    lastUrl = location.href;
-    onNav();
-  }
+  if (location.href !== lastUrl) { lastUrl = location.href; onNav(); }
 }).observe(document, { subtree: true, childList: true });
 
 onNav();
