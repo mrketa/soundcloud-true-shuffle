@@ -7,15 +7,17 @@ function startWatcher(status) {
     state.worker.terminate();
     state.worker = null;
   }
+  if (state._workerInterval) {
+    clearInterval(state._workerInterval);
+    state._workerInterval = null;
+  }
 
   state.lastTitle = playerTitle();
   let lastTitle   = state.lastTitle;
   let titleTicks  = 0;   // consecutive ticks where title differs (debounce)
   let nearEnd     = false;
 
-  state.worker = mkWorker();
-
-  state.worker.onmessage = async () => {
+  const tick = async () => {
     if (!state.active || state.busy) return;
 
     const title = playerTitle();
@@ -121,5 +123,13 @@ function startWatcher(status) {
     updateMiniPlayer();
   };
 
-  state.worker.postMessage('start');
+  state.worker = mkWorker();
+  if (state.worker) {
+    state.worker.onmessage = tick;
+    state.worker.postMessage('start');
+  } else {
+    // Blob Worker blocked (e.g. CSP) — fall back to setInterval.
+    // Background-tab throttling may apply, but this is better than no polling.
+    state._workerInterval = setInterval(tick, 300);
+  }
 }

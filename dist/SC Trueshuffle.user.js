@@ -238,22 +238,26 @@ function esc(str) {
 // when the tab is in the background.
 
 function mkWorker() {
-  const src = `
-    let t = null;
-    self.onmessage = e => {
-      if (e.data === 'start') {
-        clearInterval(t);
-        t = setInterval(() => self.postMessage(0), 300);
-      } else {
-        clearInterval(t);
-        t = null;
-      }
-    };
-  `;
-  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-  const w   = new Worker(url);
-  URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
-  return w;
+  try {
+    const src = `
+      let t = null;
+      self.onmessage = e => {
+        if (e.data === 'start') {
+          clearInterval(t);
+          t = setInterval(() => self.postMessage(0), 300);
+        } else {
+          clearInterval(t);
+          t = null;
+        }
+      };
+    `;
+    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    const w   = new Worker(url);
+    URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
+    return w;
+  } catch (_) {
+    return null; // CSP or browser restriction — caller falls back to setInterval
+  }
 }
 
 // ── src/playback.js ───────────────────────────────────────────────────────────
@@ -635,6 +639,10 @@ function stop() {
   state.worker?.postMessage('stop');
   state.worker?.terminate();
   state.worker = null;
+  if (state._workerInterval) {
+    clearInterval(state._workerInterval);
+    state._workerInterval = null;
+  }
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
   // Snapshot stats so they survive a quick restart.
   state._savedStats = { ...state.stats, _ts: Date.now() };
@@ -651,15 +659,17 @@ function startWatcher(status) {
     state.worker.terminate();
     state.worker = null;
   }
+  if (state._workerInterval) {
+    clearInterval(state._workerInterval);
+    state._workerInterval = null;
+  }
 
   state.lastTitle = playerTitle();
   let lastTitle   = state.lastTitle;
   let titleTicks  = 0;   // consecutive ticks where title differs (debounce)
   let nearEnd     = false;
 
-  state.worker = mkWorker();
-
-  state.worker.onmessage = async () => {
+  const tick = async () => {
     if (!state.active || state.busy) return;
 
     const title = playerTitle();
@@ -765,7 +775,15 @@ function startWatcher(status) {
     updateMiniPlayer();
   };
 
-  state.worker.postMessage('start');
+  state.worker = mkWorker();
+  if (state.worker) {
+    state.worker.onmessage = tick;
+    state.worker.postMessage('start');
+  } else {
+    // Blob Worker blocked (e.g. CSP) — fall back to setInterval.
+    // Background-tab throttling may apply, but this is better than no polling.
+    state._workerInterval = setInterval(tick, 300);
+  }
 }
 
 // ── src/ui/badges.js ──────────────────────────────────────────────────────────
@@ -883,7 +901,7 @@ function showStats() {
     background:#111; border:1px solid #2a2a2a; border-radius:10px;
     padding:0; z-index:999999; font-family:-apple-system,sans-serif;
     min-width:280px; box-shadow:0 8px 40px rgba(0,0,0,0.8);
-    cursor:default; user-select:none;
+    cursor:default; -webkit-user-select:none; user-select:none;
   `;
 
   overlay.innerHTML = `
@@ -1404,6 +1422,7 @@ function mkRow(m, qi, ti, cur, past) {
     border-left:3px solid ${cur ? '#f50' : 'transparent'};
     transition:background 0.15s;
     opacity:${past ? '0.3' : '1'};
+    -webkit-user-select:none;
     user-select:none;
   `;
   row.onmouseenter = () => { if (!cur) row.style.background = 'rgba(255,255,255,0.03)'; };
@@ -1591,7 +1610,7 @@ function mkUI() {
   btn.dataset.state = state.active ? 'active'  : 'idle';
 
   const label = document.createElement('label');
-  label.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#555;cursor:pointer;user-select:none;font-family:-apple-system,sans-serif;';
+  label.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#555;cursor:pointer;-webkit-user-select:none;user-select:none;font-family:-apple-system,sans-serif;';
   const cb = document.createElement('input');
   cb.type          = 'checkbox';
   cb.checked       = state.autoRepeat;

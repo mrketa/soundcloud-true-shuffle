@@ -3,20 +3,24 @@
 // when the tab is in the background.
 
 function mkWorker() {
-  const src = `
-    let t = null;
-    self.onmessage = e => {
-      if (e.data === 'start') {
-        clearInterval(t);
-        t = setInterval(() => self.postMessage(0), 300);
-      } else {
-        clearInterval(t);
-        t = null;
-      }
-    };
-  `;
-  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-  const w   = new Worker(url);
-  URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
-  return w;
+  try {
+    const src = `
+      let t = null;
+      self.onmessage = e => {
+        if (e.data === 'start') {
+          clearInterval(t);
+          t = setInterval(() => self.postMessage(0), 300);
+        } else {
+          clearInterval(t);
+          t = null;
+        }
+      };
+    `;
+    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    const w   = new Worker(url);
+    URL.revokeObjectURL(url); // Worker holds its own internal reference; safe to revoke immediately
+    return w;
+  } catch (_) {
+    return null; // CSP or browser restriction — caller falls back to setInterval
+  }
 }
