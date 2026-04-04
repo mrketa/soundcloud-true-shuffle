@@ -162,6 +162,7 @@ function updateMiniPlayer() {
     const m   = state.meta[state.queue?.[state.pos]];
     const t   = document.getElementById('tss-mini-tab-title');
     if (tab && tab.style.display !== 'none' && m && t) t.textContent = m.title;
+    updateHub();
     return;
   }
 
@@ -197,6 +198,7 @@ function updateMiniPlayer() {
         art.innerHTML = '♪';
       }
     }
+    updateHub();
     return;
   }
 
@@ -225,6 +227,7 @@ function updateMiniPlayer() {
   const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
   if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : 'end of queue';
   if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.stats.played} / ${state.queue.length}`;
+  updateHub();
 }
 
 // Shift the mini-player left when the sidebar opens so they don't overlap;

@@ -101,4 +101,5 @@ async function inject() {
 
   container.prepend(mkUI());
   mkSidebar();
+  mkHub();
 }

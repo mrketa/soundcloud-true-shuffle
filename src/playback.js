@@ -383,4 +383,5 @@ function stop() {
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
   // Snapshot stats so they survive a quick restart.
   state._savedStats = { ...state.stats, _ts: Date.now() };
+  updateHub();
 }
