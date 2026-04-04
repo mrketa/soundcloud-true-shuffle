@@ -69,7 +69,7 @@ async function onNav() {
         const raw = sessionStorage.getItem('tss_queue_cache');
         if (raw) {
           const c = JSON.parse(raw);
-          if (Date.now() - (c.ts || 0) < 10 * 60 * 1000
+          if (Date.now() - (c.ts || 0) < 30 * 60 * 1000
               && playlistBase(location.href) === playlistBase(c.playlistUrl || '')) {
             const btn    = document.getElementById('tss-btn');
             const status = document.getElementById('tss-status');

@@ -15,7 +15,7 @@ function renderList(filter = '') {
   }
 
   const q = filter.toLowerCase();
-  if (count) count.textContent = `${state.pos + 1} / ${state.queue.length}`;
+  if (count) count.textContent = `${state.stats.played} / ${state.queue.length}`;
 
   // Suspended banner — shown when an external track is playing.
   if (state.suspended && !q) {

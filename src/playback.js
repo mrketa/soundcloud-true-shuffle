@@ -63,11 +63,11 @@ async function playAt(idx) {
   if (btn) btn.click();
   else el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.click();
 
-  // Wait up to ~2.25 s for the player title to change, confirming the new track started.
   const prev = state.lastTitle;
   for (let i = 0; i < 15; i++) {
     await wait(150);
-    if (playerTitle() && playerTitle() !== prev) break;
+    const t = playerTitle();
+    if (t && t !== prev) break;
   }
 
   state.lastTitle    = playerTitle();
@@ -78,13 +78,10 @@ async function playAt(idx) {
 
 // Advance to the next track in the queue.
 async function next(status, fromWatcher = false) {
-  // Guard against stale async chains that outlive a stop() call.
   if (!state.active) return;
   if (state.busy) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
 
-  // If we've navigated away and no playlist elements are in the DOM, suspend
-  // instead of advancing the queue with nothing to play.
   if (!state.els.some(e => e && document.body.contains(e))) {
     state.suspended = true;
     updateMiniPlayer();
@@ -94,73 +91,64 @@ async function next(status, fromWatcher = false) {
   state.suspended = false;
   state.busy      = true;
 
-  // Record the just-played track in history for prevTrack() support.
   const justPlayed = state.queue[state.pos];
   if (justPlayed !== undefined) {
     state.history.push(justPlayed);
     if (state.history.length > 50) state.history.shift();
   }
 
-  // Remove the just-played track from its current position, then reinsert it
-  // into the future portion of the queue at a position biased by its priority:
-  //
-  //   weight 0.25 (low)    → last ~25 % of the remaining queue
-  //   weight 1.0  (normal) → anywhere in the remaining queue
-  //   weight 2.0  (high)   → first ~50 % of the remaining queue
   if (justPlayed !== undefined) {
     state.queue.splice(state.pos, 1);
-    const remaining = state.queue.length - state.pos;
 
-    if (remaining > 0) {
-      const weight = state.priority[justPlayed] ?? 1.0;
-
-      // For weight ≥ 1 the window starts at the front (rangeStart = 0).
-      // For weight < 1 the window starts further back.
-      const rangeStart = weight >= 1.0
-        ? 0
-        : Math.floor(remaining * (1 - weight));
-
-      // For weight ≤ 1 the window reaches the very end.
-      // For weight > 1 the window is restricted to the front portion.
-      const rangeEnd = weight <= 1.0
-        ? remaining
-        : Math.ceil(remaining / weight);
-
-      const span    = Math.max(1, rangeEnd - rangeStart);
-      const insertAt = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
-      state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
-    } else {
-      // Nothing left after current — push to end so it can be reshuffled.
-      state.queue.push(justPlayed);
+    if (state.autoRepeat) {
+      // Reinsert the played track into the future portion of the queue,
+      // biased by priority:
+      //   0.25 (low)    → last ~25 % of remaining
+      //   1.0  (normal) → anywhere in remaining
+      //   2.0  (high)   → first ~50 % of remaining
+      const remaining = state.queue.length - state.pos;
+      if (remaining > 0) {
+        const weight     = state.priority[justPlayed] ?? 1.0;
+        const rangeStart = weight >= 1.0 ? 0 : Math.floor(remaining * (1 - weight));
+        const rangeEnd   = weight <= 1.0 ? remaining : Math.ceil(remaining / weight);
+        const span       = Math.max(1, rangeEnd - rangeStart);
+        const insertAt   = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
+        state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
+      } else {
+        // Last track in the queue — start a fresh shuffled cycle.
+        state.queue = fisherYates([...Array(state.meta.length).keys()]);
+        state.pos   = 0;
+      }
     }
+    // autoRepeat=false: track is not reinserted; queue shrinks by one each play.
   }
 
-  // Insert a "play next" track at the current position so it plays immediately
-  // and the natural next track follows right after.
+  // Insert a "play next" track at the current position.
+  // Remove any existing copy first so the queue doesn't gain a duplicate.
   if (state.playNext.length > 0) {
-    const ti = state.playNext.shift();
+    const ti  = state.playNext.shift();
+    const dup = state.queue.indexOf(ti);
+    if (dup !== -1) {
+      state.queue.splice(dup, 1);
+      if (dup < state.pos) state.pos--;
+    }
     state.queue.splice(state.pos, 0, ti);
-    // pos is unchanged; queue[pos] is now the playNext track.
   }
 
-  // End of queue — reshuffle or stop.
+  // Queue exhausted — only reachable when autoRepeat=false.
   if (state.pos >= state.queue.length) {
-    if (!state.autoRepeat) {
-      stop();
-      if (status) status.textContent = '';
-      const btn = document.getElementById('tss-btn');
-      if (btn) btn.textContent = '🔀 True Shuffle';
-      state.busy = false;
-      return;
-    }
-    state.queue = fisherYates(state.queue);
-    state.pos   = 0;
+    stop();
+    if (status) status.textContent = '';
+    const btn = document.getElementById('tss-btn');
+    if (btn) btn.textContent = '🔀 True Shuffle';
+    state.busy = false;
+    return;
   }
 
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
@@ -168,10 +156,7 @@ async function next(status, fromWatcher = false) {
 async function prevTrack(status) {
   if (state.busy) return;
 
-  // Spotify-style two-phase behaviour:
-  //   > 3 s into the track → restart the current track (seekTo 0)
-  //   ≤ 3 s into the track → go back to the previous track in history
-  //                          (or restart if there is no history)
+  // > 3 s in → restart current track.  ≤ 3 s → go to previous in history.
   if (currentSec() > 3 || !state.history.length) {
     seekTo(0);
     return;
@@ -182,17 +167,19 @@ async function prevTrack(status) {
 
   const prevTi = state.history.pop();
 
-  // Remove prevTi from its future slot to prevent a duplicate entry.
-  const futureIdx = state.queue.indexOf(prevTi, state.pos);
-  if (futureIdx !== -1) state.queue.splice(futureIdx, 1);
-
-  // Insert at the current position so queue[pos] === prevTi.
+  // Search the full queue (not just the future portion) so a track that was
+  // dragged before state.pos is still found and removed before reinserting.
+  const existingIdx = state.queue.indexOf(prevTi);
+  if (existingIdx !== -1) {
+    state.queue.splice(existingIdx, 1);
+    if (existingIdx < state.pos) state.pos--;
+  }
   state.queue.splice(state.pos, 0, prevTi);
 
   await playAt(state.queue[state.pos]);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
@@ -201,12 +188,20 @@ async function jumpTo(qi, ti, status) {
   if (state.busy) return;
   state.busy         = true;
   state.manualAction = true;
-  state.suspended    = false;   // resume shuffle when user picks a queued track
-  state.pos          = qi;
+  state.suspended    = false;
+
+  // Record what was playing so prevTrack() can return to it.
+  const current = state.queue[state.pos];
+  if (current !== undefined) {
+    state.history.push(current);
+    if (state.history.length > 50) state.history.shift();
+  }
+
+  state.pos = qi;
   await playAt(ti);
   badges();
   renderList();
-  if (status) status.textContent = `▶ ${qi + 1} / ${state.queue.length}`;
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   state.busy = false;
 }
 
@@ -350,20 +345,10 @@ async function start(btn, status) {
   btn.textContent = '⏹ Stop';
   btn.disabled    = false;
 
-  if (_cached) {
-    // Resume from the interrupted track; manualAction suppresses the
-    // watcher's external-song detection for this programmatic play.
-    state.manualAction = true;
-    await playAt(state.queue[state.pos]);
-    badges();
-    renderList();
-    if (status) status.textContent = `▶ ${state.pos + 1} / ${state.queue.length}`;
-  } else {
-    await playAt(state.queue[0]);
-    badges();
-    renderList();
-    if (status) status.textContent = `▶ 1 / ${state.queue.length}`;
-  }
+  await playAt(state.queue[state.pos]);
+  badges();
+  renderList();
+  if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   startWatcher(status);
 
   const mini = document.getElementById('tss-mini');
