@@ -267,7 +267,8 @@ async function loadTracks(status) {
 }
 
 // Click the play button for track at index `idx` and wait for the title to change.
-async function playAt(idx) {
+// Pass countPlay=false when going back (prevTrack) so the played counter isn't bumped.
+async function playAt(idx, countPlay = true) {
   if (!state.active) return;
 
   const el = state.els[idx];
@@ -309,7 +310,7 @@ async function playAt(idx) {
 
   state.lastTitle    = playerTitle();
   state.lastProgress = 0;
-  if (titleChanged) trackPlayed(idx);
+  if (titleChanged && countPlay) trackPlayed(idx);
   setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 300);
 }
 
@@ -417,7 +418,7 @@ async function prevTrack(status) {
   }
   state.queue.splice(state.pos, 0, prevTi);
 
-  await playAt(state.queue[state.pos]);
+  await playAt(state.queue[state.pos], false);
   badges();
   renderList();
   if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
