@@ -140,7 +140,7 @@ async function next(status, fromWatcher = false) {
     stop();
     if (status) status.textContent = '';
     const btn = document.getElementById('tss-btn');
-    if (btn) btn.textContent = '🔀 True Shuffle';
+    if (btn) { btn.textContent = '🔀 True Shuffle'; btn.dataset.state = 'idle'; }
     state.busy = false;
     return;
   }
@@ -231,7 +231,8 @@ async function start(btn, status) {
   // Toggle off if already running.
   if (state.active) {
     stop();
-    btn.textContent = '🔀 True Shuffle';
+    btn.textContent   = '🔀 True Shuffle';
+    btn.dataset.state = 'idle';
     if (status) status.textContent = '';
     renderList();
     const mini = document.getElementById('tss-mini');
@@ -239,14 +240,16 @@ async function start(btn, status) {
     return;
   }
 
-  btn.disabled = true;
-  btn.textContent = '⏳ loading…';
+  btn.disabled      = true;
+  btn.textContent   = '⏳ loading…';
+  btn.dataset.state = 'loading';
 
   const els = await loadTracks(status);
   if (!els.length) {
     if (status) status.textContent = '❌ no tracks found';
-    btn.textContent = '🔀 True Shuffle';
-    btn.disabled    = false;
+    btn.textContent   = '🔀 True Shuffle';
+    btn.dataset.state = 'idle';
+    btn.disabled      = false;
     return;
   }
 
@@ -342,8 +345,9 @@ async function start(btn, status) {
   }
   state._savedStats = null;
 
-  btn.textContent = '⏹ Stop';
-  btn.disabled    = false;
+  btn.textContent   = '⏹ Stop';
+  btn.dataset.state = 'active';
+  btn.disabled      = false;
 
   await playAt(state.queue[state.pos]);
   badges();
