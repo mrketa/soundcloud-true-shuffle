@@ -375,6 +375,10 @@ function stop() {
   state.worker?.postMessage('stop');
   state.worker?.terminate();
   state.worker = null;
+  if (state._workerInterval) {
+    clearInterval(state._workerInterval);
+    state._workerInterval = null;
+  }
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
   // Snapshot stats so they survive a quick restart.
   state._savedStats = { ...state.stats, _ts: Date.now() };

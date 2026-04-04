@@ -75,7 +75,7 @@ function showStats() {
     background:#111; border:1px solid #2a2a2a; border-radius:10px;
     padding:0; z-index:999999; font-family:-apple-system,sans-serif;
     min-width:280px; box-shadow:0 8px 40px rgba(0,0,0,0.8);
-    cursor:default; user-select:none;
+    cursor:default; -webkit-user-select:none; user-select:none;
   `;
 
   overlay.innerHTML = `

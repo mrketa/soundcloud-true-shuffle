@@ -63,7 +63,7 @@ function mkUI() {
   btn.dataset.state = state.active ? 'active'  : 'idle';
 
   const label = document.createElement('label');
-  label.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#555;cursor:pointer;user-select:none;font-family:-apple-system,sans-serif;';
+  label.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#555;cursor:pointer;-webkit-user-select:none;user-select:none;font-family:-apple-system,sans-serif;';
   const cb = document.createElement('input');
   cb.type          = 'checkbox';
   cb.checked       = state.autoRepeat;

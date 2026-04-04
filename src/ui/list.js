@@ -104,6 +104,7 @@ function mkRow(m, qi, ti, cur, past) {
     border-left:3px solid ${cur ? '#f50' : 'transparent'};
     transition:background 0.15s;
     opacity:${past ? '0.3' : '1'};
+    -webkit-user-select:none;
     user-select:none;
   `;
   row.onmouseenter = () => { if (!cur) row.style.background = 'rgba(255,255,255,0.03)'; };
