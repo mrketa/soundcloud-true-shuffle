@@ -36,14 +36,22 @@ function startWatcher(status) {
         if (anyAlive) {
           // Still on the playlist page — resume immediately.
           state.suspended = false;
-          await next(status, true);
-          lastTitle = playerTitle();
-          nearEnd   = false;
+          try {
+            await next(status, true);
+          } finally {
+            lastTitle = playerTitle();
+            nearEnd   = false;
+          }
         } else {
           // Playlist DOM is gone — save the queue and navigate back.
+          nearEnd = false;
           const worker = state.worker;
           state.worker = null;
           if (worker) worker.terminate();
+          if (state._workerInterval) {
+            clearInterval(state._workerInterval);
+            state._workerInterval = null;
+          }
 
           try {
             const metaKeys = state.meta.map(m => trackId(m) || '');
@@ -107,9 +115,12 @@ function startWatcher(status) {
       nearEnd = true;
       pause();
       await wait(150);
-      await next(status, true);
-      lastTitle = playerTitle();
-      nearEnd   = false;
+      try {
+        await next(status, true);
+      } finally {
+        lastTitle = playerTitle();
+        nearEnd   = false;
+      }
       return;
     }
 

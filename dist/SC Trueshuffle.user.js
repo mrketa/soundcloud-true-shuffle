@@ -457,6 +457,7 @@ async function prevTrack(status) {
 
 // Jump directly to a specific position in the queue.
 async function jumpTo(qi, ti, status) {
+  if (!state.active) return;
   if (state.busy) return;
   state.busy         = true;
   state.manualAction = true;
@@ -688,14 +689,22 @@ function startWatcher(status) {
         if (anyAlive) {
           // Still on the playlist page — resume immediately.
           state.suspended = false;
-          await next(status, true);
-          lastTitle = playerTitle();
-          nearEnd   = false;
+          try {
+            await next(status, true);
+          } finally {
+            lastTitle = playerTitle();
+            nearEnd   = false;
+          }
         } else {
           // Playlist DOM is gone — save the queue and navigate back.
+          nearEnd = false;
           const worker = state.worker;
           state.worker = null;
           if (worker) worker.terminate();
+          if (state._workerInterval) {
+            clearInterval(state._workerInterval);
+            state._workerInterval = null;
+          }
 
           try {
             const metaKeys = state.meta.map(m => trackId(m) || '');
@@ -759,9 +768,12 @@ function startWatcher(status) {
       nearEnd = true;
       pause();
       await wait(150);
-      await next(status, true);
-      lastTitle = playerTitle();
-      nearEnd   = false;
+      try {
+        await next(status, true);
+      } finally {
+        lastTitle = playerTitle();
+        nearEnd   = false;
+      }
       return;
     }
 
@@ -1405,7 +1417,8 @@ function renderList(filter = '') {
 
   // Auto-scroll the current track into view (when not searching).
   if (!q) {
-    const offset = state.playNext.length ? state.playNext.length + 2 : 0;
+    let offset = state.playNext.length ? state.playNext.length + 2 : 0;
+    if (state.suspended) offset++; // account for the suspended banner prepended above
     list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
@@ -1488,9 +1501,9 @@ function showCtxMenu(e, qi, ti) {
     },
     {
       label:    '↑ move up',
-      disabled: qi <= 0,
+      disabled: qi <= state.pos + 1,
       action:   () => {
-        if (qi <= 0) return;
+        if (qi <= state.pos + 1) return;
         [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos--;
         else if (state.pos === qi - 1) state.pos++;
@@ -1702,13 +1715,22 @@ async function onNav() {
         const status = document.getElementById('tss-status');
         // Pause the watcher while updating state.els to avoid a race where
         // next() fires mid-update and reads a partially-refreshed element array.
+        // Handle both the Worker path and the setInterval fallback.
         state.worker?.postMessage('stop');
+        if (state._workerInterval) {
+          clearInterval(state._workerInterval);
+          state._workerInterval = null;
+        }
         const freshEls = await loadTracks(status);
         if (freshEls.length > 0) {
           state.els  = freshEls;
           state.meta = freshEls.map(getMeta);
         }
-        state.worker?.postMessage('start');
+        if (state.worker) {
+          state.worker.postMessage('start');
+        } else {
+          startWatcher(status);
+        }
         return;
       }
 

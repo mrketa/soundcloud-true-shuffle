@@ -25,9 +25,9 @@ function showCtxMenu(e, qi, ti) {
     },
     {
       label:    '↑ move up',
-      disabled: qi <= 0,
+      disabled: qi <= state.pos + 1,
       action:   () => {
-        if (qi <= 0) return;
+        if (qi <= state.pos + 1) return;
         [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos--;
         else if (state.pos === qi - 1) state.pos++;
