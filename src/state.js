@@ -12,6 +12,7 @@ const state = {
   meta:         [],      // { title, artist, artwork, link } per track (index = ti)
   worker:       null,    // Web Worker used for background polling
   busy:         false,   // guard: prevents re-entrant playback calls
+  loading:      false,   // true while loadTracks() is running
   lastTitle:    '',      // title of the last confirmed playing track
   lastProgress: 0,       // last known playback progress ratio (0–1)
   sidebarOpen:  false,   // is the sidebar panel visible?

@@ -80,7 +80,7 @@ function renderList(filter = '') {
       renderList(filter);
     };
 
-    row.onclick       = () => jumpTo(qi, ti, document.getElementById('tss-status'));
+    row.onclick       = () => jumpTo(qi, ti, null);
     row.oncontextmenu = e => showCtxMenu(e, qi, ti);
     list.appendChild(row);
   });

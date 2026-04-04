@@ -41,13 +41,16 @@ function mkHub() {
         animation:tss-pulse 1.2s ease-in-out infinite;
       }
       #tss-hub-qico {
-        font-size:11px; color:#333; cursor:pointer;
-        padding:2px 5px; border-radius:3px;
-        transition:color 0.15s, background 0.15s;
-        line-height:1; flex-shrink:0;
+        font-size:10px; color:#555; cursor:pointer;
+        padding:2px 7px; border-radius:3px;
+        background:#1a1a1a; border:1px solid #2a2a2a;
+        transition:color 0.15s, background 0.15s, border-color 0.15s;
+        line-height:1.6; flex-shrink:0;
       }
-      #tss-hub-qico:hover { color:#888; background:rgba(255,255,255,0.05); }
-      #tss-hub-qico[data-open="true"] { color:#f50; }
+      #tss-hub-qico:hover { color:#bbb; border-color:#444; }
+      #tss-hub-qico[data-open="true"] {
+        color:#f50; background:rgba(255,85,0,0.08); border-color:rgba(255,85,0,0.35);
+      }
     `;
     document.head.appendChild(s);
   }
@@ -146,12 +149,10 @@ function mkHub() {
 
   document.body.appendChild(hub);
 
-  const st = () => document.getElementById('tss-status');
-
   // ── Controls ──────────────────────────────────────────────────────────────
   document.getElementById('tss-hub-play').onclick  = toggle;
-  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(st());
-  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(st()); };
+  document.getElementById('tss-hub-prev').onclick  = () => prevTrack(null);
+  document.getElementById('tss-hub-next').onclick  = () => { state.manualAction = true; next(null); };
   document.getElementById('tss-hub-stats').onclick = showStats;
   document.getElementById('tss-hub-seekbar').onclick = e => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -169,10 +170,9 @@ function mkHub() {
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // ── Start button proxies the real tss-btn so all start() logic runs ───────
+  // ── Start / stop ──────────────────────────────────────────────────────────
   document.getElementById('tss-hub-start').onclick = () => {
-    const btn = document.getElementById('tss-btn');
-    if (btn && !btn.disabled) btn.click();
+    if (!state.loading) start();
   };
 
   // ── Collapse entire hub ───────────────────────────────────────────────────
@@ -228,8 +228,7 @@ function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
   const active  = state.active;
-  const tssBtn  = document.getElementById('tss-btn');
-  const loading = !active && !!tssBtn?.disabled;
+  const loading = state.loading;
 
   // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
