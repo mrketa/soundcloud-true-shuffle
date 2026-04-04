@@ -21,7 +21,7 @@ HEADER = """\
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      4.0.1
+// @version      4.1.0
 // @description  Fixes SoundCloud's broken shuffle. Loads all tracks, actually random, works in background tabs.
 // @author       keta
 // @match        https://soundcloud.com/*
