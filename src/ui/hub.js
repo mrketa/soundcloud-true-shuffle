@@ -40,17 +40,14 @@ function mkHub() {
         cursor:not-allowed !important;
         animation:tss-pulse 1.2s ease-in-out infinite;
       }
-      #tss-hub-qtoggle {
-        width:100%; background:none;
-        border:1px solid #2a2a2a; border-radius:4px;
-        color:#555; font-size:10px; padding:5px 8px;
-        cursor:pointer; font-family:-apple-system,sans-serif;
-        transition:color 0.15s, border-color 0.15s; text-align:left;
+      #tss-hub-qico {
+        font-size:11px; color:#333; cursor:pointer;
+        padding:2px 5px; border-radius:3px;
+        transition:color 0.15s, background 0.15s;
+        line-height:1; flex-shrink:0;
       }
-      #tss-hub-qtoggle:hover { color:#bbb; border-color:#444; }
-      #tss-hub-qtoggle[data-open="true"] {
-        color:#f50; border-color:rgba(255,85,0,0.4);
-      }
+      #tss-hub-qico:hover { color:#888; background:rgba(255,255,255,0.05); }
+      #tss-hub-qico[data-open="true"] { color:#f50; }
     `;
     document.head.appendChild(s);
   }
@@ -108,7 +105,11 @@ function mkHub() {
 
       <div id="tss-hub-s-queue" class="tss-hub-sec" style="display:none;">
         <div class="tss-hub-sh" data-body="tss-hub-s-queue-b">
-          <span>queue</span><span class="tss-hub-arr">▾</span>
+          <span>queue</span>
+          <div style="display:flex;align-items:center;gap:4px;">
+            <span id="tss-hub-qico" data-open="false" title="toggle queue panel">→</span>
+            <span class="tss-hub-arr">▾</span>
+          </div>
         </div>
         <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -119,7 +120,6 @@ function mkHub() {
             <span style="color:#555;font-size:10px;flex-shrink:0;">next</span>
             <span id="tss-hub-nextup" style="color:#bbb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;text-align:right;min-width:0;">—</span>
           </div>
-          <button id="tss-hub-qtoggle" data-open="false">show queue ↗</button>
         </div>
       </div>
 
@@ -158,8 +158,11 @@ function mkHub() {
     seekTo((e.clientX - r.left) / r.width);
   };
 
-  // ── Queue toggle ──────────────────────────────────────────────────────────
-  document.getElementById('tss-hub-qtoggle').onclick = () => toggleSidebar();
+  // ── Queue toggle — icon in the section header, doesn't collapse the section
+  document.getElementById('tss-hub-qico').onclick = e => {
+    e.stopPropagation();
+    toggleSidebar();
+  };
 
   // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
@@ -256,12 +259,13 @@ function updateHub() {
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
 
-  // Sync queue toggle button label with sidebar state.
-  const qt = document.getElementById('tss-hub-qtoggle');
-  if (qt) {
-    const open       = state.sidebarOpen;
-    qt.dataset.open  = open ? 'true' : 'false';
-    qt.textContent   = open ? 'hide queue ✕' : 'show queue ↗';
+  // Sync the queue-panel toggle icon with sidebar state.
+  const qi = document.getElementById('tss-hub-qico');
+  if (qi) {
+    const open      = state.sidebarOpen;
+    qi.dataset.open = open ? 'true' : 'false';
+    qi.textContent  = open ? '←' : '→';
+    qi.title        = open ? 'close queue panel' : 'open queue panel';
   }
 
   if (!active) {
