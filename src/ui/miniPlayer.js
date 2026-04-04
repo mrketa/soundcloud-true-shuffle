@@ -178,7 +178,7 @@ function updateMiniPlayer() {
     if (el('tss-mini-artist'))   el('tss-mini-artist').textContent   = '↩ not in queue';
     if (el('tss-mini-play'))     el('tss-mini-play').textContent     = paused() ? '▶' : '⏸';
     if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : '—';
-    if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.pos + 1} / ${state.queue.length}`;
+    if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.stats.played + 1} / ${state.queue.length}`;
 
     // Show artwork from SC's player bar (the external track's artwork).
     const extArtwork = playerArtwork();
@@ -224,7 +224,7 @@ function updateMiniPlayer() {
   const nextTi = state.queue[state.pos + 1];
   const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
   if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : 'end of queue';
-  if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.pos + 1} / ${state.queue.length}`;
+  if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.stats.played} / ${state.queue.length}`;
 }
 
 // Shift the mini-player left when the sidebar opens so they don't overlap;

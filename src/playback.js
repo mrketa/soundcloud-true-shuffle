@@ -64,15 +64,16 @@ async function playAt(idx) {
   else el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.click();
 
   const prev = state.lastTitle;
+  let titleChanged = false;
   for (let i = 0; i < 15; i++) {
     await wait(150);
     const t = playerTitle();
-    if (t && t !== prev) break;
+    if (t && t !== prev) { titleChanged = true; break; }
   }
 
   state.lastTitle    = playerTitle();
   state.lastProgress = 0;
-  trackPlayed(idx);
+  if (titleChanged) trackPlayed(idx);
   setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateMiniPlayer(); }, 300);
 }
 
@@ -118,6 +119,11 @@ async function next(status, fromWatcher = false) {
         // Last track in the queue — start a fresh shuffled cycle.
         state.queue = fisherYates([...Array(state.meta.length).keys()]);
         state.pos   = 0;
+        // Ensure the just-played track doesn't immediately repeat at position 0.
+        if (state.queue[0] === justPlayed && state.queue.length > 1) {
+          const swap = 1 + Math.floor(Math.random() * (state.queue.length - 1));
+          [state.queue[0], state.queue[swap]] = [state.queue[swap], state.queue[0]];
+        }
       }
     }
     // autoRepeat=false: track is not reinserted; queue shrinks by one each play.
@@ -138,6 +144,7 @@ async function next(status, fromWatcher = false) {
   // Queue exhausted — only reachable when autoRepeat=false.
   if (state.pos >= state.queue.length) {
     stop();
+    renderList();
     if (status) status.textContent = '';
     const btn = document.getElementById('tss-btn');
     if (btn) { btn.textContent = '🔀 True Shuffle'; btn.dataset.state = 'idle'; }
@@ -154,6 +161,7 @@ async function next(status, fromWatcher = false) {
 
 // Go back to the previously played track.
 async function prevTrack(status) {
+  if (!state.active) return;
   if (state.busy) return;
 
   // > 3 s in → restart current track.  ≤ 3 s → go to previous in history.

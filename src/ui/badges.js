@@ -7,7 +7,7 @@ function badges() {
 
   state.queue.forEach((ti, qi) => {
     const el = state.els[ti];
-    if (!el || el.querySelector('.tss-badge')) return;
+    if (!el || !document.body.contains(el) || el.querySelector('.tss-badge')) return;
 
     const cur = qi === state.pos;
     const b   = document.createElement('span');

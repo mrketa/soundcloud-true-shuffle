@@ -11,7 +11,7 @@ function showCtxMenu(e, qi, ti) {
   menu.id = 'tss-ctx';
   menu.style.cssText = `
     position:fixed;
-    left:${e.clientX}px;
+    left:${Math.min(e.clientX, window.innerWidth - 180)}px;
     top:${Math.min(e.clientY, window.innerHeight - 180)}px;
     background:#1a1a1a; border:1px solid #333; border-radius:5px;
     z-index:999999; font-size:12px; font-family:-apple-system,sans-serif;

@@ -324,15 +324,16 @@ async function playAt(idx) {
   else el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.click();
 
   const prev = state.lastTitle;
+  let titleChanged = false;
   for (let i = 0; i < 15; i++) {
     await wait(150);
     const t = playerTitle();
-    if (t && t !== prev) break;
+    if (t && t !== prev) { titleChanged = true; break; }
   }
 
   state.lastTitle    = playerTitle();
   state.lastProgress = 0;
-  trackPlayed(idx);
+  if (titleChanged) trackPlayed(idx);
   setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateMiniPlayer(); }, 300);
 }
 
@@ -378,6 +379,11 @@ async function next(status, fromWatcher = false) {
         // Last track in the queue — start a fresh shuffled cycle.
         state.queue = fisherYates([...Array(state.meta.length).keys()]);
         state.pos   = 0;
+        // Ensure the just-played track doesn't immediately repeat at position 0.
+        if (state.queue[0] === justPlayed && state.queue.length > 1) {
+          const swap = 1 + Math.floor(Math.random() * (state.queue.length - 1));
+          [state.queue[0], state.queue[swap]] = [state.queue[swap], state.queue[0]];
+        }
       }
     }
     // autoRepeat=false: track is not reinserted; queue shrinks by one each play.
@@ -398,6 +404,7 @@ async function next(status, fromWatcher = false) {
   // Queue exhausted — only reachable when autoRepeat=false.
   if (state.pos >= state.queue.length) {
     stop();
+    renderList();
     if (status) status.textContent = '';
     const btn = document.getElementById('tss-btn');
     if (btn) { btn.textContent = '🔀 True Shuffle'; btn.dataset.state = 'idle'; }
@@ -414,6 +421,7 @@ async function next(status, fromWatcher = false) {
 
 // Go back to the previously played track.
 async function prevTrack(status) {
+  if (!state.active) return;
   if (state.busy) return;
 
   // > 3 s in → restart current track.  ≤ 3 s → go to previous in history.
@@ -771,7 +779,7 @@ function badges() {
 
   state.queue.forEach((ti, qi) => {
     const el = state.els[ti];
-    if (!el || el.querySelector('.tss-badge')) return;
+    if (!el || !document.body.contains(el) || el.querySelector('.tss-badge')) return;
 
     const cur = qi === state.pos;
     const b   = document.createElement('span');
@@ -1120,7 +1128,7 @@ function updateMiniPlayer() {
     if (el('tss-mini-artist'))   el('tss-mini-artist').textContent   = '↩ not in queue';
     if (el('tss-mini-play'))     el('tss-mini-play').textContent     = paused() ? '▶' : '⏸';
     if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : '—';
-    if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.pos + 1} / ${state.queue.length}`;
+    if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.stats.played + 1} / ${state.queue.length}`;
 
     // Show artwork from SC's player bar (the external track's artwork).
     const extArtwork = playerArtwork();
@@ -1166,7 +1174,7 @@ function updateMiniPlayer() {
   const nextTi = state.queue[state.pos + 1];
   const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
   if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : 'end of queue';
-  if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.pos + 1} / ${state.queue.length}`;
+  if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.stats.played} / ${state.queue.length}`;
 }
 
 // Shift the mini-player left when the sidebar opens so they don't overlap;
@@ -1447,7 +1455,7 @@ function showCtxMenu(e, qi, ti) {
   menu.id = 'tss-ctx';
   menu.style.cssText = `
     position:fixed;
-    left:${e.clientX}px;
+    left:${Math.min(e.clientX, window.innerWidth - 180)}px;
     top:${Math.min(e.clientY, window.innerHeight - 180)}px;
     background:#1a1a1a; border:1px solid #333; border-radius:5px;
     z-index:999999; font-size:12px; font-family:-apple-system,sans-serif;
@@ -1672,12 +1680,16 @@ async function onNav() {
         state.suspended = false;
         await wait(1500);
         inject();
-        const status   = document.getElementById('tss-status');
+        const status = document.getElementById('tss-status');
+        // Pause the watcher while updating state.els to avoid a race where
+        // next() fires mid-update and reads a partially-refreshed element array.
+        state.worker?.postMessage('stop');
         const freshEls = await loadTracks(status);
         if (freshEls.length > 0) {
           state.els  = freshEls;
           state.meta = freshEls.map(getMeta);
         }
+        state.worker?.postMessage('start');
         return;
       }
 
