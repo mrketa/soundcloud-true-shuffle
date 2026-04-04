@@ -29,29 +29,6 @@ function playerTitle() {
   return '';
 }
 
-// Returns the artwork URL currently shown in SoundCloud's playback bar.
-// Used in suspended mode to display the artwork of an externally-playing track.
-function playerArtwork() {
-  for (const sel of [
-    '.playbackSoundBadge__avatar',
-    '.playbackSoundBadge__coverArt',
-    '.playbackSoundBadge',
-  ]) {
-    const container = document.querySelector(sel);
-    if (!container) continue;
-    // background-image on a span (SC's standard artwork rendering)
-    const span = container.querySelector('span[style*="background-image"], .sc-artwork[style*="background-image"]');
-    if (span?.style.backgroundImage) {
-      const m = span.style.backgroundImage.match(/url\(["']?(https?:[^"')]+)["']?\)/);
-      if (m) return m[1].replace(/-t\d+x\d+/, '-t200x200');
-    }
-    // fallback: img tag
-    const img = container.querySelector('img[src]');
-    if (img?.src) return img.src.replace(/-t\d+x\d+/, '-t200x200');
-  }
-  return null;
-}
-
 // Returns current playback progress as a ratio 0–1, or 0 if unavailable.
 function progress() {
   const passed = document.querySelector('.playbackTimeline__timePassed');
@@ -105,22 +82,16 @@ function seekTo(ratio) {
   bar.dispatchEvent(new MouseEvent('mouseup',   opts));
 }
 
-// Sync the play/pause icon on both the sidebar and mini-player controls.
+// Sync the play/pause icon on the hub controls.
 function refreshPlayBtn() {
-  const isPaused = paused();
-  const s = document.getElementById('tss-ctrl-play');
-  const m = document.getElementById('tss-mini-play');
-  if (s) s.textContent = isPaused ? '▶' : '⏸';
-  if (m) m.textContent = isPaused ? '▶' : '⏸';
+  const p = document.getElementById('tss-hub-play');
+  if (p) p.textContent = paused() ? '▶' : '⏸';
 }
 
-// Sync the progress bar width on both the sidebar and mini-player.
+// Sync the hub progress bar.
 function updateProgressBar() {
-  const p = `${Math.min(100, progress() * 100).toFixed(1)}%`;
-  const s = document.getElementById('tss-progress-inner');
-  const m = document.getElementById('tss-mini-progress');
-  if (s) s.style.width = p;
-  if (m) m.style.width = p;
+  const p = document.getElementById('tss-hub-prog');
+  if (p) p.style.width = `${Math.min(100, progress() * 100).toFixed(1)}%`;
 }
 
 // ── Track metadata extraction ─────────────────────────────────────────────────

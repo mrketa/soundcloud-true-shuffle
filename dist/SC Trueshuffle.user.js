@@ -79,29 +79,6 @@ function playerTitle() {
   return '';
 }
 
-// Returns the artwork URL currently shown in SoundCloud's playback bar.
-// Used in suspended mode to display the artwork of an externally-playing track.
-function playerArtwork() {
-  for (const sel of [
-    '.playbackSoundBadge__avatar',
-    '.playbackSoundBadge__coverArt',
-    '.playbackSoundBadge',
-  ]) {
-    const container = document.querySelector(sel);
-    if (!container) continue;
-    // background-image on a span (SC's standard artwork rendering)
-    const span = container.querySelector('span[style*="background-image"], .sc-artwork[style*="background-image"]');
-    if (span?.style.backgroundImage) {
-      const m = span.style.backgroundImage.match(/url\(["']?(https?:[^"')]+)["']?\)/);
-      if (m) return m[1].replace(/-t\d+x\d+/, '-t200x200');
-    }
-    // fallback: img tag
-    const img = container.querySelector('img[src]');
-    if (img?.src) return img.src.replace(/-t\d+x\d+/, '-t200x200');
-  }
-  return null;
-}
-
 // Returns current playback progress as a ratio 0–1, or 0 if unavailable.
 function progress() {
   const passed = document.querySelector('.playbackTimeline__timePassed');
@@ -155,22 +132,16 @@ function seekTo(ratio) {
   bar.dispatchEvent(new MouseEvent('mouseup',   opts));
 }
 
-// Sync the play/pause icon on both the sidebar and mini-player controls.
+// Sync the play/pause icon on the hub controls.
 function refreshPlayBtn() {
-  const isPaused = paused();
-  const s = document.getElementById('tss-ctrl-play');
-  const m = document.getElementById('tss-mini-play');
-  if (s) s.textContent = isPaused ? '▶' : '⏸';
-  if (m) m.textContent = isPaused ? '▶' : '⏸';
+  const p = document.getElementById('tss-hub-play');
+  if (p) p.textContent = paused() ? '▶' : '⏸';
 }
 
-// Sync the progress bar width on both the sidebar and mini-player.
+// Sync the hub progress bar.
 function updateProgressBar() {
-  const p = `${Math.min(100, progress() * 100).toFixed(1)}%`;
-  const s = document.getElementById('tss-progress-inner');
-  const m = document.getElementById('tss-mini-progress');
-  if (s) s.style.width = p;
-  if (m) m.style.width = p;
+  const p = document.getElementById('tss-hub-prog');
+  if (p) p.style.width = `${Math.min(100, progress() * 100).toFixed(1)}%`;
 }
 
 // ── Track metadata extraction ─────────────────────────────────────────────────
@@ -307,7 +278,7 @@ async function playAt(idx) {
     if (!anyAlive) {
       state.suspended = true;
       state.busy      = false;
-      updateMiniPlayer();
+      updateHub();
       return;
     }
 
@@ -338,7 +309,7 @@ async function playAt(idx) {
   state.lastTitle    = playerTitle();
   state.lastProgress = 0;
   if (titleChanged) trackPlayed(idx);
-  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateMiniPlayer(); }, 300);
+  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 300);
 }
 
 // Advance to the next track in the queue.
@@ -349,7 +320,7 @@ async function next(status, fromWatcher = false) {
 
   if (!state.els.some(e => e && document.body.contains(e))) {
     state.suspended = true;
-    updateMiniPlayer();
+    updateHub();
     return;
   }
 
@@ -508,8 +479,6 @@ async function start(btn, status) {
     btn.dataset.state = 'idle';
     if (status) status.textContent = '';
     renderList();
-    const mini = document.getElementById('tss-mini');
-    if (mini) mini.style.display = 'none';
     return;
   }
 
@@ -627,11 +596,7 @@ async function start(btn, status) {
   renderList();
   if (status) status.textContent = `▶ ${state.stats.played} / ${state.queue.length}`;
   startWatcher(status);
-
-  const mini = document.getElementById('tss-mini');
-  if (mini) mini.style.display = 'flex';
-  else mkMiniPlayer();
-  updateMiniPlayer();
+  updateHub();
 }
 
 function stop() {
@@ -737,7 +702,7 @@ function startWatcher(status) {
         titleTicks = 0;
         refreshPlayBtn();
         updateProgressBar();
-        updateMiniPlayer();
+        updateHub();
       }
       return;
     }
@@ -756,7 +721,7 @@ function startWatcher(status) {
           state.manualAction = false;
         } else {
           state.suspended = true;
-          updateMiniPlayer();
+          updateHub();
         }
       }
       return;
@@ -785,7 +750,7 @@ function startWatcher(status) {
 
     refreshPlayBtn();
     updateProgressBar();
-    updateMiniPlayer();
+    updateHub();
   };
 
   state.worker = mkWorker();
@@ -977,282 +942,17 @@ function showStats() {
   };
 }
 
-// ── src/ui/miniPlayer.js ──────────────────────────────────────────────────────
-
-// ── Mini player ───────────────────────────────────────────────────────────────
-
-// Build the floating mini-player widget and attach all its event handlers.
-function mkMiniPlayer() {
-  if (document.getElementById('tss-mini')) return;
-
-  const mini = document.createElement('div');
-  mini.id = 'tss-mini';
-  mini.style.cssText = `
-    position:fixed; bottom:60px; right:20px;
-    width:220px; min-width:220px; max-width:400px;
-    background:#111; border:1px solid #222; border-radius:10px;
-    padding:10px 12px; z-index:99996;
-    font-family:-apple-system,sans-serif;
-    box-shadow:0 4px 20px rgba(0,0,0,0.7);
-    display:flex; flex-direction:column; gap:8px;
-    overflow:hidden; cursor:default;
-  `;
-
-  mini.innerHTML = `
-    <div style="display:flex;gap:10px;align-items:center;">
-      <div id="tss-mini-art" style="width:40px;height:40px;border-radius:6px;background:#1a1a1a;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:18px;color:#333;">♪</div>
-      <div style="overflow:hidden;flex:1;display:flex;flex-direction:column;gap:3px;">
-        <div id="tss-mini-title"  style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;">—</div>
-        <div id="tss-mini-artist" style="color:#555;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;">—</div>
-      </div>
-      <span id="tss-mini-close" style="color:#444;cursor:pointer;font-size:16px;flex-shrink:0;align-self:flex-start;line-height:1;">×</span>
-    </div>
-    <div id="tss-mini-extra" style="display:none;flex-direction:column;gap:4px;border-top:1px solid #1a1a1a;padding-top:8px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <span style="color:#555;font-size:10px;flex-shrink:0;">next up</span>
-        <span id="tss-mini-nextup" style="color:#bbb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;text-align:right;min-width:0;">—</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="color:#555;font-size:10px;">queue</span>
-        <span id="tss-mini-queuepos" style="color:#bbb;font-size:10px;">—</span>
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;justify-content:center;gap:8px;">
-      <button id="tss-mini-prev"  style="background:none;border:none;color:#888;font-size:14px;cursor:pointer;padding:2px 6px;">⏮</button>
-      <button id="tss-mini-play"  style="background:#f50;border:none;color:#fff;width:30px;height:30px;border-radius:50%;cursor:pointer;font-size:13px;">⏸</button>
-      <button id="tss-mini-next"  style="background:none;border:none;color:#888;font-size:14px;cursor:pointer;padding:2px 6px;">⏭</button>
-      <button id="tss-mini-stats" style="background:none;border:none;color:#555;font-size:12px;cursor:pointer;padding:2px 4px;" title="stats">📊</button>
-    </div>
-    <div id="tss-mini-seekbar" style="height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden;cursor:pointer;" title="click to seek">
-      <div id="tss-mini-progress" style="height:100%;background:#f50;width:0%;transition:width 0.3s linear;pointer-events:none;"></div>
-    </div>
-    <div id="tss-mini-rzl" style="position:absolute;bottom:0;left:0;width:14px;height:14px;cursor:sw-resize;display:flex;align-items:flex-end;justify-content:flex-start;padding:2px;opacity:0.4;font-size:9px;color:#666;">◤</div>
-    <div id="tss-mini-rzr" style="position:absolute;bottom:0;right:0;width:14px;height:14px;cursor:se-resize;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px;opacity:0.4;font-size:9px;color:#666;">◥</div>
-  `;
-
-  document.body.appendChild(mini);
-
-  const st = () => document.getElementById('tss-status');
-
-  document.getElementById('tss-mini-play').onclick  = toggle;
-  document.getElementById('tss-mini-next').onclick  = () => { state.manualAction = true; next(st()); };
-  document.getElementById('tss-mini-prev').onclick  = () => prevTrack(st());
-  document.getElementById('tss-mini-stats').onclick = showStats;
-
-  document.getElementById('tss-mini-seekbar').onclick = e => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    seekTo((e.clientX - rect.left) / rect.width);
-  };
-
-  // Collapse to a small tab when closed.
-  document.getElementById('tss-mini-close').onclick = () => {
-    mini.style.display = 'none';
-    let tab = document.getElementById('tss-mini-tab');
-    if (!tab) {
-      tab = document.createElement('div');
-      tab.id = 'tss-mini-tab';
-      tab.style.cssText = `
-        position:fixed; bottom:60px; right:20px;
-        background:#111; border:1px solid #222; border-radius:8px;
-        padding:6px 10px; z-index:99996;
-        font-family:-apple-system,sans-serif;
-        display:flex; align-items:center; gap:8px;
-        cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.6);
-      `;
-      tab.innerHTML = `
-        <span style="font-size:13px;">🔀</span>
-        <span id="tss-mini-tab-title" style="color:#ccc;font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">—</span>
-      `;
-      tab.onclick = () => { mini.style.display = 'flex'; tab.style.display = 'none'; updateMiniPlayer(); };
-      document.body.appendChild(tab);
-    }
-    const m = state.meta[state.queue?.[state.pos]];
-    const t = document.getElementById('tss-mini-tab-title');
-    if (t && m) t.textContent = m.title;
-    tab.style.display = 'flex';
-  };
-
-  // Drag — only on the player body, not on buttons or resize handles.
-  mini.onmousedown = e => {
-    const ignore = ['BUTTON', 'SPAN', 'INPUT'];
-    if (ignore.includes(e.target.tagName)) return;
-    if (e.target.id === 'tss-mini-rzl' || e.target.id === 'tss-mini-rzr') return;
-
-    e.preventDefault();
-    const rect    = mini.getBoundingClientRect();
-    let curLeft   = rect.left;
-    let curTop    = rect.top;
-    mini.style.left   = curLeft + 'px';
-    mini.style.top    = curTop  + 'px';
-    mini.style.right  = 'auto';
-    mini.style.bottom = 'auto';
-    // If the user drags manually, clear the auto-shifted flag.
-    delete mini.dataset.autoShifted;
-
-    const startX = e.clientX, startY = e.clientY;
-    const move = ev => {
-      curLeft = Math.max(0, Math.min(window.innerWidth  - mini.offsetWidth,  rect.left + (ev.clientX - startX)));
-      curTop  = Math.max(0, Math.min(window.innerHeight - mini.offsetHeight, rect.top  + (ev.clientY - startY)));
-      mini.style.left = curLeft + 'px';
-      mini.style.top  = curTop  + 'px';
-    };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup',   up);
-    };
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup',   up);
-  };
-
-  // Resize handles — change width only, never position.
-  const addResize = (handleId, growLeft) => {
-    const handle = document.getElementById(handleId);
-    if (!handle) return;
-    handle.onmousedown = e => {
-      e.stopPropagation();
-      e.preventDefault();
-      const startX = e.clientX;
-      const startW = mini.offsetWidth;
-      const move = ev => {
-        const delta = growLeft ? (startX - ev.clientX) : (ev.clientX - startX);
-        const newW  = Math.max(220, Math.min(400, startW + delta));
-        mini.style.width = newW + 'px';
-        const extra = document.getElementById('tss-mini-extra');
-        if (extra) extra.style.display = newW > 280 ? 'flex' : 'none';
-      };
-      const up = () => {
-        document.removeEventListener('mousemove', move);
-        document.removeEventListener('mouseup',   up);
-      };
-      document.addEventListener('mousemove', move);
-      document.addEventListener('mouseup',   up);
-    };
-  };
-
-  addResize('tss-mini-rzl', true);
-  addResize('tss-mini-rzr', false);
-}
-
-// Sync mini-player display with current playback state.
-function updateMiniPlayer() {
-  const mini = document.getElementById('tss-mini');
-
-  // If the player is hidden, just update the collapsed tab title.
-  if (!mini || mini.style.display === 'none') {
-    const tab = document.getElementById('tss-mini-tab');
-    const m   = state.meta[state.queue?.[state.pos]];
-    const t   = document.getElementById('tss-mini-tab-title');
-    if (tab && tab.style.display !== 'none' && m && t) t.textContent = m.title;
-    updateHub();
-    return;
-  }
-
-  const el = id => document.getElementById(id);
-
-  if (state.suspended) {
-    // An external (non-queue) track is playing.  Show what SC is actually
-    // playing and indicate where the queue will resume.
-    const extTitle = playerTitle() || '—';
-    const nextTi   = state.queue[state.pos];
-    const nextM    = nextTi !== undefined ? state.meta[nextTi] : null;
-
-    if (el('tss-mini-title'))    el('tss-mini-title').textContent    = extTitle;
-    if (el('tss-mini-artist'))   el('tss-mini-artist').textContent   = '↩ not in queue';
-    if (el('tss-mini-play'))     el('tss-mini-play').textContent     = paused() ? '▶' : '⏸';
-    if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : '—';
-    if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.stats.played + 1} / ${state.queue.length}`;
-
-    // Show artwork from SC's player bar (the external track's artwork).
-    const extArtwork = playerArtwork();
-    const art = el('tss-mini-art');
-    if (art) {
-      if (extArtwork && art.dataset.src !== extArtwork) {
-        art.dataset.src = extArtwork;
-        art.innerHTML   = '';
-        const img = document.createElement('img');
-        img.src           = extArtwork;
-        img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
-        img.onerror       = () => { art.innerHTML = '♪'; };
-        art.appendChild(img);
-      } else if (!extArtwork && art.dataset.src) {
-        delete art.dataset.src;
-        art.innerHTML = '♪';
-      }
-    }
-    updateHub();
-    return;
-  }
-
-  // Normal mode: use playerTitle() as source of truth so the display stays
-  // in sync with what SoundCloud is actually playing, not just our state.
-  const currentTitle = playerTitle();
-  const m = state.meta[state.queue?.[state.pos]];
-
-  if (el('tss-mini-title'))  el('tss-mini-title').textContent  = currentTitle || m?.title  || '—';
-  if (el('tss-mini-artist')) el('tss-mini-artist').textContent = m?.artist || '—';
-  if (el('tss-mini-play'))   el('tss-mini-play').textContent   = paused() ? '▶' : '⏸';
-
-  // Update artwork only when it changes to avoid thrashing the DOM.
-  const art = el('tss-mini-art');
-  if (art && m?.artwork && art.dataset.src !== m.artwork) {
-    art.dataset.src = m.artwork;
-    art.innerHTML   = '';
-    const img = document.createElement('img');
-    img.src           = m.artwork;
-    img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
-    img.onerror       = () => { art.innerHTML = '♪'; };
-    art.appendChild(img);
-  }
-
-  const nextTi = state.queue[state.pos + 1];
-  const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
-  if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : 'end of queue';
-  if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `${state.stats.played} / ${state.queue.length}`;
-  updateHub();
-}
-
-// Shift the mini-player left when the sidebar opens so they don't overlap;
-// restore its anchored position when the sidebar closes.
-// Uses data-autoShifted to distinguish auto-moved elements from user-dragged ones.
-function shiftMiniPlayer(sidebarOpen) {
-  const mini = document.getElementById('tss-mini');
-  const tab  = document.getElementById('tss-mini-tab');
-
-  [mini, tab].forEach(el => {
-    if (!el || el.style.display === 'none') return;
-
-    if (sidebarOpen) {
-      const rect = el.getBoundingClientRect();
-      if (rect.right > window.innerWidth - 308) {
-        el.dataset.autoShifted = '1';
-        el.style.left   = (window.innerWidth - 320 - el.offsetWidth) + 'px';
-        el.style.top    = rect.top + 'px';
-        el.style.right  = 'auto';
-        el.style.bottom = 'auto';
-      }
-    } else if (el.dataset.autoShifted) {
-      // Only restore elements we auto-shifted, not ones the user dragged.
-      delete el.dataset.autoShifted;
-      el.style.left   = '';
-      el.style.top    = '';
-      el.style.right  = '20px';
-      el.style.bottom = '60px';
-    }
-  });
-}
-
 // ── src/ui/hub.js ─────────────────────────────────────────────────────────────
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
-// Modular floating panel with collapsible sections: now playing, controls,
-// queue info, and shuffle settings. Draggable. Expands when shuffle starts.
+// Central floating panel: now playing + seekbar, playback controls, queue info,
+// and shuffle settings. Draggable. The queue sidebar is toggled from here.
 //
 // ── How to remove ─────────────────────────────────────────────────────────────
 // 1. Delete this file
 // 2. Remove 'src/ui/hub.js' from FILES in build.py
-// 3. Remove mkHub() from inject.js          (1 line)
-// 4. Remove updateHub() from stop()         (1 line in playback.js)
-// 5. Remove updateHub() calls from the 3 return paths in updateMiniPlayer()
+// 3. Remove mkHub() from inject.js                    (1 line)
+// 4. Remove updateHub() calls from playback.js / watcher.js / stop()
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
@@ -1285,6 +985,17 @@ function mkHub() {
         color:#555 !important; border-color:#1e1e1e !important;
         cursor:not-allowed !important;
         animation:tss-pulse 1.2s ease-in-out infinite;
+      }
+      #tss-hub-qtoggle {
+        width:100%; background:none;
+        border:1px solid #2a2a2a; border-radius:4px;
+        color:#555; font-size:10px; padding:5px 8px;
+        cursor:pointer; font-family:-apple-system,sans-serif;
+        transition:color 0.15s, border-color 0.15s; text-align:left;
+      }
+      #tss-hub-qtoggle:hover { color:#bbb; border-color:#444; }
+      #tss-hub-qtoggle[data-open="true"] {
+        color:#f50; border-color:rgba(255,85,0,0.4);
       }
     `;
     document.head.appendChild(s);
@@ -1319,7 +1030,7 @@ function mkHub() {
           <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">
             <div id="tss-hub-art" style="width:40px;height:40px;border-radius:5px;background:#1a1a1a;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:18px;color:#333;">♪</div>
             <div style="overflow:hidden;flex:1;min-width:0;">
-              <div id="tss-hub-title"  style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">—</div>
+              <div id="tss-hub-title" style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">—</div>
               <div id="tss-hub-artist" style="color:#555;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;line-height:1.4;">—</div>
             </div>
           </div>
@@ -1345,7 +1056,7 @@ function mkHub() {
         <div class="tss-hub-sh" data-body="tss-hub-s-queue-b">
           <span>queue</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;">
+        <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="color:#555;font-size:10px;">played</span>
             <span id="tss-hub-qpos" style="color:#bbb;font-size:10px;">—</span>
@@ -1354,6 +1065,7 @@ function mkHub() {
             <span style="color:#555;font-size:10px;flex-shrink:0;">next</span>
             <span id="tss-hub-nextup" style="color:#bbb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;text-align:right;min-width:0;">—</span>
           </div>
+          <button id="tss-hub-qtoggle" data-open="false">show queue ↗</button>
         </div>
       </div>
 
@@ -1392,11 +1104,15 @@ function mkHub() {
     seekTo((e.clientX - r.left) / r.width);
   };
 
+  // ── Queue toggle ──────────────────────────────────────────────────────────
+  document.getElementById('tss-hub-qtoggle').onclick = () => toggleSidebar();
+
+  // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // Start button proxies the real tss-btn so all existing start() logic runs.
+  // ── Start button proxies the real tss-btn so all start() logic runs ───────
   document.getElementById('tss-hub-start').onclick = () => {
     const btn = document.getElementById('tss-btn');
     if (btn && !btn.disabled) btn.click();
@@ -1406,7 +1122,7 @@ function mkHub() {
   const colBtn  = document.getElementById('tss-hub-col');
   const hubBody = document.getElementById('tss-hub-body');
   colBtn.onclick = () => {
-    const open         = hubBody.style.display !== 'none';
+    const open            = hubBody.style.display !== 'none';
     hubBody.style.display = open ? 'none' : '';
     colBtn.textContent    = open ? '+' : '−';
   };
@@ -1418,7 +1134,7 @@ function mkHub() {
       const arr = sh.querySelector('.tss-hub-arr');
       if (!b) return;
       const open = b.style.display !== 'none';
-      b.style.display          = open ? 'none' : '';
+      b.style.display              = open ? 'none' : '';
       if (arr) arr.style.transform = open ? 'rotate(-90deg)' : '';
     };
   });
@@ -1450,7 +1166,7 @@ function mkHub() {
 }
 
 // Sync all hub elements with current playback state.
-// Called from updateMiniPlayer() (every watcher tick) and stop().
+// Called from playback.js, watcher.js, and stop().
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
@@ -1458,33 +1174,41 @@ function updateHub() {
   const tssBtn  = document.getElementById('tss-btn');
   const loading = !active && !!tssBtn?.disabled;
 
-  // Show/hide the three playback-only section wrappers.
+  // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = active ? '' : 'none';
   });
 
-  // Start button: three states — idle, loading, active.
+  // Start button: idle / loading / active.
   const startBtn = document.getElementById('tss-hub-start');
   if (startBtn) {
     if (loading) {
-      startBtn.textContent        = '⏳ loading…';
-      startBtn.dataset.active     = 'false';
-      startBtn.dataset.loading    = 'true';
+      startBtn.textContent     = '⏳ loading…';
+      startBtn.dataset.active  = 'false';
+      startBtn.dataset.loading = 'true';
     } else if (active) {
-      startBtn.textContent        = '⏹ Stop Shuffle';
-      startBtn.dataset.active     = 'true';
-      startBtn.dataset.loading    = 'false';
+      startBtn.textContent     = '⏹ Stop Shuffle';
+      startBtn.dataset.active  = 'true';
+      startBtn.dataset.loading = 'false';
     } else {
-      startBtn.textContent        = 'True Shuffle';
-      startBtn.dataset.active     = 'false';
-      startBtn.dataset.loading    = 'false';
+      startBtn.textContent     = 'True Shuffle';
+      startBtn.dataset.active  = 'false';
+      startBtn.dataset.loading = 'false';
     }
   }
 
-  // Keep repeat checkbox in sync (may be changed via sidebar).
+  // Keep repeat checkbox in sync (may be changed via the inject UI).
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
+
+  // Sync queue toggle button label with sidebar state.
+  const qt = document.getElementById('tss-hub-qtoggle');
+  if (qt) {
+    const open       = state.sidebarOpen;
+    qt.dataset.open  = open ? 'true' : 'false';
+    qt.textContent   = open ? 'hide queue ✕' : 'show queue ↗';
+  }
 
   if (!active) {
     // Clear stale progress bar.
@@ -1493,16 +1217,16 @@ function updateHub() {
     return;
   }
 
-  const art = document.getElementById('tss-hub-art');
-  const pb  = document.getElementById('tss-hub-play');
+  const pb = document.getElementById('tss-hub-play');
   if (pb) pb.textContent = paused() ? '▶' : '⏸';
 
-  // Suspended mode — an external track is playing.
+  // Suspended mode — an external (non-queue) track is playing.
   if (state.suspended) {
     const tEl = document.getElementById('tss-hub-title');
     const aEl = document.getElementById('tss-hub-artist');
     if (tEl) tEl.textContent = playerTitle() || '—';
     if (aEl) aEl.textContent = '↩ not in queue';
+    const art = document.getElementById('tss-hub-art');
     if (art && art.dataset.src) { delete art.dataset.src; art.innerHTML = '♪'; }
     return;
   }
@@ -1514,6 +1238,7 @@ function updateHub() {
   if (tEl) tEl.textContent = playerTitle() || m?.title  || '—';
   if (aEl) aEl.textContent = m?.artist || '—';
 
+  const art = document.getElementById('tss-hub-art');
   if (art) {
     if (m?.artwork && art.dataset.src !== m.artwork) {
       art.dataset.src = m.artwork;
@@ -1543,22 +1268,23 @@ function updateHub() {
 // ── src/ui/sidebar.js ─────────────────────────────────────────────────────────
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+// Slide-in queue panel. Toggled via the hub or the persistent edge tab.
+// Contains only the queue list and search — playback is controlled from the hub.
 
-// Build the slide-in queue panel and its persistent edge tab.
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;
 
   // Edge tab — always visible, click to open/close.
   const tab = document.createElement('div');
   tab.id = 'tss-sidebar-tab';
-  tab.textContent = '🔀';
+  tab.textContent = '≡';
   tab.style.cssText = `
     position:fixed; right:0; top:50%; transform:translateY(-50%);
     background:#f50; color:#fff;
     width:28px; height:60px;
     display:flex; align-items:center; justify-content:center;
     border-radius:6px 0 0 6px;
-    cursor:pointer; z-index:99998; font-size:16px;
+    cursor:pointer; z-index:99998; font-size:18px;
     box-shadow:-2px 0 8px rgba(0,0,0,0.4); transition:right 0.25s;
   `;
   tab.onmouseenter = () => { tab.style.background = '#e64a00'; };
@@ -1578,21 +1304,13 @@ function mkSidebar() {
   `;
 
   sidebar.innerHTML = `
-    <div style="padding:12px 14px;border-bottom:1px solid #1a1a1a;flex-shrink:0;">
+    <div style="padding:12px 14px 10px;border-bottom:1px solid #1a1a1a;flex-shrink:0;">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-        <span style="color:#fff;font-size:13px;font-weight:600;">🔀 queue</span>
+        <span style="color:#fff;font-size:13px;font-weight:600;">queue</span>
         <div style="display:flex;gap:10px;align-items:center;">
           <span id="tss-stats-btn" style="color:#555;font-size:13px;cursor:pointer;" title="session stats">📊</span>
           <span id="tss-sidebar-count" style="color:#555;font-size:11px;"></span>
         </div>
-      </div>
-      <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:10px;">
-        <button id="tss-ctrl-prev" style="background:#1a1a1a;border:none;color:#ccc;width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:14px;">⏮</button>
-        <button id="tss-ctrl-play" style="background:#f50;border:none;color:#fff;width:40px;height:40px;border-radius:50%;cursor:pointer;font-size:16px;">⏸</button>
-        <button id="tss-ctrl-next" style="background:#1a1a1a;border:none;color:#ccc;width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:14px;">⏭</button>
-      </div>
-      <div id="tss-sidebar-seekbar" style="height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden;cursor:pointer;margin-bottom:8px;" title="click to seek">
-        <div id="tss-progress-inner" style="height:100%;background:#f50;width:0%;transition:width 0.3s linear;pointer-events:none;"></div>
       </div>
       <input id="tss-search" placeholder="search queue…"
         style="width:100%;box-sizing:border-box;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:4px;color:#ccc;font-size:12px;padding:5px 8px;outline:none;" />
@@ -1603,30 +1321,19 @@ function mkSidebar() {
   document.body.appendChild(tab);
   document.body.appendChild(sidebar);
 
-  const st = () => document.getElementById('tss-status');
-
-  document.getElementById('tss-ctrl-play').onclick = toggle;
-  document.getElementById('tss-ctrl-next').onclick = () => { state.manualAction = true; next(st()); };
-  document.getElementById('tss-ctrl-prev').onclick = () => prevTrack(st());
   document.getElementById('tss-stats-btn').onclick = showStats;
-
-  document.getElementById('tss-sidebar-seekbar').onclick = e => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    seekTo((e.clientX - rect.left) / rect.width);
-  };
-
   document.getElementById('tss-search').oninput = e => renderList(e.target.value);
   document.getElementById('tss-search').onclick  = e => e.stopPropagation();
 }
 
-// Toggle the sidebar open/closed and move the mini-player out of the way.
+// Toggle the sidebar open/closed and keep the hub button in sync.
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
   const s = document.getElementById('tss-sidebar');
   const t = document.getElementById('tss-sidebar-tab');
-  if (s) s.style.right = state.sidebarOpen ? '0'      : '-320px';
-  if (t) t.style.right = state.sidebarOpen ? '300px'  : '0';
-  shiftMiniPlayer(state.sidebarOpen);
+  if (s) s.style.right = state.sidebarOpen ? '0'     : '-320px';
+  if (t) t.style.right = state.sidebarOpen ? '300px' : '0';
+  updateHub();
 }
 
 // ── src/ui/list.js ────────────────────────────────────────────────────────────
@@ -1999,7 +1706,7 @@ async function onNav() {
         // Navigated to a non-playlist page while shuffle is running.
         // Keep the queue alive but suspend so the external track plays freely.
         state.suspended = true;
-        updateMiniPlayer();
+        updateHub();
         return;
       }
 
@@ -2040,10 +1747,6 @@ async function onNav() {
 
       // Navigated to a DIFFERENT valid playlist page — full stop.
       stop();
-      const mini = document.getElementById('tss-mini');
-      const tab  = document.getElementById('tss-mini-tab');
-      if (mini) mini.style.display = 'none';
-      if (tab)  tab.style.display  = 'none';
     }
     await wait(1500); // give SoundCloud time to render the new page
     if (validPage()) {

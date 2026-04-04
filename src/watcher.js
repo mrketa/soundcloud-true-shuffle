@@ -83,7 +83,7 @@ function startWatcher(status) {
         titleTicks = 0;
         refreshPlayBtn();
         updateProgressBar();
-        updateMiniPlayer();
+        updateHub();
       }
       return;
     }
@@ -102,7 +102,7 @@ function startWatcher(status) {
           state.manualAction = false;
         } else {
           state.suspended = true;
-          updateMiniPlayer();
+          updateHub();
         }
       }
       return;
@@ -131,7 +131,7 @@ function startWatcher(status) {
 
     refreshPlayBtn();
     updateProgressBar();
-    updateMiniPlayer();
+    updateHub();
   };
 
   state.worker = mkWorker();

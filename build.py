@@ -48,8 +48,7 @@ FILES = [
     "src/watcher.js",        # background poller — uses state, utils, playback, UI fns
     "src/ui/badges.js",      # DOM badge chips — uses state
     "src/ui/stats.js",       # stats overlay — uses state, utils (esc)
-    "src/ui/miniPlayer.js",  # floating player widget — uses state, utils, playback, stats
-    "src/ui/hub.js",         # modular floating hub — uses state, utils, playback, stats, miniPlayer
+    "src/ui/hub.js",         # central floating hub — uses state, utils, playback, stats, sidebar
     "src/ui/sidebar.js",     # slide-in queue panel — uses state, utils, playback, miniPlayer
     "src/ui/list.js",        # queue list renderer — uses state, utils, playback, badges
     "src/ui/contextMenu.js", # right-click menu — uses state, playback, list

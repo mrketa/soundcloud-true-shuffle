@@ -1,13 +1,12 @@
 // ── Hub ───────────────────────────────────────────────────────────────────────
-// Modular floating panel with collapsible sections: now playing, controls,
-// queue info, and shuffle settings. Draggable. Expands when shuffle starts.
+// Central floating panel: now playing + seekbar, playback controls, queue info,
+// and shuffle settings. Draggable. The queue sidebar is toggled from here.
 //
 // ── How to remove ─────────────────────────────────────────────────────────────
 // 1. Delete this file
 // 2. Remove 'src/ui/hub.js' from FILES in build.py
-// 3. Remove mkHub() from inject.js          (1 line)
-// 4. Remove updateHub() from stop()         (1 line in playback.js)
-// 5. Remove updateHub() calls from the 3 return paths in updateMiniPlayer()
+// 3. Remove mkHub() from inject.js                    (1 line)
+// 4. Remove updateHub() calls from playback.js / watcher.js / stop()
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
@@ -40,6 +39,17 @@ function mkHub() {
         color:#555 !important; border-color:#1e1e1e !important;
         cursor:not-allowed !important;
         animation:tss-pulse 1.2s ease-in-out infinite;
+      }
+      #tss-hub-qtoggle {
+        width:100%; background:none;
+        border:1px solid #2a2a2a; border-radius:4px;
+        color:#555; font-size:10px; padding:5px 8px;
+        cursor:pointer; font-family:-apple-system,sans-serif;
+        transition:color 0.15s, border-color 0.15s; text-align:left;
+      }
+      #tss-hub-qtoggle:hover { color:#bbb; border-color:#444; }
+      #tss-hub-qtoggle[data-open="true"] {
+        color:#f50; border-color:rgba(255,85,0,0.4);
       }
     `;
     document.head.appendChild(s);
@@ -74,7 +84,7 @@ function mkHub() {
           <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">
             <div id="tss-hub-art" style="width:40px;height:40px;border-radius:5px;background:#1a1a1a;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:18px;color:#333;">♪</div>
             <div style="overflow:hidden;flex:1;min-width:0;">
-              <div id="tss-hub-title"  style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">—</div>
+              <div id="tss-hub-title" style="color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">—</div>
               <div id="tss-hub-artist" style="color:#555;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;line-height:1.4;">—</div>
             </div>
           </div>
@@ -100,7 +110,7 @@ function mkHub() {
         <div class="tss-hub-sh" data-body="tss-hub-s-queue-b">
           <span>queue</span><span class="tss-hub-arr">▾</span>
         </div>
-        <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;">
+        <div id="tss-hub-s-queue-b" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="color:#555;font-size:10px;">played</span>
             <span id="tss-hub-qpos" style="color:#bbb;font-size:10px;">—</span>
@@ -109,6 +119,7 @@ function mkHub() {
             <span style="color:#555;font-size:10px;flex-shrink:0;">next</span>
             <span id="tss-hub-nextup" style="color:#bbb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;text-align:right;min-width:0;">—</span>
           </div>
+          <button id="tss-hub-qtoggle" data-open="false">show queue ↗</button>
         </div>
       </div>
 
@@ -147,11 +158,15 @@ function mkHub() {
     seekTo((e.clientX - r.left) / r.width);
   };
 
+  // ── Queue toggle ──────────────────────────────────────────────────────────
+  document.getElementById('tss-hub-qtoggle').onclick = () => toggleSidebar();
+
+  // ── Repeat checkbox ───────────────────────────────────────────────────────
   const hubRepeat = document.getElementById('tss-hub-repeat');
   hubRepeat.checked  = state.autoRepeat;
   hubRepeat.onchange = () => { state.autoRepeat = hubRepeat.checked; };
 
-  // Start button proxies the real tss-btn so all existing start() logic runs.
+  // ── Start button proxies the real tss-btn so all start() logic runs ───────
   document.getElementById('tss-hub-start').onclick = () => {
     const btn = document.getElementById('tss-btn');
     if (btn && !btn.disabled) btn.click();
@@ -161,7 +176,7 @@ function mkHub() {
   const colBtn  = document.getElementById('tss-hub-col');
   const hubBody = document.getElementById('tss-hub-body');
   colBtn.onclick = () => {
-    const open         = hubBody.style.display !== 'none';
+    const open            = hubBody.style.display !== 'none';
     hubBody.style.display = open ? 'none' : '';
     colBtn.textContent    = open ? '+' : '−';
   };
@@ -173,7 +188,7 @@ function mkHub() {
       const arr = sh.querySelector('.tss-hub-arr');
       if (!b) return;
       const open = b.style.display !== 'none';
-      b.style.display          = open ? 'none' : '';
+      b.style.display              = open ? 'none' : '';
       if (arr) arr.style.transform = open ? 'rotate(-90deg)' : '';
     };
   });
@@ -205,7 +220,7 @@ function mkHub() {
 }
 
 // Sync all hub elements with current playback state.
-// Called from updateMiniPlayer() (every watcher tick) and stop().
+// Called from playback.js, watcher.js, and stop().
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
 
@@ -213,33 +228,41 @@ function updateHub() {
   const tssBtn  = document.getElementById('tss-btn');
   const loading = !active && !!tssBtn?.disabled;
 
-  // Show/hide the three playback-only section wrappers.
+  // Show/hide playback-only sections.
   ['tss-hub-s-np', 'tss-hub-s-ctrl', 'tss-hub-s-queue'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = active ? '' : 'none';
   });
 
-  // Start button: three states — idle, loading, active.
+  // Start button: idle / loading / active.
   const startBtn = document.getElementById('tss-hub-start');
   if (startBtn) {
     if (loading) {
-      startBtn.textContent        = '⏳ loading…';
-      startBtn.dataset.active     = 'false';
-      startBtn.dataset.loading    = 'true';
+      startBtn.textContent     = '⏳ loading…';
+      startBtn.dataset.active  = 'false';
+      startBtn.dataset.loading = 'true';
     } else if (active) {
-      startBtn.textContent        = '⏹ Stop Shuffle';
-      startBtn.dataset.active     = 'true';
-      startBtn.dataset.loading    = 'false';
+      startBtn.textContent     = '⏹ Stop Shuffle';
+      startBtn.dataset.active  = 'true';
+      startBtn.dataset.loading = 'false';
     } else {
-      startBtn.textContent        = 'True Shuffle';
-      startBtn.dataset.active     = 'false';
-      startBtn.dataset.loading    = 'false';
+      startBtn.textContent     = 'True Shuffle';
+      startBtn.dataset.active  = 'false';
+      startBtn.dataset.loading = 'false';
     }
   }
 
-  // Keep repeat checkbox in sync (may be changed via sidebar).
+  // Keep repeat checkbox in sync (may be changed via the inject UI).
   const cb = document.getElementById('tss-hub-repeat');
   if (cb && cb.checked !== state.autoRepeat) cb.checked = state.autoRepeat;
+
+  // Sync queue toggle button label with sidebar state.
+  const qt = document.getElementById('tss-hub-qtoggle');
+  if (qt) {
+    const open       = state.sidebarOpen;
+    qt.dataset.open  = open ? 'true' : 'false';
+    qt.textContent   = open ? 'hide queue ✕' : 'show queue ↗';
+  }
 
   if (!active) {
     // Clear stale progress bar.
@@ -248,16 +271,16 @@ function updateHub() {
     return;
   }
 
-  const art = document.getElementById('tss-hub-art');
-  const pb  = document.getElementById('tss-hub-play');
+  const pb = document.getElementById('tss-hub-play');
   if (pb) pb.textContent = paused() ? '▶' : '⏸';
 
-  // Suspended mode — an external track is playing.
+  // Suspended mode — an external (non-queue) track is playing.
   if (state.suspended) {
     const tEl = document.getElementById('tss-hub-title');
     const aEl = document.getElementById('tss-hub-artist');
     if (tEl) tEl.textContent = playerTitle() || '—';
     if (aEl) aEl.textContent = '↩ not in queue';
+    const art = document.getElementById('tss-hub-art');
     if (art && art.dataset.src) { delete art.dataset.src; art.innerHTML = '♪'; }
     return;
   }
@@ -269,6 +292,7 @@ function updateHub() {
   if (tEl) tEl.textContent = playerTitle() || m?.title  || '—';
   if (aEl) aEl.textContent = m?.artist || '—';
 
+  const art = document.getElementById('tss-hub-art');
   if (art) {
     if (m?.artwork && art.dataset.src !== m.artwork) {
       art.dataset.src = m.artwork;
