@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      5.0.0
+// @version      5.0.1
 // @description  Fixes SoundCloud's broken shuffle. Loads all tracks, actually random, works in background tabs.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -80,23 +80,42 @@ function playerTitle() {
   return '';
 }
 
+// Parse MM:SS or H:MM:SS text into seconds.
+function toSec(el) {
+  if (!el) return 0;
+  const m = el.textContent.match(/(?:(\d+):)?(\d{1,2}):(\d{2})\s*$/);
+  return m ? (+m[1] || 0) * 3600 + +m[2] * 60 + +m[3] : 0;
+}
+
+// SoundCloud's own progress bar is authoritative (it drives the native seek).
+// Read its aria values, else the handle offset, as a 0..1 ratio. Null if unknown.
+function nativeProgress() {
+  const bar = document.querySelector('.playControls .playbackTimeline__progressWrapper, .playbackTimeline [role="progressbar"]');
+  if (bar) {
+    const now = parseFloat(bar.getAttribute('aria-valuenow'));
+    const max = parseFloat(bar.getAttribute('aria-valuemax'));
+    if (isFinite(now) && isFinite(max) && max > 0) return Math.min(1, Math.max(0, now / max));
+  }
+  const handle = document.querySelector('.playbackTimeline__progressHandle');
+  const left = handle && parseFloat(handle.style.left);
+  if (isFinite(left)) return Math.min(1, Math.max(0, left / 100));
+  return null;
+}
+
 function progress() {
-  const passed = document.querySelector('.playbackTimeline__timePassed');
-  const total  = document.querySelector('.playbackTimeline__duration');
-  if (!passed || !total) return 0;
-  const toSec = el => {
-    const m = el.textContent.match(/(\d+):(\d{2})$/);
-    return m ? +m[1] * 60 + +m[2] : 0;
-  };
-  const d = toSec(total);
-  return d ? toSec(passed) / d : 0;
+  const np = nativeProgress();
+  if (np !== null) return np;
+  // Fallback: the right-hand timeline element counts DOWN (remaining time), so
+  // the total is elapsed + remaining. Dividing elapsed by remaining would hit
+  // 1.0 at the midpoint and cut every track in half.
+  const passed = toSec(document.querySelector('.playbackTimeline__timePassed'));
+  const remaining = toSec(document.querySelector('.playbackTimeline__duration'));
+  const total = passed + remaining;
+  return total ? Math.min(1, passed / total) : 0;
 }
 
 function currentSec() {
-  const el = document.querySelector('.playbackTimeline__timePassed');
-  if (!el) return 0;
-  const m = el.textContent.match(/(\d+):(\d{2})$/);
-  return m ? +m[1] * 60 + +m[2] : 0;
+  return toSec(document.querySelector('.playbackTimeline__timePassed'));
 }
 
 function paused() {
