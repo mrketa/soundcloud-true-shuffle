@@ -1,5 +1,45 @@
 # Changelog
 
+## v5.1.0 - 2026-07-19
+
+### Highlights
+
+- Completely redesigned the floating player and queue panel with a compact dark interface, dynamic artwork accents, a real SoundCloud waveform and resizable queue layout.
+- Reworked shuffle into round-based playback: every available track plays exactly once before a fresh queue is generated, with balanced round starters for small playlists.
+- Added one-click re-shuffle for the current playlist without reloading the page.
+
+### New features
+
+- Queue and listening-history tabs with persistent search state.
+- Cross-playlist queue support with automatic source-page switching when required.
+- Sleep timer by minutes or remaining tracks.
+- Persistent listening statistics and per-track priority controls.
+- Skip tracking that automatically deprioritizes repeatedly skipped tracks.
+- Stop-after-this-round option while continuous rounds remain the default.
+- Draggable hub and resizable queue panel with saved dimensions.
+
+### Fixed
+
+- Fixed tracks ending 20-30 seconds early, including long tracks and hour-formatted durations.
+- Prevented SoundCloud's native next track from briefly playing before True Shuffle takes control.
+- Fixed queue searches losing focus/filter state after using Play Next.
+- Fixed searched queue jumps silently skipping earlier unplayed tracks in the same round.
+- Fixed cross-playlist entries from the original playlist becoming detached and never playing.
+- Fixed Feed tracks opening their profile instead of starting playback.
+- Fixed tracks with identical displayed titles blocking the next automatic transition.
+- Fixed lifetime statistics being counted twice after stopping or restarting shuffle.
+- Fixed the hub failing to appear on slowly rendered Feed or playlist pages.
+- Fixed rapid SoundCloud SPA navigation leaving the queue in a stale suspended state.
+- Fixed queue panels overflowing the viewport at narrow widths or large saved sizes.
+- Fixed waveforms being assigned to the wrong track when SoundCloud loaded multiple resources concurrently.
+- Fixed shrinking or misleading round counters in the hub and sidebar.
+- Removed dead-track recursion that could skip the replacement track as well.
+
+### Verification
+
+- Added an automated regression suite covering parsing, natural track endings, duplicate end signals, round generation, re-shuffle, search persistence, cross-playlist recovery, Feed-safe playback, navigation recovery, statistics and waveform matching.
+- 28 automated tests pass against the v5.1.0 release script.
+
 ## v4.0.0
 
 This release is a near-complete rewrite of the v3.0.0 codebase. Every part of the script has been replaced, fixed, or extended. Highlights:

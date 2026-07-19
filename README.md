@@ -9,7 +9,7 @@
 
 <br/>
 
-![Version](https://img.shields.io/badge/version-4.1.0-ff5500?style=flat-square)
+![Version](https://img.shields.io/badge/version-5.1.0-ff5500?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
 ![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-install-brightgreen?style=flat-square&logo=tampermonkey)
 ![Works in background](https://img.shields.io/badge/background%20tab-✓-ff5500?style=flat-square)
@@ -27,8 +27,9 @@ SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happ
 - **Loads your entire playlist** before doing anything — no tracks get skipped
 - **Fisher-Yates shuffle** — genuinely random, not fake random
 - **Web Worker** — runs in a separate thread, completely unaffected by background tab throttling
-- **Auto-Repeat** — reshuffles and starts a new round when all tracks have played
-- Works on playlists, likes, tracks and reposts pages
+- **Round-based shuffle** — every track plays once before a fresh round is generated
+- **Modern floating player** — artwork, real waveform, queue, history, stats and sleep timer
+- Works on playlists, likes, tracks, reposts and the SoundCloud Feed
 
 ## Install
 
@@ -40,13 +41,12 @@ SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happ
 
 ## Usage
 
-Navigate to any SoundCloud playlist or your likes page. The **🔀 True Shuffle** button will appear at the top of the track list.
+Navigate to a supported SoundCloud playlist, library page or Feed. The floating **True Shuffle** player appears in the lower-left corner.
 
-```
-🔀 True Shuffle    ☑ Auto-Repeat    ▶ 12 / 87
-```
-
-Click it once to start, click **⏹ Stop Shuffle** to stop.
+- Click **True Shuffle** to load every available track and begin a shuffled round.
+- Click the shuffle icon in the header to re-shuffle the loaded playlist without reloading the page.
+- Open the queue icon to search, reorder, merge playlists or view listening history.
+- Enable **Stop after this round** if playback should end after every track has played once.
 
 ## How it works
 
@@ -54,12 +54,10 @@ Click it once to start, click **⏹ Stop Shuffle** to stop.
 1. Scroll to bottom of page repeatedly until all tracks are loaded
 2. Collect all track elements
 3. Fisher-Yates shuffle → build a queue
-4. Play first track, start Web Worker (800ms tick, background-safe)
-5. Worker detects track end via two methods:
-   - Title change in player bar (SC switched on its own → we override)
-   - timePassed === duration (track finished naturally)
+4. Play the first track and start the background-safe Web Worker
+5. Detect natural track endings from the audio element and guarded player-state fallbacks
 6. Play next in queue → repeat
-7. When queue is exhausted → reshuffle → new round
+7. When the round is exhausted → generate a new balanced round
 ```
 
 ## Browser support
