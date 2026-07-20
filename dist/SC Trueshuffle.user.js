@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.0.1
+// @version      6.0.2
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -9,7 +9,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
-// @sandbox      JavaScript
+// @sandbox      raw
 // @run-at       document-end
 // ==/UserScript==
 
@@ -92,7 +92,6 @@ const state = {
   _lifetimeBase: null,
   _lastAccentArtwork: '',
   _lastWaveformKey: '',
-  _qnd:         false,
   _endedHandler: null,
   _manualActionAt: 0,
   _internalNavigation: false,
@@ -131,6 +130,8 @@ const state = {
   _deckTrack: null,
   _decks: [],
   _deckTracks: [null, null],
+  _deckPrepareTokens: [0, 0],
+  _crossfadePrefetchToken: 0,
   _deckGains: [0, 0],
   _audioContext: null,
   _audioMaster: null,
@@ -148,7 +149,17 @@ const state = {
   _clientId: '',
   _lastSoundCloudVolume: null,
   _soundCloudVolumeModel: null,
+  _nativePlaybackFallback: null,
+  _nativePauseSyncPending: false,
+  _nativeGuardButtonAction: false,
   _pipBridgePlayer: null,
+  _ownPipWindow: null,
+  _ownPipMode: null,
+  _ownPipHost: null,
+  _videoPip: null,
+  _playTimeLastAt: null,
+  _playTimeWasAudible: false,
+  _playTimeRemainderMs: 0,
   stats: {
     played:     0,
     playCounts: {},
@@ -289,9 +300,73 @@ function soundCloudPaused() {
   return label.startsWith('play') || (btn.title || '').toLowerCase().startsWith('play');
 }
 
+function isTrueShuffleAudio(audio) {
+  return Boolean(audio && (
+    state._decks?.includes(audio) ||
+    audio.dataset?.tssCrossfadeDeck !== undefined
+  ));
+}
+
+function nativePlaybackFallbackActive() {
+  return Boolean(state._nativePlaybackFallback);
+}
+
+function beginNativePlaybackFallback(trackIndex) {
+  state._nativePlaybackFallback = { trackIndex };
+}
+
+function clearNativePlaybackFallback() {
+  state._nativePlaybackFallback = null;
+}
+
+function alignSoundCloudPlayButtonPaused() {
+  const button = document.querySelector('.playControls__play');
+  if (!button || soundCloudPaused() || state._nativePauseSyncPending) return;
+
+  state._nativePauseSyncPending = true;
+  state._nativeGuardButtonAction = true;
+  try { button.click(); } catch (_) {}
+  state._nativeGuardButtonAction = false;
+  setTimeout(() => { state._nativePauseSyncPending = false; }, 250);
+}
+
 function pauseSoundCloud() {
-  const b = document.querySelector('.playControls__play');
-  if (b && !soundCloudPaused()) b.click();
+  const nativeAudios = [...document.querySelectorAll('audio')]
+    .filter(audio => !isTrueShuffleAudio(audio));
+  alignSoundCloudPlayButtonPaused();
+  nativeAudios.forEach(audio => {
+    if (!audio.paused) {
+      try { audio.pause(); } catch (_) {}
+    }
+  });
+}
+
+function installNativePlaybackGuard() {
+  if (state._nativePlaybackGuardInstalled) return;
+  state._nativePlaybackGuardInstalled = true;
+
+  document.addEventListener('click', event => {
+    const button = event.target?.closest?.('.playControls__play');
+    if (!button || !state.active || state._nativeGuardButtonAction || nativePlaybackFallbackActive()) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    queueMicrotask(() => pauseSoundCloud());
+  }, true);
+
+  document.addEventListener('play', event => {
+    const audio = event.target;
+    if (audio?.tagName !== 'AUDIO' || !state.active || isTrueShuffleAudio(audio) || nativePlaybackFallbackActive()) return;
+    try { audio.pause(); } catch (_) {}
+    queueMicrotask(() => pauseSoundCloud());
+  }, true);
+
+  // SoundCloud may restore its native player shortly after a hard reload.
+  // Catch both an already-running element and delayed autoplay initialization.
+  [0, 100, 500, 1500, 3000].forEach(delay => {
+    setTimeout(() => {
+      if (state.active && !nativePlaybackFallbackActive()) pauseSoundCloud();
+    }, delay);
+  });
 }
 
 function pause() {
@@ -440,9 +515,11 @@ const SVG = {
   close:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M12.7 3.3a1 1 0 00-1.4 0L8 6.6 4.7 3.3a1 1 0 00-1.4 1.4L6.6 8l-3.3 3.3a1 1 0 101.4 1.4L8 9.4l3.3 3.3a1 1 0 001.4-1.4L9.4 8l3.3-3.3a1 1 0 000-1.4z"/></svg>`,
   chart:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="8" width="3" height="7" rx="1"/><rect x="6" y="5" width="3" height="10" rx="1"/><rect x="11" y="2" width="3" height="13" rx="1"/></svg>`,
   equalizer:`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M3 2v12M8 2v12M13 2v12"/><circle cx="3" cy="6" r="1.7" fill="currentColor" stroke="none"/><circle cx="8" cy="10" r="1.7" fill="currentColor" stroke="none"/><circle cx="13" cy="5" r="1.7" fill="currentColor" stroke="none"/></svg>`,
+  pip:     `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="1.5" y="2.5" width="9" height="7" rx="1.4"/><rect x="5.5" y="6.5" width="9" height="7" rx="1.4" fill="currentColor" stroke="none"/></svg>`,
   note:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:18px;height:18px;flex-shrink:0;opacity:0.25"><path d="M9 3v7.27A3 3 0 1 0 11 13V6h2V3H9zm-3 12a1 1 0 110-2 1 1 0 010 2z"/></svg>`,
   shuffle: `<svg viewBox="0 0 24 24" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>`,
   list:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="2.5" width="14" height="1.5" rx="0.75"/><rect x="1" y="7.25" width="14" height="1.5" rx="0.75"/><rect x="1" y="12" width="14" height="1.5" rx="0.75"/></svg>`,
+  more:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>`,
   moon:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:11px;height:11px;flex-shrink:0"><path d="M14 10.66A6.5 6.5 0 115.34 2a5 5 0 108.66 8.66z"/></svg>`,
   plus:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z"/></svg>`,
   search:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>`,
@@ -703,12 +780,20 @@ function showMergeToast(count) {
 
 // ── sleep timer ───────────────────────────────────────────────────────────────
 
-function updateSleepDisplay() {
+function timedSleepRemaining(timer, now = Date.now()) {
+  if (!timer || timer.type !== 'time') return Math.max(0, Number(timer?.remaining) || 0);
+  const deadline = Number(timer.deadline);
+  if (!Number.isFinite(deadline)) return Math.max(0, Number(timer.remaining) || 0);
+  return Math.max(0, Math.ceil((deadline - now) / 1000));
+}
+
+function updateSleepDisplay(now = Date.now()) {
   const el = document.getElementById('tss-hub-sleep-display');
   if (!el) return;
   const t = state.sleepTimer;
   if (!t) { el.textContent = ''; return; }
   if (t.type === 'time') {
+    t.remaining = timedSleepRemaining(t, now);
     const m = Math.floor(t.remaining / 60), s = t.remaining % 60;
     el.textContent = m > 0 ? `${m}m` : `${s}s`;
   } else {
@@ -723,6 +808,27 @@ function updateSleepDisplay() {
 function currentDeckAudio() {
   if (!Number.isInteger(state._deckIndex) || state._deckIndex < 0) return null;
   return state._decks[state._deckIndex] || null;
+}
+
+function sleepTimerValue() {
+  const timer = state.sleepTimer;
+  if (!timer) return 'off';
+  if (timer.type === 'tracks') return `n${timer.remaining}`;
+  const minutes = Math.max(1, Math.ceil(timer.remaining / 60));
+  if (minutes <= 15) return 't15';
+  if (minutes <= 30) return 't30';
+  return 't60';
+}
+
+function setSleepTimer(value, now = Date.now()) {
+  const raw = String(value || 'off');
+  if (raw === 'off') state.sleepTimer = null;
+  else if (raw.startsWith('t')) {
+    const remaining = Math.max(1, parseInt(raw.slice(1), 10) || 0) * 60;
+    state.sleepTimer = { type: 'time', remaining, deadline: now + remaining * 1000 };
+  }
+  else if (raw.startsWith('n')) state.sleepTimer = { type: 'tracks', remaining: Math.max(1, parseInt(raw.slice(1), 10) || 0) };
+  updateSleepDisplay(now);
 }
 
 // Better SoundCloud Feed's PiP polls SoundCloud's page-level scPlayer rather
@@ -771,7 +877,7 @@ function syncBetterFeedPipWindow() {
   if (!betterFeedPipActive()) return false;
 
   try {
-    const pipWindow = pageWindow.documentPictureInPicture?.window;
+    const pipWindow = documentPipApi()?.window;
     const pipDoc = pipWindow?.document;
     if (!pipDoc) return false;
 
@@ -823,6 +929,1024 @@ function syncBetterFeedPipWindow() {
   } catch (_) {
     return false;
   }
+}
+
+function documentPipApi() {
+  let api = null;
+  try {
+    if (typeof window !== 'undefined') api = window.documentPictureInPicture;
+    if (api && typeof api.requestWindow === 'function') return api;
+  } catch (_) {}
+  try {
+    api = pageWindow && pageWindow.documentPictureInPicture;
+    if (api && typeof api.requestWindow === 'function') return api;
+  } catch (_) {}
+  try {
+    const wrappedWindow = typeof window !== 'undefined' && window.wrappedJSObject;
+    api = wrappedWindow && wrappedWindow.documentPictureInPicture;
+    if (api && typeof api.requestWindow === 'function') return api;
+  } catch (_) {}
+  try {
+    const wrappedPageWindow = pageWindow && pageWindow.wrappedJSObject;
+    api = wrappedPageWindow && wrappedPageWindow.documentPictureInPicture;
+    if (api && typeof api.requestWindow === 'function') return api;
+  } catch (_) {}
+  return null;
+}
+
+function ownPipSupported() {
+  return Boolean(documentPipApi());
+}
+
+function standardVideoPipSupported() {
+  const prototype = pageWindow.HTMLVideoElement?.prototype;
+  return Boolean(
+    (pageWindow.document?.pictureInPictureEnabled && typeof prototype?.requestPictureInPicture === 'function') ||
+    typeof prototype?.webkitSetPresentationMode === 'function'
+  );
+}
+
+function ownPipIsOpen() {
+  if (state._ownPipMode === 'video') {
+    const video = state._videoPip?.video;
+    return Boolean(video && (
+      pageWindow.document?.pictureInPictureElement === video ||
+      video.webkitPresentationMode === 'picture-in-picture'
+    ));
+  }
+  if (state._ownPipMode === 'inline') return Boolean(state._ownPipHost?.isConnected);
+  try {
+    return Boolean(state._ownPipWindow && !state._ownPipWindow.closed);
+  } catch (_) {
+    state._ownPipWindow = null;
+    return false;
+  }
+}
+
+function setOwnPipButtonState() {
+  const button = document.getElementById('tss-hub-pip');
+  if (!button) return;
+  button.style.display = '';
+  button.dataset.open = ownPipIsOpen() ? 'true' : 'false';
+  button.setAttribute('aria-pressed', ownPipIsOpen() ? 'true' : 'false');
+  const mode = state._ownPipMode === 'video' ? 'native video PiP'
+    : state._ownPipMode === 'inline' ? 'floating player'
+    : 'True Shuffle PiP';
+  button.title = ownPipIsOpen() ? `${mode} is open` : 'Open True Shuffle PiP';
+}
+
+function closeOwnPip() {
+  const pipWindow = state._ownPipWindow;
+  const pipHost = state._ownPipHost;
+  const videoPip = state._videoPip;
+  const mode = state._ownPipMode;
+  state._ownPipWindow = null;
+  state._ownPipHost = null;
+  state._ownPipMode = null;
+  state._videoPip = null;
+  if (videoPip) {
+    if (videoPip.timer) clearInterval(videoPip.timer);
+    try {
+      if (pageWindow.document?.pictureInPictureElement === videoPip.video) {
+        void pageWindow.document.exitPictureInPicture();
+      } else if (videoPip.video?.webkitPresentationMode === 'picture-in-picture') {
+        videoPip.video.webkitSetPresentationMode('inline');
+      }
+    } catch (_) {}
+    try { videoPip.stream?.getTracks?.().forEach(track => track.stop()); } catch (_) {}
+    try { videoPip.video?.remove(); } catch (_) {}
+    try { videoPip.canvas?.remove(); } catch (_) {}
+  }
+  try { pipHost?.remove(); } catch (_) {}
+  try {
+    if (mode === 'document' && pipWindow && !pipWindow.closed) pipWindow.close();
+  } catch (_) {}
+  setOwnPipButtonState();
+}
+
+function drawOwnPipWaveform(canvas, meta, current, duration, accent) {
+  if (!canvas || !duration) return;
+  const rect = canvas.getBoundingClientRect();
+  const ratio = Math.max(1, Number(state._ownPipWindow?.devicePixelRatio) || 1);
+  const width = Math.max(1, Math.floor(rect.width * ratio));
+  const height = Math.max(1, Math.floor(rect.height * ratio));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const key = trackId(meta) || meta?.title || '';
+  const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+  const barWidth = Math.max(2, Math.round(2 * ratio));
+  const gap = Math.max(2, Math.round(2 * ratio));
+  const count = Math.max(1, Math.floor(width / (barWidth + gap)));
+  const playedX = Math.max(0, Math.min(1, current / duration)) * width;
+
+  ctx.clearRect(0, 0, width, height);
+  for (let index = 0; index < count; index++) {
+    const sourceIndex = Math.min(heights.length - 1, Math.floor(index / count * heights.length));
+    const barHeight = Math.max(3 * ratio, (Number(heights[sourceIndex]) || 24) / 100 * height);
+    const x = index * (barWidth + gap);
+    ctx.fillStyle = x < playedX ? accent : 'rgba(255,255,255,.2)';
+    ctx.fillRect(x, (height - barHeight) / 2, barWidth, barHeight);
+  }
+}
+
+function ownPipQueueOrder() {
+  const upcoming = state.queue.slice(state.pos);
+  if (!upcoming.length) return [];
+  const current = upcoming.shift();
+  const pending = [];
+  const seen = new Set();
+  for (const ti of state.playNext) {
+    if (ti === current || seen.has(ti) || !state.meta[ti]) continue;
+    seen.add(ti);
+    pending.push(ti);
+    const duplicate = upcoming.indexOf(ti);
+    if (duplicate !== -1) upcoming.splice(duplicate, 1);
+  }
+  return [current, ...pending, ...upcoming];
+}
+
+function renderOwnPipQueue(pipDocument, currentTi) {
+  const list = pipDocument.getElementById('tss-pip-queue-list');
+  const count = pipDocument.getElementById('tss-pip-queue-count');
+  if (!list || !count) return;
+
+  const queueView = pipDocument.getElementById('tss-pip-queue-view');
+  const tab = queueView?.dataset.tab === 'history' ? 'history' : 'queue';
+  const query = (pipDocument.getElementById('tss-pip-queue-search')?.value || '').trim().toLowerCase();
+  const source = tab === 'history' ? [...state.history].reverse() : ownPipQueueOrder();
+  const order = source.filter(ti => {
+    const meta = state.meta[ti];
+    return meta && (!query || String(meta.title || '').toLowerCase().includes(query) || String(meta.artist || '').toLowerCase().includes(query));
+  });
+  count.textContent = `${order.length} ${tab === 'history' ? 'played' : `track${order.length === 1 ? '' : 's'}`}`;
+  const priorityKey = order.map(ti => state.priority[ti] ?? 1).join(',');
+  const key = `${tab}|${query}|${currentTi}|${order.join(',')}|${priorityKey}|${state.roundPlayed}|${state.roundTotal}`;
+  if (list.dataset.key === key) return;
+  list.dataset.key = key;
+  list.textContent = '';
+
+  if (!order.length) {
+    const empty = pipDocument.createElement('div');
+    empty.className = 'tss-pip-queue-empty';
+    empty.textContent = query ? 'No matching tracks' : tab === 'history' ? 'Nothing played yet' : 'Queue is empty';
+    list.appendChild(empty);
+    return;
+  }
+
+  order.forEach((ti, offset) => {
+    const meta = state.meta[ti];
+    if (!meta) return;
+    const row = pipDocument.createElement('div');
+    row.className = 'tss-pip-queue-row';
+    row.dataset.current = ti === currentTi ? 'true' : 'false';
+    row.setAttribute('role', 'listitem');
+    row.style.setProperty('--row-index', String(Math.min(offset, 8)));
+
+    const art = pipDocument.createElement('span');
+    art.className = 'tss-pip-queue-art';
+    if (meta.artwork) {
+      const img = pipDocument.createElement('img');
+      img.src = meta.artwork;
+      img.alt = '';
+      img.onerror = () => { img.remove(); art.innerHTML = SVG.note; };
+      art.appendChild(img);
+    } else {
+      art.innerHTML = SVG.note;
+    }
+
+    const copy = pipDocument.createElement('span');
+    copy.className = 'tss-pip-queue-copy';
+    const title = pipDocument.createElement('span');
+    title.className = 'tss-pip-queue-title';
+    title.textContent = meta.title || '—';
+    const artist = pipDocument.createElement('span');
+    artist.className = 'tss-pip-queue-artist';
+    artist.textContent = meta.artist || '—';
+    copy.append(title, artist);
+
+    const number = pipDocument.createElement('span');
+    number.className = 'tss-pip-queue-number';
+    number.textContent = tab === 'history'
+      ? String(offset + 1)
+      : String(Math.min(
+        Math.max(1, state.roundTotal || state.queue.length),
+        Math.max(1, state.roundPlayed + offset + 1),
+      ));
+
+    const settings = pipDocument.createElement('button');
+    settings.type = 'button';
+    settings.className = 'tss-pip-track-settings';
+    settings.innerHTML = SVG.more;
+    settings.setAttribute('aria-label', `Settings for ${meta.title || 'track'}`);
+    settings.title = 'Track settings';
+    settings.onclick = event => {
+      event.stopPropagation();
+      showOwnPipTrackMenu(pipDocument, settings, ti, currentTi);
+    };
+
+    row.append(art, copy, number, settings);
+    if (ti !== currentTi) {
+      row.dataset.playable = 'true';
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      row.setAttribute('aria-label', `Play ${meta.title}`);
+      row.onclick = () => { void jumpTo(state.queue.indexOf(ti), ti); };
+      row.onkeydown = event => {
+        if (event.target !== row) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          void jumpTo(state.queue.indexOf(ti), ti);
+        }
+      };
+    } else {
+      row.setAttribute('aria-current', 'true');
+    }
+    list.appendChild(row);
+  });
+}
+
+function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
+  pipDocument.getElementById('tss-pip-track-menu')?.remove();
+  const meta = state.meta[ti] || {};
+  const menu = pipDocument.createElement('div');
+  menu.id = 'tss-pip-track-menu';
+  menu.className = 'tss-pip-track-menu';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', `Settings for ${meta.title || 'track'}`);
+
+  const priority = state.priority[ti] ?? 1;
+  const pendingNext = state.playNext.includes(ti);
+  const queueIndex = state.queue.indexOf(ti);
+  const removable = ti !== currentTi && (pendingNext || (queueIndex !== -1 && queueIndex !== state.pos));
+  menu.innerHTML = `
+    <div class="tss-pip-menu-title"><span>${esc(meta.title || 'Track settings')}</span><button type="button" aria-label="Close track settings">${SVG.close}</button></div>
+    <div class="tss-pip-menu-actions">
+      <button type="button" data-action="play"${ti === currentTi ? ' disabled' : ''}>Play now</button>
+      <button type="button" data-action="next"${ti === currentTi ? ' disabled' : ''}>Play next</button>
+    </div>
+    <div class="tss-pip-menu-label">Shuffle priority</div>
+    <div class="tss-pip-priority" role="group" aria-label="Shuffle priority">
+      <button type="button" data-priority="0.25" aria-pressed="${priority <= 0.25}">Low</button>
+      <button type="button" data-priority="1" aria-pressed="${priority > 0.25 && priority < 2}">Normal</button>
+      <button type="button" data-priority="2" aria-pressed="${priority >= 2}">High</button>
+    </div>
+    <button type="button" class="tss-pip-menu-remove" data-action="remove"${removable ? '' : ' disabled'}>Remove from queue</button>
+  `;
+
+  pipDocument.getElementById('tss-pip-player')?.appendChild(menu);
+  const playerRect = pipDocument.getElementById('tss-pip-player')?.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  if (playerRect) {
+    menu.style.top = `${Math.max(44, Math.min(playerRect.height - 190, anchorRect.top - playerRect.top - 8))}px`;
+    menu.style.right = `${Math.max(10, playerRect.right - anchorRect.right)}px`;
+  }
+
+  const close = () => menu.remove();
+  menu.querySelector('.tss-pip-menu-title button').onclick = close;
+  menu.querySelector('[data-action="play"]').onclick = () => {
+    close();
+    void jumpTo(state.queue.indexOf(ti), ti);
+  };
+  menu.querySelector('[data-action="next"]').onclick = () => {
+    queueNext(ti);
+    close();
+    renderOwnPipQueue(pipDocument, currentTi);
+  };
+  menu.querySelector('[data-action="remove"]').onclick = () => {
+    removeTrackFromUpcoming(ti);
+    close();
+    renderOwnPipQueue(pipDocument, currentTi);
+  };
+  menu.querySelectorAll('[data-priority]').forEach(button => {
+    button.onclick = () => {
+      state.priority[ti] = Number(button.dataset.priority);
+      menu.querySelectorAll('[data-priority]').forEach(option => option.setAttribute('aria-pressed', option === button ? 'true' : 'false'));
+      const list = pipDocument.getElementById('tss-pip-queue-list');
+      if (list) delete list.dataset.key;
+    };
+  });
+
+  setTimeout(() => {
+    const dismiss = event => {
+      if (!menu.contains(event.target) && event.target !== anchor) {
+        close();
+        pipDocument.removeEventListener('pointerdown', dismiss, true);
+      }
+    };
+    pipDocument.addEventListener('pointerdown', dismiss, true);
+  }, 0);
+}
+
+function showOwnPipSoundMenu(pipDocument, anchor) {
+  const existing = pipDocument.getElementById('tss-pip-sound-menu');
+  if (existing) {
+    existing.remove();
+    anchor.dataset.active = 'false';
+    anchor.setAttribute('aria-pressed', 'false');
+    return;
+  }
+  pipDocument.getElementById('tss-pip-track-menu')?.remove();
+  const menu = pipDocument.createElement('section');
+  menu.id = 'tss-pip-sound-menu';
+  menu.className = 'tss-pip-sound-menu';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', 'Playback settings');
+  const eqNames = [...Object.keys(EQ_PRESETS), ...Object.keys(state.customEqPresets || {})];
+  menu.innerHTML = `
+    <div class="tss-pip-sound-head"><div><span>Playback</span><small>Sound and timer</small></div><button type="button" aria-label="Close playback settings">${SVG.close}</button></div>
+    <div class="tss-pip-setting-row tss-pip-volume-row">
+      <button id="tss-pip-mute" class="tss-pip-mini-icon" type="button" aria-label="Mute">${SVG.volume}</button>
+      <input id="tss-pip-volume" type="range" min="0" max="100" step="1" aria-label="Volume">
+      <output id="tss-pip-volume-value">0%</output>
+    </div>
+    <div class="tss-pip-setting-block">
+      <div class="tss-pip-setting-label"><span>Crossfade</span><output id="tss-pip-crossfade-readout">off</output></div>
+      <input id="tss-pip-crossfade-slider" type="range" min="0" max="12" step="1" aria-label="Crossfade seconds">
+      <div class="tss-pip-segments" role="group" aria-label="Crossfade curve">${['smooth','clean','dj'].map(curve => `<button type="button" data-curve="${curve}" aria-pressed="${state.crossfadeCurve === curve}">${curve}</button>`).join('')}</div>
+    </div>
+    <div class="tss-pip-setting-grid">
+      <button id="tss-pip-auto-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${state.autoLevel}"><span>Auto level</span><i></i></button>
+      <button id="tss-pip-eq-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${state.eqEnabled}"><span>Equalizer</span><i></i></button>
+    </div>
+    <label class="tss-pip-select-row"><span>EQ preset</span><select id="tss-pip-eq-preset">${eqNames.map(name => `<option value="${esc(name)}"${state.eqPreset === name ? ' selected' : ''}>${esc(name)}</option>`).join('')}</select></label>
+    <div class="tss-pip-setting-grid">
+      <label class="tss-pip-check-row"><input id="tss-pip-stop-round" type="checkbox"${state.stopAfterRound ? ' checked' : ''}><span>Stop after round</span></label>
+      <label class="tss-pip-select-row tss-pip-sleep-row"><span>Sleep</span><select id="tss-pip-sleep"><option value="off">off</option><option value="t15">15 min</option><option value="t30">30 min</option><option value="t60">1 hour</option><option value="n5">5 tracks</option><option value="n10">10 tracks</option><option value="n25">25 tracks</option></select></label>
+    </div>
+    <button id="tss-pip-full-eq" class="tss-pip-full-eq" type="button">Open full equalizer</button>
+  `;
+  pipDocument.getElementById('tss-pip-player')?.appendChild(menu);
+  anchor.dataset.active = 'true';
+  anchor.setAttribute('aria-pressed', 'true');
+
+  const close = () => {
+    menu.remove();
+    anchor.dataset.active = 'false';
+    anchor.setAttribute('aria-pressed', 'false');
+  };
+  menu.querySelector('.tss-pip-sound-head button').onclick = close;
+  const volume = menu.querySelector('#tss-pip-volume');
+  const volumeValue = menu.querySelector('#tss-pip-volume-value');
+  const syncVolume = () => {
+    const percent = Math.round(state.playbackVolume * 100);
+    volume.value = String(percent);
+    volume.style.setProperty('--fill', `${percent}%`);
+    volumeValue.textContent = `${percent}%`;
+  };
+  syncVolume();
+  volume.oninput = () => { setPlaybackVolume(Number(volume.value) / 100); syncVolume(); };
+  menu.querySelector('#tss-pip-mute').onclick = event => {
+    if (state.playbackVolume > 0) {
+      event.currentTarget.dataset.previous = String(state.playbackVolume);
+      setPlaybackVolume(0);
+    } else {
+      setPlaybackVolume(Math.max(0.01, Number(event.currentTarget.dataset.previous) || 0.1));
+    }
+    syncVolume();
+  };
+
+  const crossfade = menu.querySelector('#tss-pip-crossfade-slider');
+  const crossfadeReadout = menu.querySelector('#tss-pip-crossfade-readout');
+  const syncCrossfade = () => {
+    crossfade.value = String(state.crossfadeSeconds);
+    crossfade.style.setProperty('--fill', `${state.crossfadeSeconds / 12 * 100}%`);
+    crossfadeReadout.textContent = state.crossfadeSeconds > 0 ? `${state.crossfadeSeconds}s` : 'off';
+  };
+  syncCrossfade();
+  crossfade.oninput = () => { setCrossfadeSeconds(crossfade.value); syncCrossfade(); };
+  menu.querySelectorAll('[data-curve]').forEach(button => {
+    button.onclick = () => {
+      state.crossfadeCurve = button.dataset.curve;
+      localStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      menu.querySelectorAll('[data-curve]').forEach(option => option.setAttribute('aria-pressed', option === button ? 'true' : 'false'));
+      syncCrossfadeControls();
+    };
+  });
+
+  const auto = menu.querySelector('#tss-pip-auto-toggle');
+  auto.onclick = () => { setAutoLevelEnabled(!state.autoLevel); auto.setAttribute('aria-pressed', String(state.autoLevel)); };
+  const eqToggle = menu.querySelector('#tss-pip-eq-toggle');
+  eqToggle.onclick = () => {
+    if (!state.eqEnabled && !ensureAutoLevelAudioGraph()) return;
+    state.eqEnabled = !state.eqEnabled;
+    persistEqualizer({ immediate: true });
+    syncEqualizer();
+    eqToggle.setAttribute('aria-pressed', String(state.eqEnabled));
+  };
+  const eqPreset = menu.querySelector('#tss-pip-eq-preset');
+  eqPreset.onchange = () => {
+    const values = EQ_PRESETS[eqPreset.value] || state.customEqPresets[eqPreset.value];
+    if (!Array.isArray(values) || !ensureAutoLevelAudioGraph()) return;
+    state.eqBands = values.slice(0, 5).map(value => Math.max(-12, Math.min(12, Number(value) || 0)));
+    state.eqPreset = eqPreset.value;
+    state.eqEnabled = true;
+    persistEqualizer({ immediate: true });
+    syncEqualizer();
+    eqToggle.setAttribute('aria-pressed', 'true');
+  };
+  menu.querySelector('#tss-pip-stop-round').onchange = event => { state.stopAfterRound = event.target.checked; };
+  const sleep = menu.querySelector('#tss-pip-sleep');
+  sleep.value = sleepTimerValue();
+  sleep.onchange = () => setSleepTimer(sleep.value);
+  menu.querySelector('#tss-pip-full-eq').onclick = () => {
+    try { pageWindow.focus(); } catch (_) {}
+    showEqualizer();
+  };
+}
+
+function syncOwnPipWindow() {
+  if (state._ownPipMode === 'video') {
+    if (!ownPipIsOpen()) {
+      if (state._videoPip) closeOwnPip();
+      return false;
+    }
+    drawVideoPipFrame(state._videoPip?.canvas);
+    return true;
+  }
+  if (!ownPipIsOpen()) {
+    if (state._ownPipWindow) closeOwnPip();
+    return false;
+  }
+
+  const pipWindow = state._ownPipWindow;
+  const pipDocument = pipWindow.document;
+  if (!pipDocument?.getElementById('tss-pip-player')) return false;
+
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  const meta = state.meta[currentTi];
+  const queuedNext = upcomingTrackIndex();
+  const nextMeta = queuedNext !== undefined ? state.meta[queuedNext] : null;
+  const timing = playbackTiming();
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#ff5500';
+  const total = Math.max(1, state.roundTotal || state.queue.length);
+  const inRound = Math.min(total, Math.max(1, state.roundPlayed + 1));
+
+  pipDocument.documentElement.style.setProperty('--accent', accent);
+  const title = pipDocument.getElementById('tss-pip-title');
+  const artist = pipDocument.getElementById('tss-pip-artist');
+  const position = pipDocument.getElementById('tss-pip-position');
+  const currentTime = pipDocument.getElementById('tss-pip-current');
+  const remaining = pipDocument.getElementById('tss-pip-remaining');
+  if (title) title.textContent = meta?.title || playerTitle() || '—';
+  if (artist) artist.textContent = meta?.artist || '—';
+  if (position) position.textContent = `${inRound} / ${total}`;
+  if (currentTime) currentTime.textContent = formatPlaybackClock(timing.current);
+  if (remaining) remaining.textContent = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
+
+  const artwork = pipDocument.getElementById('tss-pip-artwork');
+  const artworkFallback = pipDocument.getElementById('tss-pip-artwork-fallback');
+  if (artwork && artwork.dataset.src !== (meta?.artwork || '')) {
+    artwork.dataset.src = meta?.artwork || '';
+    artwork.src = meta?.artwork || '';
+    artwork.hidden = !meta?.artwork;
+    if (artworkFallback) artworkFallback.hidden = Boolean(meta?.artwork);
+  }
+
+  const play = pipDocument.getElementById('tss-pip-play');
+  if (play) {
+    play.innerHTML = paused() ? SVG.play : SVG.pause;
+    play.setAttribute('aria-label', paused() ? 'Play' : 'Pause');
+  }
+
+  const nextRow = pipDocument.getElementById('tss-pip-up-next-row');
+  const nextTitle = pipDocument.getElementById('tss-pip-next-title');
+  const nextArtist = pipDocument.getElementById('tss-pip-next-artist');
+  const nextNumber = pipDocument.getElementById('tss-pip-next-number');
+  const nextArtwork = pipDocument.getElementById('tss-pip-next-artwork');
+  const nextFallback = pipDocument.getElementById('tss-pip-next-fallback');
+  const nextSettings = pipDocument.getElementById('tss-pip-next-settings');
+  if (nextRow) nextRow.dataset.empty = nextMeta ? 'false' : 'true';
+  if (nextTitle) nextTitle.textContent = nextMeta?.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle');
+  if (nextArtist) nextArtist.textContent = nextMeta?.artist || (state.stopAfterRound ? 'Playback will stop' : 'A new round will begin');
+  if (nextNumber) nextNumber.textContent = nextMeta ? String(Math.min(total, inRound + 1)) : '—';
+  if (nextArtwork && nextArtwork.dataset.src !== (nextMeta?.artwork || '')) {
+    nextArtwork.dataset.src = nextMeta?.artwork || '';
+    nextArtwork.src = nextMeta?.artwork || '';
+    nextArtwork.hidden = !nextMeta?.artwork;
+    if (nextFallback) nextFallback.hidden = Boolean(nextMeta?.artwork);
+  }
+  if (nextSettings) {
+    nextSettings.disabled = queuedNext === undefined;
+    nextSettings.dataset.ti = queuedNext === undefined ? '' : String(queuedNext);
+    nextSettings.setAttribute('aria-label', `Settings for ${nextMeta?.title || 'up next'}`);
+  }
+
+  const crossfade = pipDocument.getElementById('tss-pip-crossfade');
+  const crossfadeValue = pipDocument.getElementById('tss-pip-crossfade-value');
+  const autoLevel = pipDocument.getElementById('tss-pip-auto-level');
+  const processing = pipDocument.getElementById('tss-pip-processing');
+  const pipState = pipDocument.getElementById('tss-pip-state');
+  if (crossfade) {
+    crossfade.dataset.active = state.crossfadeSeconds > 0 ? 'true' : 'false';
+    crossfade.hidden = state.crossfadeSeconds <= 0;
+  }
+  if (crossfadeValue) crossfadeValue.textContent = `${state.crossfadeSeconds}s fade`;
+  if (autoLevel) {
+    autoLevel.dataset.active = state.autoLevel ? 'true' : 'false';
+    autoLevel.hidden = !state.autoLevel;
+  }
+  if (processing) processing.hidden = state.crossfadeSeconds <= 0 && !state.autoLevel;
+  if (pipState) {
+    const status = state.suspended ? 'external playback'
+      : state.loading ? 'loading'
+      : state._crossfading ? 'mixing'
+      : state.busy ? 'switching'
+      : state.crossfadeStatus === 'loading' ? 'loading next'
+      : state.crossfadeStatus === 'fallback' ? 'fallback'
+      : '';
+    pipState.textContent = status;
+    pipState.hidden = !status;
+  }
+
+  renderOwnPipQueue(pipDocument, currentTi);
+
+  drawOwnPipWaveform(
+    pipDocument.getElementById('tss-pip-waveform'),
+    meta,
+    Math.max(0, timing.current),
+    Math.max(0, timing.duration),
+    accent,
+  );
+  return true;
+}
+
+function drawVideoPipFrame(canvas) {
+  const ctx = canvas?.getContext?.('2d');
+  if (!ctx) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  const meta = state.meta[currentTi] || {};
+  const nextTi = upcomingTrackIndex();
+  const nextMeta = state.meta[nextTi] || {};
+  const timing = playbackTiming();
+  const duration = Math.max(1, timing.duration || 1);
+  const ratio = Math.max(0, Math.min(1, timing.current / duration));
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#ff5500';
+  const key = trackId(meta) || meta.title || '';
+  const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+
+  ctx.fillStyle = '#080808';
+  ctx.fillRect(0, 0, width, height);
+  const glow = ctx.createRadialGradient(width * .2, 0, 0, width * .2, 0, width * .72);
+  glow.addColorStop(0, `${accent}32`);
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = accent;
+  ctx.fillRect(34, 31, 5, 24);
+  ctx.fillStyle = 'rgba(255,255,255,.92)';
+  ctx.font = '700 17px system-ui, sans-serif';
+  ctx.fillText('TRUE SHUFFLE', 53, 50);
+  ctx.fillStyle = 'rgba(255,255,255,.96)';
+  ctx.font = '700 31px system-ui, sans-serif';
+  ctx.fillText(String(meta.title || playerTitle() || 'Now playing').slice(0, 33), 34, 121);
+  ctx.fillStyle = 'rgba(255,255,255,.5)';
+  ctx.font = '500 18px system-ui, sans-serif';
+  ctx.fillText(String(meta.artist || '').slice(0, 42), 35, 151);
+
+  const waveX = 35, waveY = 187, waveW = width - 70, waveH = 62;
+  const count = 96, gap = 3, barW = Math.max(2, (waveW - gap * (count - 1)) / count);
+  for (let i = 0; i < count; i++) {
+    const source = Math.min(heights.length - 1, Math.floor(i / count * heights.length));
+    const barH = Math.max(4, (Number(heights[source]) || 24) / 100 * waveH);
+    ctx.fillStyle = i / count <= ratio ? accent : 'rgba(255,255,255,.22)';
+    ctx.fillRect(waveX + i * (barW + gap), waveY + waveH - barH, barW, barH);
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.48)';
+  ctx.font = '500 15px system-ui, sans-serif';
+  ctx.fillText(formatPlaybackClock(timing.current), waveX, 272);
+  const remaining = `-${formatPlaybackClock(Math.max(0, duration - timing.current))}`;
+  ctx.fillText(remaining, width - 35 - ctx.measureText(remaining).width, 272);
+
+  ctx.fillStyle = 'rgba(255,255,255,.28)';
+  ctx.font = '700 13px system-ui, sans-serif';
+  ctx.fillText('UP NEXT', 35, 316);
+  ctx.fillStyle = 'rgba(255,255,255,.78)';
+  ctx.font = '600 16px system-ui, sans-serif';
+  ctx.fillText(String(nextMeta.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle')).slice(0, 46), 119, 316);
+}
+
+async function openVideoPipFallback() {
+  if (!standardVideoPipSupported() || typeof document.createElement('canvas').captureStream !== 'function') return false;
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 360;
+  canvas.style.cssText = 'position:fixed;width:1px;height:1px;left:-9999px;top:-9999px;pointer-events:none';
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.style.cssText = canvas.style.cssText;
+  document.body.append(canvas, video);
+  const stream = canvas.captureStream(8);
+  video.srcObject = stream;
+  drawVideoPipFrame(canvas);
+  try {
+    await video.play();
+  } catch (error) {
+    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+    video.remove();
+    canvas.remove();
+    throw error;
+  }
+
+  let syncing = true;
+  const syncVideoState = () => {
+    syncing = true;
+    const shouldPause = paused();
+    if (shouldPause && !video.paused) video.pause();
+    else if (!shouldPause && video.paused) void video.play().catch(() => {});
+    queueMicrotask(() => { syncing = false; });
+  };
+  video.addEventListener('pause', () => {
+    if (!syncing && !paused()) pause();
+  });
+  video.addEventListener('play', () => {
+    if (!syncing && paused()) void toggle();
+  });
+
+  try {
+    if (typeof video.requestPictureInPicture === 'function') await video.requestPictureInPicture();
+    else if (typeof video.webkitSetPresentationMode === 'function') video.webkitSetPresentationMode('picture-in-picture');
+    else throw new Error('Video PiP unavailable');
+  } catch (error) {
+    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+    video.remove();
+    canvas.remove();
+    throw error;
+  }
+
+  const timer = setInterval(() => {
+    drawVideoPipFrame(canvas);
+    syncVideoState();
+  }, 250);
+  state._ownPipMode = 'video';
+  state._videoPip = { video, canvas, stream, timer };
+  const cleanup = () => {
+    if (state._videoPip?.video !== video) return;
+    clearInterval(timer);
+    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+    video.remove();
+    canvas.remove();
+    state._videoPip = null;
+    state._ownPipMode = null;
+    setOwnPipButtonState();
+  };
+  video.addEventListener('leavepictureinpicture', cleanup, { once: true });
+  video.addEventListener('webkitpresentationmodechanged', () => {
+    if (video.webkitPresentationMode !== 'picture-in-picture') cleanup();
+  });
+  showMergeToast('using native video PiP fallback');
+  setOwnPipButtonState();
+  return true;
+}
+
+function openInPagePipFallback() {
+  const host = document.createElement('div');
+  host.id = 'tss-inline-pip';
+  host.setAttribute('role', 'dialog');
+  host.setAttribute('aria-label', 'True Shuffle floating player');
+  host.style.cssText = 'position:fixed;right:20px;bottom:90px;width:390px;height:330px;min-width:330px;min-height:280px;max-width:min(92vw,680px);max-height:min(86vh,720px);z-index:999999;resize:both;overflow:hidden;border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.72);background:#080808';
+  const iframe = document.createElement('iframe');
+  iframe.title = 'True Shuffle floating player';
+  iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;background:#080808';
+  host.appendChild(iframe);
+  document.body.appendChild(host);
+  state._ownPipHost = host;
+  state._ownPipMode = 'inline';
+  try {
+    mountOwnPipWindow(iframe.contentWindow, 'inline');
+  } catch (error) {
+    host.remove();
+    state._ownPipHost = null;
+    state._ownPipWindow = null;
+    state._ownPipMode = null;
+    throw error;
+  }
+
+  const header = iframe.contentDocument?.querySelector('.tss-pip-header');
+  if (header) {
+    header.style.cursor = 'grab';
+    header.addEventListener('pointerdown', event => {
+      if (event.target.closest('button')) return;
+      event.preventDefault();
+      const rect = host.getBoundingClientRect();
+      const startX = event.screenX;
+      const startY = event.screenY;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      header.style.cursor = 'grabbing';
+      const move = moveEvent => {
+        const left = Math.max(0, Math.min(innerWidth - host.offsetWidth, startLeft + moveEvent.screenX - startX));
+        const top = Math.max(0, Math.min(innerHeight - host.offsetHeight, startTop + moveEvent.screenY - startY));
+        host.style.left = `${left}px`;
+        host.style.top = `${top}px`;
+        host.style.right = 'auto';
+        host.style.bottom = 'auto';
+      };
+      const up = () => {
+        header.style.cursor = 'grab';
+        iframe.contentDocument.removeEventListener('pointermove', move);
+        iframe.contentDocument.removeEventListener('pointerup', up);
+        iframe.contentDocument.removeEventListener('pointercancel', up);
+      };
+      iframe.contentDocument.addEventListener('pointermove', move);
+      iframe.contentDocument.addEventListener('pointerup', up);
+      iframe.contentDocument.addEventListener('pointercancel', up);
+    });
+  }
+  showMergeToast('using floating player fallback');
+  return true;
+}
+
+async function openOwnPip() {
+  if (!state.active) {
+    showMergeToast('start True Shuffle before opening PiP');
+    return false;
+  }
+  if (ownPipIsOpen()) {
+    try { state._ownPipWindow?.focus?.(); } catch (_) {}
+    return true;
+  }
+
+  const documentPip = documentPipApi();
+  if (documentPip) {
+    let pipWindow = null;
+    try {
+      pipWindow = await documentPip.requestWindow({ width: 390, height: 330 });
+      return mountOwnPipWindow(pipWindow, 'document');
+    } catch (error) {
+      console.warn('[True Shuffle] Document PiP failed; trying fallback.', error);
+      try { pipWindow?.close?.(); } catch (_) {}
+      state._ownPipWindow = null;
+      state._ownPipMode = null;
+    }
+  }
+  if (standardVideoPipSupported()) {
+    try {
+      if (await openVideoPipFallback()) return true;
+    } catch (_) {}
+  }
+  return openInPagePipFallback();
+}
+
+function mountOwnPipWindow(pipWindow, mode = 'document') {
+  state._ownPipWindow = pipWindow;
+  state._ownPipMode = mode;
+  const pipDocument = pipWindow.document;
+  pipDocument.title = 'True Shuffle';
+  const style = pipDocument.createElement('style');
+  style.textContent = `
+    :root{color-scheme:dark;--accent:#ff5500;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+    *{box-sizing:border-box}
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#080808;color:#f4f4f4}
+    button{font:inherit}
+    #tss-pip-player{height:100%;min-height:300px;padding:12px 14px;display:flex;flex-direction:column;position:relative;overflow:hidden;background:radial-gradient(circle at 50% -12%,rgba(255,255,255,.045),transparent 42%),#080808;border:1px solid rgba(255,255,255,.14)}
+    .tss-pip-header{height:31px;display:flex;align-items:center;gap:9px;flex:0 0 auto}
+    .tss-pip-brandmark,.tss-pip-close{display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.035);color:#fff;cursor:pointer}
+    .tss-pip-brandmark{width:30px;height:30px;border-radius:8px;color:var(--accent)}
+    .tss-pip-brandmark svg{width:13px!important;height:13px!important}
+    .tss-pip-brand{margin-right:auto;font-size:10px;font-weight:780;letter-spacing:.16em;text-transform:uppercase;white-space:nowrap}
+    .tss-pip-state{max-width:78px;overflow:hidden;color:rgba(255,255,255,.3);font-size:8px;font-weight:620;white-space:nowrap;text-overflow:ellipsis}.tss-pip-state[hidden]{display:none}
+    .tss-pip-live{display:flex;align-items:center;gap:6px;color:var(--accent);font-size:9px;font-weight:760;letter-spacing:.08em;text-transform:uppercase}
+    .tss-pip-live svg{width:13px!important;height:13px!important}
+    .tss-pip-view-toggle{width:29px;height:29px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:transparent;color:rgba(255,255,255,.52);cursor:pointer}
+    .tss-pip-view-toggle:hover,.tss-pip-view-toggle[data-active="true"]{color:var(--accent);background:rgba(255,255,255,.06)}
+    .tss-pip-view-toggle svg{width:13px!important;height:13px!important}
+    .tss-pip-close{width:29px;height:29px;border:0;border-radius:8px;background:transparent;color:rgba(255,255,255,.58)}
+    .tss-pip-close:hover{color:#fff;background:rgba(255,255,255,.07)}
+    .tss-pip-stage{flex:1;min-height:0;position:relative;margin-top:10px}
+    .tss-pip-view{position:absolute;inset:0;min-height:0;transition:transform .24s cubic-bezier(.22,1,.36,1),opacity .18s ease;will-change:transform,opacity}
+    #tss-pip-now-view{display:flex;flex-direction:column;transform:translateX(0);opacity:1}
+    #tss-pip-queue-view{display:flex;flex-direction:column;transform:translateX(34px);opacity:0;pointer-events:none}
+    .tss-pip-stage[data-view="queue"] #tss-pip-now-view{transform:translateX(-34px);opacity:0;pointer-events:none}
+    .tss-pip-stage[data-view="queue"] #tss-pip-queue-view{transform:translateX(0);opacity:1;pointer-events:auto}
+    .tss-pip-track{display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:13px;min-height:76px}
+    .tss-pip-art{width:76px;height:76px;border-radius:12px;overflow:hidden;position:relative;background:#151515;box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
+    .tss-pip-art img{display:block;width:100%;height:100%;object-fit:cover}
+    .tss-pip-art-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.26)}
+    .tss-pip-art-fallback[hidden],.tss-pip-art img[hidden]{display:none}
+    .tss-pip-title{font-size:17px;line-height:1.15;font-weight:720;letter-spacing:-.025em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-artist{margin-top:4px;color:rgba(255,255,255,.48);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-track-meta{display:flex;align-items:center;gap:8px;margin-top:7px;min-width:0}.tss-pip-position{color:rgba(255,255,255,.68);font-size:9px;font-weight:620;letter-spacing:.08em;white-space:nowrap}
+    .tss-pip-processing{display:flex;align-items:center;gap:5px;min-width:0;color:rgba(255,255,255,.27);font-size:8px;font-weight:560;white-space:nowrap}.tss-pip-processing[hidden],.tss-pip-processing span[hidden]{display:none}.tss-pip-processing::before{content:'·';color:rgba(255,255,255,.18)}.tss-pip-processing span+span::before{content:'·';margin-right:5px;color:rgba(255,255,255,.18)}
+    .tss-pip-wave{margin-top:11px}
+    #tss-pip-waveform{display:block;width:100%;height:28px;cursor:pointer}
+    .tss-pip-times{display:flex;justify-content:space-between;margin-top:3px;color:rgba(255,255,255,.47);font-size:8px;font-variant-numeric:tabular-nums}
+    .tss-pip-controls{display:flex;align-items:center;justify-content:center;gap:22px;margin:9px 0 11px}
+    .tss-pip-control{display:flex;align-items:center;justify-content:center;width:39px;height:39px;padding:0;border:1px solid rgba(255,255,255,.08);border-radius:50%;background:#1a1a1a;color:rgba(255,255,255,.82);cursor:pointer;transition:transform .14s,background .14s,color .14s}
+    .tss-pip-control:hover{transform:translateY(-1px);background:#222;color:#fff}
+    .tss-pip-control:active{transform:scale(.96)}
+    .tss-pip-control-primary{width:52px;height:52px;background:var(--accent);border-color:color-mix(in srgb,var(--accent),white 18%);color:#fff;box-shadow:0 8px 21px color-mix(in srgb,var(--accent),transparent 72%)}
+    .tss-pip-control-primary:hover{background:color-mix(in srgb,var(--accent),white 8%)}
+    .tss-pip-control svg{width:15px!important;height:15px!important}
+    .tss-pip-control-primary svg{width:17px!important;height:17px!important}
+    .tss-pip-up-next{border-top:1px solid rgba(255,255,255,.08);padding-top:9px}
+    .tss-pip-kicker{font-size:9px;font-weight:790;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.82)}
+    .tss-pip-next-row{display:grid;grid-template-columns:39px minmax(0,1fr) auto 28px;align-items:center;gap:9px;margin-top:7px;min-height:39px}
+    .tss-pip-next-art{width:39px;height:39px;border-radius:7px;overflow:hidden;position:relative;background:#151515;box-shadow:0 0 0 1px rgba(255,255,255,.07)}
+    .tss-pip-next-art img{display:block;width:100%;height:100%;object-fit:cover}
+    .tss-pip-next-art img[hidden],.tss-pip-next-art .tss-pip-art-fallback[hidden]{display:none}
+    .tss-pip-next-title{font-size:11px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-next-artist{margin-top:4px;color:rgba(255,255,255,.38);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-next-number{color:rgba(255,255,255,.48);font-size:11px;font-variant-numeric:tabular-nums}
+    button:focus-visible,#tss-pip-waveform:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    .tss-pip-queue-head{display:flex;align-items:center;justify-content:space-between;padding:7px 1px 6px;border-top:1px solid rgba(255,255,255,.08)}
+    .tss-pip-queue-count{color:rgba(255,255,255,.34);font-size:9px;font-variant-numeric:tabular-nums}
+    .tss-pip-queue-tools{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px;padding-bottom:7px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .tss-pip-tabs{display:flex;align-items:center;padding:2px;border-radius:7px;background:rgba(255,255,255,.035)}.tss-pip-tab{height:25px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.32);font-size:8px;font-weight:720;letter-spacing:.07em;text-transform:uppercase;cursor:pointer}.tss-pip-tab[aria-selected="true"]{background:rgba(255,255,255,.08);color:#fff}
+    .tss-pip-search-wrap{position:relative;min-width:0}.tss-pip-search-wrap svg{position:absolute;left:8px;top:50%;width:10px!important;height:10px!important;transform:translateY(-50%);color:rgba(255,255,255,.25);pointer-events:none}.tss-pip-queue-search{width:100%;height:29px;padding:0 9px 0 25px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(255,255,255,.025);color:#fff;font:500 9px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;outline:0}.tss-pip-queue-search::placeholder{color:rgba(255,255,255,.22)}.tss-pip-queue-search:focus{border-color:color-mix(in srgb,var(--accent),transparent 35%)}
+    .tss-pip-queue-list{min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.18) transparent}
+    .tss-pip-queue-list::-webkit-scrollbar{width:5px}.tss-pip-queue-list::-webkit-scrollbar-track{background:transparent}.tss-pip-queue-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:9px}
+    .tss-pip-queue-row{width:100%;min-height:49px;padding:5px 3px 5px 6px;display:grid;grid-template-columns:36px minmax(0,1fr) auto 28px;align-items:center;gap:8px;border:0;border-bottom:1px solid rgba(255,255,255,.055);background:transparent;color:#fff;text-align:left;transition:background .14s,opacity .18s,transform .22s cubic-bezier(.22,1,.36,1)}
+    .tss-pip-queue-row[data-playable="true"]{cursor:pointer}
+    .tss-pip-queue-row:hover{background:rgba(255,255,255,.045)}
+    .tss-pip-queue-row[data-current="true"]{background:color-mix(in srgb,var(--accent),transparent 92%);box-shadow:inset 2px 0 var(--accent);cursor:default}
+    .tss-pip-queue-art{width:36px;height:36px;border-radius:7px;overflow:hidden;background:#151515;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.24)}
+    .tss-pip-queue-art img{display:block;width:100%;height:100%;object-fit:cover}
+    .tss-pip-queue-copy{display:block;min-width:0}.tss-pip-queue-title{display:block;font-size:10px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tss-pip-queue-artist{display:block;margin-top:3px;color:rgba(255,255,255,.35);font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-queue-number{color:rgba(255,255,255,.34);font-size:9px;font-variant-numeric:tabular-nums}
+    .tss-pip-queue-row[data-current="true"] .tss-pip-queue-number{color:var(--accent)}
+    .tss-pip-queue-empty{padding:34px 12px;text-align:center;color:rgba(255,255,255,.25);font-size:10px}
+    .tss-pip-track-settings{width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.35);cursor:pointer}
+    .tss-pip-track-settings:hover,.tss-pip-track-settings[aria-expanded="true"]{background:rgba(255,255,255,.07);color:#fff}.tss-pip-track-settings:disabled{opacity:.22;cursor:default;background:transparent;color:rgba(255,255,255,.25)}
+    .tss-pip-track-menu{position:absolute;z-index:20;width:210px;padding:9px;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:rgba(19,19,19,.97);box-shadow:0 18px 45px rgba(0,0,0,.65);backdrop-filter:blur(18px);animation:tssPipMenuIn .16s cubic-bezier(.22,1,.36,1)}
+    .tss-pip-menu-title{display:flex;align-items:center;gap:8px;padding:2px 2px 9px;color:rgba(255,255,255,.78);font-size:10px;font-weight:680;border-bottom:1px solid rgba(255,255,255,.07)}
+    .tss-pip-menu-title span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tss-pip-menu-title button{width:24px;height:24px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.42);cursor:pointer}.tss-pip-menu-title button:hover{background:rgba(255,255,255,.07);color:#fff}
+    .tss-pip-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.tss-pip-menu-actions button,.tss-pip-menu-remove{height:30px;border:1px solid rgba(255,255,255,.09);border-radius:7px;background:rgba(255,255,255,.045);color:rgba(255,255,255,.78);font-size:9px;font-weight:650;cursor:pointer}.tss-pip-menu-actions button:hover{border-color:color-mix(in srgb,var(--accent),transparent 45%);color:#fff}.tss-pip-menu-actions button:disabled,.tss-pip-menu-remove:disabled{opacity:.28;cursor:default}
+    .tss-pip-menu-label{margin:10px 2px 6px;color:rgba(255,255,255,.34);font-size:8px;font-weight:720;letter-spacing:.1em;text-transform:uppercase}.tss-pip-priority{display:grid;grid-template-columns:repeat(3,1fr);padding:2px;border-radius:8px;background:rgba(255,255,255,.04)}.tss-pip-priority button{height:27px;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.35);font-size:8px;font-weight:700;cursor:pointer}.tss-pip-priority button[aria-pressed="true"]{background:var(--accent);color:#fff;box-shadow:0 3px 10px color-mix(in srgb,var(--accent),transparent 68%)}
+    .tss-pip-menu-remove{width:100%;margin-top:8px;background:rgba(255,74,74,.055);border-color:rgba(255,74,74,.12);color:#d87878}.tss-pip-menu-remove:not(:disabled):hover{background:rgba(255,74,74,.11);color:#ff9292}
+    .tss-pip-sound-menu{position:absolute;z-index:19;inset:48px 12px 12px;padding:12px;overflow-y:auto;overscroll-behavior:contain;border:1px solid rgba(255,255,255,.13);border-radius:13px;background:rgba(14,14,14,.985);box-shadow:0 20px 55px rgba(0,0,0,.72);backdrop-filter:blur(20px);animation:tssPipMenuIn .18s cubic-bezier(.22,1,.36,1);scrollbar-width:thin}
+    .tss-pip-sound-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.07)}.tss-pip-sound-head>div{display:flex;flex-direction:column;gap:2px}.tss-pip-sound-head span{font-size:11px;font-weight:720}.tss-pip-sound-head small{color:rgba(255,255,255,.3);font-size:8px}.tss-pip-sound-head button,.tss-pip-mini-icon{display:flex;align-items:center;justify-content:center;border:0;background:transparent;color:rgba(255,255,255,.45);cursor:pointer}.tss-pip-sound-head button{width:26px;height:26px;border-radius:6px}.tss-pip-sound-head button:hover,.tss-pip-mini-icon:hover{background:rgba(255,255,255,.07);color:#fff}
+    .tss-pip-setting-row{display:flex;align-items:center;gap:9px;padding:11px 0}.tss-pip-mini-icon{width:28px;height:28px;border-radius:7px}.tss-pip-setting-row output,.tss-pip-setting-label output{color:rgba(255,255,255,.4);font-size:8px;font-variant-numeric:tabular-nums}.tss-pip-setting-row output{width:30px;text-align:right}
+    .tss-pip-sound-menu input[type="range"]{--fill:0%;width:100%;height:3px;margin:0;appearance:none;border:0;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--fill),rgba(255,255,255,.11) var(--fill));cursor:pointer}.tss-pip-sound-menu input[type="range"]::-webkit-slider-thumb{width:12px;height:12px;appearance:none;border:2px solid #fff;border-radius:50%;background:var(--accent);box-shadow:0 2px 7px rgba(0,0,0,.5)}.tss-pip-sound-menu input[type="range"]::-moz-range-thumb{width:9px;height:9px;border:2px solid #fff;border-radius:50%;background:var(--accent)}
+    .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.65);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(255,255,255,.035)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.3);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[aria-pressed="true"]{background:rgba(255,255,255,.09);color:#fff}
+    .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:rgba(255,255,255,.025);color:rgba(255,255,255,.58);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(255,255,255,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.58);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
+    .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.72);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#151515}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.38);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
+    .tss-pip-stage[data-view="queue"] .tss-pip-queue-row{animation:tssPipRowIn .26s both cubic-bezier(.22,1,.36,1);animation-delay:calc(var(--row-index) * 18ms)}
+    @keyframes tssPipRowIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}@keyframes tssPipMenuIn{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
+    @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu{transition:none!important;animation:none!important}}
+    @media(max-height:300px){#tss-pip-player{min-height:280px;padding:10px 13px}.tss-pip-stage{margin-top:6px}.tss-pip-track{grid-template-columns:70px minmax(0,1fr);min-height:70px}.tss-pip-art{width:70px;height:70px}.tss-pip-wave{margin-top:7px}#tss-pip-waveform{height:24px}.tss-pip-controls{margin:5px 0 7px}.tss-pip-control-primary{width:47px;height:47px}.tss-pip-up-next{padding-top:6px}.tss-pip-next-row{grid-template-columns:34px minmax(0,1fr) auto 28px;min-height:34px;margin-top:5px}.tss-pip-next-art{width:34px;height:34px}}
+  `;
+  pipDocument.head.appendChild(style);
+  pipDocument.body.innerHTML = `
+    <main id="tss-pip-player">
+      <header class="tss-pip-header">
+        <div class="tss-pip-brandmark" aria-hidden="true">${SVG.shuffle}</div>
+        <div class="tss-pip-brand">True Shuffle</div>
+        <div id="tss-pip-state" class="tss-pip-state" hidden></div>
+        <div class="tss-pip-live" aria-label="Picture in picture">${SVG.pip}<span>PiP</span></div>
+        <button id="tss-pip-sound" class="tss-pip-view-toggle" type="button" aria-label="Playback settings" aria-pressed="false" title="Playback settings">${SVG.equalizer}</button>
+        <button id="tss-pip-view-toggle" class="tss-pip-view-toggle" type="button" aria-label="Show queue" aria-pressed="false" title="Show queue">${SVG.list}</button>
+        <button id="tss-pip-close" class="tss-pip-close" type="button" aria-label="Close picture in picture">${SVG.close}</button>
+      </header>
+      <div id="tss-pip-stage" class="tss-pip-stage" data-view="player">
+      <div id="tss-pip-now-view" class="tss-pip-view" aria-hidden="false">
+      <section class="tss-pip-track">
+        <div class="tss-pip-art">
+          <img id="tss-pip-artwork" alt="" hidden>
+          <span id="tss-pip-artwork-fallback" class="tss-pip-art-fallback">${SVG.note}</span>
+        </div>
+        <div style="min-width:0">
+          <div id="tss-pip-title" class="tss-pip-title">—</div>
+          <div id="tss-pip-artist" class="tss-pip-artist">—</div>
+          <div class="tss-pip-track-meta">
+            <span id="tss-pip-position" class="tss-pip-position">—</span>
+            <span id="tss-pip-processing" class="tss-pip-processing" hidden><span id="tss-pip-crossfade"><span id="tss-pip-crossfade-value">0s fade</span></span><span id="tss-pip-auto-level">auto level</span></span>
+          </div>
+        </div>
+      </section>
+      <section class="tss-pip-wave">
+        <canvas id="tss-pip-waveform" tabindex="0" aria-label="Seek through track"></canvas>
+        <div class="tss-pip-times"><span id="tss-pip-current">0:00</span><span id="tss-pip-remaining">-0:00</span></div>
+      </section>
+      <section class="tss-pip-controls" aria-label="Playback controls">
+        <button id="tss-pip-prev" class="tss-pip-control" type="button" aria-label="Previous track">${SVG.prev}</button>
+        <button id="tss-pip-play" class="tss-pip-control tss-pip-control-primary" type="button" aria-label="Play">${SVG.play}</button>
+        <button id="tss-pip-next" class="tss-pip-control" type="button" aria-label="Next track">${SVG.next}</button>
+      </section>
+      <section class="tss-pip-up-next">
+        <div class="tss-pip-kicker">Up next</div>
+        <div id="tss-pip-up-next-row" class="tss-pip-next-row">
+          <div class="tss-pip-next-art">
+            <img id="tss-pip-next-artwork" alt="" hidden>
+            <span id="tss-pip-next-fallback" class="tss-pip-art-fallback">${SVG.note}</span>
+          </div>
+          <div style="min-width:0"><div id="tss-pip-next-title" class="tss-pip-next-title">—</div><div id="tss-pip-next-artist" class="tss-pip-next-artist">—</div></div>
+          <div id="tss-pip-next-number" class="tss-pip-next-number">—</div>
+          <button id="tss-pip-next-settings" class="tss-pip-track-settings" type="button" aria-label="Settings for up next" title="Track settings">${SVG.more}</button>
+        </div>
+      </section>
+      </div>
+      <section id="tss-pip-queue-view" class="tss-pip-view" data-tab="queue" aria-hidden="true">
+        <div class="tss-pip-queue-head"><span class="tss-pip-kicker">Queue</span><span id="tss-pip-queue-count" class="tss-pip-queue-count">0 tracks</span></div>
+        <div class="tss-pip-queue-tools">
+          <div class="tss-pip-tabs" role="tablist" aria-label="Queue view"><button id="tss-pip-tab-queue" class="tss-pip-tab" type="button" role="tab" aria-selected="true">Queue</button><button id="tss-pip-tab-history" class="tss-pip-tab" type="button" role="tab" aria-selected="false">History</button></div>
+          <label class="tss-pip-search-wrap">${SVG.search}<input id="tss-pip-queue-search" class="tss-pip-queue-search" type="search" autocomplete="off" placeholder="Search tracks" aria-label="Search tracks"></label>
+        </div>
+        <div id="tss-pip-queue-list" class="tss-pip-queue-list" role="list"></div>
+      </section>
+      </div>
+    </main>
+  `;
+
+  pipDocument.getElementById('tss-pip-close').onclick = closeOwnPip;
+  const soundButton = pipDocument.getElementById('tss-pip-sound');
+  soundButton.onclick = () => showOwnPipSoundMenu(pipDocument, soundButton);
+  const viewToggle = pipDocument.getElementById('tss-pip-view-toggle');
+  viewToggle.onclick = () => {
+    pipDocument.getElementById('tss-pip-track-menu')?.remove();
+    pipDocument.getElementById('tss-pip-sound-menu')?.remove();
+    soundButton.dataset.active = 'false';
+    soundButton.setAttribute('aria-pressed', 'false');
+    const stage = pipDocument.getElementById('tss-pip-stage');
+    const nowView = pipDocument.getElementById('tss-pip-now-view');
+    const queueView = pipDocument.getElementById('tss-pip-queue-view');
+    const showQueue = stage.dataset.view !== 'queue';
+    stage.dataset.view = showQueue ? 'queue' : 'player';
+    nowView.setAttribute('aria-hidden', showQueue ? 'true' : 'false');
+    queueView.setAttribute('aria-hidden', showQueue ? 'false' : 'true');
+    if ('inert' in nowView) nowView.inert = showQueue;
+    if ('inert' in queueView) queueView.inert = !showQueue;
+    viewToggle.dataset.active = showQueue ? 'true' : 'false';
+    viewToggle.setAttribute('aria-pressed', showQueue ? 'true' : 'false');
+    viewToggle.setAttribute('aria-label', showQueue ? 'Show player' : 'Show queue');
+    viewToggle.title = showQueue ? 'Show player' : 'Show queue';
+    viewToggle.innerHTML = showQueue ? SVG.equalizer : SVG.list;
+    if (showQueue) renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+  };
+  const setPipQueueTab = tab => {
+    const queueView = pipDocument.getElementById('tss-pip-queue-view');
+    queueView.dataset.tab = tab;
+    pipDocument.getElementById('tss-pip-tab-queue').setAttribute('aria-selected', tab === 'queue' ? 'true' : 'false');
+    pipDocument.getElementById('tss-pip-tab-history').setAttribute('aria-selected', tab === 'history' ? 'true' : 'false');
+    const list = pipDocument.getElementById('tss-pip-queue-list');
+    if (list) delete list.dataset.key;
+    renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+  };
+  pipDocument.getElementById('tss-pip-tab-queue').onclick = () => setPipQueueTab('queue');
+  pipDocument.getElementById('tss-pip-tab-history').onclick = () => setPipQueueTab('history');
+  pipDocument.getElementById('tss-pip-queue-search').oninput = () => {
+    const list = pipDocument.getElementById('tss-pip-queue-list');
+    if (list) delete list.dataset.key;
+    renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+  };
+  pipDocument.getElementById('tss-pip-play').onclick = () => { void toggle(); };
+  pipDocument.getElementById('tss-pip-prev').onclick = () => { void prevTrack(); };
+  pipDocument.getElementById('tss-pip-next').onclick = () => {
+    if (state.busy) return;
+    state.manualAction = true;
+    state._manualActionAt = Date.now();
+    void next();
+  };
+  pipDocument.getElementById('tss-pip-next-settings').onclick = event => {
+    event.stopPropagation();
+    const ti = Number(event.currentTarget.dataset.ti);
+    if (Number.isInteger(ti) && state.meta[ti]) {
+      showOwnPipTrackMenu(
+        pipDocument,
+        event.currentTarget,
+        ti,
+        Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos],
+      );
+    }
+  };
+  const currentArtwork = pipDocument.getElementById('tss-pip-artwork');
+  currentArtwork.onerror = () => {
+    currentArtwork.hidden = true;
+    pipDocument.getElementById('tss-pip-artwork-fallback').hidden = false;
+  };
+  const upcomingArtwork = pipDocument.getElementById('tss-pip-next-artwork');
+  upcomingArtwork.onerror = () => {
+    upcomingArtwork.hidden = true;
+    pipDocument.getElementById('tss-pip-next-fallback').hidden = false;
+  };
+  const seekFromPip = event => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width > 0) seekTo((event.clientX - rect.left) / rect.width);
+  };
+  pipDocument.getElementById('tss-pip-waveform').onclick = seekFromPip;
+  pipDocument.getElementById('tss-pip-waveform').onkeydown = event => {
+    if (event.key === 'ArrowLeft') seekTo(Math.max(0, progress() - 0.03));
+    if (event.key === 'ArrowRight') seekTo(Math.min(1, progress() + 0.03));
+  };
+  if (mode === 'document') {
+    pipWindow.addEventListener('pagehide', () => {
+      if (state._ownPipWindow === pipWindow) {
+        state._ownPipWindow = null;
+        state._ownPipMode = null;
+        setOwnPipButtonState();
+      }
+    }, { once: true });
+  }
+
+  setOwnPipButtonState();
+  syncOwnPipWindow();
+  return true;
 }
 
 function installBetterFeedPipBridge() {
@@ -1317,6 +2441,51 @@ function syncPlaybackVolumeControls() {
   }
 }
 
+function setPlaybackVolume(value) {
+  state.playbackVolume = Math.max(0, Math.min(1, Number(value) || 0));
+  state._playbackVolumeStored = true;
+  state._playbackVolumeInitialized = true;
+  localStorage.setItem('tss_playback_volume', String(state.playbackVolume));
+  syncCrossfadeVolume();
+  setSoundCloudVolume(state.playbackVolume);
+  syncPlaybackVolumeControls();
+}
+
+function setAutoLevelEnabled(enabled) {
+  const nextValue = Boolean(enabled);
+  if (nextValue && !ensureAutoLevelAudioGraph()) {
+    state.autoLevel = false;
+    localStorage.setItem('tss_auto_level', 'false');
+    syncPlaybackVolumeControls();
+    return false;
+  }
+  state.autoLevel = nextValue;
+  localStorage.setItem('tss_auto_level', String(state.autoLevel));
+  if (state.autoLevel && state._audioContext?.state === 'suspended') void state._audioContext.resume();
+  state._deckTracks.forEach((ti, index) => {
+    if (Number.isInteger(ti)) applyCachedAutoLevel(index, ti);
+  });
+  syncCrossfadeVolume();
+  syncPlaybackVolumeControls();
+  return true;
+}
+
+function setCrossfadeSeconds(value) {
+  const previousSeconds = state.crossfadeSeconds;
+  state.crossfadeSeconds = Math.max(0, Math.min(12, Number(value) || 0));
+  localStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
+  if (state.crossfadeSeconds <= 0) {
+    setCrossfadeStatus('off');
+  } else {
+    setCrossfadeStatus('armed');
+    if (previousSeconds <= 0) {
+      ensureAutoLevelAudioGraph();
+      if (state.active && currentDeckAudio()) void prefetchUpcomingCrossfadeTrack();
+    }
+  }
+  syncCrossfadeControls();
+}
+
 function setCrossfadeStatus(status) {
   state.crossfadeStatus = status;
   const el = document.getElementById('tss-hub-crossfade-status');
@@ -1452,6 +2621,8 @@ function resetDeck(audio, index) {
 
 function stopCrossfadeDecks() {
   state._crossfadeToken++;
+  state._crossfadePrefetchToken++;
+  state._deckPrepareTokens = state._deckPrepareTokens.map(token => token + 1);
   state._crossfading = false;
   state._crossfadePending = false;
   state._crossfadeSchedule?.resolve?.(false);
@@ -1467,10 +2638,14 @@ async function prepareCrossfadeDeck(index, ti) {
   if (state.autoLevel || state.eqEnabled || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
   const audio = decks[index];
   if (!audio || !state.meta[ti]) return null;
+  const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
+  state._deckPrepareTokens[index] = requestToken;
+  const requestIsCurrent = () => state._deckPrepareTokens[index] === requestToken
+    && state._decks[index] === audio;
   if (state._deckTracks[index] === ti && audio.currentSrc && audio.readyState >= 1) return audio;
 
   const streamUrl = await resolveCrossfadeStream(state.meta[ti]);
-  if (!streamUrl) return null;
+  if (!requestIsCurrent() || !streamUrl) return null;
   resetDeck(audio, index);
   audio.src = streamUrl;
   audio.preload = 'auto';
@@ -1643,20 +2818,45 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
 
 async function prefetchUpcomingCrossfadeTrack() {
   if (!state.active || state._crossfading) return;
-  const nextTi = state.queue[state.pos + 1];
+  const nextTi = upcomingTrackIndex();
   if (nextTi === undefined) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
+  const requestToken = ++state._crossfadePrefetchToken;
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
   const audio = await prepareCrossfadeDeck(standby, nextTi);
+  if (requestToken !== state._crossfadePrefetchToken
+      || !state.active
+      || state._crossfading
+      || standby === state._deckIndex
+      || upcomingTrackIndex() !== nextTi) return;
   if (state.crossfadeSeconds > 0) setCrossfadeStatus(audio ? 'ready' : 'fallback');
 }
 
 function upcomingCrossfadeDeckReady() {
-  const nextTi = state.queue[state.pos + 1];
+  const nextTi = upcomingTrackIndex();
   if (nextTi === undefined) return false;
   const standby = state._deckIndex === 0 ? 1 : 0;
   const audio = state._decks[standby];
   return Boolean(audio && state._deckTracks[standby] === nextTi && audio.readyState >= 2);
+}
+
+function upcomingTrackIndex() {
+  return state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1];
+}
+
+function refreshUpcomingCrossfadePreparation() {
+  state._crossfadePrefetchToken++;
+  const standby = state._deckIndex === 0 ? 1 : 0;
+  if (standby < 0 || standby >= state._decks.length) return;
+
+  state._deckPrepareTokens[standby] = (state._deckPrepareTokens[standby] || 0) + 1;
+  if (state._crossfading || standby === state._deckIndex) return;
+
+  const nextTi = upcomingTrackIndex();
+  if (state._deckTracks[standby] !== null && state._deckTracks[standby] !== nextTi) {
+    resetDeck(state._decks[standby], standby);
+  }
+  if (state.active && currentDeckAudio()) void prefetchUpcomingCrossfadeTrack();
 }
 
 async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
@@ -1716,6 +2916,41 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
 function trackPlayed(ti) {
   state.stats.played++;
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
+}
+
+function consumeCurrentQueueTrack() {
+  const justPlayed = state.queue[state.pos];
+  if (justPlayed === undefined) return undefined;
+
+  state.history.push(justPlayed);
+  if (state.history.length > 100) state.history.shift();
+
+  // Spotify-style shuffle: each track plays exactly once per round.
+  // The played track is removed and NOT re-inserted; only when the
+  // whole round is exhausted do we reshuffle everything for a new round.
+  state.queue.splice(state.pos, 1);
+  state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
+
+  const remaining = state.queue.length - state.pos;
+  if (!state.stopAfterRound && remaining <= 0) {
+    const aliveIndices = [...Array(state.meta.length).keys()].filter(trackAvailable);
+    state.queue = buildBalancedRound(aliveIndices, justPlayed);
+    state.pos = 0;
+    state.roundPlayed = 0;
+    state.roundTotal = state.queue.length;
+  }
+
+  if (state.playNext.length > 0) {
+    const ti = state.playNext.shift();
+    const dup = state.queue.indexOf(ti);
+    if (dup !== -1) {
+      state.queue.splice(dup, 1);
+      if (dup < state.pos) state.pos--;
+    }
+    state.queue.splice(state.pos, 0, ti);
+  }
+
+  return justPlayed;
 }
 
 async function loadTracks() {
@@ -1807,6 +3042,7 @@ async function loadTrackSourcePage(idx) {
 
 async function playAt(idx, countPlay = true) {
   if (!state.active) return;
+  clearNativePlaybackFallback();
 
   let el = state.els[idx];
   if (!el || !document.body.contains(el)) {
@@ -1828,6 +3064,7 @@ async function playAt(idx, countPlay = true) {
     }
     state.roundTotal = Math.max(state.roundPlayed, state.roundTotal - removedUpcoming);
     state.playNext = state.playNext.filter(ti => ti !== idx);
+    refreshUpcomingCrossfadePreparation();
     const anyPlayable = state.queue.some(trackAvailable);
     if (!anyPlayable) {
       state.suspended = true;
@@ -1866,11 +3103,13 @@ async function playAt(idx, countPlay = true) {
     '.sound__coverArt button',
   ].join(', '));
   if (!btn) {
+    clearNativePlaybackFallback();
     if (!wasPaused && paused()) toggle();
     state.busy = false;
     showMergeToast('play button not found for this track');
     return;
   }
+  beginNativePlaybackFallback(idx);
   btn.click();
 
   const prev = state.lastTitle;
@@ -1932,38 +3171,7 @@ async function next(fromWatcher = false) {
     }
   }
 
-  if (justPlayed !== undefined) {
-    state.history.push(justPlayed);
-    if (state.history.length > 100) state.history.shift();
-  }
-
-  if (justPlayed !== undefined) {
-    // Spotify-style shuffle: each track plays exactly once per round.
-    // The played track is removed and NOT re-inserted; only when the
-    // whole round is exhausted do we reshuffle everything for a new round.
-    state.queue.splice(state.pos, 1);
-    state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
-
-    const remaining = state.queue.length - state.pos;
-    if (!state.stopAfterRound && remaining <= 0) {
-      // round complete → fresh shuffle with a balanced starting position
-      const aliveIndices = [...Array(state.meta.length).keys()].filter(trackAvailable);
-      state.queue = buildBalancedRound(aliveIndices, justPlayed);
-      state.pos   = 0;
-      state.roundPlayed = 0;
-      state.roundTotal = state.queue.length;
-    }
-  }
-
-  if (state.playNext.length > 0) {
-    const ti  = state.playNext.shift();
-    const dup = state.queue.indexOf(ti);
-    if (dup !== -1) {
-      state.queue.splice(dup, 1);
-      if (dup < state.pos) state.pos--;
-    }
-    state.queue.splice(state.pos, 0, ti);
-  }
+  consumeCurrentQueueTrack();
 
   if (state.pos >= state.queue.length) {
     stop();
@@ -1998,6 +3206,7 @@ async function prevTrack() {
     if (existingIdx < state.pos) state.pos--;
   }
   state.queue.splice(state.pos, 0, prevTi);
+  refreshUpcomingCrossfadePreparation();
 
   await playAt(state.queue[state.pos], false);
   badges();
@@ -2019,6 +3228,15 @@ function moveSelectedTrackToCurrent(ti) {
   const targetIndex = state.queue.indexOf(ti);
   if (targetIndex !== -1) state.queue.splice(targetIndex, 1);
   state.queue.splice(state.pos, 0, ti);
+  refreshUpcomingCrossfadePreparation();
+  return true;
+}
+
+function removePlayNextOccurrences(ti) {
+  const remaining = state.playNext.filter(pendingTi => pendingTi !== ti);
+  if (remaining.length === state.playNext.length) return false;
+  state.playNext = remaining;
+  refreshUpcomingCrossfadePreparation();
   return true;
 }
 
@@ -2029,9 +3247,11 @@ async function jumpTo(qi, ti) {
   state.manualAction = true;
   state._manualActionAt = Date.now();
   state.suspended    = false;
+  const removedPlayNext = removePlayNextOccurrences(ti);
 
   if (!moveSelectedTrackToCurrent(ti)) {
     await playAt(ti, false);
+    if (removedPlayNext) renderList();
     state.busy = false;
     return;
   }
@@ -2042,11 +3262,37 @@ async function jumpTo(qi, ti) {
 }
 
 function queueNext(ti) {
-  if (state._qnd) return;
-  state._qnd = true;
-  setTimeout(() => { state._qnd = false; }, 500);
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  if (ti === currentTi || state.playNext.includes(ti)) return false;
+  const reintroducesPlayedTrack = state.history.includes(ti)
+    && !state.queue.slice(state.pos + 1).includes(ti);
   state.playNext.push(ti);
+  if (reintroducesPlayedTrack) state.roundTotal++;
+  refreshUpcomingCrossfadePreparation();
   renderList();
+  return true;
+}
+
+function removeTrackFromUpcoming(ti) {
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  if (ti === currentTi) return false;
+
+  const remainingPlayNext = state.playNext.filter(pendingTi => pendingTi !== ti);
+  const removedPlayNext = remainingPlayNext.length !== state.playNext.length;
+  const qi = state.queue.findIndex((queuedTi, index) => index > state.pos && queuedTi === ti);
+  if (!removedPlayNext && qi === -1) return false;
+
+  state.playNext = remainingPlayNext;
+  if (qi !== -1) {
+    state.queue.splice(qi, 1);
+    state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
+  } else if (removedPlayNext && state.history.includes(ti)) {
+    state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
+  }
+  refreshUpcomingCrossfadePreparation();
+  if (qi !== -1) badges();
+  renderList();
+  return true;
 }
 
 function removeFromQueue(qi) {
@@ -2054,6 +3300,7 @@ function removeFromQueue(qi) {
   state.queue.splice(qi, 1);
   if (qi >= state.pos) state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
   if (qi < state.pos) state.pos--;
+  refreshUpcomingCrossfadePreparation();
   badges();
   renderList();
 }
@@ -2099,6 +3346,7 @@ async function mergeCurrentPage() {
     const shuffled = fisherYates(added);
     state.queue.splice(state.pos + 1, 0, ...shuffled);
     state.roundTotal += added.length;
+    refreshUpcomingCrossfadePreparation();
 
     // adopt this page as the active playlist context and resume
     state.playlistUrl = location.href.split(/[?#]/)[0];
@@ -2154,6 +3402,7 @@ async function reshuffleCurrentPage() {
       state.roundPlayed = 0;
       state.roundTotal = state.queue.length;
       state.suspended = false;
+      refreshUpcomingCrossfadePreparation();
       badges();
       renderList();
       updateHub();
@@ -2189,6 +3438,7 @@ async function reshuffleCurrentPage() {
     state.roundPlayed = 0;
     state.roundTotal = state.queue.length;
     state.suspended = false;
+    refreshUpcomingCrossfadePreparation();
     state.manualAction = false;
     state.playlistUrl = pageUrl;
     saveLifetimeStats();
@@ -2216,6 +3466,50 @@ async function reshuffleCurrentPage() {
     setLoading(false);
     updateHub();
   }
+}
+
+function remapCachedQueue(cache, meta) {
+  const idToNew = {};
+  meta.forEach((m, ti) => { const id = trackId(m); if (id) idToNew[id] = ti; });
+
+  const metaKeys = cache.metaKeys;
+  const remapOld = oldTi => {
+    const id = metaKeys[oldTi];
+    return (id && idToNew[id] !== undefined) ? idToNew[id] : null;
+  };
+  const remappedQueue = cache.queue.map(remapOld).filter(ti => ti !== null);
+  if (!remappedQueue.length) return null;
+
+  // A snapshot contains only the unplayed part of the current round. Add
+  // genuinely new playlist entries, never old entries already consumed.
+  const cachedIds = new Set(metaKeys.filter(Boolean));
+  const extras = fisherYates([...Array(meta.length).keys()].filter(ti => {
+    const id = trackId(meta[ti]);
+    return !id || !cachedIds.has(id);
+  }));
+  const finalQueue = remappedQueue.concat(extras);
+
+  const cachedPos = typeof cache.pos === 'number' ? cache.pos : 0;
+  const posId = metaKeys[cache.queue[cachedPos]] || '';
+  let newPos = finalQueue.findIndex(newTi => trackId(meta[newTi]) === posId);
+  if (newPos === -1) newPos = 0;
+
+  const history = (Array.isArray(cache.history) ? cache.history : [])
+    .map(remapOld).filter(ti => ti !== null);
+  const priority = {};
+  for (const [key, weight] of Object.entries(cache.priority || {})) {
+    const newTi = remapOld(+key);
+    if (newTi !== null) priority[newTi] = weight;
+  }
+
+  return {
+    queue: finalQueue,
+    pos: newPos,
+    history,
+    priority,
+    roundPlayed: Math.max(0, Number(cache.roundPlayed) || 0),
+    roundTotal: Math.max(finalQueue.length, Number(cache.roundTotal) || finalQueue.length),
+  };
 }
 
 async function start() {
@@ -2250,39 +3544,10 @@ async function start() {
           && Array.isArray(_c.queue) && _c.queue.length > 0
           && Array.isArray(_c.metaKeys)) {
 
-        const idToNew = {};
-        state.meta.forEach((m, ti) => { const id = trackId(m); if (id) idToNew[id] = ti; });
-
-        const mk       = _c.metaKeys;
-        const remapOld = oldTi => { const id = mk[oldTi]; return (id && idToNew[id] !== undefined) ? idToNew[id] : null; };
-
-        const remappedQueue = _c.queue.map(remapOld).filter(ti => ti !== null);
-        const inQueue       = new Set(remappedQueue);
-        const extras        = fisherYates([...Array(state.meta.length).keys()].filter(ti => !inQueue.has(ti)));
-        const finalQueue    = remappedQueue.concat(extras);
-
-        if (remappedQueue.length > 0) {
-          const cachedPos = typeof _c.pos === 'number' ? _c.pos : 0;
-          const posId     = mk[_c.queue[cachedPos]] || '';
-          let   newPos    = finalQueue.findIndex(newTi => trackId(state.meta[newTi]) === posId);
-          if (newPos === -1) newPos = 0;
-
-          const newHistory  = (Array.isArray(_c.history) ? _c.history : []).map(remapOld).filter(ti => ti !== null);
-          const newPriority = {};
-          for (const [k, w] of Object.entries(_c.priority || {})) {
-            const nti = remapOld(+k);
-            if (nti !== null) newPriority[nti] = w;
-          }
-
+        const restored = remapCachedQueue(_c, state.meta);
+        if (restored) {
           sessionStorage.removeItem('tss_queue_cache');
-          _cached = {
-            queue: finalQueue,
-            pos: newPos,
-            history: newHistory,
-            priority: newPriority,
-            roundPlayed: Math.max(0, Number(_c.roundPlayed) || 0),
-            roundTotal: Math.max(finalQueue.length, Number(_c.roundTotal) || finalQueue.length),
-          };
+          _cached = restored;
         }
       }
     }
@@ -2334,6 +3599,8 @@ async function start() {
 }
 
 function stop() {
+  closeOwnPip();
+  clearNativePlaybackFallback();
   stopCrossfadeDecks();
   state.active     = false;
   state.busy       = false;
@@ -2387,7 +3654,9 @@ function startWatcher() {
     nearEnd = false;
   };
 
-  const returnToQueuePage = () => {
+  const returnToQueuePage = (consumeCurrent = false) => {
+    if (consumeCurrent) consumeCurrentQueueTrack();
+
     const worker = state.worker;
     state.worker = null;
     if (worker) worker.terminate();
@@ -2398,17 +3667,21 @@ function startWatcher() {
     }
 
     try {
-      sessionStorage.setItem('tss_queue_cache', JSON.stringify({
-        queue:       state.queue.slice(),
-        pos:         state.pos,
-        history:     state.history.slice(),
-        priority:    { ...state.priority },
-        playlistUrl: state.playlistUrl,
-        ts:          Date.now(),
-        metaKeys:    state.meta.map(m => trackId(m) || ''),
-        roundPlayed: state.roundPlayed,
-        roundTotal:  state.roundTotal,
-      }));
+      if (state.queue.length) {
+        sessionStorage.setItem('tss_queue_cache', JSON.stringify({
+          queue:       state.queue.slice(),
+          pos:         state.pos,
+          history:     state.history.slice(),
+          priority:    { ...state.priority },
+          playlistUrl: state.playlistUrl,
+          ts:          Date.now(),
+          metaKeys:    state.meta.map(m => trackId(m) || ''),
+          roundPlayed: state.roundPlayed,
+          roundTotal:  state.roundTotal,
+        }));
+      } else {
+        sessionStorage.removeItem('tss_queue_cache');
+      }
     } catch (_) {}
 
     state.active    = false;
@@ -2432,7 +3705,7 @@ function startWatcher() {
           state.suspended = false;
           await next(true);
         } else {
-          returnToQueuePage();
+          returnToQueuePage(true);
           return;
         }
       } else {
@@ -2453,6 +3726,7 @@ function startWatcher() {
 
   const tick = async () => {
     if (!state.active) return;
+    if (checkSleepTimerDeadline()) return;
 
     // Better SoundCloud Feed discovers scPlayer asynchronously and may replace
     // the object after True Shuffle started, so re-check the cheap bridge guard.
@@ -2475,6 +3749,7 @@ function startWatcher() {
       syncPlaybackVolumeFromSoundCloud();
       refreshPlayBtn();
       updateHub();
+      syncOwnPipWindow();
       syncBetterFeedPipWindow();
     }
 
@@ -2602,25 +3877,44 @@ function badges() {
 
 // ── stats ─────────────────────────────────────────────────────────────────────
 
-function tickPlayTime() {
-  if (state.active && !state.suspended && !paused()) {
-    state.stats.elapsed = (state.stats.elapsed || 0) + 1;
+function tickPlayTime(now = Date.now()) {
+  const currentAt = Number(now);
+  const audible = state.active && !state.suspended && !paused();
+  const previousAt = Number(state._playTimeLastAt);
+  const elapsedMs = audible && state._playTimeWasAudible && Number.isFinite(previousAt)
+    ? Math.max(0, currentAt - previousAt)
+    : 0;
 
-    // sleep timer: time countdown
-    if (state.sleepTimer?.type === 'time') {
-      state.sleepTimer.remaining--;
-      updateSleepDisplay();
-      if (state.sleepTimer.remaining <= 0) {
-        state.sleepTimer = null;
-        const sel = document.getElementById('tss-hub-sleep');
-        if (sel) sel.value = 'off';
-        pause();
-        stop();
-        updateHub();
-        renderList();
-      }
-    }
+  state._playTimeLastAt = currentAt;
+  state._playTimeWasAudible = audible;
+
+  if (elapsedMs > 0) {
+    const totalMs = (state._playTimeRemainderMs || 0) + elapsedMs;
+    const wholeSeconds = Math.floor(totalMs / 1000);
+    state._playTimeRemainderMs = totalMs - wholeSeconds * 1000;
+    if (wholeSeconds > 0) state.stats.elapsed = (state.stats.elapsed || 0) + wholeSeconds;
   }
+
+  checkSleepTimerDeadline(currentAt);
+}
+
+function checkSleepTimerDeadline(now = Date.now()) {
+  const timer = state.sleepTimer;
+  if (!state.active || timer?.type !== 'time') return false;
+
+  timer.remaining = timedSleepRemaining(timer, now);
+  updateSleepDisplay(now);
+  if (timer.remaining > 0) return false;
+
+  // Clear first so simultaneous worker/window/catch-up ticks cannot stop twice.
+  state.sleepTimer = null;
+  const sel = document.getElementById('tss-hub-sleep');
+  if (sel) sel.value = 'off';
+  pause();
+  stop();
+  updateHub();
+  renderList();
+  return true;
 }
 setInterval(tickPlayTime, 1000);
 
@@ -2742,6 +4036,9 @@ function showStats() {
   document.getElementById('tss-stats-close').onclick = () => overlay.remove();
   document.getElementById('tss-stats-reset').onclick = () => {
     state.stats        = { played: 0, playCounts: {}, elapsed: 0 };
+    state._playTimeLastAt = Date.now();
+    state._playTimeWasAudible = false;
+    state._playTimeRemainderMs = 0;
     state._savedStats  = null;
     state._lifetimeBase = { played: 0, elapsed: 0, playCounts: {} };
     try { localStorage.removeItem(LIFETIME_KEY); } catch (_) {}
@@ -3150,6 +4447,7 @@ function mkHub() {
       #tss-hub-seekbar:hover { transform:scaleY(2.5); }
 
       #tss-hub-qico[data-open="true"] { color:var(--tss-a,#ff5500) !important; }
+      #tss-hub-pip[data-open="true"] { color:var(--tss-a,#ff5500) !important;border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.44) !important;background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.12) !important; }
 
       #tss-hub-reshuffle {
         width:28px; height:28px; padding:0; border-radius:8px;
@@ -3604,6 +4902,7 @@ function mkHub() {
           <span class="tss-deck-label">True Shuffle</span>
         </div>
         <div style="display:flex; gap:3px; align-items:center;">
+          <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP" style="display:none;">${SVG.pip}</button>
           <button id="tss-hub-eq" class="tss-hub-btn tss-hub-btn-icon" data-active="false" aria-label="Equalizer" aria-pressed="false" title="Equalizer off">${SVG.equalizer}</button>
           <button id="tss-hub-stats" class="tss-hub-btn tss-hub-btn-icon" aria-label="Session stats" title="session stats">${SVG.chart}</button>
           <button id="tss-hub-qico"  class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Queue panel" title="queue panel">${SVG.list}</button>
@@ -3731,6 +5030,8 @@ function mkHub() {
   };
   document.getElementById('tss-hub-stats').onclick = showStats;
   document.getElementById('tss-hub-eq').onclick = showEqualizer;
+  document.getElementById('tss-hub-pip').onclick = () => { void openOwnPip(); };
+  setOwnPipButtonState();
   document.getElementById('tss-hub-reshuffle').onclick = e => {
     e.stopPropagation();
     reshuffleCurrentPage();
@@ -3752,15 +5053,7 @@ function mkHub() {
   };
 
   document.getElementById('tss-hub-sleep').onchange = e => {
-    const v = e.target.value;
-    if (v === 'off') {
-      state.sleepTimer = null;
-    } else if (v.startsWith('t')) {
-      state.sleepTimer = { type: 'time',   remaining: parseInt(v.slice(1)) * 60 };
-    } else {
-      state.sleepTimer = { type: 'tracks', remaining: parseInt(v.slice(1)) };
-    }
-    updateSleepDisplay();
+    setSleepTimer(e.target.value);
   };
 
   const crossfadeCard = document.getElementById('tss-crossfade-card');
@@ -3773,19 +5066,7 @@ function mkHub() {
 
   const crossfadeSlider = document.getElementById('tss-hub-crossfade');
   crossfadeSlider.oninput = e => {
-    const previousSeconds = state.crossfadeSeconds;
-    state.crossfadeSeconds = Math.max(0, Math.min(12, Number(e.target.value) || 0));
-    localStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
-    if (state.crossfadeSeconds <= 0) {
-      setCrossfadeStatus('off');
-    } else {
-      setCrossfadeStatus('armed');
-      if (previousSeconds <= 0) {
-        ensureAutoLevelAudioGraph();
-        if (state.active && currentDeckAudio()) void prefetchUpcomingCrossfadeTrack();
-      }
-    }
-    syncCrossfadeControls();
+    setCrossfadeSeconds(e.target.value);
   };
 
   document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
@@ -3805,31 +5086,11 @@ function mkHub() {
 
   const playbackVolume = document.getElementById('tss-hub-volume');
   playbackVolume.oninput = () => {
-    state.playbackVolume = Math.max(0, Math.min(1, Number(playbackVolume.value) / 100));
-    state._playbackVolumeStored = true;
-    state._playbackVolumeInitialized = true;
-    localStorage.setItem('tss_playback_volume', String(state.playbackVolume));
-    syncCrossfadeVolume();
-    setSoundCloudVolume(state.playbackVolume);
-    syncPlaybackVolumeControls();
+    setPlaybackVolume(Number(playbackVolume.value) / 100);
   };
   const autoLevel = document.getElementById('tss-auto-level');
   autoLevel.onclick = () => {
-    const enabling = !state.autoLevel;
-    if (enabling && !ensureAutoLevelAudioGraph()) {
-      state.autoLevel = false;
-      localStorage.setItem('tss_auto_level', 'false');
-      syncPlaybackVolumeControls();
-      return;
-    }
-    state.autoLevel = enabling;
-    localStorage.setItem('tss_auto_level', String(state.autoLevel));
-    if (state.autoLevel && state._audioContext?.state === 'suspended') void state._audioContext.resume();
-    state._deckTracks.forEach((ti, index) => {
-      if (Number.isInteger(ti)) applyCachedAutoLevel(index, ti);
-    });
-    syncCrossfadeVolume();
-    syncPlaybackVolumeControls();
+    setAutoLevelEnabled(!state.autoLevel);
   };
   syncCrossfadeControls();
   syncPlaybackVolumeControls();
@@ -3870,6 +5131,7 @@ function mkHub() {
 
 function updateHub() {
   if (!document.getElementById('tss-hub')) return;
+  setOwnPipButtonState();
 
   const active  = state.active;
   const loading = state.loading;
@@ -4022,7 +5284,7 @@ function updateHub() {
   if (currentTime) currentTime.textContent = formatPlaybackClock(timing.current);
   if (remainingTime) remainingTime.textContent = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
 
-  const nextTi = state.queue[state.pos + 1];
+  const nextTi = upcomingTrackIndex();
   const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
   const qpos   = document.getElementById('tss-hub-qpos');
   const nextup = document.getElementById('tss-hub-nextup');
@@ -4310,7 +5572,12 @@ function renderList(filter) {
       const row = mkRow(m, -1, ti, false, false);
       row.style.opacity    = '0.65';
       row.style.borderLeft = '2px solid #2e2e2e';
-      row.oncontextmenu = e => { e.preventDefault(); state.playNext.splice(i, 1); renderList(); };
+      row.oncontextmenu = e => {
+        e.preventDefault();
+        state.playNext.splice(i, 1);
+        refreshUpcomingCrossfadePreparation();
+        renderList();
+      };
       list.appendChild(row);
     });
 
@@ -4346,6 +5613,7 @@ function renderList(filter) {
       else if (src < state.pos && qi >= state.pos) state.pos--;
       else if (src > state.pos && qi <= state.pos) state.pos++;
       state.dragSrc = null;
+      refreshUpcomingCrossfadePreparation();
       badges();
       renderList(filter);
     };
@@ -4511,6 +5779,7 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos--;
         else if (state.pos === qi - 1) state.pos++;
+        refreshUpcomingCrossfadePreparation();
         badges(); renderList();
       },
     },
@@ -4522,6 +5791,7 @@ function showCtxMenu(e, qi, ti) {
         [state.queue[qi], state.queue[qi + 1]] = [state.queue[qi + 1], state.queue[qi]];
         if      (state.pos === qi)     state.pos++;
         else if (state.pos === qi + 1) state.pos--;
+        refreshUpcomingCrossfadePreparation();
         badges(); renderList();
       },
     },
@@ -4645,6 +5915,7 @@ window.addEventListener('pagehide', () => {
 });
 
 document.addEventListener('visibilitychange', () => {
+  checkSleepTimerDeadline();
   const deck = currentDeckAudio();
   if (document.visibilityState === 'visible' && state.active && deck && !deck.paused
       && state._audioContext && state._audioContext.state !== 'running') {
@@ -4652,6 +5923,11 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+window.addEventListener('pageshow', () => {
+  checkSleepTimerDeadline();
+});
+
+installNativePlaybackGuard();
 onNav();
 
 })();

@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const scriptPath = process.env.TSS_SCRIPT
@@ -120,14 +122,168 @@ test('natural-end transition is protected against duplicate signals', () => {
   assert.match(watcher, /await next\(true\)/);
 });
 
+function createTimeHarness() {
+  let now = 100_000;
+  let isPaused = false;
+  let pauseCalls = 0;
+  let stopCalls = 0;
+  const display = { textContent: '' };
+  const select = { value: '' };
+  const state = {
+    active: true,
+    suspended: false,
+    sleepTimer: null,
+    _playTimeLastAt: null,
+    _playTimeWasAudible: false,
+    _playTimeRemainderMs: 0,
+    stats: { played: 0, playCounts: {}, elapsed: 0 },
+  };
+  const document = {
+    getElementById(id) {
+      if (id === 'tss-hub-sleep-display') return display;
+      if (id === 'tss-hub-sleep') return select;
+      return null;
+    },
+  };
+  const timedSleepRemaining = Function(
+    `return (${extractFunction('timedSleepRemaining')})`,
+  )();
+  const updateSleepDisplay = Function(
+    'state', 'document', 'timedSleepRemaining',
+    `return (${extractFunction('updateSleepDisplay')})`,
+  )(state, document, timedSleepRemaining);
+  const setSleepTimer = Function(
+    'state', 'updateSleepDisplay',
+    `return (${extractFunction('setSleepTimer')})`,
+  )(state, updateSleepDisplay);
+  const sleepTimerValue = Function(
+    'state',
+    `return (${extractFunction('sleepTimerValue')})`,
+  )(state);
+  const checkSleepTimerDeadline = Function(
+    'state', 'timedSleepRemaining', 'updateSleepDisplay', 'document',
+    'pause', 'stop', 'updateHub', 'renderList',
+    `return (${extractFunction('checkSleepTimerDeadline')})`,
+  )(
+    state,
+    timedSleepRemaining,
+    updateSleepDisplay,
+    document,
+    () => { pauseCalls++; isPaused = true; },
+    () => { stopCalls++; state.active = false; },
+    () => {},
+    () => {},
+  );
+  const tickPlayTime = Function(
+    'state', 'paused', 'checkSleepTimerDeadline',
+    `return (${extractFunction('tickPlayTime')})`,
+  )(
+    state,
+    () => isPaused,
+    checkSleepTimerDeadline,
+  );
+
+  return {
+    state,
+    display,
+    select,
+    setSleepTimer: value => setSleepTimer(value, now),
+    sleepTimerValue,
+    tick: () => tickPlayTime(now),
+    checkDeadline: () => checkSleepTimerDeadline(now),
+    advance: milliseconds => { now += milliseconds; },
+    setPaused: value => { isPaused = value; },
+    pauseCalls: () => pauseCalls,
+    stopCalls: () => stopCalls,
+  };
+}
+
+test('time sleep timer follows its deadline across a throttled background gap', () => {
+  const h = createTimeHarness();
+  h.setSleepTimer('t15');
+  assert.equal(h.state.sleepTimer.remaining, 900);
+  assert.equal(h.display.textContent, '15m');
+  assert.equal(h.sleepTimerValue(), 't15');
+
+  h.tick();
+  h.advance(1_000);
+  h.tick();
+  assert.equal(h.state.sleepTimer.remaining, 899);
+
+  h.advance(599_000);
+  h.tick();
+  assert.equal(h.state.sleepTimer.remaining, 300);
+  assert.equal(h.display.textContent, '5m');
+
+  h.advance(300_000);
+  h.tick();
+  assert.equal(h.state.sleepTimer, null);
+  assert.equal(h.select.value, 'off');
+  assert.equal(h.pauseCalls(), 1);
+  assert.equal(h.stopCalls(), 1);
+  assert.equal(h.checkDeadline(), false);
+  assert.equal(h.pauseCalls(), 1);
+  assert.equal(h.stopCalls(), 1);
+});
+
+test('listening stats use real timestamp deltas without paused, suspended, or duplicate ticks', () => {
+  const h = createTimeHarness();
+  h.tick();
+  h.advance(1_250);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 1);
+
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 1);
+
+  h.advance(60_000);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 61);
+
+  h.setPaused(true);
+  h.advance(10_000);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 61);
+  h.setPaused(false);
+  h.advance(10_000);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 61);
+  h.advance(2_000);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 63);
+
+  h.state.suspended = true;
+  h.advance(5_000);
+  h.tick();
+  h.state.suspended = false;
+  h.advance(5_000);
+  h.tick();
+  assert.equal(h.state.stats.elapsed, 63);
+});
+
+test('track sleep timer remains transition-count based', () => {
+  const h = createTimeHarness();
+  h.setSleepTimer('n3');
+  assert.equal(h.sleepTimerValue(), 'n3');
+  h.tick();
+  h.advance(600_000);
+  h.tick();
+  assert.deepEqual(h.state.sleepTimer, { type: 'tracks', remaining: 3 });
+  assert.match(extractFunction('next'), /state\.sleepTimer\.remaining--/);
+});
+
 function createWatcherHarness() {
   let title = 'Track A';
   let timing = { current: 0, duration: 2000, ended: false, source: 'audio' };
   let isPaused = false;
+  let pageElementsPresent = true;
   let endedHandler = null;
   let nextCalls = 0;
   let pauseCalls = 0;
+  let navigationClicks = 0;
+  let deadlineChecks = 0;
   const events = [];
+  const storage = new Map();
 
   const state = {
     active: true,
@@ -140,6 +296,20 @@ function createWatcherHarness() {
     _workerInterval: null,
     _endedHandler: null,
     els: [{}],
+    queue: [0, 1, 2],
+    pos: 0,
+    history: [],
+    priority: {},
+    playlistUrl: 'https://soundcloud.com/test/source-playlist',
+    meta: [
+      { link: 'track-a' },
+      { link: 'track-b' },
+      { link: 'track-c' },
+    ],
+    playNext: [],
+    stopAfterRound: false,
+    roundPlayed: 0,
+    roundTotal: 3,
   };
   const worker = {
     onmessage: null,
@@ -147,7 +317,18 @@ function createWatcherHarness() {
     postMessage() {},
   };
   const documentMock = {
-    body: { contains: () => true },
+    body: {
+      contains: () => pageElementsPresent,
+      appendChild(node) { node.parentNode = this; },
+    },
+    createElement() {
+      return {
+        href: '',
+        parentNode: null,
+        click() { navigationClicks++; },
+        remove() { this.parentNode = null; },
+      };
+    },
     addEventListener(type, handler) {
       if (type === 'ended') endedHandler = handler;
     },
@@ -168,11 +349,23 @@ function createWatcherHarness() {
   };
   const playbackTiming = () => ({ ...timing });
   const progress = () => timing.duration ? timing.current / timing.duration : 0;
+  const trackId = meta => meta?.link || '';
+  const consumeCurrentQueueTrack = Function(
+    'state', 'trackAvailable', 'buildBalancedRound',
+    `return (${extractFunction('consumeCurrentQueueTrack')})`,
+  )(state, () => true, items => items.slice());
+  const sessionStorage = {
+    setItem(key, value) { storage.set(key, value); },
+    getItem(key) { return storage.get(key) || null; },
+    removeItem(key) { storage.delete(key); },
+  };
 
   const factory = Function(
     'state', 'playerTitle', 'progress', 'paused', 'pause', 'wait', 'document', 'next',
     'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker', 'settleScheduledCrossfade',
-    'installBetterFeedPipBridge', 'syncBetterFeedPipWindow',
+    'installBetterFeedPipBridge', 'syncOwnPipWindow', 'syncBetterFeedPipWindow',
+    'consumeCurrentQueueTrack', 'sessionStorage', 'trackId', 'currentDeckAudio',
+    'checkSleepTimerDeadline',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -191,6 +384,12 @@ function createWatcherHarness() {
     () => {},
     () => {},
     () => {},
+    () => {},
+    consumeCurrentQueueTrack,
+    sessionStorage,
+    trackId,
+    () => null,
+    () => { deadlineChecks++; return false; },
   );
   startWatcher();
 
@@ -201,8 +400,12 @@ function createWatcherHarness() {
     setTiming: value => { timing = { ...timing, ...value }; },
     setPaused: value => { isPaused = value; },
     setTitle: value => { title = value; },
+    setPageElementsPresent: value => { pageElementsPresent = value; },
     nextCalls: () => nextCalls,
     pauseCalls: () => pauseCalls,
+    navigationClicks: () => navigationClicks,
+    deadlineChecks: () => deadlineChecks,
+    cachedQueue: () => JSON.parse(storage.get('tss_queue_cache') || 'null'),
     events: () => events.slice(),
     flush: async () => {
       await Promise.resolve();
@@ -218,6 +421,15 @@ test('a long track is not advanced with 30 seconds remaining', async () => {
   await h.worker.onmessage();
   assert.equal(h.nextCalls(), 0);
   assert.equal(h.state.suspended, false);
+  assert.equal(h.deadlineChecks(), 1);
+});
+
+test('sleep deadline catch-up runs from worker ticks and lifecycle events', () => {
+  const watcher = extractFunction('startWatcher');
+  assert.match(watcher, /if \(checkSleepTimerDeadline\(\)\) return;/);
+  assert.match(source, /visibilitychange[\s\S]*?checkSleepTimerDeadline\(\)/);
+  assert.match(source, /addEventListener\('pageshow'[\s\S]*?checkSleepTimerDeadline\(\)/);
+  assert.match(source, /state\._workerInterval = setInterval\(tick, 50\)/);
 });
 
 test('the native ended event advances exactly once even when signalled twice', async () => {
@@ -227,6 +439,89 @@ test('the native ended event advances exactly once even when signalled twice', a
   h.ended();
   await h.flush();
   assert.equal(h.nextCalls(), 1);
+});
+
+test('a suspended external end consumes and caches the source queue exactly once before returning', async () => {
+  const h = createWatcherHarness();
+  h.state.suspended = true;
+  h.setPageElementsPresent(false);
+  h.setTiming({ current: 2000, duration: 2000, ended: true });
+
+  h.ended();
+  h.ended();
+  await h.flush();
+
+  assert.equal(h.nextCalls(), 0);
+  assert.equal(h.navigationClicks(), 1);
+  assert.equal(h.state.active, false);
+  assert.deepEqual(h.state.queue, [1, 2]);
+  assert.deepEqual(h.state.history, [0]);
+  assert.equal(h.state.roundPlayed, 1);
+  assert.equal(h.state.roundTotal, 3);
+  assert.deepEqual(h.cachedQueue(), {
+    queue: [1, 2],
+    pos: 0,
+    history: [0],
+    priority: {},
+    playlistUrl: 'https://soundcloud.com/test/source-playlist',
+    ts: h.cachedQueue().ts,
+    metaKeys: ['track-a', 'track-b', 'track-c'],
+    roundPlayed: 1,
+    roundTotal: 3,
+  });
+});
+
+test('restoring a consumed suspended queue does not reinsert played tracks into the round', () => {
+  const remapCachedQueue = Function(
+    'trackId', 'fisherYates',
+    `return (${extractFunction('remapCachedQueue')})`,
+  )(
+    meta => meta?.link || '',
+    items => items.slice().reverse(),
+  );
+  const restored = remapCachedQueue({
+    queue: [1, 2],
+    pos: 0,
+    history: [0],
+    priority: { 1: 1.75 },
+    metaKeys: ['track-a', 'track-b', 'track-c'],
+    roundPlayed: 1,
+    roundTotal: 3,
+  }, [
+    { link: 'track-c' },
+    { link: 'track-a' },
+    { link: 'track-b' },
+    { link: 'track-new' },
+  ]);
+
+  assert.deepEqual(restored.queue, [2, 0, 3]);
+  assert.equal(restored.pos, 0);
+  assert.deepEqual(restored.history, [1]);
+  assert.deepEqual(restored.priority, { 2: 1.75 });
+  assert.equal(restored.roundPlayed, 1);
+  assert.equal(restored.roundTotal, 3);
+  assert.equal(restored.queue.includes(1), false);
+  assert.equal(new Set(restored.queue).size, restored.queue.length);
+});
+
+test('a suspended end on the last stop-after-round track returns without caching a replay', async () => {
+  const h = createWatcherHarness();
+  h.state.suspended = true;
+  h.state.queue = [0];
+  h.state.meta = [{ link: 'track-a' }];
+  h.state.roundTotal = 1;
+  h.state.stopAfterRound = true;
+  h.setPageElementsPresent(false);
+  h.setTiming({ current: 2000, duration: 2000, ended: true });
+
+  h.ended();
+  await h.flush();
+
+  assert.deepEqual(h.state.queue, []);
+  assert.deepEqual(h.state.history, [0]);
+  assert.equal(h.state.roundPlayed, 1);
+  assert.equal(h.cachedQueue(), null);
+  assert.equal(h.navigationClicks(), 1);
 });
 
 test('a finished track parked at its endpoint advances without an ended signal', async () => {
@@ -342,9 +637,9 @@ test('jumping to a searched track keeps skipped upcoming tracks in the round', (
     roundTotal: 4,
   };
   const moveSelectedTrackToCurrent = Function(
-    'state',
+    'state', 'refreshUpcomingCrossfadePreparation',
     `return (${extractFunction('moveSelectedTrackToCurrent')})`,
-  )(state);
+  )(state, () => {});
 
   assert.equal(moveSelectedTrackToCurrent(2), true);
   assert.deepEqual(state.queue, [2, 1, 3]);
@@ -530,11 +825,12 @@ test('PiP visual sync repaints Better Feed waveform and time labels from the liv
     meta: [{ title: 'Live track', link: 'https://soundcloud.com/test/live' }],
   };
   const syncBetterFeedPipWindow = Function(
-    'state', 'pageWindow', 'betterFeedPipActive', 'playbackTiming',
+    'state', 'pageWindow', 'documentPipApi', 'betterFeedPipActive', 'playbackTiming',
     'formatPlaybackClock', 'trackId', 'waveformCache', 'DEFAULT_WAVE_HEIGHTS',
     `return (${extractFunction('syncBetterFeedPipWindow')})`,
   )(
-    state, pageWindow, () => true, () => ({ current: 90, duration: 180 }),
+    state, pageWindow, () => pageWindow.documentPictureInPicture,
+    () => true, () => ({ current: 90, duration: 180 }),
     seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`,
     meta => meta.link, new Map([['https://soundcloud.com/test/live', [25, 50, 75, 100]]]),
     [50, 50, 50, 50],
@@ -551,10 +847,519 @@ test('PiP visual sync repaints Better Feed waveform and time labels from the liv
   assert.equal(bars.filter(call => call[1] === '#f50').length, 50);
 });
 
+test('native True Shuffle PiP mirrors the active deck and upcoming queue item', () => {
+  const nodes = new Map();
+  const node = id => {
+    const value = {
+      id,
+      textContent: '',
+      innerHTML: '',
+      dataset: {},
+      hidden: false,
+      src: '',
+      attributes: {},
+      setAttribute(name, entry) { this.attributes[name] = entry; },
+    };
+    nodes.set(id, value);
+    return value;
+  };
+  [
+    'tss-pip-player', 'tss-pip-title', 'tss-pip-artist', 'tss-pip-position',
+    'tss-pip-current', 'tss-pip-remaining', 'tss-pip-artwork',
+    'tss-pip-artwork-fallback', 'tss-pip-play', 'tss-pip-up-next-row',
+    'tss-pip-next-title', 'tss-pip-next-artist', 'tss-pip-next-number',
+    'tss-pip-next-artwork', 'tss-pip-next-fallback', 'tss-pip-next-settings', 'tss-pip-crossfade',
+    'tss-pip-crossfade-value', 'tss-pip-auto-level', 'tss-pip-processing', 'tss-pip-waveform',
+  ].forEach(node);
+  const pipDocument = {
+    documentElement: { style: { setProperty() {} } },
+    getElementById: id => nodes.get(id) || null,
+  };
+  const state = {
+    _ownPipWindow: { closed: false, document: pipDocument },
+    _deckTrack: 0,
+    queue: [0, 1],
+    playNext: [],
+    pos: 0,
+    roundPlayed: 2,
+    roundTotal: 10,
+    stopAfterRound: false,
+    crossfadeSeconds: 8,
+    autoLevel: true,
+    meta: [
+      { title: 'Current', artist: 'Artist A', artwork: 'current.jpg', link: 'current' },
+      { title: 'Upcoming', artist: 'Artist B', artwork: 'next.jpg', link: 'next' },
+    ],
+  };
+  const drawn = [];
+  const syncOwnPipWindow = Function(
+    'state', 'ownPipIsOpen', 'closeOwnPip', 'playbackTiming', 'getComputedStyle',
+    'document', 'playerTitle', 'paused', 'SVG', 'trackId', 'waveformCache',
+    'DEFAULT_WAVE_HEIGHTS', 'formatPlaybackClock', 'drawOwnPipWaveform', 'renderOwnPipQueue',
+    'upcomingTrackIndex',
+    `return (${extractFunction('syncOwnPipWindow')})`,
+  )(
+    state, () => true, () => {}, () => ({ current: 63, duration: 91 }),
+    () => ({ getPropertyValue: () => '#64d8e8' }), { documentElement: {} },
+    () => '', () => false, { play: '<play>', pause: '<pause>' }, meta => meta.link,
+    new Map(), [50], seconds => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`,
+    (...args) => drawn.push(args), () => {},
+    () => state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1],
+  );
+
+  assert.equal(syncOwnPipWindow(), true);
+  assert.equal(nodes.get('tss-pip-title').textContent, 'Current');
+  assert.equal(nodes.get('tss-pip-artist').textContent, 'Artist A');
+  assert.equal(nodes.get('tss-pip-position').textContent, '3 / 10');
+  assert.equal(nodes.get('tss-pip-current').textContent, '1:03');
+  assert.equal(nodes.get('tss-pip-remaining').textContent, '-0:28');
+  assert.equal(nodes.get('tss-pip-play').innerHTML, '<pause>');
+  assert.equal(nodes.get('tss-pip-next-title').textContent, 'Upcoming');
+  assert.equal(nodes.get('tss-pip-next-artist').textContent, 'Artist B');
+  assert.equal(nodes.get('tss-pip-next-number').textContent, '4');
+  assert.equal(nodes.get('tss-pip-crossfade-value').textContent, '8s fade');
+  assert.equal(nodes.get('tss-pip-crossfade').dataset.active, 'true');
+  assert.equal(nodes.get('tss-pip-auto-level').dataset.active, 'true');
+  assert.equal(drawn.length, 1);
+  assert.equal(drawn[0][1].title, 'Current');
+});
+
+test('native PiP queue puts play-next requests directly after the current track', () => {
+  const state = {
+    queue: [4, 1, 2, 3],
+    pos: 0,
+    playNext: [3, 1, 3],
+    meta: [{}, {}, {}, {}, {}],
+  };
+  const ownPipQueueOrder = Function(
+    'state',
+    `return (${extractFunction('ownPipQueueOrder')})`,
+  )(state);
+  assert.deepEqual(ownPipQueueOrder(), [4, 3, 1, 2]);
+  assert.equal(new Set(ownPipQueueOrder()).size, 4);
+});
+
+test('queueNext rejects the playing track, deduplicates identical requests, and keeps distinct rapid actions', () => {
+  const state = {
+    _deckTrack: 1,
+    queue: [1, 2, 3],
+    pos: 0,
+    playNext: [],
+    history: [],
+    roundTotal: 3,
+  };
+  let refreshes = 0;
+  let renders = 0;
+  const queueNext = Function(
+    'state', 'refreshUpcomingCrossfadePreparation', 'renderList',
+    `return (${extractFunction('queueNext')})`,
+  )(state, () => { refreshes++; }, () => { renders++; });
+
+  assert.equal(queueNext(1), false);
+  assert.deepEqual(state.playNext, []);
+  assert.equal(queueNext(2), true);
+  assert.equal(queueNext(2), false);
+  assert.equal(queueNext(3), true);
+  assert.deepEqual(state.playNext, [2, 3]);
+  assert.equal(refreshes, 2);
+  assert.equal(renders, 2);
+});
+
+test('queueNext extends the round only when reintroducing a played history track', () => {
+  const state = {
+    _deckTrack: 2,
+    queue: [2, 3, 4],
+    pos: 0,
+    playNext: [],
+    history: [0, 1],
+    roundTotal: 5,
+  };
+  const queueNext = Function(
+    'state', 'refreshUpcomingCrossfadePreparation', 'renderList',
+    `return (${extractFunction('queueNext')})`,
+  )(state, () => {}, () => {});
+
+  assert.equal(queueNext(1), true);
+  assert.equal(state.roundTotal, 6);
+  assert.equal(queueNext(1), false);
+  assert.equal(queueNext(2), false);
+  assert.equal(queueNext(3), true);
+  assert.equal(state.roundTotal, 6);
+});
+
+test('jumpTo removes every matching play-next entry before playing now', async () => {
+  const state = {
+    active: true,
+    busy: false,
+    manualAction: false,
+    suspended: true,
+    queue: [0, 1, 2],
+    playNext: [2, 1, 2],
+    pos: 0,
+    history: [],
+    roundPlayed: 0,
+    roundTotal: 3,
+  };
+  let refreshes = 0;
+  let renders = 0;
+  const played = [];
+  const removePlayNextOccurrences = Function(
+    'state', 'refreshUpcomingCrossfadePreparation',
+    `return (${extractFunction('removePlayNextOccurrences')})`,
+  )(state, () => { refreshes++; });
+  const moveSelectedTrackToCurrent = Function(
+    'state', 'refreshUpcomingCrossfadePreparation',
+    `return (${extractFunction('moveSelectedTrackToCurrent')})`,
+  )(state, () => { refreshes++; });
+  const jumpTo = Function(
+    'state', 'removePlayNextOccurrences', 'moveSelectedTrackToCurrent',
+    'playAt', 'badges', 'renderList',
+    `return (${extractFunction('jumpTo').replace(/^function /, 'async function ')})`,
+  )(
+    state, removePlayNextOccurrences, moveSelectedTrackToCurrent,
+    async (ti, countPlay = true) => played.push([ti, countPlay]),
+    () => {}, () => { renders++; },
+  );
+
+  await jumpTo(-1, 2);
+
+  assert.deepEqual(state.playNext, [1]);
+  assert.deepEqual(state.queue, [2, 1]);
+  assert.deepEqual(played, [[2, true]]);
+  assert.equal(refreshes, 2);
+  assert.equal(renders, 1);
+});
+
+function createUpcomingRemovalHarness(overrides) {
+  const state = {
+    _deckTrack: 0,
+    queue: [0, 1, 2],
+    playNext: [],
+    pos: 0,
+    roundPlayed: 0,
+    roundTotal: 3,
+    history: [],
+    ...overrides,
+  };
+  let refreshes = 0;
+  let renders = 0;
+  let badgeRefreshes = 0;
+  const removeTrackFromUpcoming = Function(
+    'state', 'refreshUpcomingCrossfadePreparation', 'badges', 'renderList',
+    `return (${extractFunction('removeTrackFromUpcoming')})`,
+  )(
+    state,
+    () => { refreshes++; },
+    () => { badgeRefreshes++; },
+    () => { renders++; },
+  );
+  return { state, removeTrackFromUpcoming, refreshes: () => refreshes, renders: () => renders, badgeRefreshes: () => badgeRefreshes };
+}
+
+test('removing a play-next-only track clears every occurrence with one refresh', () => {
+  const h = createUpcomingRemovalHarness({ queue: [0, 1], playNext: [7, 7], history: [7], roundTotal: 3 });
+
+  assert.equal(h.removeTrackFromUpcoming(7), true);
+  assert.deepEqual(h.state.playNext, []);
+  assert.deepEqual(h.state.queue, [0, 1]);
+  assert.equal(h.state.roundTotal, 2);
+  assert.equal(h.state.pos, 0);
+  assert.equal(h.refreshes(), 1);
+  assert.equal(h.renders(), 1);
+  assert.equal(h.badgeRefreshes(), 0);
+});
+
+test('removing a track clears play-next and its future round occurrence together', () => {
+  const h = createUpcomingRemovalHarness({ playNext: [2, 2] });
+
+  assert.equal(h.removeTrackFromUpcoming(2), true);
+  assert.deepEqual(h.state.playNext, []);
+  assert.deepEqual(h.state.queue, [0, 1]);
+  assert.equal(h.state.roundTotal, 2);
+  assert.equal(h.state.pos, 0);
+  assert.equal(h.refreshes(), 1);
+  assert.equal(h.renders(), 1);
+  assert.equal(h.badgeRefreshes(), 1);
+});
+
+test('removing the current track is rejected without mutating either queue', () => {
+  const h = createUpcomingRemovalHarness({ playNext: [0, 0] });
+
+  assert.equal(h.removeTrackFromUpcoming(0), false);
+  assert.deepEqual(h.state.playNext, [0, 0]);
+  assert.deepEqual(h.state.queue, [0, 1, 2]);
+  assert.equal(h.state.roundTotal, 3);
+  assert.equal(h.state.pos, 0);
+  assert.equal(h.refreshes(), 0);
+  assert.equal(h.renders(), 0);
+});
+
+test('PiP track menu routes play-now and removal through play-next-aware mutations', () => {
+  const menu = extractFunction('showOwnPipTrackMenu');
+  assert.match(menu, /const pendingNext = state\.playNext\.includes\(ti\)/);
+  assert.match(menu, /void jumpTo\(state\.queue\.indexOf\(ti\), ti\)/);
+  assert.match(menu, /removeTrackFromUpcoming\(ti\)/);
+});
+
+test('native True Shuffle PiP is progressive enhancement with complete controls', () => {
+  const apiResolverSource = extractFunction('documentPipApi');
+  const support = extractFunction('ownPipSupported');
+  const open = extractFunction('openOwnPip');
+  const mount = extractFunction('mountOwnPipWindow');
+  const stop = extractFunction('stop');
+  const hub = extractFunction('mkHub');
+  const unsupportedResolver = Function('pageWindow', `return (${apiResolverSource})`)({});
+  const supportedResolver = Function('pageWindow', `return (${apiResolverSource})`)({
+    documentPictureInPicture: { requestWindow() {} },
+  });
+  const wrappedResolver = Function('pageWindow', `return (${apiResolverSource})`)({
+    wrappedJSObject: { documentPictureInPicture: { requestWindow() {} } },
+  });
+  const unsupported = Function('documentPipApi', `return (${support})`)(unsupportedResolver);
+  const supported = Function('documentPipApi', `return (${support})`)(supportedResolver);
+  assert.equal(unsupported(), false);
+  assert.equal(supported(), true);
+  assert.equal(wrappedResolver()?.requestWindow instanceof Function, true);
+  assert.match(apiResolverSource, /wrappedJSObject/);
+  assert.match(support, /documentPipApi/);
+  assert.match(open, /requestWindow\(\{ width: 390, height: 330 \}\)/);
+  assert.match(open, /openVideoPipFallback/);
+  assert.match(open, /openInPagePipFallback/);
+  assert.match(mount, /tss-pip-waveform/);
+  assert.match(mount, /tss-pip-view-toggle/);
+  assert.match(mount, /tss-pip-queue-view/);
+  assert.match(mount, /tss-pip-stage/);
+  assert.match(mount, /tssPipRowIn/);
+  assert.match(mount, /overflow-x:hidden/);
+  assert.match(mount, /tss-pip-next-settings/);
+  assert.match(mount, /renderOwnPipQueue/);
+  assert.match(mount, /tss-pip-tab-history/);
+  assert.match(mount, /tss-pip-queue-search/);
+  assert.match(mount, /showOwnPipSoundMenu/);
+  assert.match(extractFunction('renderOwnPipQueue'), /showOwnPipTrackMenu/);
+  assert.match(extractFunction('showOwnPipTrackMenu'), /Shuffle priority/);
+  assert.match(extractFunction('showOwnPipTrackMenu'), /Remove from queue/);
+  assert.match(mount, /state\.manualAction = true/);
+  assert.match(mount, /void next\(\)/);
+  assert.match(mount, /void prevTrack\(\)/);
+  assert.match(mount, /void toggle\(\)/);
+  assert.match(stop, /closeOwnPip\(\)/);
+  assert.match(hub, /id="tss-hub-pip"/);
+});
+
+test('PiP fallbacks cover native video and an interactive in-page player', () => {
+  const videoSupport = extractFunction('standardVideoPipSupported');
+  const video = extractFunction('openVideoPipFallback');
+  const inline = extractFunction('openInPagePipFallback');
+  const close = extractFunction('closeOwnPip');
+  assert.match(videoSupport, /requestPictureInPicture/);
+  assert.match(videoSupport, /webkitSetPresentationMode/);
+  assert.match(video, /captureStream\(8\)/);
+  assert.match(video, /drawVideoPipFrame/);
+  assert.match(inline, /resize:both/);
+  assert.match(inline, /mountOwnPipWindow/);
+  assert.match(inline, /pointermove/);
+  assert.match(close, /exitPictureInPicture/);
+  assert.match(close, /_ownPipHost/);
+});
+
 test('watcher retries the PiP bridge after Better SoundCloud Feed discovers scPlayer', () => {
   const watcher = extractFunction('startWatcher');
   assert.match(watcher, /installBetterFeedPipBridge\(\)/);
+  assert.match(watcher, /syncOwnPipWindow\(\)/);
   assert.match(watcher, /syncBetterFeedPipWindow\(\)/);
+});
+
+test('native playback pause aligns the transport once without touching True Shuffle decks', () => {
+  const ownDeck = { paused: false, dataset: { tssCrossfadeDeck: '0' }, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  const nativeAudio = { paused: false, dataset: {}, pauseCalls: 0, pause() { this.paused = true; this.pauseCalls++; } };
+  const button = {
+    title: 'Pause current track',
+    clickCalls: 0,
+    getAttribute: () => 'Pause current track',
+    click() { this.clickCalls++; this.title = 'Play current track'; },
+  };
+  const timers = [];
+  const state = {
+    _decks: [ownDeck],
+    _nativePauseSyncPending: false,
+    _nativeGuardButtonAction: false,
+  };
+  const document = {
+    querySelectorAll(selector) {
+      assert.equal(selector, 'audio');
+      return [ownDeck, nativeAudio];
+    },
+    querySelector(selector) {
+      assert.equal(selector, '.playControls__play');
+      return button;
+    },
+  };
+  const isTrueShuffleAudio = Function(
+    'state',
+    `return (${extractFunction('isTrueShuffleAudio')})`,
+  )(state);
+  const soundCloudPaused = Function(
+    'document',
+    `return (${extractFunction('soundCloudPaused')})`,
+  )(document);
+  const alignSoundCloudPlayButtonPaused = Function(
+    'state',
+    'document',
+    'soundCloudPaused',
+    'setTimeout',
+    `return (${extractFunction('alignSoundCloudPlayButtonPaused')})`,
+  )(state, document, soundCloudPaused, (fn, delay) => timers.push({ fn, delay }));
+  const pauseSoundCloud = Function(
+    'document',
+    'isTrueShuffleAudio',
+    'alignSoundCloudPlayButtonPaused',
+    `return (${extractFunction('pauseSoundCloud')})`,
+  )(document, isTrueShuffleAudio, alignSoundCloudPlayButtonPaused);
+
+  pauseSoundCloud();
+  pauseSoundCloud();
+
+  assert.equal(ownDeck.pauseCalls, 0);
+  assert.equal(nativeAudio.pauseCalls, 1);
+  assert.equal(button.clickCalls, 1);
+  assert.equal(state._nativeGuardButtonAction, false);
+  assert.deepEqual(timers.map(timer => timer.delay), [250]);
+});
+
+test('native playback guard blocks autoplay and manual transport starts outside fallback only', () => {
+  const listeners = {};
+  const timers = [];
+  const microtasks = [];
+  const state = {
+    active: true,
+    _decks: [],
+    _nativePlaybackFallback: null,
+    _nativePlaybackGuardInstalled: false,
+    _nativeGuardButtonAction: false,
+  };
+  const document = {
+    addEventListener(type, handler, capture) { listeners[type] = { handler, capture }; },
+  };
+  const nativePlaybackFallbackActive = Function(
+    'state',
+    `return (${extractFunction('nativePlaybackFallbackActive')})`,
+  )(state);
+  let pauseSoundCloudCalls = 0;
+  const installNativePlaybackGuard = Function(
+    'state',
+    'document',
+    'isTrueShuffleAudio',
+    'nativePlaybackFallbackActive',
+    'pauseSoundCloud',
+    'queueMicrotask',
+    'setTimeout',
+    `return (${extractFunction('installNativePlaybackGuard')})`,
+  )(
+    state,
+    document,
+    audio => state._decks.includes(audio) || audio.dataset?.tssCrossfadeDeck !== undefined,
+    nativePlaybackFallbackActive,
+    () => { pauseSoundCloudCalls++; },
+    fn => microtasks.push(fn),
+    (fn, delay) => timers.push({ fn, delay }),
+  );
+
+  installNativePlaybackGuard();
+  assert.equal(listeners.click.capture, true);
+  assert.equal(listeners.play.capture, true);
+  assert.deepEqual(timers.map(timer => timer.delay), [0, 100, 500, 1500, 3000]);
+
+  state.active = false;
+  const inactiveClick = {
+    target: { closest: () => ({}) },
+    prevented: false,
+    preventDefault() { this.prevented = true; },
+    stopImmediatePropagation() {},
+  };
+  const inactiveAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  listeners.click.handler(inactiveClick);
+  listeners.play.handler({ target: inactiveAudio });
+  timers.forEach(timer => timer.fn());
+  assert.equal(inactiveClick.prevented, false);
+  assert.equal(inactiveAudio.pauseCalls, 0);
+  assert.equal(pauseSoundCloudCalls, 0);
+  state.active = true;
+
+  const transport = { closest: selector => selector === '.playControls__play' ? transport : null };
+  const manualClick = {
+    target: transport,
+    prevented: false,
+    stopped: false,
+    preventDefault() { this.prevented = true; },
+    stopImmediatePropagation() { this.stopped = true; },
+  };
+  listeners.click.handler(manualClick);
+  assert.equal(manualClick.prevented, true);
+  assert.equal(manualClick.stopped, true);
+  microtasks.shift()();
+  assert.equal(pauseSoundCloudCalls, 1);
+
+  const nativeAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  listeners.play.handler({ target: nativeAudio });
+  assert.equal(nativeAudio.pauseCalls, 1);
+
+  const ownDeck = { tagName: 'AUDIO', dataset: { tssCrossfadeDeck: '1' }, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  listeners.play.handler({ target: ownDeck });
+  assert.equal(ownDeck.pauseCalls, 0);
+
+  state._nativePlaybackFallback = { trackIndex: 7 };
+  const fallbackClick = {
+    target: transport,
+    prevented: false,
+    preventDefault() { this.prevented = true; },
+    stopImmediatePropagation() {},
+  };
+  listeners.click.handler(fallbackClick);
+  listeners.play.handler({ target: nativeAudio });
+  assert.equal(fallbackClick.prevented, false);
+  assert.equal(nativeAudio.pauseCalls, 1);
+
+  state._nativePlaybackFallback = null;
+  timers.forEach(timer => timer.fn());
+  assert.equal(pauseSoundCloudCalls, 6);
+
+  const guard = extractFunction('installNativePlaybackGuard');
+  assert.match(guard, /addEventListener\('click'/);
+  assert.match(guard, /addEventListener\('play'/);
+  assert.match(guard, /isTrueShuffleAudio\(audio\)/);
+  assert.match(guard, /\[0, 100, 500, 1500, 3000\]/);
+  assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
+});
+
+test('build copies the canonical userscript byte-for-byte without using legacy modules', () => {
+  const root = path.resolve(__dirname, '..');
+  const buildSource = fs.readFileSync(path.join(root, 'build.py'), 'utf8');
+  assert.doesNotMatch(buildSource, /src[/\\\\]|FILES\s*=|HEADER\s*=|FOOTER\s*=/);
+  assert.match(buildSource, /SOURCE\s*=\s*ROOT \/ "SC Trueshuffle\.js"/);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tss-build-'));
+  const output = path.join(tempDir, 'SC Trueshuffle.user.js');
+  try {
+    const result = childProcess.spawnSync(
+      process.env.PYTHON || 'python',
+      [path.join(root, 'build.py'), '--output', output],
+      { cwd: root, encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(fs.readFileSync(output), fs.readFileSync(scriptPath));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('playAt scopes native fallback permission and clears it on the next path or stop', () => {
+  const playAt = extractFunction('playAt');
+  const stop = extractFunction('stop');
+  assert.match(playAt, /if \(!state\.active\) return;\s*clearNativePlaybackFallback\(\);/);
+  assert.match(playAt, /beginNativePlaybackFallback\(idx\);\s*btn\.click\(\);/);
+  assert.match(playAt, /if \(!btn\) \{\s*clearNativePlaybackFallback\(\);/);
+  assert.match(stop, /clearNativePlaybackFallback\(\);/);
 });
 
 (async () => {

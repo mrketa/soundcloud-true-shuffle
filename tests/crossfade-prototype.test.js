@@ -4,8 +4,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const scriptPath = process.argv[2]
-  ? path.resolve(process.argv[2])
+const scriptPath = process.env.TSS_SCRIPT
+  ? path.resolve(process.env.TSS_SCRIPT)
+  : process.argv[2]
+    ? path.resolve(process.argv[2])
   : path.resolve(__dirname, '..', 'SC Trueshuffle.js');
 const source = fs.readFileSync(scriptPath, 'utf8');
 
@@ -26,14 +28,14 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 test('release metadata identifies the v6 stable userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.0\.1/);
+  assert.match(source, /@version\s+6\.0\.2/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {
   assert.match(source, /@grant\s+GM_getValue/);
   assert.match(source, /@grant\s+GM_setValue/);
   assert.match(source, /@grant\s+unsafeWindow/);
-  assert.match(source, /@sandbox\s+JavaScript/);
+  assert.match(source, /@sandbox\s+raw/);
   assert.match(source, /const pageWindow = typeof unsafeWindow !== 'undefined' \? unsafeWindow : window/);
   assert.doesNotMatch(source, /window\.webpackJsonp/);
   assert.match(source, /pageWindow\.webpackJsonp/);
@@ -215,7 +217,8 @@ test('playback always retains the normal SoundCloud fallback', () => {
   const playAt = extractFunction('playAt');
   assert.match(playAt, /if \(await playWithCrossfadeDeck\(idx, countPlay, requestedFade\)\) return/);
   assert.match(playAt, /setCrossfadeStatus\('fallback'\)/);
-  assert.match(playAt, /btn\.click\(\)/);
+  assert.match(playAt, /beginNativePlaybackFallback\(idx\);\s*btn\.click\(\)/);
+  assert.match(playAt, /clearNativePlaybackFallback\(\)/);
   assert.ok(playAt.indexOf('playWithCrossfadeDeck') < playAt.indexOf('btn.click()'));
 });
 
@@ -226,6 +229,163 @@ test('custom two-deck player is the default even without optional processing', (
   assert.doesNotMatch(player, /crossfadeSeconds <= 0/);
   assert.match(playAt, /playWithCrossfadeDeck\(idx, countPlay, requestedFade\)/);
   assert.match(prefetch, /if \(!state\.active \|\| state\._crossfading\) return/);
+});
+
+test('delayed deck preparation cannot overwrite a newer request for the same deck', async () => {
+  const standby = {
+    src: '', currentSrc: '', readyState: 0, volume: 0,
+    pauseCalls: 0, loadCalls: 0,
+    pause() { this.pauseCalls++; },
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.currentSrc = ''; } },
+    load() { this.loadCalls++; this.currentSrc = this.src; this.readyState = 1; },
+  };
+  const state = {
+    autoLevel: false,
+    eqEnabled: false,
+    crossfadeSeconds: 6,
+    meta: [{ id: 'old' }, { id: 'new' }],
+    _decks: [{}, standby],
+    _deckTracks: [null, null],
+    _deckPrepareTokens: [0, 0],
+    _deckGains: [0, 0],
+    _deckAudioGraphs: [null, null],
+  };
+  const deferred = new Map();
+  const prepareCrossfadeDeck = Function(
+    'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
+    'resolveCrossfadeStream', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
+    `return (${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')})`,
+  )(
+    state,
+    () => state._decks,
+    () => {},
+    meta => new Promise(resolve => deferred.set(meta.id, resolve)),
+    (audio, index) => {
+      audio.pause();
+      audio.removeAttribute('src');
+      state._deckTracks[index] = null;
+      state._deckGains[index] = 0;
+    },
+    () => {},
+    () => {},
+  );
+
+  const oldRequest = prepareCrossfadeDeck(1, 0);
+  const newRequest = prepareCrossfadeDeck(1, 1);
+  deferred.get('new')('stream-new');
+  assert.equal(await newRequest, standby);
+  assert.equal(state._deckTracks[1], 1);
+  assert.equal(standby.src, 'stream-new');
+  assert.equal(standby.pauseCalls, 1);
+  assert.equal(standby.loadCalls, 1);
+
+  deferred.get('old')('stream-old');
+  assert.equal(await oldRequest, null);
+  assert.equal(state._deckTracks[1], 1);
+  assert.equal(standby.src, 'stream-new');
+  assert.equal(standby.pauseCalls, 1);
+  assert.equal(standby.loadCalls, 1);
+});
+
+test('play-next and reorder invalidation prepare the authoritative standby track', async () => {
+  const makeAudio = src => ({
+    src, currentSrc: src, readyState: 2, volume: 0,
+    pauseCalls: 0, loadCalls: 0,
+    pause() { this.pauseCalls++; },
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.currentSrc = ''; } },
+    load() { this.loadCalls++; this.currentSrc = this.src; this.readyState = 2; },
+  });
+  const active = makeAudio('stream-0');
+  const standby = makeAudio('stream-1');
+  const state = {
+    active: true,
+    autoLevel: false,
+    eqEnabled: false,
+    crossfadeSeconds: 6,
+    _crossfading: false,
+    _deckIndex: 0,
+    _decks: [active, standby],
+    _deckTracks: [0, 1],
+    _deckPrepareTokens: [0, 0],
+    _crossfadePrefetchToken: 0,
+    _deckGains: [1, 0],
+    _deckAudioGraphs: [null, null],
+    queue: [0, 1, 2],
+    playNext: [],
+    pos: 0,
+    meta: [{ id: 0 }, { id: 1 }, { id: 2 }],
+  };
+  const resolved = [];
+  const resetDeck = (audio, index) => {
+    audio.pause();
+    audio.removeAttribute('src');
+    state._deckTracks[index] = null;
+    state._deckGains[index] = 0;
+  };
+  const functions = Function(
+    'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
+    'resolveCrossfadeStream', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
+    'currentDeckAudio', 'setCrossfadeStatus',
+    `${extractFunction('upcomingTrackIndex')};
+     ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
+     ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
+     ${extractFunction('refreshUpcomingCrossfadePreparation')};
+     return { upcomingTrackIndex, refreshUpcomingCrossfadePreparation };`,
+  )(
+    state,
+    () => state._decks,
+    () => {},
+    async meta => { resolved.push(meta.id); return `stream-${meta.id}`; },
+    resetDeck,
+    () => {},
+    () => {},
+    () => active,
+    () => {},
+  );
+  const settlePrefetch = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  state.playNext.push(2);
+  assert.equal(functions.upcomingTrackIndex(), 2);
+  functions.refreshUpcomingCrossfadePreparation();
+  await settlePrefetch();
+  assert.equal(state._deckTracks[1], 2);
+  assert.equal(standby.src, 'stream-2');
+
+  state.playNext.length = 0;
+  state.queue = [0, 1, 2];
+  assert.equal(functions.upcomingTrackIndex(), 1);
+  functions.refreshUpcomingCrossfadePreparation();
+  await settlePrefetch();
+  assert.equal(state._deckTracks[1], 1);
+  assert.equal(standby.src, 'stream-1');
+  assert.deepEqual(resolved, [2, 1]);
+
+  state._crossfading = true;
+  state.playNext.push(2);
+  const pausesBeforeMixInvalidation = standby.pauseCalls;
+  functions.refreshUpcomingCrossfadePreparation();
+  await settlePrefetch();
+  assert.equal(state._deckTracks[1], 1);
+  assert.equal(standby.pauseCalls, pausesBeforeMixInvalidation);
+  assert.deepEqual(resolved, [2, 1]);
+});
+
+test('all upcoming-order mutation paths invalidate standby preparation', () => {
+  assert.match(extractFunction('queueNext'), /refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('removeFromQueue'), /refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('moveSelectedTrackToCurrent'), /refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('mergeCurrentPage'), /refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('reshuffleCurrentPage'), /refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('renderList'), /state\.playNext\.splice[\s\S]*?refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('renderList'), /row\.ondrop[\s\S]*?refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('showCtxMenu'), /move up[\s\S]*?refreshUpcomingCrossfadePreparation\(\)/);
+  assert.match(extractFunction('showOwnPipTrackMenu'), /queueNext\(ti\)/);
+  assert.match(extractFunction('showOwnPipTrackMenu'), /removeTrackFromUpcoming\(ti\)/);
+  assert.match(extractFunction('showOwnPipTrackMenu'), /jumpTo\(state\.queue\.indexOf\(ti\), ti\)/);
+  assert.match(extractFunction('removePlayNextOccurrences'), /refreshUpcomingCrossfadePreparation\(\)/);
 });
 
 test('five-band equalizer is persistent and inserted before loudness analysis', () => {
@@ -518,12 +678,19 @@ test('stopping shuffle always tears down both experimental decks', () => {
   const teardown = extractFunction('stopCrossfadeDecks');
   assert.match(stop, /stopCrossfadeDecks\(\)/);
   assert.match(teardown, /state\._crossfadeToken\+\+/);
+  assert.match(teardown, /state\._crossfadePrefetchToken\+\+/);
+  assert.match(teardown, /state\._deckPrepareTokens = state\._deckPrepareTokens\.map/);
   assert.match(teardown, /state\._decks\.forEach/);
   assert.match(teardown, /state\._deckIndex = -1/);
 });
 
-for (const { name, fn } of tests) {
-  fn();
-  console.log(`ok - ${name}`);
-}
-console.log('\nAll crossfade prototype tests passed.');
+(async () => {
+  for (const { name, fn } of tests) {
+    await fn();
+    console.log(`ok - ${name}`);
+  }
+  console.log('\nAll crossfade prototype tests passed.');
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
