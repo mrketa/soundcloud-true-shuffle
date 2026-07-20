@@ -613,11 +613,21 @@ test('queue search refresh keeps the current query when no filter is passed', ()
   assert.match(renderList, /getElementById\('tss-search'\)\?\.value/);
 });
 
+test('playlist row additions and removals trigger a fast live sync', () => {
+  const mutation = extractFunction('mutationChangesPlaylistTracks');
+  const schedule = extractFunction('scheduleLiveQueueSync');
+  assert.match(mutation, /record\.addedNodes, \.\.\.record\.removedNodes/);
+  assert.match(schedule, /delay = 250/);
+  assert.match(schedule, /state\.loading \|\| state\.busy \|\| state\._liveSyncInFlight/);
+  assert.match(schedule, /scheduleLiveQueueSync\(300\)/);
+});
+
 test('re-shuffle replaces a new playlist and resets hidden weighting', () => {
   const reshuffle = extractFunction('reshuffleCurrentPage');
   const hub = extractFunction('mkHub');
-  assert.match(reshuffle, /const newEls = await loadTracks\(\)/);
-  assert.match(reshuffle, /state\.els = newEls/);
+  assert.match(reshuffle, /completePlaylistCollection\(pageUrl, pageEls, snapshotPromise\)/);
+  assert.match(reshuffle, /state\.els = collection\.els/);
+  assert.match(reshuffle, /state\.meta = collection\.meta/);
   assert.match(reshuffle, /state\.queue = newQueue/);
   assert.match(reshuffle, /state\.priority = \{\}/);
   assert.match(reshuffle, /state\.skipCounts = \{\}/);
@@ -1103,7 +1113,6 @@ test('PiP track menu routes play-now and removal through play-next-aware mutatio
 
 test('native True Shuffle PiP is progressive enhancement with complete controls', () => {
   const apiResolverSource = extractFunction('documentPipApi');
-  const support = extractFunction('ownPipSupported');
   const open = extractFunction('openOwnPip');
   const mount = extractFunction('mountOwnPipWindow');
   const stop = extractFunction('stop');
@@ -1115,13 +1124,10 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   const wrappedResolver = Function('pageWindow', `return (${apiResolverSource})`)({
     wrappedJSObject: { documentPictureInPicture: { requestWindow() {} } },
   });
-  const unsupported = Function('documentPipApi', `return (${support})`)(unsupportedResolver);
-  const supported = Function('documentPipApi', `return (${support})`)(supportedResolver);
-  assert.equal(unsupported(), false);
-  assert.equal(supported(), true);
+  assert.equal(Boolean(unsupportedResolver()), false);
+  assert.equal(Boolean(supportedResolver()), true);
   assert.equal(wrappedResolver()?.requestWindow instanceof Function, true);
   assert.match(apiResolverSource, /wrappedJSObject/);
-  assert.match(support, /documentPipApi/);
   assert.match(open, /requestWindow\(\{ width: 390, height: 330 \}\)/);
   assert.match(open, /openVideoPipFallback/);
   assert.match(open, /openInPagePipFallback/);
@@ -1360,6 +1366,291 @@ test('playAt scopes native fallback permission and clears it on the next path or
   assert.match(playAt, /beginNativePlaybackFallback\(idx\);\s*btn\.click\(\);/);
   assert.match(playAt, /if \(!btn\) \{\s*clearNativePlaybackFallback\(\);/);
   assert.match(stop, /clearNativePlaybackFallback\(\);/);
+});
+
+test('playlist hydration parser exposes the complete stable track id list', () => {
+  const playlistSnapshotFromHtml = Function(`return (${extractFunction('playlistSnapshotFromHtml')})`)();
+  const payload = [
+    { hydratable: 'user', data: { id: 9 } },
+    { hydratable: 'playlist', data: {
+      id: 44, kind: 'playlist', track_count: 3,
+      tracks: [
+        { id: 10, title: 'A', permalink_url: 'https://soundcloud.com/a/a' },
+        { id: 11, kind: 'track' },
+        { id: 12, kind: 'track' },
+      ],
+    } },
+  ];
+  const snapshot = playlistSnapshotFromHtml(`<script>window.__sc_hydration = ${JSON.stringify(payload)};</script>`);
+  assert.equal(snapshot.id, 44);
+  assert.equal(snapshot.trackCount, 3);
+  assert.equal(snapshot.complete, true);
+  assert.deepEqual(snapshot.tracks.map(track => track.id), [10, 11, 12]);
+  assert.equal(playlistSnapshotFromHtml('<html></html>'), null);
+});
+
+test('live tracks are inserted only into the unplayed part of the round', () => {
+  const insertTracksRandomlyAfterCurrent = Function(
+    `return (${extractFunction('insertTracksRandomlyAfterCurrent')})`,
+  )();
+  const queue = [0, 1, 2, 3];
+  const values = [0, 0.999999];
+  insertTracksRandomlyAfterCurrent(queue, 1, [4, 5], () => values.shift());
+  assert.deepEqual(queue.slice(0, 2), [0, 1]);
+  assert.equal(new Set(queue).size, 6);
+  assert.deepEqual([...queue].sort((a, b) => a - b), [0, 1, 2, 3, 4, 5]);
+  assert.ok(queue.indexOf(4) > 1);
+  assert.ok(queue.indexOf(5) > 1);
+});
+
+test('complete playlist collection fills tracks SoundCloud did not render in the DOM', async () => {
+  const pageUrl = 'https://soundcloud.com/user/sets/list';
+  const firstEl = { id: 'first' };
+  const getMeta = el => ({ title: 'First', artist: 'A', link: `https://soundcloud.com/a/${el.id}`, sourcePage: pageUrl });
+  const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const completePlaylistCollection = Function(
+    'getMeta', 'fetchLivePlaylistSnapshot', 'resolvePlaylistSnapshotMetas', 'trackId',
+    `return (${extractFunction('completePlaylistCollection').replace(/^function /, 'async function ')})`,
+  )(
+    getMeta, async () => null,
+    async () => [
+      getMeta(firstEl),
+      { title: 'Second', artist: 'B', link: 'https://soundcloud.com/b/second', sourcePage: pageUrl },
+      { title: 'Third', artist: 'C', link: 'https://soundcloud.com/c/third', sourcePage: pageUrl },
+    ],
+    trackId,
+  );
+  const snapshot = { complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] };
+  const result = await completePlaylistCollection(pageUrl, [firstEl], Promise.resolve(snapshot));
+  assert.equal(result.meta.length, 3);
+  assert.equal(result.els.length, 3);
+  assert.equal(result.els[0], firstEl);
+  assert.equal(result.els[1], null);
+  assert.equal(result.complete, true);
+});
+
+test('playlist metadata is batch-resolved in bounded requests and keeps playlist order', async () => {
+  const requests = [];
+  const snapshot = { tracks: [...Array(117)].map((_, index) => ({ id: index + 1 })) };
+  const resolvePlaylistSnapshotMetas = Function(
+    'metaFromSoundCloudTrack', 'discoverSoundCloudClientIdFromBundle', 'fetch', 'URL',
+    `return (${extractFunction('resolvePlaylistSnapshotMetas').replace(/^function /, 'async function ')})`,
+  )(
+    (track, sourcePage, playlistPosition) => track.title
+      ? { soundcloudId: track.id, title: track.title, link: `https://soundcloud.com/a/${track.id}`, sourcePage, playlistPosition }
+      : null,
+    async () => 'client-id',
+    async endpoint => {
+      const ids = endpoint.searchParams.get('ids').split(',').map(Number);
+      requests.push(ids);
+      return { ok: true, json: async () => ids.map(id => ({ id, title: `Track ${id}` })) };
+    },
+    URL,
+  );
+  const metas = await resolvePlaylistSnapshotMetas(snapshot, 'https://soundcloud.com/user/sets/list');
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests.map(batch => batch.length), [50, 50, 17]);
+  assert.equal(metas.length, 117);
+  assert.equal(metas[0].soundcloudId, 1);
+  assert.equal(metas[116].soundcloudId, 117);
+  assert.equal(metas[116].playlistPosition, 117);
+});
+
+test('metadata-only playlist tracks try the custom player before DOM fallback', () => {
+  const playAt = extractFunction('playAt');
+  const customAttempt = playAt.indexOf('playWithCrossfadeDeck(idx, countPlay, requestedFade)');
+  const reconnectAttempt = playAt.indexOf('reconnectTrackElement(idx)');
+  assert.ok(customAttempt >= 0);
+  assert.ok(reconnectAttempt > customAttempt);
+});
+
+test('live queue application preserves current playback and updates the round once', () => {
+  const state = {
+    active: true, suspended: false, pos: 0,
+    queue: [0, 1], roundTotal: 2,
+    meta: [
+      { title: 'Current', artist: 'A', link: 'https://soundcloud.com/a/current' },
+      { title: 'Later', artist: 'B', link: 'https://soundcloud.com/b/later' },
+    ],
+    els: [{}, {}],
+  };
+  const calls = [];
+  const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const applyLiveQueueTracks = Function(
+    'state', 'trackId', 'getMeta', 'insertTracksRandomlyAfterCurrent', 'fisherYates',
+    'refreshUpcomingCrossfadePreparation', 'badges', 'renderList', 'updateHub', 'showMergeToast',
+    `return (${extractFunction('applyLiveQueueTracks')})`,
+  )(
+    state, trackId, () => ({}),
+    (queue, pos, indices) => queue.splice(pos + 1, 0, ...indices),
+    items => items.slice(),
+    () => calls.push('prefetch'), () => calls.push('badges'),
+    () => calls.push('list'), () => calls.push('hub'), message => calls.push(message),
+  );
+  const added = applyLiveQueueTracks([
+    { soundcloudId: 20, title: 'New A', artist: 'C', link: 'https://soundcloud.com/c/new-a', sourcePage: 'playlist' },
+    { soundcloudId: 21, title: 'New B', artist: 'D', link: 'https://soundcloud.com/d/new-b', sourcePage: 'playlist' },
+    { soundcloudId: 20, title: 'Duplicate', artist: 'C', link: 'https://soundcloud.com/c/new-a', sourcePage: 'playlist' },
+  ]);
+  assert.equal(added, 2);
+  assert.equal(state.queue[0], 0);
+  assert.equal(state.roundTotal, 4);
+  assert.equal(state.meta.length, 4);
+  assert.equal(new Set(state.queue).size, 4);
+  assert.deepEqual(calls.slice(0, 4), ['prefetch', 'badges', 'list', 'hub']);
+  assert.equal(calls[4], '2 new tracks added to this round');
+});
+
+test('live sync baselines existing ids then resolves only newly added tracks', async () => {
+  const state = {
+    active: true, loading: false, busy: false, suspended: false,
+    playlistUrl: 'https://soundcloud.com/user/sets/list',
+    _liveSyncKnownIds: new Set(), _liveSyncInFlight: false,
+    _liveSyncLastCheck: 0, _liveSyncSource: '', meta: [{}, {}],
+  };
+  const snapshots = [
+    { tracks: [{ id: 1 }, { id: 2 }] },
+    { tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] },
+  ];
+  const resolved = [];
+  const applied = [];
+  const syncLiveQueue = Function(
+    'state', 'LIVE_SYNC_INTERVAL_MS', 'fetchLivePlaylistSnapshot', 'resolveLiveTrackMeta',
+    'playlistBase', 'location', 'document', 'applyLiveQueueTracks', 'reconcileLivePlaylistSnapshot',
+    'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
+    `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
+  )(
+    state, 30_000, async () => snapshots.shift(),
+    async track => { resolved.push(track.id); return { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track' }; },
+    value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
+    metas => { applied.push(...metas); return metas.length; },
+    () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
+  );
+  assert.equal(await syncLiveQueue({ force: true }), 0);
+  assert.deepEqual([...state._liveSyncKnownIds], [1, 2]);
+  assert.equal(await syncLiveQueue({ force: true }), 1);
+  assert.deepEqual(resolved, [3]);
+  assert.equal(applied.length, 1);
+  assert.ok(state._liveSyncKnownIds.has(3));
+  assert.equal(state._liveSyncInFlight, false);
+});
+
+test('live sync retries newly added tracks that could not be resolved yet', async () => {
+  const state = {
+    active: true, loading: false, busy: false, suspended: false,
+    playlistUrl: 'https://soundcloud.com/user/sets/list',
+    _liveSyncKnownIds: new Set([1, 2]), _liveSyncInFlight: false,
+    _liveSyncLastCheck: 0, _liveSyncSource: 'https://soundcloud.com/user/sets/list', meta: [{}, {}],
+  };
+  let resolveAttempts = 0;
+  const applied = [];
+  const syncLiveQueue = Function(
+    'state', 'LIVE_SYNC_INTERVAL_MS', 'fetchLivePlaylistSnapshot', 'resolveLiveTrackMeta',
+    'playlistBase', 'location', 'document', 'applyLiveQueueTracks', 'reconcileLivePlaylistSnapshot',
+    'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
+    `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
+  )(
+    state, 30_000, async () => ({ tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
+    async track => {
+      resolveAttempts++;
+      return resolveAttempts === 1
+        ? null
+        : { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track' };
+    },
+    value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
+    metas => { applied.push(...metas); return metas.length; },
+    () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
+  );
+
+  assert.equal(await syncLiveQueue({ force: true }), 0);
+  assert.equal(state._liveSyncKnownIds.has(3), false);
+  assert.equal(await syncLiveQueue({ force: true }), 1);
+  assert.equal(resolveAttempts, 2);
+  assert.equal(applied.length, 1);
+  assert.equal(state._liveSyncKnownIds.has(3), true);
+});
+
+test('live snapshot removes missing tracks only from the upcoming queue', () => {
+  const sourcePage = 'https://soundcloud.com/user/sets/list';
+  const state = {
+    queue: [0, 1, 2, 3], pos: 1, playNext: [2, 3], history: [0],
+    roundPlayed: 1, roundTotal: 4, _deckTrack: 1,
+    _liveSyncKnownIds: new Set([10, 11, 12, 13]),
+    meta: [
+      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
+      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
+      { soundcloudId: 12, link: 'https://soundcloud.com/a/three', sourcePage },
+      { soundcloudId: 13, link: 'https://soundcloud.com/a/four', sourcePage },
+    ],
+    els: [{}, {}, {}, {}],
+  };
+  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const reconcile = Function(
+    'state', 'playlistBase', 'trackId', 'getMeta',
+    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
+  )(state, playlistBase, trackId, () => ({}));
+
+  const removed = reconcile({ tracks: [{ id: 10 }, { id: 11 }, { id: 13 }] }, sourcePage, []);
+  assert.equal(removed, 1);
+  assert.deepEqual(state.queue, [0, 1, 3]);
+  assert.deepEqual(state.playNext, [3]);
+  assert.equal(state.roundTotal, 3);
+  assert.equal(state.meta[2].unavailable, true);
+  assert.equal(state._liveSyncKnownIds.has(12), false);
+  assert.equal(state.queue[state.pos], 1);
+});
+
+test('live snapshot keeps a removed current track playing until it finishes', () => {
+  const sourcePage = 'https://soundcloud.com/user/sets/list';
+  const state = {
+    queue: [0, 1, 2], pos: 1, playNext: [], history: [0],
+    roundPlayed: 1, roundTotal: 3, _deckTrack: 1,
+    _liveSyncKnownIds: new Set([10, 11, 12]),
+    meta: [
+      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
+      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
+      { soundcloudId: 12, link: 'https://soundcloud.com/a/three', sourcePage },
+    ],
+    els: [{}, {}, {}],
+  };
+  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const reconcile = Function(
+    'state', 'playlistBase', 'trackId', 'getMeta',
+    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
+  )(state, playlistBase, trackId, () => ({}));
+
+  assert.equal(reconcile({ tracks: [{ id: 10 }, { id: 12 }] }, sourcePage, []), 1);
+  assert.equal(state.queue[state.pos], 1);
+  assert.equal(state.meta[1].removedFromPlaylist, true);
+  assert.equal(state.meta[1].unavailable, undefined);
+  assert.equal(state.roundTotal, 3);
+});
+
+test('partial live snapshots never remove unseen playlist tracks', () => {
+  const sourcePage = 'https://soundcloud.com/user/sets/list';
+  const state = {
+    queue: [0, 1], pos: 0, playNext: [], history: [],
+    roundPlayed: 0, roundTotal: 2, _deckTrack: 0,
+    _liveSyncKnownIds: new Set([10, 11]),
+    meta: [
+      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
+      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
+    ],
+    els: [{}, {}],
+  };
+  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const reconcile = Function(
+    'state', 'playlistBase', 'trackId', 'getMeta',
+    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
+  )(state, playlistBase, trackId, () => ({}));
+
+  assert.equal(reconcile({ complete: false, tracks: [{ id: 10 }] }, sourcePage, []), 0);
+  assert.deepEqual(state.queue, [0, 1]);
+  assert.equal(state._liveSyncKnownIds.has(11), true);
+  assert.equal(state.meta[1].unavailable, undefined);
 });
 
 (async () => {

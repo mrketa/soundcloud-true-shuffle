@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.0.2
+// @version      6.1.0
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -135,7 +135,6 @@ const state = {
   _deckGains: [0, 0],
   _audioContext: null,
   _audioMaster: null,
-  _audioLimiter: null,
   _deckAudioGraphs: [null, null],
   _autoLevelLastTick: 0,
   _autoLevelCache: (() => {
@@ -160,6 +159,11 @@ const state = {
   _playTimeLastAt: null,
   _playTimeWasAudible: false,
   _playTimeRemainderMs: 0,
+  _liveSyncKnownIds: new Set(),
+  _liveSyncInFlight: false,
+  _liveSyncLastCheck: 0,
+  _liveSyncSource: '',
+  _liveSyncTimer: null,
   stats: {
     played:     0,
     playCounts: {},
@@ -495,6 +499,54 @@ function getMeta(el) {
     waveform: waveformUrl(el),
     sourcePage: location.href.split(/[?#]/)[0].replace(/\/+$/, ''),
   };
+}
+
+const LIVE_SYNC_INTERVAL_MS = 30_000;
+
+function playlistSnapshotFromHtml(html) {
+  const match = String(html || '').match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\]);<\/script>/);
+  if (!match) return null;
+  try {
+    const hydration = JSON.parse(match[1]);
+    const entry = hydration.find(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
+    const tracks = Array.isArray(entry?.data?.tracks) ? entry.data.tracks : [];
+    if (!tracks.length) return null;
+    const trackCount = Number(entry.data.track_count) || tracks.length;
+    return {
+      id: entry.data.id || null,
+      trackCount,
+      complete: tracks.length >= trackCount,
+      tracks: tracks.filter(track => Number.isFinite(Number(track?.id))),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
+  if (!track?.permalink_url || !track?.title) return null;
+  const artworkUrl = track.artwork_url || track.user?.avatar_url || null;
+  return {
+    soundcloudId: Number(track.id) || null,
+    title: track.title || '—',
+    artist: track.user?.username || track.publisher_metadata?.artist || '—',
+    artwork: artworkUrl ? artworkUrl.replace(/-([a-z]+|t\d+x\d+)\.(jpg|png)$/i, '-t200x200.$2') : null,
+    link: track.permalink_url,
+    artistLink: track.user?.permalink_url || null,
+    waveform: track.waveform_url || null,
+    sourcePage,
+    playlistPosition: Number.isFinite(Number(playlistPosition)) ? Number(playlistPosition) : null,
+  };
+}
+
+function insertTracksRandomlyAfterCurrent(queue, pos, trackIndices, random = Math.random) {
+  const start = Math.max(0, Math.min(queue.length, Number(pos) + 1));
+  for (const ti of trackIndices) {
+    const availableSlots = queue.length - start + 1;
+    const offset = Math.floor(Math.max(0, Math.min(0.999999999, Number(random()) || 0)) * availableSlots);
+    queue.splice(start + offset, 0, ti);
+  }
+  return queue;
 }
 
 function esc(str) {
@@ -952,10 +1004,6 @@ function documentPipApi() {
     if (api && typeof api.requestWindow === 'function') return api;
   } catch (_) {}
   return null;
-}
-
-function ownPipSupported() {
-  return Boolean(documentPipApi());
 }
 
 function standardVideoPipSupported() {
@@ -2131,7 +2179,6 @@ function ensureAutoLevelAudioGraph() {
       limiter.connect(context.destination);
       state._audioContext = context;
       state._audioMaster = master;
-      state._audioLimiter = limiter;
     }
 
     decks.forEach((audio, index) => {
@@ -2930,6 +2977,9 @@ function consumeCurrentQueueTrack() {
   // whole round is exhausted do we reshuffle everything for a new round.
   state.queue.splice(state.pos, 1);
   state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
+  if (state.meta[justPlayed]?.removedFromPlaylist) {
+    state.meta[justPlayed].unavailable = true;
+  }
 
   const remaining = state.queue.length - state.pos;
   if (!state.stopAfterRound && remaining <= 0) {
@@ -3045,6 +3095,14 @@ async function playAt(idx, countPlay = true) {
   clearNativePlaybackFallback();
 
   let el = state.els[idx];
+  if ((!el || !document.body.contains(el)) && state.meta[idx]?.link) {
+    const requestedFade = currentDeckAudio()
+      ? (state._crossfadePending
+        ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
+        : (state.crossfadeManual ? Math.min(1.25, state.crossfadeSeconds) : 0))
+      : 0;
+    if (await playWithCrossfadeDeck(idx, countPlay, requestedFade)) return;
+  }
   if (!el || !document.body.contains(el)) {
     el = reconnectTrackElement(idx);
     if (!el && await loadTrackSourcePage(idx)) el = state.els[idx];
@@ -3305,18 +3363,311 @@ function removeFromQueue(qi) {
   renderList();
 }
 
+async function fetchLivePlaylistSnapshot(sourcePage) {
+  if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) return null;
+  try {
+    const requestUrl = new URL(sourcePage);
+    requestUrl.searchParams.set('_tss_live_sync', String(Date.now()));
+    const response = await fetch(requestUrl, {
+      cache: 'no-store',
+      credentials: 'include',
+      headers: { Accept: 'text/html' },
+    });
+    if (!response.ok) return null;
+    return playlistSnapshotFromHtml(await response.text());
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolveLiveTrackMeta(track, sourcePage, playlistPosition = null) {
+  const hydrated = metaFromSoundCloudTrack(track, sourcePage, playlistPosition);
+  if (hydrated) return hydrated;
+
+  const id = Number(track?.id);
+  if (!Number.isFinite(id)) return null;
+  const clientId = await discoverSoundCloudClientIdFromBundle();
+  if (!clientId) return null;
+  try {
+    const response = await fetch(`https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`);
+    if (!response.ok) return null;
+    return metaFromSoundCloudTrack(await response.json(), sourcePage, playlistPosition);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolvePlaylistSnapshotMetas(snapshot, sourcePage) {
+  if (!snapshot?.tracks?.length) return [];
+  const resolvedById = new Map();
+  const unresolvedIds = [];
+
+  snapshot.tracks.forEach((track, index) => {
+    const meta = metaFromSoundCloudTrack(track, sourcePage, index + 1);
+    if (meta) resolvedById.set(Number(track.id), meta);
+    else unresolvedIds.push(Number(track.id));
+  });
+
+  if (unresolvedIds.length) {
+    const clientId = await discoverSoundCloudClientIdFromBundle();
+    if (clientId) {
+      for (let start = 0; start < unresolvedIds.length; start += 50) {
+        const ids = unresolvedIds.slice(start, start + 50);
+        try {
+          const endpoint = new URL('https://api-v2.soundcloud.com/tracks');
+          endpoint.searchParams.set('ids', ids.join(','));
+          endpoint.searchParams.set('client_id', clientId);
+          const response = await fetch(endpoint);
+          if (!response.ok) continue;
+          const tracks = await response.json();
+          if (!Array.isArray(tracks)) continue;
+          tracks.forEach(track => {
+            const position = snapshot.tracks.findIndex(item => Number(item.id) === Number(track?.id)) + 1;
+            const meta = metaFromSoundCloudTrack(track, sourcePage, position);
+            if (meta) resolvedById.set(Number(track.id), meta);
+          });
+        } catch (_) {}
+      }
+    }
+  }
+
+  return snapshot.tracks
+    .map(track => resolvedById.get(Number(track.id)) || null)
+    .filter(Boolean);
+}
+
+async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise = null) {
+  const domMeta = pageEls.map(getMeta);
+  if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) {
+    return { els: pageEls, meta: domMeta, complete: true };
+  }
+
+  const snapshot = await (snapshotPromise || fetchLivePlaylistSnapshot(sourcePage));
+  if (!snapshot?.complete || snapshot.tracks.length <= domMeta.length) {
+    return { els: pageEls, meta: domMeta, complete: Boolean(snapshot?.complete) };
+  }
+
+  const snapshotMeta = await resolvePlaylistSnapshotMetas(snapshot, sourcePage);
+  if (snapshotMeta.length !== snapshot.tracks.length) {
+    return { els: pageEls, meta: domMeta, complete: false };
+  }
+
+  const elementsByLink = new Map();
+  pageEls.forEach(el => {
+    const id = trackId(getMeta(el));
+    if (id && !elementsByLink.has(id)) elementsByLink.set(id, el);
+  });
+  return {
+    els: snapshotMeta.map(meta => elementsByLink.get(trackId(meta)) || null),
+    meta: snapshotMeta,
+    complete: true,
+  };
+}
+
+function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
+  if (!state.active || state.suspended || !Array.isArray(metas) || !metas.length) return 0;
+
+  const existingById = new Map();
+  state.meta.forEach((meta, ti) => {
+    const id = trackId(meta);
+    if (id) existingById.set(id, ti);
+  });
+  const elementsById = new Map();
+  pageEls.forEach(el => {
+    const id = trackId(getMeta(el));
+    if (id && !elementsById.has(id)) elementsById.set(id, el);
+  });
+
+  const added = [];
+  for (const meta of metas) {
+    const id = trackId(meta);
+    if (!id || existingById.has(id)) continue;
+    const ti = state.meta.length;
+    state.meta.push(meta);
+    state.els.push(elementsById.get(id) || null);
+    existingById.set(id, ti);
+    added.push(ti);
+  }
+  if (!added.length) return 0;
+
+  insertTracksRandomlyAfterCurrent(state.queue, state.pos, fisherYates(added));
+  state.roundTotal += added.length;
+  refreshUpcomingCrossfadePreparation();
+  badges();
+  renderList();
+  updateHub();
+  if (notify) showMergeToast(`${added.length} new track${added.length === 1 ? '' : 's'} added to this round`);
+  return added.length;
+}
+
+function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
+  const snapshotIds = new Set(snapshot.tracks.map(track => Number(track.id)));
+  const positions = new Map(snapshot.tracks.map((track, index) => [Number(track.id), index + 1]));
+  const elementsByLink = new Map();
+  pageEls.forEach(el => {
+    const id = trackId(getMeta(el));
+    if (id && !elementsByLink.has(id)) elementsByLink.set(id, el);
+  });
+
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  let removed = 0;
+  let removedFromRound = 0;
+
+  for (const knownId of snapshot.complete === false ? [] : [...state._liveSyncKnownIds]) {
+    if (snapshotIds.has(knownId)) continue;
+    state._liveSyncKnownIds.delete(knownId);
+    const ti = state.meta.findIndex(meta => Number(meta?.soundcloudId) === knownId
+      && playlistBase(meta?.sourcePage || '') === playlistBase(sourcePage));
+    if (ti === -1) continue;
+
+    const meta = state.meta[ti];
+    meta.removedFromPlaylist = true;
+    if (ti !== currentTi) meta.unavailable = true;
+    state.els[ti] = null;
+
+    let removedQueued = 0;
+    for (let qi = state.queue.length - 1; qi >= 0; qi--) {
+      if (state.queue[qi] !== ti || qi === state.pos) continue;
+      if (qi >= state.pos) removedQueued++;
+      state.queue.splice(qi, 1);
+      if (qi < state.pos) state.pos = Math.max(0, state.pos - 1);
+    }
+    const hadPlayNext = state.playNext.includes(ti);
+    state.playNext = state.playNext.filter(pendingTi => pendingTi !== ti);
+    removedFromRound += removedQueued;
+    if (!removedQueued && hadPlayNext && state.history.includes(ti)) removedFromRound++;
+    removed++;
+  }
+
+  state.meta.forEach((meta, ti) => {
+    const id = Number(meta?.soundcloudId);
+    if (!snapshotIds.has(id)) return;
+    meta.playlistPosition = positions.get(id);
+    if (playlistBase(meta.sourcePage || '') !== playlistBase(sourcePage)) return;
+    delete meta.removedFromPlaylist;
+    delete meta.unavailable;
+    const el = elementsByLink.get(trackId(meta));
+    if (el) state.els[ti] = el;
+  });
+
+  if (removedFromRound) {
+    const minimum = state.roundPlayed + (state.queue[state.pos] === undefined ? 0 : 1);
+    state.roundTotal = Math.max(minimum, state.roundTotal - removedFromRound);
+  }
+  return removed;
+}
+
+function showLiveSyncResult(added, removed) {
+  const parts = [];
+  if (added) parts.push(`${added} new track${added === 1 ? '' : 's'} added`);
+  if (removed) parts.push(`${removed} track${removed === 1 ? '' : 's'} removed`);
+  if (parts.length) showMergeToast(`${parts.join(', ')} in this round`);
+}
+
+async function syncLiveQueue(options) {
+  options = options || {};
+  const sourcePage = String(state.playlistUrl || '').split(/[?#]/)[0].replace(/\/+$/, '');
+  if (!state.active || state.loading || state.busy || state.suspended
+      || !/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage)) return 0;
+  if (state._liveSyncInFlight) return 0;
+
+  const now = Date.now();
+  if (!options.force && now - state._liveSyncLastCheck < LIVE_SYNC_INTERVAL_MS) return 0;
+  state._liveSyncInFlight = true;
+  state._liveSyncLastCheck = now;
+  try {
+    const snapshot = await fetchLivePlaylistSnapshot(sourcePage);
+    if (!snapshot?.tracks?.length || !state.active || state.playlistUrl.split(/[?#]/)[0].replace(/\/+$/, '') !== sourcePage) return 0;
+
+    const pageEls = playlistBase(location.href) === playlistBase(sourcePage)
+      ? [...document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item')]
+      : [];
+    const sourceChanged = state._liveSyncSource !== sourcePage;
+    if (sourceChanged || !state._liveSyncKnownIds.size) {
+      state._liveSyncSource = sourcePage;
+      state._liveSyncKnownIds = new Set(snapshot.tracks.map(track => Number(track.id)));
+      const sourceIndices = state.meta
+        .map((meta, ti) => ({ meta, ti }))
+        .filter(item => playlistBase(item.meta?.sourcePage || sourcePage) === playlistBase(sourcePage));
+      if (snapshot.tracks.length === sourceIndices.length) {
+        snapshot.tracks.forEach((track, index) => {
+          const meta = state.meta[sourceIndices[index].ti];
+          meta.soundcloudId = Number(track.id);
+          meta.playlistPosition = index + 1;
+        });
+      }
+      reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls);
+      badges();
+      renderList();
+      return 0;
+    }
+
+    const removed = reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls);
+    const candidates = snapshot.tracks.filter(track => !state._liveSyncKnownIds.has(Number(track.id)));
+    if (!candidates.length) {
+      if (removed) {
+        refreshUpcomingCrossfadePreparation();
+        badges();
+        renderList();
+        updateHub();
+        showLiveSyncResult(0, removed);
+      } else {
+        badges();
+      }
+      return 0;
+    }
+
+    const metas = [];
+    for (const track of candidates) {
+      const playlistPosition = snapshot.tracks.findIndex(item => Number(item.id) === Number(track.id)) + 1;
+      const meta = await resolveLiveTrackMeta(track, sourcePage, playlistPosition);
+      if (meta) metas.push(meta);
+    }
+    if (!state.active || state.suspended) return 0;
+
+    const added = applyLiveQueueTracks(metas, pageEls, false);
+    for (const meta of metas) {
+      if (meta.soundcloudId) state._liveSyncKnownIds.add(Number(meta.soundcloudId));
+    }
+    if (removed && !added) {
+      refreshUpcomingCrossfadePreparation();
+      badges();
+      renderList();
+      updateHub();
+    }
+    showLiveSyncResult(added, removed);
+    return added;
+  } finally {
+    state._liveSyncInFlight = false;
+  }
+}
+
+function resetLiveQueueSync() {
+  if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
+  state._liveSyncKnownIds = new Set();
+  state._liveSyncInFlight = false;
+  state._liveSyncLastCheck = 0;
+  state._liveSyncSource = '';
+  state._liveSyncTimer = null;
+}
+
 async function mergeCurrentPage() {
   if (!state.active) { showMergeToast(-1); return; }
 
   const btn = document.getElementById('tss-merge-btn');
   if (btn) { btn.style.opacity = '0.35'; btn.style.pointerEvents = 'none'; }
 
-  const newEls = await loadTracks();
+  const pageUrl = location.href.split(/[?#]/)[0].replace(/\/+$/, '');
+  const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
+    ? fetchLivePlaylistSnapshot(pageUrl)
+    : null;
+  const pageEls = await loadTracks();
+  const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
 
   if (btn) { btn.style.opacity = ''; btn.style.pointerEvents = ''; }
 
   if (!state.active) return;
-  if (!newEls.length) { showMergeToast(0); return; }
+  if (!collection.meta.length) { showMergeToast(0); return; }
 
   const existingById = new Map();
   state.meta.forEach((m, ti) => {
@@ -3325,12 +3676,12 @@ async function mergeCurrentPage() {
   });
   const added = [];
 
-  newEls.forEach(el => {
-    const m  = getMeta(el);
+  collection.meta.forEach((m, index) => {
+    const el = collection.els[index] || null;
     const id = trackId(m);
     if (id && existingById.has(id)) {
       const ti = existingById.get(id);
-      state.els[ti] = el;
+      if (el) state.els[ti] = el;
       state.meta[ti] = { ...state.meta[ti], ...m };
       delete state.meta[ti].unavailable;
       return;
@@ -3352,6 +3703,8 @@ async function mergeCurrentPage() {
     state.playlistUrl = location.href.split(/[?#]/)[0];
     state.suspended   = false;
     state.lastTitle   = playerTitle();
+    resetLiveQueueSync();
+    void syncLiveQueue({ force: true });
 
     // restart watcher if it died during suspension navigation
     if (!state.worker && !state._workerInterval) startWatcher();
@@ -3385,8 +3738,7 @@ async function reshuffleCurrentPage() {
 
   try {
     if (samePlaylist && !state.suspended) {
-      const alive = [...Array(state.els.length).keys()]
-        .filter(ti => state.els[ti] && document.body.contains(state.els[ti]));
+      const alive = [...Array(state.meta.length).keys()].filter(trackAvailable);
       const currentTi = state.queue[state.pos];
       if (!alive.length || currentTi === undefined) {
         showMergeToast('nothing to reshuffle');
@@ -3413,21 +3765,24 @@ async function reshuffleCurrentPage() {
     state.loading = true;
     state.busy = true;
     updateHub();
-    const newEls = await loadTracks();
-    if (!newEls.length) {
+    const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
+      ? fetchLivePlaylistSnapshot(pageUrl)
+      : null;
+    const pageEls = await loadTracks();
+    const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
+    if (!collection.meta.length) {
       showMergeToast('no tracks found on this page');
       return;
     }
 
-    const newMeta = newEls.map(getMeta);
-    const newQueue = buildReshuffledQueue([...Array(newEls.length).keys()]);
+    const newQueue = buildReshuffledQueue([...Array(collection.meta.length).keys()]);
     if (!newQueue.length) {
       showMergeToast('no tracks found on this page');
       return;
     }
 
-    state.els = newEls;
-    state.meta = newMeta;
+    state.els = collection.els;
+    state.meta = collection.meta;
     state.queue = newQueue;
     state.pos = 0;
     state.playNext = [];
@@ -3524,15 +3879,20 @@ async function start() {
   state.loading = true;
   updateHub();
 
-  const els = await loadTracks();
-  if (!els.length) {
+  const pageUrl = location.href.split(/[?#]/)[0].replace(/\/+$/, '');
+  const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
+    ? fetchLivePlaylistSnapshot(pageUrl)
+    : null;
+  const pageEls = await loadTracks();
+  const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
+  if (!collection.meta.length || playlistBase(location.href) !== playlistBase(pageUrl)) {
     state.loading = false;
     updateHub();
     return;
   }
 
-  state.els  = els;
-  state.meta = els.map(getMeta);
+  state.els  = collection.els;
+  state.meta = collection.meta;
 
   let _cached = null;
   try {
@@ -3562,7 +3922,7 @@ async function start() {
     state.roundTotal = _cached.roundTotal;
   } else {
     state.priority = {};
-    state.queue    = fisherYates([...Array(els.length).keys()]);
+    state.queue    = fisherYates([...Array(state.meta.length).keys()]);
     state.pos      = 0;
     state.history  = [];
     state.roundPlayed = 0;
@@ -3596,6 +3956,7 @@ async function start() {
   renderList();
   startWatcher();
   updateHub();
+  void syncLiveQueue({ force: true });
 }
 
 function stop() {
@@ -3606,6 +3967,7 @@ function stop() {
   state.busy       = false;
   state.loading    = false;
   state.sleepTimer = null;
+  resetLiveQueueSync();
   const sleepSel = document.getElementById('tss-hub-sleep');
   if (sleepSel) sleepSel.value = 'off';
   state.worker?.postMessage('stop');
@@ -3727,6 +4089,10 @@ function startWatcher() {
   const tick = async () => {
     if (!state.active) return;
     if (checkSleepTimerDeadline()) return;
+    if (!state.busy && Number.isFinite(state._liveSyncLastCheck)
+        && Date.now() - state._liveSyncLastCheck >= 30_000) {
+      void syncLiveQueue();
+    }
 
     // Better SoundCloud Feed discovers scPlayer asynchronously and may replace
     // the object after True Shuffle started, so re-check the cheap bridge guard.
@@ -4592,13 +4958,6 @@ function mkHub() {
       }
       #tss-hub-title { font-size:15.5px !important;font-weight:740 !important;letter-spacing:-0.02em;line-height:1.16 !important; }
       #tss-hub-artist { font-size:11px !important;color:rgba(255,255,255,.52) !important;margin-top:4px !important; }
-      .tss-round-pill {
-        display:inline-flex;align-items:center;max-width:100%;margin-top:10px;
-        border:1px solid rgba(255,255,255,0.11);border-radius:999px;
-        background:rgba(255,255,255,0.035);padding:4px 9px;
-        color:var(--tss-a,#ff5500);font-size:9px;font-weight:750;
-        letter-spacing:0.08em;text-transform:uppercase;
-      }
       #tss-hub-qpos {
         display:inline-block;max-width:100%;margin-top:8px;
         border:0;border-radius:0;background:transparent;padding:0;
@@ -4720,12 +5079,12 @@ function mkHub() {
       #tss-tab-queue[data-active="true"],#tss-tab-history[data-active="true"] {
         color:var(--tss-a,#ff5500) !important;border-bottom-color:var(--tss-a,#ff5500) !important;
       }
-      #tss-merge-btn,#tss-stats-btn {
+      #tss-merge-btn {
         color:rgba(255,255,255,.45) !important;display:flex !important;align-items:center;justify-content:center;
         min-height:30px;padding:0 9px !important;border:1px solid rgba(255,255,255,.09);border-radius:8px !important;
         background:rgba(255,255,255,.025) !important;cursor:pointer;transition:color .18s,border-color .18s,background .18s;
       }
-      #tss-merge-btn:hover,#tss-stats-btn:hover { color:#fff !important;border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.065) !important; }
+      #tss-merge-btn:hover { color:#fff !important;border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.065) !important; }
       .tss-side-searchwrap { position:relative;margin-top:13px; }
       .tss-side-searchicon { position:absolute;left:11px;top:50%;transform:translateY(-50%);color:rgba(255,255,255,.28);pointer-events:none;display:flex; }
       #tss-search { width:100% !important;box-sizing:border-box !important;background:rgba(255,255,255,.025) !important;border:1px solid rgba(255,255,255,.09) !important;border-radius:9px !important;color:#dedede !important;font-size:11px !important;padding:9px 11px !important;outline:none !important;font-family:-apple-system,'Segoe UI',system-ui,sans-serif !important;transition:border-color .18s,background .18s !important; }
@@ -4853,12 +5212,6 @@ function mkHub() {
       #tss-stats-lifetime { color:rgba(255,255,255,.54);font-size:10px;font-variant-numeric:tabular-nums; }
       .tss-stats-section { display:flex;align-items:center;justify-content:space-between;padding:13px 0 6px; }
       .tss-stat-track { display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05); }
-      .tss-stat-art { width:30px;height:30px;border-radius:7px;overflow:hidden;background:rgba(255,255,255,.04);display:flex;align-items:center;justify-content:center; }
-      .tss-stat-art img { width:100%;height:100%;object-fit:cover;display:block; }
-      .tss-stat-copy { min-width:0; }
-      .tss-stat-title { color:rgba(255,255,255,.72);font-size:10.5px;font-weight:590;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
-      .tss-stat-artist { margin-top:2px;color:rgba(255,255,255,.28);font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
-      .tss-stat-count { color:var(--tss-a,#ff5500);font-size:10px;font-weight:700;font-variant-numeric:tabular-nums; }
       .tss-stat-priority { min-width:52px;border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:4px 7px;background:rgba(255,255,255,.025);font:700 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;cursor:pointer; }
       .tss-stat-priority:hover { background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.15); }
       .tss-stat-track > span:first-child { color:rgba(255,255,255,.7) !important;font-size:10.5px !important;font-weight:560; }
@@ -5900,7 +6253,26 @@ async function onNav() {
 
 let lastUrl = location.href;
 let injectRetryTimer = null;
-new MutationObserver(() => {
+function scheduleLiveQueueSync(delay = 250) {
+  if (!state.active || state.suspended) return;
+  if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
+  state._liveSyncTimer = setTimeout(() => {
+    state._liveSyncTimer = null;
+    if (state.loading || state.busy || state._liveSyncInFlight) {
+      scheduleLiveQueueSync(300);
+      return;
+    }
+    void syncLiveQueue({ force: true });
+  }, delay);
+}
+
+function mutationChangesPlaylistTracks(records) {
+  const selector = '.trackList__item, .soundList__item, li.sc-list-item';
+  return records.some(record => [...record.addedNodes, ...record.removedNodes].some(node =>
+    node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))));
+}
+
+new MutationObserver(records => {
   if (location.href !== lastUrl) { lastUrl = location.href; onNav(); }
   else if (validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
     injectRetryTimer = setTimeout(() => {
@@ -5908,6 +6280,7 @@ new MutationObserver(() => {
       inject();
     }, 250);
   }
+  if (mutationChangesPlaylistTracks(records)) scheduleLiveQueueSync();
 }).observe(document, { subtree: true, childList: true });
 
 window.addEventListener('pagehide', () => {
@@ -5916,6 +6289,7 @@ window.addEventListener('pagehide', () => {
 
 document.addEventListener('visibilitychange', () => {
   checkSleepTimerDeadline();
+  if (document.visibilityState === 'visible') scheduleLiveQueueSync(250);
   const deck = currentDeckAudio();
   if (document.visibilityState === 'visible' && state.active && deck && !deck.paused
       && state._audioContext && state._audioContext.state !== 'running') {
@@ -5925,6 +6299,7 @@ document.addEventListener('visibilitychange', () => {
 
 window.addEventListener('pageshow', () => {
   checkSleepTimerDeadline();
+  scheduleLiveQueueSync(250);
 });
 
 installNativePlaybackGuard();
