@@ -26,7 +26,7 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 test('release metadata identifies the v6 stable userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.0\.0/);
+  assert.match(source, /@version\s+6\.0\.1/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.0.0
+// @version      6.0.1
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -148,6 +148,7 @@ const state = {
   _clientId: '',
   _lastSoundCloudVolume: null,
   _soundCloudVolumeModel: null,
+  _pipBridgePlayer: null,
   stats: {
     played:     0,
     playCounts: {},
@@ -393,6 +394,14 @@ function waveformUrl(el) {
   return match ? match[0].replace(/&amp;/g, '&') : null;
 }
 
+function getArtistLink(el) {
+  const a = el.querySelector('.trackItem__username, .soundTitle__username, a.sc-link-secondary');
+  if (!a) return null;
+  const href = a.getAttribute('href');
+  if (!href) return null;
+  return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
+}
+
 function trackId(m) {
   if (!m) return null;
   if (m.link) return m.link;
@@ -407,6 +416,7 @@ function getMeta(el) {
     artist:  el.querySelector('.trackItem__username, .soundTitle__username, .sc-link-secondary')?.textContent.trim() || '—',
     artwork: artwork(el),
     link:    getLink(el),
+    artistLink: getArtistLink(el),
     waveform: waveformUrl(el),
     sourcePage: location.href.split(/[?#]/)[0].replace(/\/+$/, ''),
   };
@@ -713,6 +723,173 @@ function updateSleepDisplay() {
 function currentDeckAudio() {
   if (!Number.isInteger(state._deckIndex) || state._deckIndex < 0) return null;
   return state._decks[state._deckIndex] || null;
+}
+
+// Better SoundCloud Feed's PiP polls SoundCloud's page-level scPlayer rather
+// than Media Session. While True Shuffle's private deck is audible, expose a
+// small scPlayer-compatible view of that deck. Every wrapper delegates back to
+// SoundCloud unchanged as soon as custom-deck playback is inactive.
+function betterFeedPipActive() {
+  return state.active && Number.isInteger(state._deckTrack) && Boolean(currentDeckAudio());
+}
+
+function betterFeedPipSound() {
+  if (!betterFeedPipActive()) return null;
+  const ti = state._deckTrack;
+  const meta = state.meta[ti];
+  if (!meta) return null;
+
+  return {
+    // SoundCloud ids are positive. A stable negative queue index lets the PiP
+    // detect True Shuffle track changes without impersonating a native model.
+    id: -(ti + 1),
+    attributes: {
+      title: meta.title || '—',
+      artwork_url: meta.artwork || null,
+      permalink_url: meta.link || null,
+      waveform_url: meta.waveform || null,
+      publisher_metadata: { artist: meta.artist || '—' },
+      user: {
+        username: meta.artist || '—',
+        permalink_url: meta.artistLink || null,
+        avatar_url: null,
+      },
+    },
+    player: {
+      getPosition: () => Math.max(0, playbackTiming().current * 1000),
+      getDuration: () => Math.max(0, playbackTiming().duration * 1000),
+    },
+  };
+}
+
+// Better SoundCloud Feed owns the PiP UI, but its canvas progress can stop
+// repainting while the SoundCloud tab is in the background. Keep that visual
+// surface aligned with the same background-safe clock used by our hub. The
+// selectors are deliberately scoped to Better Feed's PiP and this is a no-op
+// everywhere else.
+function syncBetterFeedPipWindow() {
+  if (!betterFeedPipActive()) return false;
+
+  try {
+    const pipWindow = pageWindow.documentPictureInPicture?.window;
+    const pipDoc = pipWindow?.document;
+    if (!pipDoc) return false;
+
+    const timing = playbackTiming();
+    const current = Math.max(0, Number(timing.current) || 0);
+    const duration = Math.max(0, Number(timing.duration) || 0);
+    const timeLabels = pipDoc.querySelectorAll('.pip-time');
+    if (timeLabels[0]) timeLabels[0].textContent = formatPlaybackClock(current);
+    if (timeLabels[1]) timeLabels[1].textContent = formatPlaybackClock(duration);
+
+    const canvas = pipDoc.querySelector('.pip-waveform');
+    if (!canvas || !duration) return true;
+
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.floor(rect.width || canvas.width || 0);
+    const height = Math.floor(rect.height || canvas.height || 0);
+    if (width <= 0 || height <= 0) return true;
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return true;
+
+    const meta = state.meta[state._deckTrack];
+    const key = trackId(meta) || meta?.title || '';
+    const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+    const styles = typeof pipWindow.getComputedStyle === 'function'
+      ? pipWindow.getComputedStyle(pipDoc.documentElement)
+      : null;
+    const activeColor = styles?.getPropertyValue('--special-color')?.trim() || '#ff5500';
+    const dimColor = styles?.getPropertyValue('--secondary-color')?.trim() || '#666';
+    const barWidth = 2;
+    const barGap = 1;
+    const barCount = Math.max(1, Math.floor(width / (barWidth + barGap)));
+    const progressX = Math.max(0, Math.min(1, current / duration)) * width;
+
+    ctx.clearRect(0, 0, width, height);
+    for (let i = 0; i < barCount; i++) {
+      const sourceIndex = Math.min(
+        heights.length - 1,
+        Math.floor((i / barCount) * heights.length),
+      );
+      const barHeight = Math.max(2, (Number(heights[sourceIndex]) || 24) / 100 * height);
+      const x = i * (barWidth + barGap);
+      ctx.fillStyle = x < progressX ? activeColor : dimColor;
+      ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function installBetterFeedPipBridge() {
+  const player = pageWindow.scPlayer;
+  if (!player || typeof player !== 'object') return false;
+  if (state._pipBridgePlayer === player) return true;
+
+  const methodNames = [
+    'getCurrentSound', 'getCurrentQueueItem', 'isPlaying', 'toggleCurrent',
+    'playNext', 'playPrev', 'seekCurrentTo', 'seekCurrentBy',
+  ];
+  const originals = Object.fromEntries(methodNames.map(name => [name, player[name]]));
+  const callOriginal = (name, args) => {
+    const fn = originals[name];
+    return typeof fn === 'function' ? fn.apply(player, args) : undefined;
+  };
+  const evaluateAmount = callback => Number(typeof callback === 'function' ? callback() : callback);
+  const seekDeck = (callback, relative) => {
+    const deck = currentDeckAudio();
+    if (!deck) return;
+    const amountMs = evaluateAmount(callback);
+    if (!Number.isFinite(amountMs)) return;
+    const base = relative ? (Number(deck.currentTime) || 0) : 0;
+    const duration = Number.isFinite(deck.duration) && deck.duration > 0 ? deck.duration : Infinity;
+    deck.currentTime = Math.max(0, Math.min(duration, base + amountMs / 1000));
+    updateProgressBar();
+    updateHub();
+  };
+
+  try {
+    player.getCurrentSound = (...args) => betterFeedPipActive()
+      ? betterFeedPipSound()
+      : callOriginal('getCurrentSound', args);
+    player.getCurrentQueueItem = (...args) => betterFeedPipActive()
+      ? null
+      : callOriginal('getCurrentQueueItem', args);
+    player.isPlaying = (...args) => betterFeedPipActive()
+      ? !currentDeckAudio().paused
+      : callOriginal('isPlaying', args);
+    player.toggleCurrent = (...args) => {
+      if (!betterFeedPipActive()) return callOriginal('toggleCurrent', args);
+      void toggle();
+    };
+    player.playNext = (...args) => {
+      if (!betterFeedPipActive()) return callOriginal('playNext', args);
+      state.manualAction = true;
+      state._manualActionAt = Date.now();
+      void next();
+    };
+    player.playPrev = (...args) => {
+      if (!betterFeedPipActive()) return callOriginal('playPrev', args);
+      void prevTrack();
+    };
+    player.seekCurrentTo = (callback, ...args) => {
+      if (!betterFeedPipActive()) return callOriginal('seekCurrentTo', [callback, ...args]);
+      seekDeck(callback, false);
+    };
+    player.seekCurrentBy = (callback, ...args) => {
+      if (!betterFeedPipActive()) return callOriginal('seekCurrentBy', [callback, ...args]);
+      seekDeck(callback, true);
+    };
+  } catch (_) {
+    return false;
+  }
+
+  state._pipBridgePlayer = player;
+  return true;
 }
 
 function ensureCrossfadeDecks() {
@@ -1512,6 +1689,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
 
   state._deckIndex = incomingIndex;
   state._deckTrack = ti;
+  installBetterFeedPipBridge();
   if (!canMix) {
     state._deckGains[incomingIndex] = 1;
     syncCrossfadeVolume();
@@ -2276,6 +2454,10 @@ function startWatcher() {
   const tick = async () => {
     if (!state.active) return;
 
+    // Better SoundCloud Feed discovers scPlayer asynchronously and may replace
+    // the object after True Shuffle started, so re-check the cheap bridge guard.
+    installBetterFeedPipBridge();
+
     // Worker ticks continue in background tabs and release next() as soon as
     // Web Audio's independent clock reaches the end of the scheduled fade.
     settleScheduledCrossfade();
@@ -2293,6 +2475,7 @@ function startWatcher() {
       syncPlaybackVolumeFromSoundCloud();
       refreshPlayBtn();
       updateHub();
+      syncBetterFeedPipWindow();
     }
 
     if (Number.isInteger(state._deckTrack)) {

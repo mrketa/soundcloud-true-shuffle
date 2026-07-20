@@ -172,6 +172,7 @@ function createWatcherHarness() {
   const factory = Function(
     'state', 'playerTitle', 'progress', 'paused', 'pause', 'wait', 'document', 'next',
     'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker', 'settleScheduledCrossfade',
+    'installBetterFeedPipBridge', 'syncBetterFeedPipWindow',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -187,6 +188,8 @@ function createWatcherHarness() {
     () => {},
     playbackTiming,
     () => worker,
+    () => {},
+    () => {},
     () => {},
   );
   startWatcher();
@@ -404,6 +407,155 @@ test('round labels use stable round counters rather than shrinking queue length'
   assert.match(list, /state\.roundTotal/);
 });
 }
+
+test('Better SoundCloud Feed PiP receives custom-deck metadata and millisecond timing', () => {
+  const state = {
+    active: true,
+    _deckTrack: 4,
+    meta: [{}, {}, {}, {}, {
+      title: 'Deck Track',
+      artist: 'Deck Artist',
+      artwork: 'https://i1.sndcdn.com/artworks-test-large.jpg',
+      link: 'https://soundcloud.com/deck-artist/deck-track',
+      artistLink: 'https://soundcloud.com/deck-artist',
+      waveform: 'https://wave.sndcdn.com/test.json',
+    }],
+  };
+  const betterFeedPipActive = Function(
+    'state', 'currentDeckAudio',
+    `return (${extractFunction('betterFeedPipActive')})`,
+  )(state, () => ({ paused: false }));
+  const betterFeedPipSound = Function(
+    'state', 'betterFeedPipActive', 'playbackTiming',
+    `return (${extractFunction('betterFeedPipSound')})`,
+  )(state, betterFeedPipActive, () => ({ current: 12.5, duration: 203.25 }));
+
+  const sound = betterFeedPipSound();
+  assert.equal(sound.id, -5);
+  assert.equal(sound.attributes.title, 'Deck Track');
+  assert.equal(sound.attributes.publisher_metadata.artist, 'Deck Artist');
+  assert.equal(sound.attributes.artwork_url, 'https://i1.sndcdn.com/artworks-test-large.jpg');
+  assert.equal(sound.attributes.permalink_url, 'https://soundcloud.com/deck-artist/deck-track');
+  assert.equal(sound.attributes.user.permalink_url, 'https://soundcloud.com/deck-artist');
+  assert.equal(sound.attributes.waveform_url, 'https://wave.sndcdn.com/test.json');
+  assert.equal(sound.player.getPosition(), 12500);
+  assert.equal(sound.player.getDuration(), 203250);
+});
+
+test('PiP scPlayer bridge controls True Shuffle only while its custom deck is active', async () => {
+  const calls = [];
+  const state = {
+    active: true,
+    manualAction: false,
+    _manualActionAt: 0,
+    _deckTrack: 0,
+    _pipBridgePlayer: null,
+  };
+  const nativeSound = { id: 99 };
+  const customSound = { id: -1 };
+  const player = {
+    getCurrentSound: () => nativeSound,
+    isPlaying: () => false,
+    toggleCurrent: () => calls.push('native-toggle'),
+    playNext: () => calls.push('native-next'),
+    playPrev: () => calls.push('native-prev'),
+    seekCurrentTo: callback => calls.push(['native-seek-to', callback()]),
+    seekCurrentBy: callback => calls.push(['native-seek-by', callback()]),
+  };
+  const deck = { currentTime: 10, duration: 100, paused: false };
+  const pageWindow = { scPlayer: player };
+  const betterFeedPipActive = () => state.active && Number.isInteger(state._deckTrack);
+  const installBetterFeedPipBridge = Function(
+    'state', 'pageWindow', 'betterFeedPipActive', 'betterFeedPipSound',
+    'toggle', 'next', 'prevTrack', 'currentDeckAudio', 'updateProgressBar', 'updateHub',
+    `return (${extractFunction('installBetterFeedPipBridge')})`,
+  )(
+    state, pageWindow, betterFeedPipActive, () => customSound,
+    async () => calls.push('deck-toggle'), async () => calls.push('deck-next'),
+    async () => calls.push('deck-prev'), () => deck, () => {}, () => {},
+  );
+
+  assert.equal(installBetterFeedPipBridge(), true);
+  assert.equal(player.getCurrentSound(), customSound);
+  assert.equal(player.isPlaying(), true);
+  player.toggleCurrent();
+  player.playNext();
+  assert.equal(state.manualAction, true);
+  assert.ok(state._manualActionAt > 0);
+  player.playPrev();
+  player.seekCurrentTo(() => 42000);
+  player.seekCurrentBy(() => -5000);
+  await Promise.resolve();
+  assert.equal(deck.currentTime, 37);
+  assert.deepEqual(calls, ['deck-toggle', 'deck-next', 'deck-prev']);
+
+  state.active = false;
+  assert.equal(player.getCurrentSound(), nativeSound);
+  assert.equal(player.isPlaying(), false);
+  player.toggleCurrent();
+  assert.equal(calls.at(-1), 'native-toggle');
+});
+
+test('PiP visual sync repaints Better Feed waveform and time labels from the live deck clock', () => {
+  const timeLabels = [{ textContent: '' }, { textContent: '' }];
+  const fills = [];
+  const context = {
+    fillStyle: '',
+    clearRect: (...args) => fills.push(['clear', ...args]),
+    fillRect: (...args) => fills.push(['fill', context.fillStyle, ...args]),
+  };
+  const canvas = {
+    width: 0,
+    height: 0,
+    getBoundingClientRect: () => ({ width: 300, height: 30 }),
+    getContext: () => context,
+  };
+  const pipDocument = {
+    documentElement: {},
+    querySelectorAll: selector => selector === '.pip-time' ? timeLabels : [],
+    querySelector: selector => selector === '.pip-waveform' ? canvas : null,
+  };
+  const pageWindow = {
+    documentPictureInPicture: {
+      window: {
+        document: pipDocument,
+        getComputedStyle: () => ({
+          getPropertyValue: name => name === '--special-color' ? '#f50' : '#777',
+        }),
+      },
+    },
+  };
+  const state = {
+    _deckTrack: 0,
+    meta: [{ title: 'Live track', link: 'https://soundcloud.com/test/live' }],
+  };
+  const syncBetterFeedPipWindow = Function(
+    'state', 'pageWindow', 'betterFeedPipActive', 'playbackTiming',
+    'formatPlaybackClock', 'trackId', 'waveformCache', 'DEFAULT_WAVE_HEIGHTS',
+    `return (${extractFunction('syncBetterFeedPipWindow')})`,
+  )(
+    state, pageWindow, () => true, () => ({ current: 90, duration: 180 }),
+    seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`,
+    meta => meta.link, new Map([['https://soundcloud.com/test/live', [25, 50, 75, 100]]]),
+    [50, 50, 50, 50],
+  );
+
+  assert.equal(syncBetterFeedPipWindow(), true);
+  assert.equal(timeLabels[0].textContent, '1:30');
+  assert.equal(timeLabels[1].textContent, '3:00');
+  assert.equal(canvas.width, 300);
+  assert.equal(canvas.height, 30);
+  const bars = fills.filter(call => call[0] === 'fill');
+  assert.ok(bars.some(call => call[1] === '#f50' && call[2] < 150));
+  assert.ok(bars.some(call => call[1] === '#777' && call[2] >= 150));
+  assert.equal(bars.filter(call => call[1] === '#f50').length, 50);
+});
+
+test('watcher retries the PiP bridge after Better SoundCloud Feed discovers scPlayer', () => {
+  const watcher = extractFunction('startWatcher');
+  assert.match(watcher, /installBetterFeedPipBridge\(\)/);
+  assert.match(watcher, /syncBetterFeedPipWindow\(\)/);
+});
 
 (async () => {
   for (const { name, fn } of tests) {
