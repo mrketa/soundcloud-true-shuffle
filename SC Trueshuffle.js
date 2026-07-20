@@ -1,17 +1,56 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      5.1.0
-// @description  Fixes SoundCloud's broken shuffle. Loads all tracks, actually random, works in background tabs.
+// @version      6.0.0
+// @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
 // @license      MIT
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @sandbox      JavaScript
 // @run-at       document-end
 // ==/UserScript==
 
 (function () {
 'use strict';
+
+const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
+const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
+
+function sanitizeCustomEqPresets(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([name, values]) =>
+    !BLOCKED_EQ_PRESET_NAMES.has(String(name).trim().toLowerCase())
+      && Array.isArray(values) && values.length === 5
+  ).slice(0, 20).map(([name, values]) => [
+    String(name).slice(0, 24),
+    values.map(band => Math.max(-12, Math.min(12, Number(band) || 0))),
+  ]));
+}
+
+function localCustomEqPresets() {
+  try {
+    return sanitizeCustomEqPresets(JSON.parse(localStorage.getItem('tss_eq_custom_presets') || '{}'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function loadCustomEqPresets() {
+  const localPresets = localCustomEqPresets();
+  try {
+    if (typeof GM_getValue !== 'function') return localPresets;
+    const stored = GM_getValue(CUSTOM_EQ_PRESETS_KEY, null);
+    // Once the Tampermonkey vault exists it is authoritative, including an
+    // intentionally empty object after the user deleted every preset.
+    if (stored !== null && stored !== undefined) return sanitizeCustomEqPresets(stored);
+    if (typeof GM_setValue === 'function') GM_setValue(CUSTOM_EQ_PRESETS_KEY, localPresets);
+  } catch (_) {}
+  return localPresets;
+}
 
 // init accent CSS vars early so all CSS can reference them
 document.documentElement.style.setProperty('--tss-a',  '#ff5500');
@@ -57,6 +96,58 @@ const state = {
   _endedHandler: null,
   _manualActionAt: 0,
   _internalNavigation: false,
+  crossfadeSeconds: Math.max(0, Math.min(12, Number(localStorage.getItem('tss_crossfade_seconds')) || 0)),
+  crossfadeCurve: ['smooth', 'clean', 'dj'].includes(localStorage.getItem('tss_crossfade_curve'))
+    ? localStorage.getItem('tss_crossfade_curve')
+    : 'smooth',
+  crossfadeManual: localStorage.getItem('tss_crossfade_manual') !== 'false',
+  _playbackVolumeStored: localStorage.getItem('tss_playback_volume') !== null
+    || localStorage.getItem('tss_crossfade_output') !== null,
+  _playbackVolumeInitialized: false,
+  playbackVolume: (() => {
+    const saved = localStorage.getItem('tss_playback_volume') ?? localStorage.getItem('tss_crossfade_output');
+    if (saved === null) return 0.1;
+    const value = Number(saved);
+    return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.1;
+  })(),
+  autoLevel: localStorage.getItem('tss_auto_level') === 'true',
+  eqEnabled: localStorage.getItem('tss_eq_enabled') === 'true',
+  eqBands: (() => {
+    try {
+      const values = JSON.parse(localStorage.getItem('tss_eq_bands') || '[]');
+      return Array.isArray(values) && values.length === 5
+        ? values.map(value => Math.max(-12, Math.min(12, Number(value) || 0)))
+        : [0, 0, 0, 0, 0];
+    } catch (_) { return [0, 0, 0, 0, 0]; }
+  })(),
+  eqPreset: localStorage.getItem('tss_eq_preset') || 'Flat',
+  customEqPresets: loadCustomEqPresets(),
+  crossfadeStatus: 'off',
+  _crossfadePending: false,
+  _crossfading: false,
+  _crossfadeSchedule: null,
+  _crossfadeToken: 0,
+  _deckIndex: -1,
+  _deckTrack: null,
+  _decks: [],
+  _deckTracks: [null, null],
+  _deckGains: [0, 0],
+  _audioContext: null,
+  _audioMaster: null,
+  _audioLimiter: null,
+  _deckAudioGraphs: [null, null],
+  _autoLevelLastTick: 0,
+  _autoLevelCache: (() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('tss_auto_level_cache_v2') || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (_) { return {}; }
+  })(),
+  _autoLevelCacheTimer: null,
+  _streamCache: new Map(),
+  _clientId: '',
+  _lastSoundCloudVolume: null,
+  _soundCloudVolumeModel: null,
   stats: {
     played:     0,
     playCounts: {},
@@ -112,6 +203,9 @@ function buildBalancedRound(indices, previousTi = null) {
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
 function playerTitle() {
+  if (state._deckTrack !== null && state.meta[state._deckTrack]) {
+    return state.meta[state._deckTrack].title || '';
+  }
   for (const s of ['.playbackSoundBadge__titleLink', '.playbackSoundBadge a[title]', '.playerTrackName']) {
     const el = document.querySelector(s);
     if (!el) continue;
@@ -132,6 +226,8 @@ function parseTimeText(text) {
 }
 
 function activeAudio() {
+  const deck = currentDeckAudio();
+  if (deck) return deck;
   const audios = [...document.querySelectorAll('audio')];
   return audios.find(a => !a.paused && a.currentSrc)
       || audios.find(a => a.currentSrc)
@@ -180,24 +276,72 @@ function formatPlaybackClock(seconds) {
 }
 
 function paused() {
+  const deck = currentDeckAudio();
+  if (deck) return deck.paused;
+  return soundCloudPaused();
+}
+
+function soundCloudPaused() {
   const btn = document.querySelector('.playControls__play');
   if (!btn) return false;
   const label = (btn.getAttribute('aria-label') || '').toLowerCase();
   return label.startsWith('play') || (btn.title || '').toLowerCase().startsWith('play');
 }
 
-function pause() {
+function pauseSoundCloud() {
   const b = document.querySelector('.playControls__play');
-  if (b && !paused()) b.click();
+  if (b && !soundCloudPaused()) b.click();
 }
 
-function toggle() {
+function pause() {
+  const deck = currentDeckAudio();
+  if (deck) {
+    state._decks.forEach(audio => { if (audio && !audio.paused) audio.pause(); });
+    if (state._crossfading) suspendAudioGraph();
+    return;
+  }
+  pauseSoundCloud();
+}
+
+async function toggle() {
+  const deck = currentDeckAudio();
+  if (deck) {
+    if (state._crossfading) {
+      const mixingDecks = state._decks.filter((audio, index) =>
+        audio && state._deckTracks[index] !== null
+      );
+      const shouldResume = mixingDecks.length > 0 && mixingDecks.every(audio => audio.paused);
+      if (shouldResume) {
+        await resumeAudioGraph();
+        await Promise.all(mixingDecks.map(audio => audio.play().catch(() => {})));
+      } else {
+        mixingDecks.forEach(audio => { if (!audio.paused) audio.pause(); });
+        await suspendAudioGraph();
+      }
+      setTimeout(refreshPlayBtn, 80);
+      return;
+    }
+    if (deck.paused) {
+      await resumeAudioGraph();
+      await deck.play().catch(() => {});
+    } else {
+      deck.pause();
+    }
+    setTimeout(refreshPlayBtn, 80);
+    return;
+  }
   document.querySelector('.playControls__play')?.click();
   setTimeout(refreshPlayBtn, 150);
 }
 
 function seekTo(ratio) {
   ratio = Math.max(0, Math.min(1, ratio));
+  const deck = currentDeckAudio();
+  if (deck && Number.isFinite(deck.duration) && deck.duration > 0) {
+    deck.currentTime = deck.duration * ratio;
+    updateProgressBar();
+    return;
+  }
   const bar = document.querySelector('.playControls .playbackTimeline__progressWrapper');
   if (!bar) return;
   const rect = bar.getBoundingClientRect();
@@ -285,12 +429,32 @@ const SVG = {
   next:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="11.5" y="2" width="2.5" height="12" rx="1"/><path d="M3 3v10l8-5z"/></svg>`,
   close:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M12.7 3.3a1 1 0 00-1.4 0L8 6.6 4.7 3.3a1 1 0 00-1.4 1.4L6.6 8l-3.3 3.3a1 1 0 101.4 1.4L8 9.4l3.3 3.3a1 1 0 001.4-1.4L9.4 8l3.3-3.3a1 1 0 000-1.4z"/></svg>`,
   chart:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="8" width="3" height="7" rx="1"/><rect x="6" y="5" width="3" height="10" rx="1"/><rect x="11" y="2" width="3" height="13" rx="1"/></svg>`,
+  equalizer:`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M3 2v12M8 2v12M13 2v12"/><circle cx="3" cy="6" r="1.7" fill="currentColor" stroke="none"/><circle cx="8" cy="10" r="1.7" fill="currentColor" stroke="none"/><circle cx="13" cy="5" r="1.7" fill="currentColor" stroke="none"/></svg>`,
   note:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:18px;height:18px;flex-shrink:0;opacity:0.25"><path d="M9 3v7.27A3 3 0 1 0 11 13V6h2V3H9zm-3 12a1 1 0 110-2 1 1 0 010 2z"/></svg>`,
   shuffle: `<svg viewBox="0 0 24 24" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>`,
   list:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="2.5" width="14" height="1.5" rx="0.75"/><rect x="1" y="7.25" width="14" height="1.5" rx="0.75"/><rect x="1" y="12" width="14" height="1.5" rx="0.75"/></svg>`,
   moon:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:11px;height:11px;flex-shrink:0"><path d="M14 10.66A6.5 6.5 0 115.34 2a5 5 0 108.66 8.66z"/></svg>`,
   plus:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z"/></svg>`,
   search:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>`,
+  volume:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M2 6h3l3-2.5v9L5 10H2z"/><path d="M11 5.5a4 4 0 010 5"/><path d="M13 3.5a7 7 0 010 9"/></svg>`,
+};
+
+const EQ_BANDS = [
+  { label: '60',  frequency: 60,    type: 'lowshelf',  q: 0.7 },
+  { label: '250', frequency: 250,   type: 'peaking',   q: 0.9 },
+  { label: '1k',  frequency: 1000,  type: 'peaking',   q: 0.9 },
+  { label: '4k',  frequency: 4000,  type: 'peaking',   q: 0.9 },
+  { label: '12k', frequency: 12000, type: 'highshelf', q: 0.7 },
+];
+
+const EQ_GRAPH_X = [50, 155, 260, 365, 470];
+
+const EQ_PRESETS = {
+  Flat:         [0, 0, 0, 0, 0],
+  'Bass Boost': [7, 4, 0, -1, 1],
+  Punch:        [5, 3, -1, 2, 1],
+  Vocal:        [-2, 0, 4, 3, 1],
+  Bright:       [-1, 0, 1, 4, 6],
 };
 
 const DEFAULT_WAVE_HEIGHTS = [34,58,82,48,72,96,62,42,78,54,88,66,38,74,100,56,84,46,68,92,52,76,40,86,64,98,44,72,58,90,50,80,36,70,94,60,84,46,76,54,100,68,42,88,58,74,48,92,64,82,38,70,56,86];
@@ -307,7 +471,7 @@ function normalizeTrackUrl(url) {
 }
 
 function hydrationWaveformUrl(meta) {
-  const roots = window.__sc_hydration;
+  const roots = pageWindow.__sc_hydration;
   if (!Array.isArray(roots)) return null;
 
   const wantedUrl = normalizeTrackUrl(meta?.link);
@@ -544,6 +708,833 @@ function updateSleepDisplay() {
 
 // ── playback ──────────────────────────────────────────────────────────────────
 
+// Experimental two-deck playback. SoundCloud's normal player remains the
+// fallback whenever a public progressive stream cannot be resolved.
+function currentDeckAudio() {
+  if (!Number.isInteger(state._deckIndex) || state._deckIndex < 0) return null;
+  return state._decks[state._deckIndex] || null;
+}
+
+function ensureCrossfadeDecks() {
+  if (state._decks.length === 2 && state._decks.every(Boolean)) return state._decks;
+  state._decks = [0, 1].map(index => {
+    const audio = document.createElement('audio');
+    audio.id = `tss-crossfade-deck-${index + 1}`;
+    audio.preload = 'auto';
+    audio.playsInline = true;
+    audio.crossOrigin = 'anonymous';
+    audio.dataset.tssCrossfadeDeck = String(index);
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+    return audio;
+  });
+  state._deckTracks = [null, null];
+  state._deckGains = [0, 0];
+  return state._decks;
+}
+
+function autoLevelTrackKey(ti) {
+  const meta = state.meta[ti];
+  return trackId(meta) || normalizeTrackUrl(meta?.link) || '';
+}
+
+function calculateAutoLevelGain(rms, currentGain = 1, calibrating = false) {
+  const level = Number(rms);
+  const current = Math.max(0.2, Math.min(1, Number(currentGain) || 1));
+  if (!Number.isFinite(level) || level < 0.015) return current;
+  const desired = Math.max(0.2, Math.min(1, 0.13 / level));
+  if (desired >= current) return current;
+  const speed = calibrating ? 0.72 : 0.12;
+  return Math.max(0.2, current + (desired - current) * speed);
+}
+
+function saveAutoLevelCacheSoon() {
+  clearTimeout(state._autoLevelCacheTimer);
+  state._autoLevelCacheTimer = setTimeout(() => {
+    const entries = Object.entries(state._autoLevelCache)
+      .sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
+      .slice(0, 300);
+    state._autoLevelCache = Object.fromEntries(entries);
+    try { localStorage.setItem('tss_auto_level_cache_v2', JSON.stringify(state._autoLevelCache)); } catch (_) {}
+  }, 800);
+}
+
+let equalizerPersistTimer = null;
+let customPresetsPending = false;
+
+function flushEqualizerPersistence() {
+  clearTimeout(equalizerPersistTimer);
+  equalizerPersistTimer = null;
+  const customPresets = sanitizeCustomEqPresets(state.customEqPresets);
+  state.customEqPresets = customPresets;
+  if (customPresetsPending) {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(CUSTOM_EQ_PRESETS_KEY, customPresets);
+    } catch (_) {}
+    customPresetsPending = false;
+  }
+  try {
+    localStorage.setItem('tss_eq_enabled', String(state.eqEnabled));
+    localStorage.setItem('tss_eq_bands', JSON.stringify(state.eqBands));
+    localStorage.setItem('tss_eq_preset', state.eqPreset);
+    // Keep a local mirror for migration and non-Tampermonkey development runs.
+    localStorage.setItem('tss_eq_custom_presets', JSON.stringify(customPresets));
+  } catch (_) {}
+}
+
+function persistEqualizer({ customPresets = false, immediate = false } = {}) {
+  customPresetsPending = customPresetsPending || customPresets;
+  clearTimeout(equalizerPersistTimer);
+  if (immediate) {
+    flushEqualizerPersistence();
+  } else {
+    equalizerPersistTimer = setTimeout(flushEqualizerPersistence, 220);
+  }
+}
+
+function syncEqualizer() {
+  const now = state._audioContext?.currentTime || 0;
+  state._deckAudioGraphs.forEach(graph => {
+    if (!graph?.eqFilters) return;
+    graph.eqFilters.forEach((filter, index) => {
+      const value = state.eqEnabled ? state.eqBands[index] : 0;
+      filter.gain.setTargetAtTime(value, now, 0.025);
+    });
+  });
+
+  const button = document.getElementById('tss-hub-eq');
+  if (button) {
+    button.dataset.active = String(state.eqEnabled);
+    button.setAttribute('aria-pressed', String(state.eqEnabled));
+    button.title = state.eqEnabled ? 'Equalizer on' : 'Equalizer off';
+  }
+}
+
+function ensureAutoLevelAudioGraph() {
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+    || pageWindow.AudioContext || pageWindow.webkitAudioContext;
+  if (!AudioContextCtor) return false;
+  const decks = ensureCrossfadeDecks();
+  try {
+    if (!state._audioContext) {
+      const context = new AudioContextCtor();
+      const master = context.createGain();
+      const limiter = context.createDynamicsCompressor();
+      master.gain.value = state.playbackVolume;
+      limiter.threshold.value = -2;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.25;
+      master.connect(limiter);
+      limiter.connect(context.destination);
+      state._audioContext = context;
+      state._audioMaster = master;
+      state._audioLimiter = limiter;
+    }
+
+    decks.forEach((audio, index) => {
+      if (state._deckAudioGraphs[index]) return;
+      const source = state._audioContext.createMediaElementSource(audio);
+      const eqFilters = EQ_BANDS.map((band, bandIndex) => {
+        const filter = state._audioContext.createBiquadFilter();
+        filter.type = band.type;
+        filter.frequency.value = band.frequency;
+        filter.Q.value = band.q;
+        filter.gain.value = state.eqEnabled ? state.eqBands[bandIndex] : 0;
+        return filter;
+      });
+      const analyser = state._audioContext.createAnalyser();
+      const autoGain = state._audioContext.createGain();
+      const mixGain = state._audioContext.createGain();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.72;
+      autoGain.gain.value = 1;
+      mixGain.gain.value = state._deckGains[index] || 0;
+      source.connect(eqFilters[0]);
+      eqFilters.forEach((filter, filterIndex) => {
+        filter.connect(eqFilters[filterIndex + 1] || analyser);
+      });
+      analyser.connect(autoGain);
+      autoGain.connect(mixGain);
+      mixGain.connect(state._audioMaster);
+      audio.volume = 1;
+      state._deckAudioGraphs[index] = {
+        source, eqFilters, analyser, autoGain, mixGain,
+        buffer: new Float32Array(analyser.fftSize),
+        smoothedRms: 0,
+        peakRms: 0,
+        currentGain: 1,
+        samples: 0,
+        trackKey: '',
+      };
+    });
+    syncEqualizer();
+    if (state._audioContext.state === 'suspended') void state._audioContext.resume();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function resumeAudioGraph() {
+  const context = state._audioContext;
+  if (!context || context.state === 'running') return true;
+  if (context.state === 'closed') return false;
+  try {
+    await context.resume();
+    return context.state === 'running';
+  } catch (_) {
+    return false;
+  }
+}
+
+async function suspendAudioGraph() {
+  const context = state._audioContext;
+  if (!context || context.state !== 'running') return true;
+  try {
+    await context.suspend();
+    return context.state === 'suspended';
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyCachedAutoLevel(index, ti) {
+  const graph = state._deckAudioGraphs[index];
+  if (!graph) return;
+  const key = autoLevelTrackKey(ti);
+  const cached = Number(state._autoLevelCache[key]?.gain);
+  graph.trackKey = key;
+  graph.samples = 0;
+  graph.smoothedRms = 0;
+  graph.peakRms = 0;
+  graph.currentGain = state.autoLevel && Number.isFinite(cached)
+    ? Math.max(0.2, Math.min(1, cached))
+    : 1;
+  graph.autoGain.gain.setValueAtTime(graph.currentGain, state._audioContext.currentTime);
+}
+
+function processAutoLevel() {
+  if (!state.autoLevel || !state._audioContext) return;
+  const now = performance.now();
+  if (now - state._autoLevelLastTick < 60) return;
+  state._autoLevelLastTick = now;
+
+  state._deckAudioGraphs.forEach((graph, index) => {
+    const audio = state._decks[index];
+    if (!graph || !audio || audio.paused || !audio.currentSrc || state._deckGains[index] <= 0.001) return;
+    graph.analyser.getFloatTimeDomainData(graph.buffer);
+    let sum = 0;
+    for (const sample of graph.buffer) sum += sample * sample;
+    const rms = Math.sqrt(sum / graph.buffer.length);
+    if (rms < 0.015) return;
+    graph.smoothedRms = graph.smoothedRms
+      ? graph.smoothedRms * 0.55 + rms * 0.45
+      : rms;
+    graph.peakRms = Math.max(graph.peakRms, graph.smoothedRms);
+    graph.samples++;
+    const calibrating = graph.samples <= 12;
+    const nextGain = calculateAutoLevelGain(graph.peakRms, graph.currentGain, calibrating);
+    const reduced = nextGain < graph.currentGain - 0.001;
+    graph.currentGain = nextGain;
+    graph.autoGain.gain.setTargetAtTime(
+      graph.currentGain,
+      state._audioContext.currentTime,
+      calibrating ? 0.035 : 0.35,
+    );
+    if (graph.trackKey && (graph.samples === 12 || (reduced && graph.samples % 8 === 0))) {
+      state._autoLevelCache[graph.trackKey] = { gain: graph.currentGain, ts: Date.now() };
+      saveAutoLevelCacheSoon();
+    }
+  });
+}
+
+function normalizeSoundCloudVolume(value, maxValue) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return null;
+
+  const declaredMax = Number(maxValue);
+  const scale = Number.isFinite(declaredMax) && declaredMax > 0
+    ? declaredMax
+    : raw > 1 ? 100 : 1;
+  return Math.max(0, Math.min(1, raw / scale));
+}
+
+function soundCloudVolumeModel() {
+  if (state._soundCloudVolumeModel) return state._soundCloudVolumeModel;
+  const registry = pageWindow.webpackJsonp;
+  if (!registry || typeof registry.push !== 'function') return null;
+
+  let webpackRequire = null;
+  try {
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const moduleId = `tss-volume-module-${stamp}`;
+    registry.push([
+      [`tss-volume-chunk-${stamp}`],
+      { [moduleId]: (module, exports, requireFn) => { webpackRequire = requireFn; } },
+      [[moduleId]],
+    ]);
+  } catch (_) {
+    return null;
+  }
+  if (!webpackRequire?.c) return null;
+
+  for (const cached of Object.values(webpackRequire.c)) {
+    const exported = cached?.exports;
+    const candidates = [exported, exported?.default];
+    if (exported && typeof exported === 'object') candidates.push(...Object.values(exported));
+    for (const candidate of candidates) {
+      if (candidate
+          && typeof candidate.getVolume === 'function'
+          && typeof candidate.getMuted === 'function'
+          && typeof candidate.setVolumeAndMuted === 'function') {
+        state._soundCloudVolumeModel = candidate;
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function soundCloudVolumeSlider() {
+  return document.querySelector([
+    '.volume [role="slider"][aria-valuenow]',
+    '.volume__slider[aria-valuenow]',
+    '[role="slider"][aria-label*="olume"][aria-valuenow]',
+  ].join(', '));
+}
+
+function soundCloudVolume() {
+  const model = soundCloudVolumeModel();
+  if (model) {
+    const value = model.getMuted() ? 0 : Number(model.getVolume());
+    if (Number.isFinite(value)) return Math.max(0, Math.min(1, value));
+  }
+  const slider = soundCloudVolumeSlider();
+  const sliderVolume = normalizeSoundCloudVolume(
+    slider?.getAttribute('aria-valuenow'),
+    slider?.getAttribute('aria-valuemax'),
+  );
+  if (sliderVolume !== null) return sliderVolume;
+
+  const nativeAudio = [...document.querySelectorAll('audio')]
+    .find(audio => !audio.dataset.tssCrossfadeDeck && audio.currentSrc);
+  return Number.isFinite(nativeAudio?.volume)
+    ? Math.max(0, Math.min(1, nativeAudio.volume))
+    : null;
+}
+
+function setSoundCloudVolume(value) {
+  const level = Math.max(0, Math.min(1, Number(value) || 0));
+  const model = soundCloudVolumeModel();
+  if (model) {
+    model.setVolumeAndMuted({ volume: level, muted: level === 0 });
+    state._lastSoundCloudVolume = level;
+    return true;
+  }
+
+  const slider = soundCloudVolumeSlider();
+  if (!slider) return false;
+
+  const track = slider.querySelector('.volume__sliderBackground') || slider;
+  const rect = track.getBoundingClientRect();
+  if (!rect || rect.height <= 0) return false;
+
+  const opts = {
+    bubbles: true,
+    cancelable: true,
+    clientX: rect.left + rect.width / 2,
+    clientY: rect.top + 4 + rect.height * (1 - level),
+    button: 0,
+    buttons: 1,
+  };
+  slider.dispatchEvent(new MouseEvent('mousedown', opts));
+  document.dispatchEvent(new MouseEvent('mousemove', opts));
+  document.dispatchEvent(new MouseEvent('mouseup', opts));
+  state._lastSoundCloudVolume = level;
+  return true;
+}
+
+function initializePlaybackVolume() {
+  if (state._playbackVolumeInitialized) return true;
+  const nativeVolume = soundCloudVolume();
+  if (state._playbackVolumeStored) {
+    const synchronized = setSoundCloudVolume(state.playbackVolume);
+    state._playbackVolumeInitialized = synchronized;
+    syncPlaybackVolumeControls();
+    return synchronized;
+  }
+  if (!Number.isFinite(nativeVolume)) return false;
+  state.playbackVolume = nativeVolume;
+  state._lastSoundCloudVolume = nativeVolume;
+  state._playbackVolumeStored = true;
+  state._playbackVolumeInitialized = true;
+  try { localStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
+  syncCrossfadeVolume();
+  syncPlaybackVolumeControls();
+  return true;
+}
+
+function syncPlaybackVolumeFromSoundCloud() {
+  if (!state._playbackVolumeInitialized && !initializePlaybackVolume()) return;
+  const nativeVolume = soundCloudVolume();
+  if (!Number.isFinite(nativeVolume)) return;
+  const changedOutsideHub = state._lastSoundCloudVolume === null
+    || Math.abs(nativeVolume - state._lastSoundCloudVolume) > 0.004;
+  state._lastSoundCloudVolume = nativeVolume;
+  if (!changedOutsideHub || Math.abs(nativeVolume - state.playbackVolume) <= 0.004) return;
+  state.playbackVolume = nativeVolume;
+  try { localStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
+  syncCrossfadeVolume();
+  syncPlaybackVolumeControls();
+}
+
+function syncCrossfadeVolume() {
+  if (!state._decks.length) return;
+  const master = state.playbackVolume;
+  if (state._audioMaster) {
+    state._audioMaster.gain.setTargetAtTime(master, state._audioContext.currentTime, 0.015);
+  }
+  state._decks.forEach((audio, index) => {
+    if (!audio) return;
+    const automatedGain = scheduledCrossfadeGain(index);
+    const gain = automatedGain === null
+      ? (Number.isFinite(state._deckGains[index]) ? state._deckGains[index] : 0)
+      : automatedGain;
+    if (automatedGain !== null) state._deckGains[index] = automatedGain;
+    const graph = state._deckAudioGraphs?.[index];
+    if (graph) {
+      audio.volume = 1;
+      // The audio clock owns mixGain while a crossfade is scheduled. Rewriting
+      // it from the UI watcher would destroy background-safe automation.
+      if (automatedGain === null) {
+        graph.mixGain.gain.cancelScheduledValues(state._audioContext.currentTime);
+        graph.mixGain.gain.setValueAtTime(gain, state._audioContext.currentTime);
+      }
+      graph.autoGain.gain.setTargetAtTime(state.autoLevel ? graph.currentGain : 1, state._audioContext.currentTime, 0.08);
+    } else {
+      audio.volume = Math.max(0, Math.min(1, master * gain));
+    }
+  });
+}
+
+function syncPlaybackVolumeControls() {
+  const percent = Math.round(state.playbackVolume * 100);
+  const slider = document.getElementById('tss-hub-volume');
+  const readout = document.getElementById('tss-hub-volume-value');
+  if (slider) {
+    if (slider.value !== String(percent)) slider.value = String(percent);
+    slider.style.setProperty('--tss-volume-fill', `${percent}%`);
+  }
+  if (readout) readout.textContent = `${percent}%`;
+  const auto = document.getElementById('tss-auto-level');
+  if (auto) {
+    auto.dataset.active = String(state.autoLevel);
+    auto.setAttribute('aria-pressed', String(state.autoLevel));
+    const label = auto.querySelector('.tss-auto-label');
+    if (label) label.textContent = state.autoLevel ? 'AUTO ON' : 'AUTO OFF';
+    auto.title = state.autoLevel
+      ? 'Auto Level is reducing louder tracks'
+      : 'Automatically reduce louder tracks';
+  }
+}
+
+function setCrossfadeStatus(status) {
+  state.crossfadeStatus = status;
+  const el = document.getElementById('tss-hub-crossfade-status');
+  if (!el) return;
+  const labels = {
+    off: 'off',
+    armed: 'armed',
+    loading: 'loading next',
+    ready: 'next ready',
+    mixing: 'mixing',
+    fallback: 'normal fallback',
+  };
+  el.textContent = labels[status] || status;
+  el.dataset.status = status;
+}
+
+function syncCrossfadeControls() {
+  const seconds = Math.max(0, Math.min(12, Math.round(state.crossfadeSeconds)));
+  const valueText = seconds > 0 ? `${seconds} sec` : 'off';
+  const card = document.getElementById('tss-crossfade-card');
+  if (card) card.dataset.enabled = seconds > 0 ? 'true' : 'false';
+
+  const slider = document.getElementById('tss-hub-crossfade');
+  if (slider) {
+    if (slider.value !== String(seconds)) slider.value = String(seconds);
+    slider.style.setProperty('--tss-crossfade-fill', `${(seconds / 12) * 100}%`);
+  }
+  const summary = document.getElementById('tss-crossfade-summary-seconds');
+  const readout = document.getElementById('tss-crossfade-seconds');
+  if (summary) summary.textContent = valueText;
+  if (readout) readout.textContent = valueText;
+
+  document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
+    const active = button.dataset.curve === state.crossfadeCurve;
+    button.dataset.active = active ? 'true' : 'false';
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  const manual = document.getElementById('tss-crossfade-manual');
+  if (manual && manual.checked !== state.crossfadeManual) manual.checked = state.crossfadeManual;
+
+}
+
+function discoverSoundCloudClientId() {
+  if (state._clientId) return state._clientId;
+  try {
+    const entries = performance.getEntriesByType('resource');
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const match = String(entries[i].name || '').match(/[?&]client_id=([A-Za-z0-9_-]+)/);
+      if (match) {
+        state._clientId = match[1];
+        return state._clientId;
+      }
+    }
+  } catch (_) {}
+  return '';
+}
+
+async function discoverSoundCloudClientIdFromBundle() {
+  const existing = discoverSoundCloudClientId();
+  if (existing) return existing;
+  const scripts = [...document.scripts]
+    .map(script => script.src)
+    .filter(src => /a-v2\.sndcdn\.com\/assets\/.+\.js/i.test(src))
+    .slice(-8);
+  for (const src of scripts) {
+    try {
+      const text = await fetch(src).then(response => response.ok ? response.text() : '');
+      const match = text.match(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9_-]{20,})["']/);
+      if (match) {
+        state._clientId = match[1];
+        return state._clientId;
+      }
+    } catch (_) {}
+  }
+  return '';
+}
+
+async function resolveCrossfadeStream(meta) {
+  const key = normalizeTrackUrl(meta?.link);
+  if (!key) return null;
+  const cached = state._streamCache.get(key);
+  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached.url;
+
+  const clientId = await discoverSoundCloudClientIdFromBundle();
+  if (!clientId) return null;
+  try {
+    const resolvedResponse = await fetch(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`);
+    if (!resolvedResponse.ok) return null;
+    const track = await resolvedResponse.json();
+    const transcodings = Array.isArray(track?.media?.transcodings) ? track.media.transcodings : [];
+    const progressive = transcodings.find(item => item?.format?.protocol === 'progressive' && /audio\/(mpeg|mp3)/i.test(item?.format?.mime_type || ''))
+      || transcodings.find(item => item?.format?.protocol === 'progressive');
+    if (!progressive?.url) return null;
+
+    const endpoint = new URL(progressive.url);
+    endpoint.searchParams.set('client_id', clientId);
+    if (track.track_authorization) endpoint.searchParams.set('track_authorization', track.track_authorization);
+    const streamResponse = await fetch(endpoint);
+    if (!streamResponse.ok) return null;
+    const stream = await streamResponse.json();
+    if (!stream?.url) return null;
+    state._streamCache.set(key, { url: stream.url, ts: Date.now() });
+    return stream.url;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resetDeck(audio, index) {
+  if (!audio) return;
+  audio.pause();
+  audio.removeAttribute('src');
+  try { audio.load(); } catch (_) {}
+  if (Number.isInteger(index)) {
+    state._deckTracks[index] = null;
+    state._deckGains[index] = 0;
+    const graph = state._deckAudioGraphs[index];
+    if (graph) {
+      const now = state._audioContext.currentTime;
+      graph.trackKey = '';
+      graph.samples = 0;
+      graph.smoothedRms = 0;
+      graph.peakRms = 0;
+      graph.currentGain = 1;
+      graph.autoGain.gain.cancelScheduledValues(now);
+      graph.autoGain.gain.setValueAtTime(1, now);
+      graph.mixGain.gain.cancelScheduledValues(now);
+      graph.mixGain.gain.setValueAtTime(0, now);
+    }
+  }
+  audio.volume = state._deckAudioGraphs[index] ? 1 : 0;
+}
+
+function stopCrossfadeDecks() {
+  state._crossfadeToken++;
+  state._crossfading = false;
+  state._crossfadePending = false;
+  state._crossfadeSchedule?.resolve?.(false);
+  state._crossfadeSchedule = null;
+  state._decks.forEach((audio, index) => resetDeck(audio, index));
+  state._deckIndex = -1;
+  state._deckTrack = null;
+  setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'armed' : 'off');
+}
+
+async function prepareCrossfadeDeck(index, ti) {
+  const decks = ensureCrossfadeDecks();
+  if (state.autoLevel || state.eqEnabled || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
+  const audio = decks[index];
+  if (!audio || !state.meta[ti]) return null;
+  if (state._deckTracks[index] === ti && audio.currentSrc && audio.readyState >= 1) return audio;
+
+  const streamUrl = await resolveCrossfadeStream(state.meta[ti]);
+  if (!streamUrl) return null;
+  resetDeck(audio, index);
+  audio.src = streamUrl;
+  audio.preload = 'auto';
+  state._deckTracks[index] = ti;
+  state._deckGains[index] = 0;
+  applyCachedAutoLevel(index, ti);
+  syncCrossfadeVolume();
+  audio.load();
+  return audio;
+}
+
+async function waitForDeck(audio, timeout = 5000) {
+  if (audio.readyState >= 2) return true;
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = ok => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      audio.removeEventListener('canplay', onReady);
+      audio.removeEventListener('error', onError);
+      resolve(ok);
+    };
+    const onReady = () => finish(true);
+    const onError = () => finish(false);
+    const timer = setTimeout(() => finish(audio.readyState >= 2), timeout);
+    audio.addEventListener('canplay', onReady, { once: true });
+    audio.addEventListener('error', onError, { once: true });
+  });
+}
+
+function crossfadeGains(t, curve = state.crossfadeCurve) {
+  const clamped = Math.max(0, Math.min(1, t));
+  if (curve === 'clean') return [1 - clamped, clamped];
+
+  const phase = curve === 'dj'
+    ? Math.max(0, Math.min(1, 0.5 + (clamped - 0.5) * 1.35))
+    : clamped * clamped * (3 - 2 * clamped);
+  const outgoing = Math.cos(phase * Math.PI / 2);
+  const incoming = Math.sin(phase * Math.PI / 2);
+  const headroom = 1 / Math.max(1, outgoing + incoming);
+  return [outgoing * headroom, incoming * headroom];
+}
+
+function scheduledCrossfadeGain(index) {
+  const schedule = state._crossfadeSchedule;
+  const context = state._audioContext;
+  if (!schedule || !context) return null;
+  if (index !== schedule.outgoingIndex && index !== schedule.incomingIndex) return null;
+  const elapsed = Math.max(0, context.currentTime - schedule.startTime);
+  const t = Math.max(0, Math.min(1, elapsed / schedule.duration));
+  const gains = crossfadeGains(t, schedule.curve);
+  return index === schedule.outgoingIndex ? gains[0] : gains[1];
+}
+
+function scheduleAudioParamCurve(param, values, startTime, duration) {
+  param.cancelScheduledValues(startTime);
+  param.setValueAtTime(values[0], startTime);
+  if (typeof param.setValueCurveAtTime === 'function') {
+    param.setValueCurveAtTime(values, startTime, duration);
+    return;
+  }
+  // Very old Web Audio implementations: approximate the same shape with
+  // short linear ramps. The audio timeline still runs independently of UI.
+  for (let i = 1; i < values.length; i++) {
+    param.linearRampToValueAtTime(values[i], startTime + duration * (i / (values.length - 1)));
+  }
+}
+
+function waitForCrossfadeSchedule(schedule, token) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = completed => {
+      if (settled) return;
+      settled = true;
+      delete schedule.resolve;
+      resolve(completed);
+    };
+    schedule.resolve = finish;
+    const poll = () => {
+      if (token !== state._crossfadeToken || state._crossfadeSchedule !== schedule) {
+        finish(false);
+        return;
+      }
+      if (state._audioContext?.currentTime >= schedule.endTime - 0.005) {
+        finish(true);
+        return;
+      }
+      setTimeout(poll, 80);
+    };
+    poll();
+  });
+}
+
+function settleScheduledCrossfade() {
+  const schedule = state._crossfadeSchedule;
+  if (!schedule || typeof schedule.resolve !== 'function') return;
+  if (state._audioContext?.currentTime >= schedule.endTime - 0.005) schedule.resolve(true);
+}
+
+function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
+  const duration = Math.max(0.25, seconds);
+  const startedAt = Number(incoming.currentTime) || 0;
+  const outgoingIndex = state._decks.indexOf(outgoing);
+  const incomingIndex = state._decks.indexOf(incoming);
+  const curve = state.crossfadeCurve;
+  return new Promise(resolve => {
+    const poll = () => {
+      if (token !== state._crossfadeToken) { resolve(false); return; }
+      const elapsed = Math.max(0, (Number(incoming.currentTime) || startedAt) - startedAt);
+      const t = Math.max(0, Math.min(1, elapsed / duration));
+      const [outgoingGain, incomingGain] = crossfadeGains(t, curve);
+      state._deckGains[outgoingIndex] = outgoingGain;
+      state._deckGains[incomingIndex] = incomingGain;
+      syncCrossfadeVolume();
+      if (t >= 1) { resolve(true); return; }
+      setTimeout(poll, 50);
+    };
+    poll();
+  });
+}
+
+async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
+  const duration = Math.max(0.25, seconds);
+  const outgoingIndex = state._decks.indexOf(outgoing);
+  const incomingIndex = state._decks.indexOf(incoming);
+  const curve = state.crossfadeCurve;
+  state._crossfading = true;
+  setCrossfadeStatus('mixing');
+
+  const graphReady = ensureAutoLevelAudioGraph()
+    && state._deckAudioGraphs[outgoingIndex]
+    && state._deckAudioGraphs[incomingIndex]
+    && await resumeAudioGraph();
+
+  let completed = false;
+  if (graphReady) {
+    const context = state._audioContext;
+    const startTime = context.currentTime + 0.015;
+    const steps = 129;
+    const outgoingValues = new Float32Array(steps);
+    const incomingValues = new Float32Array(steps);
+    for (let i = 0; i < steps; i++) {
+      const [outGain, inGain] = crossfadeGains(i / (steps - 1), curve);
+      outgoingValues[i] = outGain;
+      incomingValues[i] = inGain;
+    }
+    const schedule = {
+      token, outgoingIndex, incomingIndex, curve,
+      startTime, duration, endTime: startTime + duration,
+    };
+    state._crossfadeSchedule = schedule;
+    scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
+    scheduleAudioParamCurve(state._deckAudioGraphs[incomingIndex].mixGain.gain, incomingValues, startTime, duration);
+    completed = await waitForCrossfadeSchedule(schedule, token);
+  } else {
+    completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
+  }
+
+  if (!completed || token !== state._crossfadeToken) return false;
+  state._crossfadeSchedule = null;
+  outgoing.pause();
+  state._deckGains[outgoingIndex] = 0;
+  state._deckGains[incomingIndex] = 1;
+  syncCrossfadeVolume();
+  state._crossfading = false;
+  setCrossfadeStatus('ready');
+  return true;
+}
+
+async function prefetchUpcomingCrossfadeTrack() {
+  if (!state.active || state._crossfading) return;
+  const nextTi = state.queue[state.pos + 1];
+  if (nextTi === undefined) return;
+  const standby = state._deckIndex === 0 ? 1 : 0;
+  if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
+  const audio = await prepareCrossfadeDeck(standby, nextTi);
+  if (state.crossfadeSeconds > 0) setCrossfadeStatus(audio ? 'ready' : 'fallback');
+}
+
+function upcomingCrossfadeDeckReady() {
+  const nextTi = state.queue[state.pos + 1];
+  if (nextTi === undefined) return false;
+  const standby = state._deckIndex === 0 ? 1 : 0;
+  const audio = state._decks[standby];
+  return Boolean(audio && state._deckTracks[standby] === nextTi && audio.readyState >= 2);
+}
+
+async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
+  const outgoing = currentDeckAudio();
+  const outgoingIndex = state._deckIndex;
+  const incomingIndex = outgoingIndex === 0 ? 1 : 0;
+  if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
+  const incoming = await prepareCrossfadeDeck(incomingIndex, ti);
+  if (!incoming || !await waitForDeck(incoming)) {
+    if (state.crossfadeSeconds > 0) setCrossfadeStatus('fallback');
+    return false;
+  }
+
+  const canMix = Boolean(outgoing && !outgoing.paused && !outgoing.ended && requestedFade > 0);
+  const token = ++state._crossfadeToken;
+  incoming.currentTime = 0;
+  state._deckGains[incomingIndex] = canMix ? 0 : 1;
+  if (Number.isInteger(outgoingIndex) && outgoingIndex >= 0 && !canMix) {
+    state._deckGains[outgoingIndex] = 0;
+  }
+  syncCrossfadeVolume();
+  pauseSoundCloud();
+  await resumeAudioGraph();
+  try {
+    await incoming.play();
+  } catch (_) {
+    if (state.crossfadeSeconds > 0) setCrossfadeStatus('fallback');
+    return false;
+  }
+
+  state._deckIndex = incomingIndex;
+  state._deckTrack = ti;
+  if (!canMix) {
+    state._deckGains[incomingIndex] = 1;
+    syncCrossfadeVolume();
+  }
+  state.lastTitle = state.meta[ti]?.title || '';
+  state.lastProgress = 0;
+  if (countPlay) trackPlayed(ti);
+
+  if (canMix) {
+    await animateDeckCrossfade(outgoing, incoming, requestedFade, token);
+    resetDeck(outgoing, outgoingIndex);
+  } else if (outgoing && outgoing !== incoming) {
+    resetDeck(outgoing, outgoingIndex);
+    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+  } else {
+    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+  }
+
+  setTimeout(() => { void prefetchUpcomingCrossfadeTrack(); }, 0);
+  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 80);
+  return true;
+}
+
 function trackPlayed(ti) {
   state.stats.played++;
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
@@ -669,6 +1660,17 @@ async function playAt(idx, countPlay = true) {
     const replacement = state.queue[state.pos];
     if (replacement !== undefined) await playAt(replacement, countPlay);
     return;
+  }
+
+  {
+    const requestedFade = currentDeckAudio()
+      ? (state._crossfadePending
+        ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
+        : (state.crossfadeManual ? Math.min(1.25, state.crossfadeSeconds) : 0))
+      : 0;
+    if (await playWithCrossfadeDeck(idx, countPlay, requestedFade)) return;
+    stopCrossfadeDecks();
+    setCrossfadeStatus('fallback');
   }
 
   const wasPaused = paused();
@@ -1144,6 +2146,7 @@ async function start() {
   state._savedStats  = null;
   state._lifetimeBase = { played: state.stats.played, elapsed: state.stats.elapsed, playCounts: { ...state.stats.playCounts } };
 
+  initializePlaybackVolume();
   await playAt(state.queue[state.pos]);
   if (!state.active) return;
   badges();
@@ -1153,6 +2156,7 @@ async function start() {
 }
 
 function stop() {
+  stopCrossfadeDecks();
   state.active     = false;
   state.busy       = false;
   state.loading    = false;
@@ -1262,13 +2266,19 @@ function startWatcher() {
   };
 
   const onMediaEnded = e => {
-    if (e.target?.tagName === 'AUDIO') void advanceAtNaturalEnd();
+    if (e.target?.tagName !== 'AUDIO') return;
+    if (Number.isInteger(state._deckTrack) && e.target !== currentDeckAudio()) return;
+    void advanceAtNaturalEnd();
   };
   state._endedHandler = onMediaEnded;
   document.addEventListener('ended', onMediaEnded, true);
 
   const tick = async () => {
     if (!state.active) return;
+
+    // Worker ticks continue in background tabs and release next() as soon as
+    // Web Audio's independent clock reaches the end of the scheduled fade.
+    settleScheduledCrossfade();
 
     // A manual transition normally clears when the title changes. Tracks can
     // legitimately share the same displayed title, so never keep the guard
@@ -1280,8 +2290,14 @@ function startWatcher() {
     // End detection runs at 50 ms; visual refreshes keep their old cadence.
     if (++uiTicks >= 6) {
       uiTicks = 0;
+      syncPlaybackVolumeFromSoundCloud();
       refreshPlayBtn();
       updateHub();
+    }
+
+    if (Number.isInteger(state._deckTrack)) {
+      syncCrossfadeVolume();
+      processAutoLevel();
     }
 
     if (state.busy) return;
@@ -1292,6 +2308,32 @@ function startWatcher() {
 
     if (timing.ended) {
       await advanceAtNaturalEnd();
+      return;
+    }
+
+    const remainingSeconds = timing.duration > 0
+      ? Math.max(0, timing.duration - timing.current)
+      : Infinity;
+    const shouldCrossfade = state.crossfadeSeconds > 0
+      && Number.isInteger(state._deckTrack)
+      && !state._crossfading
+      && !nearEnd
+      && !paused()
+      && upcomingCrossfadeDeckReady()
+      && !(state.stopAfterRound && state.pos >= state.queue.length - 1)
+      && !(state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)
+      && timing.current > 0
+      && remainingSeconds > 0.05
+      && remainingSeconds <= state.crossfadeSeconds;
+    if (shouldCrossfade) {
+      nearEnd = true;
+      state._crossfadePending = remainingSeconds;
+      try {
+        await next(true);
+      } finally {
+        state._crossfadePending = false;
+        await resetEndGuard();
+      }
       return;
     }
 
@@ -1463,6 +2505,7 @@ setInterval(renderStats, 1000);
 function showStats() {
   const existing = document.getElementById('tss-stats-overlay');
   if (existing) { existing.remove(); return; }
+  closeEqualizer();
 
   const overlay = document.createElement('div');
   overlay.id = 'tss-stats-overlay';
@@ -1543,6 +2586,306 @@ function showStats() {
 }
 
 // ── hub ───────────────────────────────────────────────────────────────────────
+
+function equalizerPresetName() {
+  for (const [name, values] of Object.entries({ ...EQ_PRESETS, ...state.customEqPresets })) {
+    if (values.every((value, index) => value === state.eqBands[index])) return name;
+  }
+  return 'Custom';
+}
+
+function renderEqualizerPresetButtons() {
+  const container = document.querySelector('#tss-eq-overlay .tss-eq-presets');
+  if (!container) return;
+  const signature = JSON.stringify(Object.keys(state.customEqPresets));
+  if (container.dataset.signature === signature) return;
+  const builtIns = Object.keys(EQ_PRESETS).map(name =>
+    `<button type="button" class="tss-eq-preset" data-preset="${esc(name)}">${esc(name)}</button>`
+  ).join('');
+  const custom = Object.keys(state.customEqPresets).map(name => `
+    <span class="tss-eq-custom-preset">
+      <button type="button" class="tss-eq-preset" data-preset="${esc(name)}">${esc(name)}</button>
+      <button type="button" class="tss-eq-preset-remove" data-remove-preset="${esc(name)}" aria-label="Delete ${esc(name)} preset">${SVG.close}</button>
+    </span>
+  `).join('');
+  container.innerHTML = `${builtIns}${custom}<button type="button" id="tss-eq-save-open">+ Save preset</button>`;
+  container.dataset.signature = signature;
+}
+
+function equalizerGraphY(value) {
+  return 107.5 - (Math.max(-12, Math.min(12, Number(value) || 0)) / 12) * 82.5;
+}
+
+function equalizerGraphPath(values = state.eqBands) {
+  const points = EQ_GRAPH_X.map((x, index) => ({ x, y: equalizerGraphY(values[index]) }));
+  let path = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length; i++) {
+    const previous = points[i - 1], current = points[i];
+    const midpoint = (previous.x + current.x) / 2;
+    path += ` C ${midpoint} ${previous.y}, ${midpoint} ${current.y}, ${current.x} ${current.y}`;
+  }
+  return { line: path, area: `${path} L ${points.at(-1).x} 190 L ${points[0].x} 190 Z`, points };
+}
+
+function renderEqualizerGraph() {
+  const overlay = document.getElementById('tss-eq-overlay');
+  if (!overlay) return;
+  const graph = equalizerGraphPath();
+  const line = overlay.querySelector('#tss-eq-curve');
+  const area = overlay.querySelector('#tss-eq-area');
+  if (line) line.setAttribute('d', graph.line);
+  if (area) area.setAttribute('d', graph.area);
+  graph.points.forEach((point, index) => {
+    overlay.querySelectorAll(`.tss-eq-point[data-band="${index}"]`).forEach(circle => {
+      circle.setAttribute('cy', String(point.y));
+      circle.setAttribute('aria-valuenow', String(state.eqBands[index]));
+      circle.setAttribute('aria-valuetext', `${state.eqBands[index] > 0 ? '+' : ''}${state.eqBands[index]} dB`);
+    });
+    const value = overlay.querySelector(`.tss-eq-point-value[data-band="${index}"]`);
+    if (value) {
+      value.setAttribute('y', String(Math.max(16, point.y - 15)));
+      value.textContent = `${state.eqBands[index] > 0 ? '+' : ''}${state.eqBands[index]}`;
+    }
+  });
+}
+
+function closeEqualizer() {
+  const overlay = document.getElementById('tss-eq-overlay');
+  overlay?._cancelDrag?.();
+  if (overlay?._onKeydown) document.removeEventListener('keydown', overlay._onKeydown);
+  overlay?.remove();
+  document.getElementById('tss-modal-backdrop')?.remove();
+}
+
+function setEqualizerBand(index, value) {
+  if (!ensureAutoLevelAudioGraph()) return;
+  state.eqBands[index] = Math.max(-12, Math.min(12, Math.round(Number(value) || 0)));
+  state.eqPreset = equalizerPresetName();
+  state.eqEnabled = true;
+  persistEqualizer();
+  syncEqualizer();
+  updateEqualizerPopup();
+}
+
+function updateEqualizerPopup() {
+  const overlay = document.getElementById('tss-eq-overlay');
+  if (!overlay) return;
+  renderEqualizerPresetButtons();
+  const power = overlay.querySelector('#tss-eq-power');
+  if (power) {
+    power.dataset.active = String(state.eqEnabled);
+    power.setAttribute('aria-pressed', String(state.eqEnabled));
+    power.textContent = state.eqEnabled ? 'EQ ON' : 'EQ OFF';
+  }
+  overlay.querySelectorAll('.tss-eq-preset').forEach(button => {
+    button.dataset.active = String(button.dataset.preset === state.eqPreset);
+  });
+  renderEqualizerGraph();
+}
+
+function showEqualizer() {
+  const existing = document.getElementById('tss-eq-overlay');
+  if (existing) { closeEqualizer(); return; }
+  document.getElementById('tss-stats-overlay')?.remove();
+
+  const backdrop = document.createElement('div');
+  backdrop.id = 'tss-modal-backdrop';
+  document.body.appendChild(backdrop);
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tss-eq-overlay';
+  overlay.innerHTML = `
+    <div class="tss-eq-head">
+      <div>
+        <div class="tss-eq-kicker">True Shuffle</div>
+        <div class="tss-eq-title">5-band equalizer</div>
+      </div>
+      <div class="tss-eq-head-actions">
+        <button id="tss-eq-power" type="button" aria-pressed="false">EQ OFF</button>
+        <button id="tss-eq-close" class="tss-stats-close" aria-label="Close equalizer">${SVG.close}</button>
+      </div>
+    </div>
+    <div class="tss-eq-body">
+      <div class="tss-eq-presets" role="group" aria-label="Equalizer presets">
+        ${Object.keys(EQ_PRESETS).map(name => `<button type="button" class="tss-eq-preset" data-preset="${esc(name)}">${esc(name)}</button>`).join('')}
+      </div>
+      <div id="tss-eq-save-row" data-open="false">
+        <label class="tss-eq-save-field"><span>Preset name</span><input id="tss-eq-save-name" type="text" maxlength="24" autocomplete="off" placeholder="My sound"></label>
+        <button id="tss-eq-save-confirm" type="button">Save</button>
+        <button id="tss-eq-save-cancel" type="button" aria-label="Cancel saving preset">${SVG.close}</button>
+        <span id="tss-eq-save-error" role="alert"></span>
+      </div>
+      <div class="tss-eq-graph-wrap">
+        <svg id="tss-eq-graph" class="tss-eq-graph" viewBox="0 0 520 230" role="group" aria-label="Five band equalizer curve">
+          <defs>
+            <linearGradient id="tss-eq-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#ff5500" stop-opacity=".48"/>
+              <stop offset="100%" stop-color="#ff5500" stop-opacity=".025"/>
+            </linearGradient>
+          </defs>
+          <g class="tss-eq-grid" aria-hidden="true">
+            <line x1="50" y1="25" x2="50" y2="190"/><line x1="155" y1="25" x2="155" y2="190"/>
+            <line x1="260" y1="25" x2="260" y2="190"/><line x1="365" y1="25" x2="365" y2="190"/>
+            <line x1="470" y1="25" x2="470" y2="190"/><line class="tss-eq-zero" x1="28" y1="107.5" x2="492" y2="107.5"/>
+          </g>
+          <path id="tss-eq-area" fill="url(#tss-eq-fill)" aria-hidden="true"/>
+          <path id="tss-eq-curve" fill="none" stroke="#ff5b0a" stroke-width="3" stroke-linecap="round" aria-hidden="true"/>
+          ${EQ_BANDS.map((band, index) => `
+            <text class="tss-eq-point-value" data-band="${index}" x="${EQ_GRAPH_X[index]}" y="90" text-anchor="middle">0</text>
+            <circle class="tss-eq-point tss-eq-point-visible" data-band="${index}" cx="${EQ_GRAPH_X[index]}" cy="107.5" r="5" aria-hidden="true"/>
+            <circle class="tss-eq-point tss-eq-point-hit" data-band="${index}" cx="${EQ_GRAPH_X[index]}" cy="107.5" r="17" tabindex="0" role="slider" aria-label="${band.label} hertz" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0"/>
+            <text class="tss-eq-frequency" x="${EQ_GRAPH_X[index]}" y="218" text-anchor="middle">${band.label}</text>
+          `).join('')}
+          <text class="tss-eq-axis-label" x="1" y="29">+12</text>
+          <text class="tss-eq-axis-label" x="8" y="111">0</text>
+          <text class="tss-eq-axis-label" x="1" y="194">-12</text>
+        </svg>
+      </div>
+      <div class="tss-eq-footer"><span>Drag points to fine-tune</span><button id="tss-eq-reset" type="button">Reset</button></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  backdrop.onclick = closeEqualizer;
+  overlay.querySelector('#tss-eq-close').onclick = closeEqualizer;
+  overlay.querySelector('#tss-eq-power').onclick = () => {
+    const enabling = !state.eqEnabled;
+    if (enabling && !ensureAutoLevelAudioGraph()) return;
+    state.eqEnabled = enabling;
+    persistEqualizer({ immediate: true });
+    syncEqualizer();
+    updateEqualizerPopup();
+  };
+  const presets = overlay.querySelector('.tss-eq-presets');
+  const saveRow = overlay.querySelector('#tss-eq-save-row');
+  const saveName = overlay.querySelector('#tss-eq-save-name');
+  const saveError = overlay.querySelector('#tss-eq-save-error');
+  presets.onclick = event => {
+    const remove = event.target.closest('[data-remove-preset]');
+    if (remove) {
+      const name = remove.dataset.removePreset;
+      delete state.customEqPresets[name];
+      if (state.eqPreset === name) state.eqPreset = equalizerPresetName();
+      persistEqualizer({ customPresets: true, immediate: true });
+      presets.dataset.signature = '';
+      updateEqualizerPopup();
+      return;
+    }
+    if (event.target.closest('#tss-eq-save-open')) {
+      saveRow.dataset.open = 'true';
+      saveError.textContent = '';
+      saveName.value = state.customEqPresets[state.eqPreset] ? state.eqPreset : '';
+      saveName.focus();
+      saveName.select();
+      return;
+    }
+    const button = event.target.closest('.tss-eq-preset');
+    if (!button || !ensureAutoLevelAudioGraph()) return;
+    const values = EQ_PRESETS[button.dataset.preset] || state.customEqPresets[button.dataset.preset];
+    if (!values) return;
+    state.eqBands = values.slice();
+    state.eqPreset = button.dataset.preset;
+    state.eqEnabled = true;
+    persistEqualizer({ immediate: true });
+    syncEqualizer();
+    updateEqualizerPopup();
+  };
+  const savePreset = () => {
+    const requested = saveName.value.trim().replace(/\s+/g, ' ').slice(0, 24);
+    if (!requested) { saveError.textContent = 'Enter a name'; return; }
+    if (Object.keys(EQ_PRESETS).some(name => name.toLowerCase() === requested.toLowerCase())) {
+      saveError.textContent = 'Built-in names cannot be replaced';
+      return;
+    }
+    if (BLOCKED_EQ_PRESET_NAMES.has(requested.toLowerCase())) {
+      saveError.textContent = 'Choose a different preset name';
+      return;
+    }
+    const existingName = Object.keys(state.customEqPresets).find(name => name.toLowerCase() === requested.toLowerCase());
+    if (!existingName && Object.keys(state.customEqPresets).length >= 20) {
+      saveError.textContent = 'Maximum 20 custom presets';
+      return;
+    }
+    const name = existingName || requested;
+    state.customEqPresets[name] = state.eqBands.slice();
+    state.eqPreset = name;
+    persistEqualizer({ customPresets: true, immediate: true });
+    saveRow.dataset.open = 'false';
+    presets.dataset.signature = '';
+    updateEqualizerPopup();
+  };
+  overlay.querySelector('#tss-eq-save-confirm').onclick = savePreset;
+  overlay.querySelector('#tss-eq-save-cancel').onclick = () => { saveRow.dataset.open = 'false'; saveError.textContent = ''; };
+  saveName.onkeydown = event => {
+    if (event.key === 'Enter') { event.preventDefault(); savePreset(); }
+    if (event.key === 'Escape') { event.stopPropagation(); saveRow.dataset.open = 'false'; }
+  };
+  overlay.querySelector('#tss-eq-reset').onclick = () => {
+    if (!ensureAutoLevelAudioGraph()) return;
+    state.eqBands = EQ_PRESETS.Flat.slice();
+    state.eqPreset = 'Flat';
+    state.eqEnabled = true;
+    persistEqualizer({ immediate: true });
+    syncEqualizer();
+    updateEqualizerPopup();
+  };
+
+  const svg = overlay.querySelector('#tss-eq-graph');
+  let draggingBand = null;
+  let draggingPoint = null;
+  let draggingPointerId = null;
+  const valueFromPointer = event => {
+    const rect = svg.getBoundingClientRect();
+    const y = (event.clientY - rect.top) * (230 / rect.height);
+    return Math.round(((107.5 - y) / 82.5) * 12);
+  };
+  const move = event => {
+    if (draggingBand === null) return;
+    event.preventDefault();
+    setEqualizerBand(draggingBand, valueFromPointer(event));
+  };
+  const up = () => {
+    if (draggingPoint && draggingPointerId !== null && typeof draggingPoint.releasePointerCapture === 'function') {
+      try { draggingPoint.releasePointerCapture(draggingPointerId); } catch (_) {}
+    }
+    draggingBand = null;
+    draggingPoint = null;
+    draggingPointerId = null;
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    document.removeEventListener('pointercancel', up);
+    window.removeEventListener('blur', up);
+  };
+  overlay._cancelDrag = up;
+  overlay.querySelectorAll('.tss-eq-point-hit').forEach(point => {
+    point.onpointerdown = event => {
+      event.preventDefault();
+      draggingBand = Number(point.dataset.band);
+      draggingPoint = point;
+      draggingPointerId = event.pointerId;
+      if (typeof point.setPointerCapture === 'function') {
+        try { point.setPointerCapture(event.pointerId); } catch (_) {}
+      }
+      document.addEventListener('pointermove', move, { passive: false });
+      document.addEventListener('pointerup', up);
+      document.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
+      setEqualizerBand(draggingBand, valueFromPointer(event));
+    };
+    point.onkeydown = event => {
+      if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const index = Number(point.dataset.band);
+      const nextValue = event.key === 'Home' ? -12
+        : event.key === 'End' ? 12
+          : state.eqBands[index] + (event.key === 'ArrowUp' ? 1 : -1);
+      setEqualizerBand(index, nextValue);
+    };
+  });
+  overlay._onKeydown = event => { if (event.key === 'Escape') closeEqualizer(); };
+  document.addEventListener('keydown', overlay._onKeydown);
+  updateEqualizerPopup();
+}
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
@@ -1681,6 +3024,56 @@ function mkHub() {
       #tss-hub-sleep:hover { border-color:rgba(255,255,255,0.18); }
       #tss-hub-sleep option { background:#1a1a1a; }
 
+      .tss-crossfade-card {
+        margin:0 14px 13px;border:1px solid rgba(255,255,255,.075);
+        border-radius:10px;background:rgba(255,255,255,.025);overflow:hidden;
+        transition:border-color .18s ease,background .18s ease;
+      }
+      .tss-crossfade-card[data-open="true"] {
+        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.22);
+        background:rgba(255,255,255,.035);
+      }
+      #tss-crossfade-summary {
+        width:100%;min-height:38px;padding:0 10px;border:0;background:transparent;color:#fff;
+        display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;
+        font-family:-apple-system,'Segoe UI',system-ui,sans-serif;text-align:left;
+      }
+      #tss-crossfade-summary:hover { background:rgba(255,255,255,.025); }
+      #tss-crossfade-summary:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:-2px; }
+      .tss-crossfade-copy { display:flex;align-items:center;gap:8px;min-width:0; }
+      .tss-crossfade-dot { width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.16);box-shadow:0 0 0 3px rgba(255,255,255,.035); }
+      .tss-crossfade-card[data-enabled="true"] .tss-crossfade-dot { background:var(--tss-a,#ff5500);box-shadow:0 0 0 3px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.12); }
+      .tss-crossfade-label { color:rgba(255,255,255,.72);font-size:8px;font-weight:760;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap; }
+      #tss-hub-crossfade-status { color:rgba(255,255,255,.3);font-size:8px;white-space:nowrap; }
+      #tss-hub-crossfade-status[data-status="mixing"] { color:var(--tss-a,#ff5500); }
+      #tss-hub-crossfade-status[data-status="fallback"] { color:#d39a62; }
+      .tss-crossfade-summary-value { display:flex;align-items:center;gap:7px;color:rgba(255,255,255,.48);font-size:9px;font-weight:700; }
+      #tss-crossfade-chevron { width:10px;height:10px;transition:transform .18s ease; }
+      .tss-crossfade-card[data-open="true"] #tss-crossfade-chevron { transform:rotate(180deg); }
+      .tss-crossfade-reveal { display:grid;grid-template-rows:0fr;transition:grid-template-rows .2s ease; }
+      .tss-crossfade-card[data-open="true"] .tss-crossfade-reveal { grid-template-rows:1fr; }
+      .tss-crossfade-settings { min-height:0;overflow:hidden; }
+      .tss-crossfade-settings-inner { padding:2px 10px 11px;border-top:1px solid rgba(255,255,255,.06); }
+      .tss-crossfade-setting-head { display:flex;align-items:center;justify-content:space-between;margin:9px 0 7px;color:rgba(255,255,255,.42);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.08em; }
+      #tss-crossfade-seconds { color:#fff;font-size:9px;letter-spacing:0;text-transform:none; }
+      #tss-hub-crossfade {
+        width:100%;height:16px;margin:0;appearance:none;background:transparent;cursor:pointer;accent-color:var(--tss-a,#ff5500);
+      }
+      #tss-hub-crossfade::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#ff5500) var(--tss-crossfade-fill,0%),rgba(255,255,255,.11) var(--tss-crossfade-fill,0%)); }
+      #tss-hub-crossfade::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-crossfade:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:3px;border-radius:4px; }
+      .tss-crossfade-ticks { display:flex;justify-content:space-between;color:rgba(255,255,255,.22);font-size:7px;margin-top:1px; }
+      .tss-crossfade-modes { display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;background:rgba(0,0,0,.26);border-radius:7px; }
+      .tss-crossfade-mode { border:0;border-radius:5px;padding:6px 3px;background:transparent;color:rgba(255,255,255,.34);font:700 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s; }
+      .tss-crossfade-mode:hover { color:rgba(255,255,255,.72); }
+      .tss-crossfade-mode[data-active="true"] { color:#fff;background:rgba(255,255,255,.09);box-shadow:0 1px 4px rgba(0,0,0,.25); }
+      .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:1px; }
+      .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.42);font-size:8px;cursor:pointer; }
+      .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#ff5500);cursor:pointer; }
+      @media (prefers-reduced-motion:reduce) {
+        .tss-crossfade-reveal,#tss-crossfade-chevron { transition:none; }
+      }
+
       /* v5 deck concept — visual layer only */
       #tss-hub {
         --tss-panel:rgba(10,10,10,0.96);
@@ -1747,6 +3140,23 @@ function mkHub() {
       .tss-deck-controls { display:flex;align-items:center;justify-content:center;gap:16px;padding:9px 14px 15px; }
       .tss-deck-controls .tss-hub-btn-sm { width:40px;height:40px;background:rgba(255,255,255,0.095);color:rgba(255,255,255,.82); }
       .tss-deck-controls .tss-hub-btn-lg { width:54px;height:54px;box-shadow:0 7px 24px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.34),0 0 0 1px rgba(255,255,255,.14); }
+      .tss-master-volume { display:grid;grid-template-columns:14px minmax(0,1fr) 31px 62px;align-items:center;gap:9px;margin:-3px 14px 13px;color:rgba(255,255,255,.38); }
+      #tss-hub-volume { width:100%;height:18px;margin:0;appearance:none;background:transparent;cursor:pointer; }
+      #tss-hub-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#ff5500) var(--tss-volume-fill,10%),rgba(255,255,255,.12) var(--tss-volume-fill,10%)); }
+      #tss-hub-volume::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-volume:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:3px;border-radius:4px; }
+      #tss-hub-volume-value { color:rgba(255,255,255,.48);font-size:9px;font-weight:700;text-align:right;font-variant-numeric:tabular-nums; }
+      #tss-auto-level {
+        height:22px;padding:0 7px;display:flex;align-items:center;justify-content:center;gap:5px;
+        border:1px solid #555;border-radius:7px;background:#171717;
+        color:#c8c8c8;font:700 8px/1 Arial,sans-serif;letter-spacing:.06em;cursor:pointer;
+        box-shadow:0 1px 3px rgba(0,0,0,.55);transition:color .16s,border-color .16s,background .16s,box-shadow .16s;
+      }
+      #tss-auto-level:hover { color:#fff;background:#242424;border-color:#777; }
+      #tss-auto-level[data-active="true"] { color:#fff;border-color:#ff7a33;background:#e84d00;box-shadow:0 0 0 1px rgba(255,255,255,.16),0 0 10px rgba(255,85,0,.34); }
+      #tss-auto-level:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px; }
+      .tss-auto-dot { width:5px;height:5px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor; }
+      #tss-auto-level[data-active="true"] .tss-auto-dot { box-shadow:0 0 6px currentColor; }
       .tss-hub-btn:focus-visible,#tss-hub-start:focus-visible,#tss-hub-sleep:focus-visible {
         outline:2px solid var(--tss-a,#ff5500);outline-offset:2px;
       }
@@ -1877,6 +3287,63 @@ function mkHub() {
         width:54px;background:var(--tss-a,#ff5500);
       }
 
+      #tss-hub-eq[data-active="true"] { color:#fff !important;border-color:#ff7a33 !important;background:#e84d00 !important;box-shadow:0 0 9px rgba(255,85,0,.3); }
+      #tss-modal-backdrop { position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.42);-webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);animation:tss-backdrop-in .18s ease-out; }
+      @keyframes tss-backdrop-in { from { opacity:0; } to { opacity:1; } }
+      #tss-eq-overlay {
+        position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;
+        width:560px;max-width:calc(100vw - 28px);box-sizing:border-box;color:#eee;
+        background:rgba(9,9,9,.99);border:1px solid rgba(255,255,255,.12);border-radius:18px;
+        box-shadow:0 30px 90px rgba(0,0,0,.82),0 0 0 1px rgba(255,85,0,.035);
+        font-family:-apple-system,'Segoe UI',system-ui,sans-serif;-webkit-user-select:none;user-select:none;
+        -webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);
+        animation:tss-eq-in .18s cubic-bezier(.2,.8,.2,1);
+      }
+      @keyframes tss-eq-in { from { opacity:0;transform:translate(-50%,-48%) scale(.985); } to { opacity:1;transform:translate(-50%,-50%) scale(1); } }
+      .tss-eq-head { display:flex;align-items:center;justify-content:space-between;padding:17px 18px 14px;border-bottom:1px solid rgba(255,255,255,.075); }
+      .tss-eq-kicker { color:#ff6a1f;font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
+      .tss-eq-title { margin-top:4px;color:#f3f3f3;font-size:17px;font-weight:680;letter-spacing:-.02em; }
+      .tss-eq-head-actions { display:flex;align-items:center;gap:7px; }
+      #tss-eq-power { height:32px;padding:0 10px;border:1px solid #555;border-radius:8px;background:#171717;color:#c8c8c8;cursor:pointer;font:750 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.08em;transition:all .18s; }
+      #tss-eq-power[data-active="true"] { color:#fff;border-color:#ff7a33;background:#e84d00;box-shadow:0 0 9px rgba(255,85,0,.3); }
+      #tss-eq-power:focus-visible,.tss-eq-preset:focus-visible,.tss-eq-point-hit:focus-visible,#tss-eq-reset:focus-visible { outline:2px solid #ff6a1f;outline-offset:2px; }
+      .tss-eq-body { position:relative;padding:15px 18px 16px; }
+      .tss-eq-presets { display:flex;gap:7px;overflow-x:auto;padding:1px 1px 12px;scrollbar-width:none; }
+      .tss-eq-presets::-webkit-scrollbar { display:none; }
+      .tss-eq-preset { flex:0 0 auto;height:30px;padding:0 11px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.035);color:rgba(255,255,255,.56);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
+      .tss-eq-preset:hover { color:#fff;border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.07); }
+      .tss-eq-preset[data-active="true"] { color:#fff;border-color:rgba(255,106,31,.7);background:rgba(255,85,0,.18); }
+      .tss-eq-custom-preset { display:inline-flex;flex:0 0 auto; }
+      .tss-eq-custom-preset .tss-eq-preset { border-radius:8px 0 0 8px;border-right:0; }
+      .tss-eq-preset-remove { width:25px;height:30px;padding:0;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.1);border-radius:0 8px 8px 0;background:rgba(255,255,255,.035);color:rgba(255,255,255,.3);cursor:pointer;transition:color .18s,border-color .18s,background .18s; }
+      .tss-eq-preset-remove:hover { color:#ff8050;border-color:rgba(255,128,80,.4);background:rgba(255,85,0,.1); }
+      #tss-eq-save-open { flex:0 0 auto;height:30px;padding:0 11px;border:1px dashed rgba(255,255,255,.2);border-radius:8px;background:transparent;color:rgba(255,255,255,.48);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-save-open:hover { color:#fff;border-color:#ff6a1f;background:rgba(255,85,0,.08); }
+      #tss-eq-save-row { display:none;grid-template-columns:minmax(0,1fr) auto 30px;align-items:end;gap:7px;margin:-2px 1px 12px;padding:10px;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:rgba(255,255,255,.025); }
+      #tss-eq-save-row[data-open="true"] { display:grid; }
+      .tss-eq-save-field { display:grid;gap:5px;min-width:0; }
+      .tss-eq-save-field span { color:rgba(255,255,255,.38);font-size:8px;font-weight:700;letter-spacing:.08em;text-transform:uppercase; }
+      #tss-eq-save-name { width:100%;height:31px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:#111;color:#eee;outline:none;font:500 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-eq-save-name:focus { border-color:#ff6a1f;box-shadow:0 0 0 2px rgba(255,85,0,.12); }
+      #tss-eq-save-confirm,#tss-eq-save-cancel { height:31px;border:1px solid rgba(255,255,255,.13);border-radius:7px;cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-eq-save-confirm { padding:0 12px;background:#e84d00;border-color:#ff7130;color:#fff; }
+      #tss-eq-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:#171717;color:rgba(255,255,255,.5); }
+      #tss-eq-save-error { grid-column:1/-1;min-height:0;color:#ff805f;font-size:8px; }
+      .tss-eq-graph-wrap { border-top:1px solid rgba(255,255,255,.055);border-bottom:1px solid rgba(255,255,255,.055);padding:4px 0 1px; }
+      .tss-eq-graph { display:block;width:100%;height:auto;overflow:visible;touch-action:none; }
+      .tss-eq-grid line { stroke:rgba(255,255,255,.105);stroke-width:1;stroke-dasharray:3 4; }
+      .tss-eq-grid .tss-eq-zero { stroke:rgba(255,255,255,.28);stroke-dasharray:none; }
+      .tss-eq-point-visible { fill:#ff5b0a;stroke:#fff;stroke-width:2.5;filter:drop-shadow(0 2px 4px rgba(0,0,0,.8));pointer-events:none; }
+      .tss-eq-point-hit { fill:transparent;stroke:transparent;cursor:ns-resize;pointer-events:all;touch-action:none; }
+      .tss-eq-point-visible:has(+ .tss-eq-point-hit:hover),.tss-eq-point-visible:has(+ .tss-eq-point-hit:focus-visible) { fill:#fff; }
+      .tss-eq-point-value { fill:rgba(255,255,255,.72);font-size:9px;font-weight:750;font-variant-numeric:tabular-nums;pointer-events:none; }
+      .tss-eq-frequency { fill:rgba(255,255,255,.48);font-size:10px;font-weight:700;pointer-events:none; }
+      .tss-eq-axis-label { fill:rgba(255,255,255,.3);font-size:8px;font-weight:700;pointer-events:none; }
+      .tss-eq-footer { display:flex;align-items:center;justify-content:space-between;margin-top:11px;color:rgba(255,255,255,.3);font-size:8px;font-weight:700;letter-spacing:.07em;text-transform:uppercase; }
+      #tss-eq-reset { height:30px;padding:0 13px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:transparent;color:rgba(255,255,255,.68);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-reset:hover { color:#fff;border-color:rgba(255,255,255,.34);background:rgba(255,255,255,.055); }
+      @media (max-width:520px) { #tss-eq-overlay { width:calc(100vw - 20px); } .tss-eq-body { padding-inline:10px; } .tss-eq-head { padding-inline:12px; } .tss-eq-preset { padding-inline:9px; } }
+
       #tss-stats-overlay {
         color:#eeeeee;background:rgba(10,10,10,.985) !important;
         border:1px solid rgba(255,255,255,.09) !important;border-radius:18px !important;
@@ -1954,6 +3421,7 @@ function mkHub() {
           <span class="tss-deck-label">True Shuffle</span>
         </div>
         <div style="display:flex; gap:3px; align-items:center;">
+          <button id="tss-hub-eq" class="tss-hub-btn tss-hub-btn-icon" data-active="false" aria-label="Equalizer" aria-pressed="false" title="Equalizer off">${SVG.equalizer}</button>
           <button id="tss-hub-stats" class="tss-hub-btn tss-hub-btn-icon" aria-label="Session stats" title="session stats">${SVG.chart}</button>
           <button id="tss-hub-qico"  class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Queue panel" title="queue panel">${SVG.list}</button>
           <button id="tss-hub-col"   class="tss-hub-btn tss-hub-btn-icon" title="collapse" style="font-size:15px; line-height:1; padding:3px 6px;">−</button>
@@ -2002,6 +3470,43 @@ function mkHub() {
             <button id="tss-hub-next" class="tss-hub-btn tss-hub-btn-sm" aria-label="Next track">${SVG.next}</button>
           </div>
 
+          <div class="tss-master-volume">
+            <span aria-hidden="true">${SVG.volume}</span>
+            <input id="tss-hub-volume" type="range" min="0" max="100" step="1" value="10" aria-label="True Shuffle volume">
+            <span id="tss-hub-volume-value" aria-live="polite">10%</span>
+            <button id="tss-auto-level" type="button" aria-pressed="false" title="Automatically reduce louder tracks"><span class="tss-auto-dot" aria-hidden="true"></span><span class="tss-auto-label">AUTO OFF</span></button>
+          </div>
+
+          <div class="tss-crossfade-card" id="tss-crossfade-card" data-open="false" data-enabled="false">
+            <button id="tss-crossfade-summary" type="button" aria-expanded="false" aria-controls="tss-crossfade-settings">
+              <span class="tss-crossfade-copy">
+                <span class="tss-crossfade-dot" aria-hidden="true"></span>
+                <span class="tss-crossfade-label">Crossfade</span>
+                <span id="tss-hub-crossfade-status" data-status="off" aria-live="polite">off</span>
+              </span>
+              <span class="tss-crossfade-summary-value">
+                <span id="tss-crossfade-summary-seconds">off</span>
+                <svg id="tss-crossfade-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+            </button>
+            <div class="tss-crossfade-reveal" id="tss-crossfade-settings">
+              <div class="tss-crossfade-settings">
+                <div class="tss-crossfade-settings-inner">
+                  <div class="tss-crossfade-setting-head"><span>Duration</span><span id="tss-crossfade-seconds">off</span></div>
+                  <input id="tss-hub-crossfade" type="range" min="0" max="12" step="1" value="0" aria-label="Crossfade duration in seconds">
+                  <div class="tss-crossfade-ticks" aria-hidden="true"><span>off</span><span>3</span><span>6</span><span>9</span><span>12s</span></div>
+                  <div class="tss-crossfade-setting-head"><span>Mix style</span></div>
+                  <div class="tss-crossfade-modes" role="group" aria-label="Crossfade mix style">
+                    <button type="button" class="tss-crossfade-mode" data-curve="smooth" title="Gentle, rounded handoff">Smooth</button>
+                    <button type="button" class="tss-crossfade-mode" data-curve="clean" title="Linear blend with minimal coloration">Clean</button>
+                    <button type="button" class="tss-crossfade-mode" data-curve="dj" title="Faster handoff around the midpoint">DJ</button>
+                  </div>
+                  <label class="tss-crossfade-manual"><span>Fade manual skips</span><input id="tss-crossfade-manual" type="checkbox"></label>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
 
         <div id="tss-hub-actions" style="padding:0 14px 14px;">
@@ -2042,6 +3547,7 @@ function mkHub() {
     next();
   };
   document.getElementById('tss-hub-stats').onclick = showStats;
+  document.getElementById('tss-hub-eq').onclick = showEqualizer;
   document.getElementById('tss-hub-reshuffle').onclick = e => {
     e.stopPropagation();
     reshuffleCurrentPage();
@@ -2057,7 +3563,10 @@ function mkHub() {
   stopAfterRound.checked  = state.stopAfterRound;
   stopAfterRound.onchange = () => { state.stopAfterRound = stopAfterRound.checked; };
 
-  document.getElementById('tss-hub-start').onclick = () => { if (!state.loading) start(); };
+  document.getElementById('tss-hub-start').onclick = () => {
+    if (state.autoLevel || state.eqEnabled || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
+    if (!state.loading) start();
+  };
 
   document.getElementById('tss-hub-sleep').onchange = e => {
     const v = e.target.value;
@@ -2070,6 +3579,79 @@ function mkHub() {
     }
     updateSleepDisplay();
   };
+
+  const crossfadeCard = document.getElementById('tss-crossfade-card');
+  const crossfadeSummary = document.getElementById('tss-crossfade-summary');
+  crossfadeSummary.onclick = () => {
+    const open = crossfadeCard.dataset.open !== 'true';
+    crossfadeCard.dataset.open = open ? 'true' : 'false';
+    crossfadeSummary.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+
+  const crossfadeSlider = document.getElementById('tss-hub-crossfade');
+  crossfadeSlider.oninput = e => {
+    const previousSeconds = state.crossfadeSeconds;
+    state.crossfadeSeconds = Math.max(0, Math.min(12, Number(e.target.value) || 0));
+    localStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
+    if (state.crossfadeSeconds <= 0) {
+      setCrossfadeStatus('off');
+    } else {
+      setCrossfadeStatus('armed');
+      if (previousSeconds <= 0) {
+        ensureAutoLevelAudioGraph();
+        if (state.active && currentDeckAudio()) void prefetchUpcomingCrossfadeTrack();
+      }
+    }
+    syncCrossfadeControls();
+  };
+
+  document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
+    button.onclick = () => {
+      state.crossfadeCurve = button.dataset.curve;
+      localStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      syncCrossfadeControls();
+    };
+  });
+
+  const crossfadeManual = document.getElementById('tss-crossfade-manual');
+  crossfadeManual.onchange = () => {
+    state.crossfadeManual = crossfadeManual.checked;
+    localStorage.setItem('tss_crossfade_manual', String(state.crossfadeManual));
+    syncCrossfadeControls();
+  };
+
+  const playbackVolume = document.getElementById('tss-hub-volume');
+  playbackVolume.oninput = () => {
+    state.playbackVolume = Math.max(0, Math.min(1, Number(playbackVolume.value) / 100));
+    state._playbackVolumeStored = true;
+    state._playbackVolumeInitialized = true;
+    localStorage.setItem('tss_playback_volume', String(state.playbackVolume));
+    syncCrossfadeVolume();
+    setSoundCloudVolume(state.playbackVolume);
+    syncPlaybackVolumeControls();
+  };
+  const autoLevel = document.getElementById('tss-auto-level');
+  autoLevel.onclick = () => {
+    const enabling = !state.autoLevel;
+    if (enabling && !ensureAutoLevelAudioGraph()) {
+      state.autoLevel = false;
+      localStorage.setItem('tss_auto_level', 'false');
+      syncPlaybackVolumeControls();
+      return;
+    }
+    state.autoLevel = enabling;
+    localStorage.setItem('tss_auto_level', String(state.autoLevel));
+    if (state.autoLevel && state._audioContext?.state === 'suspended') void state._audioContext.resume();
+    state._deckTracks.forEach((ti, index) => {
+      if (Number.isInteger(ti)) applyCachedAutoLevel(index, ti);
+    });
+    syncCrossfadeVolume();
+    syncPlaybackVolumeControls();
+  };
+  syncCrossfadeControls();
+  syncPlaybackVolumeControls();
+  syncEqualizer();
+  initializePlaybackVolume();
 
   const colBtn  = document.getElementById('tss-hub-col');
   const hubBody = document.getElementById('tss-hub-body');
@@ -2149,6 +3731,16 @@ function updateHub() {
 
   const cb = document.getElementById('tss-hub-stop-after');
   if (cb && cb.checked !== state.stopAfterRound) cb.checked = state.stopAfterRound;
+
+  syncCrossfadeControls();
+  syncPlaybackVolumeControls();
+  if (state.crossfadeSeconds > 0 && state.crossfadeStatus === 'off') {
+    setCrossfadeStatus('armed');
+  } else if (state.crossfadeSeconds <= 0 && !currentDeckAudio()) {
+    setCrossfadeStatus('off');
+  } else {
+    setCrossfadeStatus(state.crossfadeStatus);
+  }
 
   const qi = document.getElementById('tss-hub-qico');
   if (qi) {
@@ -2864,6 +4456,18 @@ new MutationObserver(() => {
     }, 250);
   }
 }).observe(document, { subtree: true, childList: true });
+
+window.addEventListener('pagehide', () => {
+  if (equalizerPersistTimer || customPresetsPending) flushEqualizerPersistence();
+});
+
+document.addEventListener('visibilitychange', () => {
+  const deck = currentDeckAudio();
+  if (document.visibilityState === 'visible' && state.active && deck && !deck.paused
+      && state._audioContext && state._audioContext.state !== 'running') {
+    void resumeAudioGraph();
+  }
+});
 
 onNav();
 

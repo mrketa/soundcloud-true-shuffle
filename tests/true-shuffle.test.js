@@ -171,7 +171,7 @@ function createWatcherHarness() {
 
   const factory = Function(
     'state', 'playerTitle', 'progress', 'paused', 'pause', 'wait', 'document', 'next',
-    'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker',
+    'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker', 'settleScheduledCrossfade',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -187,6 +187,7 @@ function createWatcherHarness() {
     () => {},
     playbackTiming,
     () => worker,
+    () => {},
   );
   startWatcher();
 

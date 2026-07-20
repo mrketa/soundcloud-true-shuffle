@@ -1,5 +1,39 @@
 # Changelog
 
+## v6.0.0 - 2026-07-20
+
+### Highlights
+
+- Replaced SoundCloud's player as the primary playback path with True Shuffle's own two-deck audio engine. SoundCloud playback remains available as a fallback when a stream cannot be resolved or loaded.
+- Added customizable DJ-style crossfade with a 0–12 second duration, Smooth, Clean and DJ curves, plus optional fades for manual skips.
+- Added a visual 5-band equalizer with built-in presets, fine-tuning and user-created presets that persist through Tampermonkey storage.
+- Added Auto Level to reduce loudness differences between tracks, with faster initial calibration and a per-track learned-level cache.
+
+### Audio and controls
+
+- Added a continuous global output-volume slider shared by custom-deck and fallback playback.
+- Kept hub, SoundCloud and deck volume synchronized in both directions.
+- Added dual-deck pause and resume during active crossfades.
+- Added background-safe crossfade automation based on the Web Audio clock instead of animation frames.
+- Added equalizer and Auto Level processing to the primary playback path even when crossfade is disabled.
+- Added a contrast-safe Auto Level state so its enabled status remains visible over dark artwork.
+
+### Equalizer and persistence
+
+- Added Flat, Bass Boost, Warm, Vocal, Bright and other tuning presets.
+- Added an interactive frequency-response graph for 60 Hz, 150 Hz, 400 Hz, 1 kHz and 15 kHz.
+- Added save, load and delete controls for custom presets.
+- Migrated custom presets from page storage into Tampermonkey's persistent userscript storage.
+- Throttled EQ persistence while dragging and hardened custom preset validation.
+
+### Reliability
+
+- Added safe fallback to SoundCloud's native player when public progressive audio is unavailable.
+- Improved compatibility with Chrome, Firefox, Edge, Brave, Opera and Safari-compatible userscript managers.
+- Preserved playback coordination in background tabs through the existing Web Worker and Web Audio scheduling.
+- Cleaned up equalizer pointer capture and modal event listeners when dialogs close.
+- Added regression coverage for deck playback, crossfade curves, volume synchronization, Auto Level, equalizer presets, persistent storage and background audio scheduling.
+
 ## v5.1.0 - 2026-07-19
 
 ### Highlights
