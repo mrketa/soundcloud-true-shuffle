@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.0
+// @version      6.1.1
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -95,6 +95,11 @@ const state = {
   _endedHandler: null,
   _manualActionAt: 0,
   _internalNavigation: false,
+  _internalNavigationTarget: '',
+  _internalNavigationToken: 0,
+  _likeBusy: false,
+  _likeStateTrack: null,
+  _likeStateLastCheck: 0,
   crossfadeSeconds: Math.max(0, Math.min(12, Number(localStorage.getItem('tss_crossfade_seconds')) || 0)),
   crossfadeCurve: ['smooth', 'clean', 'dj'].includes(localStorage.getItem('tss_crossfade_curve'))
     ? localStorage.getItem('tss_crossfade_curve')
@@ -164,6 +169,9 @@ const state = {
   _liveSyncLastCheck: 0,
   _liveSyncSource: '',
   _liveSyncTimer: null,
+  _tabTitleBeforePlayback: null,
+  _tabTitleValue: '',
+  _browserMetadataKey: '',
   stats: {
     played:     0,
     playCounts: {},
@@ -490,6 +498,7 @@ function trackId(m) {
 }
 
 function getMeta(el) {
+  const likeButton = el.querySelector('.sc-button-like');
   return {
     title:   el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.textContent.trim() || '—',
     artist:  el.querySelector('.trackItem__username, .soundTitle__username, .sc-link-secondary')?.textContent.trim() || '—',
@@ -497,11 +506,12 @@ function getMeta(el) {
     link:    getLink(el),
     artistLink: getArtistLink(el),
     waveform: waveformUrl(el),
+    liked: likeButton ? soundCloudLikeButtonState(likeButton) : null,
     sourcePage: location.href.split(/[?#]/)[0].replace(/\/+$/, ''),
   };
 }
 
-const LIVE_SYNC_INTERVAL_MS = 30_000;
+const LIVE_SYNC_INTERVAL_MS = 10_000;
 
 function playlistSnapshotFromHtml(html) {
   const match = String(html || '').match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\]);<\/script>/);
@@ -534,6 +544,7 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
     link: track.permalink_url,
     artistLink: track.user?.permalink_url || null,
     waveform: track.waveform_url || null,
+    liked: typeof track.user_favorite === 'boolean' ? track.user_favorite : null,
     sourcePage,
     playlistPosition: Number.isFinite(Number(playlistPosition)) ? Number(playlistPosition) : null,
   };
@@ -576,6 +587,8 @@ const SVG = {
   plus:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z"/></svg>`,
   search:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>`,
   volume:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M2 6h3l3-2.5v9L5 10H2z"/><path d="M11 5.5a4 4 0 010 5"/><path d="M13 3.5a7 7 0 010 9"/></svg>`,
+  heart:   `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M8 13.6S2.2 10.2 2.2 5.8A3.1 3.1 0 018 4.25 3.1 3.1 0 0113.8 5.8C13.8 10.2 8 13.6 8 13.6z"/></svg>`,
+  heartFilled:`<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M8 14.2l-.42-.25C5.62 12.78 1.5 9.86 1.5 5.77A3.82 3.82 0 018 3.04a3.82 3.82 0 016.5 2.73c0 4.09-4.12 7.01-6.08 8.18L8 14.2z"/></svg>`,
 };
 
 const EQ_BANDS = [
@@ -1405,6 +1418,99 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
   };
 }
 
+function soundCloudLikeButtonState(button) {
+  if (!button) return null;
+  const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim();
+  return button.classList.contains('sc-button-selected') || /\bunlike\b/i.test(label);
+}
+
+function findSoundCloudLikeButton(ti) {
+  const meta = state.meta[ti];
+  const wanted = normalizeTrackUrl(meta?.link);
+  if (!wanted) return null;
+
+  const bound = state.els[ti];
+  if (bound && document.body.contains(bound)) {
+    const button = bound.querySelector('.sc-button-like');
+    if (button) return button;
+  }
+
+  const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
+  if (playerLink && normalizeTrackUrl(playerLink.href) === wanted) {
+    const button = playerLink.closest('.playbackSoundBadge')?.querySelector('.playbackSoundBadge__like, .sc-button-like');
+    if (button) return button;
+  }
+
+  if (normalizeTrackUrl(location.href) === wanted) {
+    const button = document.querySelector('.listenEngagement__actions .sc-button-like, .soundActions .sc-button-like');
+    if (button) return button;
+  }
+
+  for (const link of document.querySelectorAll('a[href]')) {
+    if (normalizeTrackUrl(link.href) !== wanted) continue;
+    const root = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound');
+    const button = root?.querySelector('.sc-button-like');
+    if (button) return button;
+  }
+  return null;
+}
+
+function currentTrackLikeState(ti, force = false) {
+  const now = Date.now();
+  const meta = state.meta[ti];
+  if (!meta) return { liked: false, available: false };
+  if (!force && state._likeStateTrack === ti && now - state._likeStateLastCheck < 1000) {
+    return { liked: meta.liked === true, available: meta.likeAvailable === true };
+  }
+
+  const button = findSoundCloudLikeButton(ti);
+  state._likeStateTrack = ti;
+  state._likeStateLastCheck = now;
+  meta.likeAvailable = Boolean(button);
+  if (button) meta.liked = soundCloudLikeButtonState(button);
+  return { liked: meta.liked === true, available: Boolean(button) };
+}
+
+async function toggleCurrentTrackLike() {
+  if (state._likeBusy) return false;
+  const ti = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
+  const meta = state.meta[ti];
+  const button = findSoundCloudLikeButton(ti);
+  if (!meta || !button) {
+    showMergeToast('like unavailable until this track is visible on SoundCloud');
+    currentTrackLikeState(ti, true);
+    syncOwnPipWindow();
+    return false;
+  }
+
+  state._likeBusy = true;
+  const before = soundCloudLikeButtonState(button);
+  meta.likeAvailable = true;
+  meta.liked = !before;
+  syncOwnPipWindow();
+  try {
+    button.click();
+    for (const delay of [120, 380, 800]) {
+      await wait(delay);
+      const currentButton = findSoundCloudLikeButton(ti);
+      if (!currentButton) continue;
+      const actual = soundCloudLikeButtonState(currentButton);
+      meta.liked = actual;
+      if (actual !== before) break;
+    }
+    return meta.liked !== before;
+  } finally {
+    state._likeBusy = false;
+    state._likeStateLastCheck = 0;
+    currentTrackLikeState(ti, true);
+    syncOwnPipWindow();
+  }
+}
+
+function ownPipWindowTitle(meta, isPaused) {
+  return meta?.title && !isPaused ? `Playing: ${meta.title}` : 'True Shuffle';
+}
+
 function syncOwnPipWindow() {
   if (state._ownPipMode === 'video') {
     if (!ownPipIsOpen()) {
@@ -1432,6 +1538,7 @@ function syncOwnPipWindow() {
   const total = Math.max(1, state.roundTotal || state.queue.length);
   const inRound = Math.min(total, Math.max(1, state.roundPlayed + 1));
 
+  pipDocument.title = ownPipWindowTitle(meta, paused());
   pipDocument.documentElement.style.setProperty('--accent', accent);
   const title = pipDocument.getElementById('tss-pip-title');
   const artist = pipDocument.getElementById('tss-pip-artist');
@@ -1457,6 +1564,20 @@ function syncOwnPipWindow() {
   if (play) {
     play.innerHTML = paused() ? SVG.play : SVG.pause;
     play.setAttribute('aria-label', paused() ? 'Play' : 'Pause');
+  }
+
+  const like = pipDocument.getElementById('tss-pip-like');
+  if (like) {
+    const likeState = currentTrackLikeState(currentTi);
+    like.innerHTML = likeState.liked ? SVG.heartFilled : SVG.heart;
+    like.dataset.liked = likeState.liked ? 'true' : 'false';
+    like.dataset.available = likeState.available ? 'true' : 'false';
+    like.disabled = state._likeBusy || !likeState.available;
+    like.setAttribute('aria-pressed', likeState.liked ? 'true' : 'false');
+    like.setAttribute('aria-label', likeState.liked ? 'Unlike current track' : 'Like current track');
+    like.title = likeState.available
+      ? (likeState.liked ? 'Unlike on SoundCloud' : 'Like on SoundCloud')
+      : 'Like is available when the track is visible on SoundCloud';
   }
 
   const nextRow = pipDocument.getElementById('tss-pip-up-next-row');
@@ -1764,6 +1885,9 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-live svg{width:13px!important;height:13px!important}
     .tss-pip-view-toggle{width:29px;height:29px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:transparent;color:rgba(255,255,255,.52);cursor:pointer}
     .tss-pip-view-toggle:hover,.tss-pip-view-toggle[data-active="true"]{color:var(--accent);background:rgba(255,255,255,.06)}
+    .tss-pip-view-toggle[data-liked="true"]{color:var(--accent);background:color-mix(in srgb,var(--accent),transparent 88%)}
+    .tss-pip-view-toggle[data-liked="true"]:hover{background:color-mix(in srgb,var(--accent),transparent 82%)}
+    .tss-pip-view-toggle:disabled{opacity:.3;cursor:not-allowed;background:transparent}
     .tss-pip-view-toggle svg{width:13px!important;height:13px!important}
     .tss-pip-close{width:29px;height:29px;border:0;border-radius:8px;background:transparent;color:rgba(255,255,255,.58)}
     .tss-pip-close:hover{color:#fff;background:rgba(255,255,255,.07)}
@@ -1838,6 +1962,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-stage[data-view="queue"] .tss-pip-queue-row{animation:tssPipRowIn .26s both cubic-bezier(.22,1,.36,1);animation-delay:calc(var(--row-index) * 18ms)}
     @keyframes tssPipRowIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}@keyframes tssPipMenuIn{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
     @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu{transition:none!important;animation:none!important}}
+    @media(max-width:360px){.tss-pip-header{gap:6px}.tss-pip-live span{display:none}.tss-pip-brand{font-size:9px}.tss-pip-state{max-width:52px}}
     @media(max-height:300px){#tss-pip-player{min-height:280px;padding:10px 13px}.tss-pip-stage{margin-top:6px}.tss-pip-track{grid-template-columns:70px minmax(0,1fr);min-height:70px}.tss-pip-art{width:70px;height:70px}.tss-pip-wave{margin-top:7px}#tss-pip-waveform{height:24px}.tss-pip-controls{margin:5px 0 7px}.tss-pip-control-primary{width:47px;height:47px}.tss-pip-up-next{padding-top:6px}.tss-pip-next-row{grid-template-columns:34px minmax(0,1fr) auto 28px;min-height:34px;margin-top:5px}.tss-pip-next-art{width:34px;height:34px}}
   `;
   pipDocument.head.appendChild(style);
@@ -1848,6 +1973,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
         <div class="tss-pip-brand">True Shuffle</div>
         <div id="tss-pip-state" class="tss-pip-state" hidden></div>
         <div class="tss-pip-live" aria-label="Picture in picture">${SVG.pip}<span>PiP</span></div>
+        <button id="tss-pip-like" class="tss-pip-view-toggle" type="button" aria-label="Like current track" aria-pressed="false" data-liked="false" title="Like on SoundCloud">${SVG.heart}</button>
         <button id="tss-pip-sound" class="tss-pip-view-toggle" type="button" aria-label="Playback settings" aria-pressed="false" title="Playback settings">${SVG.equalizer}</button>
         <button id="tss-pip-view-toggle" class="tss-pip-view-toggle" type="button" aria-label="Show queue" aria-pressed="false" title="Show queue">${SVG.list}</button>
         <button id="tss-pip-close" class="tss-pip-close" type="button" aria-label="Close picture in picture">${SVG.close}</button>
@@ -1903,6 +2029,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   `;
 
   pipDocument.getElementById('tss-pip-close').onclick = closeOwnPip;
+  pipDocument.getElementById('tss-pip-like').onclick = () => { void toggleCurrentTrackLike(); };
   const soundButton = pipDocument.getElementById('tss-pip-sound');
   soundButton.onclick = () => showOwnPipSoundMenu(pipDocument, soundButton);
   const viewToggle = pipDocument.getElementById('tss-pip-view-toggle');
@@ -2590,6 +2717,51 @@ function discoverSoundCloudClientId() {
   return '';
 }
 
+function syncBrowserNowPlaying() {
+  const ti = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue?.[state.pos];
+  const meta = state.active && Number.isInteger(ti) ? state.meta[ti] : null;
+
+  if (!meta?.title) {
+    if (state._tabTitleBeforePlayback !== null && document.title === state._tabTitleValue) {
+      document.title = state._tabTitleBeforePlayback;
+    }
+    state._tabTitleBeforePlayback = null;
+    state._tabTitleValue = '';
+    state._browserMetadataKey = '';
+    return false;
+  }
+
+  if (state._tabTitleBeforePlayback === null) {
+    state._tabTitleBeforePlayback = document.title || 'SoundCloud';
+  }
+  const artist = meta.artist && meta.artist !== '—' ? String(meta.artist).trim() : '';
+  const tabTitle = artist ? `${meta.title} · ${artist}` : String(meta.title);
+  state._tabTitleValue = tabTitle;
+  if (document.title !== tabTitle) document.title = tabTitle;
+
+  try {
+    const mediaSession = pageWindow.navigator?.mediaSession;
+    const MediaMetadataCtor = pageWindow.MediaMetadata;
+    const metadataKey = [meta.title, artist, meta.artwork || ''].join('\n');
+    if (mediaSession && typeof MediaMetadataCtor === 'function'
+        && state._browserMetadataKey !== metadataKey) {
+      const init = {
+        title: String(meta.title),
+        artist,
+        album: 'SoundCloud True Shuffle',
+      };
+      if (meta.artwork) init.artwork = [{ src: meta.artwork }];
+      mediaSession.metadata = new MediaMetadataCtor(init);
+      state._browserMetadataKey = metadataKey;
+    }
+    if (mediaSession && 'playbackState' in mediaSession) {
+      mediaSession.playbackState = paused() ? 'paused' : 'playing';
+    }
+  } catch (_) {}
+
+  return true;
+}
+
 async function discoverSoundCloudClientIdFromBundle() {
   const existing = discoverSoundCloudClientId();
   if (existing) return existing;
@@ -3061,31 +3233,43 @@ function navigateToPage(url) {
   setTimeout(() => a.remove(), 2000);
 }
 
+function cancelInternalNavigation() {
+  state._internalNavigationToken++;
+  state._internalNavigation = false;
+  state._internalNavigationTarget = '';
+}
+
 async function loadTrackSourcePage(idx) {
   const sourcePage = state.meta[idx]?.sourcePage;
   if (!sourcePage || playlistBase(sourcePage) === playlistBase(location.href)) return false;
 
+  const navigationToken = ++state._internalNavigationToken;
   state._internalNavigation = true;
+  state._internalNavigationTarget = sourcePage;
   state.suspended = true;
   updateHub();
   navigateToPage(sourcePage);
 
   try {
     for (let i = 0; i < 40; i++) {
-      if (!state.active) return false;
+      if (!state.active || navigationToken !== state._internalNavigationToken) return false;
       if (playlistBase(location.href) === playlistBase(sourcePage)) break;
       await wait(250);
     }
     if (playlistBase(location.href) !== playlistBase(sourcePage)) return false;
 
     const pageEls = await loadTracks();
-    if (!state.active || !pageEls.length) return false;
+    if (!state.active || navigationToken !== state._internalNavigationToken
+        || playlistBase(location.href) !== playlistBase(sourcePage) || !pageEls.length) return false;
     bindCurrentPageElements(pageEls);
     state.suspended = false;
     state.playlistUrl = sourcePage;
     return Boolean(state.els[idx] && document.body.contains(state.els[idx]));
   } finally {
-    state._internalNavigation = false;
+    if (navigationToken === state._internalNavigationToken) {
+      state._internalNavigation = false;
+      state._internalNavigationTarget = '';
+    }
     updateHub();
   }
 }
@@ -3583,23 +3767,27 @@ async function syncLiveQueue(options) {
       ? [...document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item')]
       : [];
     const sourceChanged = state._liveSyncSource !== sourcePage;
-    if (sourceChanged || !state._liveSyncKnownIds.size) {
+    const initializing = sourceChanged || !state._liveSyncKnownIds.size;
+    if (initializing) {
       state._liveSyncSource = sourcePage;
-      state._liveSyncKnownIds = new Set(snapshot.tracks.map(track => Number(track.id)));
+      state._liveSyncKnownIds = new Set();
       const sourceIndices = state.meta
         .map((meta, ti) => ({ meta, ti }))
         .filter(item => playlistBase(item.meta?.sourcePage || sourcePage) === playlistBase(sourcePage));
+      sourceIndices.forEach(({ meta }) => {
+        const id = Number(meta?.soundcloudId);
+        if (Number.isFinite(id)) state._liveSyncKnownIds.add(id);
+      });
       if (snapshot.tracks.length === sourceIndices.length) {
         snapshot.tracks.forEach((track, index) => {
           const meta = state.meta[sourceIndices[index].ti];
-          meta.soundcloudId = Number(track.id);
+          if (!Number.isFinite(Number(meta.soundcloudId))) meta.soundcloudId = Number(track.id);
           meta.playlistPosition = index + 1;
+          if (Number(meta.soundcloudId) === Number(track.id)) {
+            state._liveSyncKnownIds.add(Number(track.id));
+          }
         });
       }
-      reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls);
-      badges();
-      renderList();
-      return 0;
     }
 
     const removed = reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls);
@@ -3613,6 +3801,7 @@ async function syncLiveQueue(options) {
         showLiveSyncResult(0, removed);
       } else {
         badges();
+        if (initializing) renderList();
       }
       return 0;
     }
@@ -3627,13 +3816,20 @@ async function syncLiveQueue(options) {
 
     const added = applyLiveQueueTracks(metas, pageEls, false);
     for (const meta of metas) {
-      if (meta.soundcloudId) state._liveSyncKnownIds.add(Number(meta.soundcloudId));
+      const id = Number(meta?.soundcloudId);
+      const represented = Number.isFinite(id) && state.meta.some(existing =>
+        Number(existing?.soundcloudId) === id
+        && playlistBase(existing?.sourcePage || sourcePage) === playlistBase(sourcePage));
+      if (represented) state._liveSyncKnownIds.add(id);
     }
     if (removed && !added) {
       refreshUpcomingCrossfadePreparation();
       badges();
       renderList();
       updateHub();
+    } else if (initializing && !added) {
+      badges();
+      renderList();
     }
     showLiveSyncResult(added, removed);
     return added;
@@ -3967,6 +4163,7 @@ function stop() {
   state.busy       = false;
   state.loading    = false;
   state.sleepTimer = null;
+  syncBrowserNowPlaying();
   resetLiveQueueSync();
   const sleepSel = document.getElementById('tss-hub-sleep');
   if (sleepSel) sleepSel.value = 'off';
@@ -4090,7 +4287,7 @@ function startWatcher() {
     if (!state.active) return;
     if (checkSleepTimerDeadline()) return;
     if (!state.busy && Number.isFinite(state._liveSyncLastCheck)
-        && Date.now() - state._liveSyncLastCheck >= 30_000) {
+        && Date.now() - state._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS) {
       void syncLiveQueue();
     }
 
@@ -5483,13 +5680,14 @@ function mkHub() {
 }
 
 function updateHub() {
+  syncBrowserNowPlaying();
   if (!document.getElementById('tss-hub')) return;
   setOwnPipButtonState();
 
   const active  = state.active;
   const loading = state.loading;
 
-  const onDifferentPlaylist = active
+  const onDifferentPlaylist = active && isCollectionPage(location.href)
     && playlistBase(location.href) !== playlistBase(state.playlistUrl);
   const reshuffleTitle = onDifferentPlaylist
     ? 'Load & re-shuffle this playlist'
@@ -6191,13 +6389,46 @@ async function inject() {
 
 // ── nav ───────────────────────────────────────────────────────────────────────
 
-const validPage    = () => /soundcloud\.com\/(feed|stream|[^/]+\/(sets\/|likes|tracks|reposts))/.test(location.href);
+const validPage    = () => isSoundCloudPage(location.href);
 const playlistBase = url => url.split(/[?#]/)[0].replace(/\/+$/, '');
+
+function soundCloudPathParts(url) {
+  try {
+    const parsed = new URL(String(url || ''), 'https://soundcloud.com');
+    if (parsed.hostname !== 'soundcloud.com') return null;
+    return parsed.pathname.split('/').filter(Boolean);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isSoundCloudPage(url) {
+  return soundCloudPathParts(url) !== null;
+}
+
+function isCollectionPage(url) {
+  const parts = soundCloudPathParts(url);
+  if (!parts) return false;
+
+  // A concrete playlist/album or one of SoundCloud's user track collections
+  // can replace the queue and therefore keeps the existing merge workflow.
+  if (parts.length >= 3 && parts[1] === 'sets' && Boolean(parts[2])) return true;
+  return parts.length === 2 && ['likes', 'tracks', 'reposts'].includes(parts[1]);
+}
+
+function isPassiveBrowsePage(url) {
+  return isSoundCloudPage(url) && !isCollectionPage(url);
+}
 
 let navLock = false;
 let navPending = false;
 async function onNav() {
-  if (state._internalNavigation) return;
+  if (state._internalNavigation) {
+    if (playlistBase(location.href) === playlistBase(state._internalNavigationTarget || '')) return;
+    // A user navigation supersedes a track-source navigation that True Shuffle
+    // started internally. Never let the old async load overwrite the new page.
+    cancelInternalNavigation();
+  }
   if (navLock) { navPending = true; return; }
   navLock = true;
   try {
@@ -6217,6 +6448,18 @@ async function onNav() {
         const freshEls = await loadTracks();
         if (freshEls.length > 0) bindCurrentPageElements(freshEls);
         if (state.worker) { state.worker.postMessage('start'); } else { startWatcher(); }
+        return;
+      }
+
+      // Passive browse navigation does not replace the shuffled collection. The
+      // custom deck remains authoritative there, and live sync can continue to
+      // poll the persisted source playlist without its DOM being visible.
+      if (isPassiveBrowsePage(location.href)) {
+        state.suspended = false;
+        await wait(1500);
+        inject();
+        updateHub();
+        void syncLiveQueue({ force: true });
         return;
       }
 
@@ -6253,6 +6496,13 @@ async function onNav() {
 
 let lastUrl = location.href;
 let injectRetryTimer = null;
+function checkForNavigation() {
+  if (location.href === lastUrl) return false;
+  lastUrl = location.href;
+  void onNav();
+  return true;
+}
+
 function scheduleLiveQueueSync(delay = 250) {
   if (!state.active || state.suspended) return;
   if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
@@ -6272,16 +6522,29 @@ function mutationChangesPlaylistTracks(records) {
     node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))));
 }
 
+function scheduleLiveQueueSyncFromMutation(records) {
+  if (playlistBase(location.href) !== playlistBase(state.playlistUrl)
+      || !mutationChangesPlaylistTracks(records)) return false;
+  scheduleLiveQueueSync();
+  return true;
+}
+
 new MutationObserver(records => {
-  if (location.href !== lastUrl) { lastUrl = location.href; onNav(); }
+  if (checkForNavigation()) return;
   else if (validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
     injectRetryTimer = setTimeout(() => {
       injectRetryTimer = null;
       inject();
     }, 250);
   }
-  if (mutationChangesPlaylistTracks(records)) scheduleLiveQueueSync();
+  scheduleLiveQueueSyncFromMutation(records);
 }).observe(document, { subtree: true, childList: true });
+
+// SoundCloud can update history before it renders the next route. Polling the
+// URL keeps navigation responsive even when that transition produces no DOM
+// mutation, including while the custom player is active in the background.
+setInterval(checkForNavigation, 250);
+window.addEventListener('popstate', checkForNavigation);
 
 window.addEventListener('pagehide', () => {
   if (equalizerPersistTimer || customPresetsPending) flushEqualizerPersistence();

@@ -613,13 +613,56 @@ test('queue search refresh keeps the current query when no filter is passed', ()
   assert.match(renderList, /getElementById\('tss-search'\)\?\.value/);
 });
 
-test('playlist row additions and removals trigger a fast live sync', () => {
+test('track-row mutations fast-sync only on the active source collection', () => {
   const mutation = extractFunction('mutationChangesPlaylistTracks');
   const schedule = extractFunction('scheduleLiveQueueSync');
+  const scheduleFromMutation = extractFunction('scheduleLiveQueueSyncFromMutation');
+  const state = {
+    active: true,
+    suspended: false,
+    loading: false,
+    busy: false,
+    _liveSyncInFlight: false,
+    _liveSyncTimer: null,
+    playlistUrl: 'https://soundcloud.com/test/sets/source-playlist?ref=clipboard',
+  };
+  const location = { href: 'https://soundcloud.com/feed' };
+  const timers = [];
+  const syncCalls = [];
+  const createHarness = Function(
+    'state', 'location', 'setTimeout', 'clearTimeout', 'syncLiveQueue', 'playlistBase',
+    `${mutation}\n${schedule}\n${scheduleFromMutation}\n`
+      + 'return { mutationChangesPlaylistTracks, scheduleLiveQueueSyncFromMutation };',
+  );
+  const harness = createHarness(
+    state,
+    location,
+    callback => { timers.push(callback); return timers.length; },
+    () => {},
+    options => { syncCalls.push(options); },
+    value => value.split(/[?#]/)[0].replace(/\/+$/, ''),
+  );
+  const trackRow = {
+    nodeType: 1,
+    matches: selector => selector.includes('.trackList__item'),
+    querySelector: () => null,
+  };
+  const records = [{ addedNodes: [trackRow], removedNodes: [] }];
+
   assert.match(mutation, /record\.addedNodes, \.\.\.record\.removedNodes/);
   assert.match(schedule, /delay = 250/);
   assert.match(schedule, /state\.loading \|\| state\.busy \|\| state\._liveSyncInFlight/);
   assert.match(schedule, /scheduleLiveQueueSync\(300\)/);
+  assert.equal(harness.mutationChangesPlaylistTracks(records), true);
+
+  assert.equal(harness.scheduleLiveQueueSyncFromMutation(records), false);
+  assert.equal(timers.length, 0, 'passive-page mutations must not schedule a source fetch');
+
+  location.href = 'https://soundcloud.com/test/sets/source-playlist#tracks';
+  assert.equal(harness.scheduleLiveQueueSyncFromMutation(records), true);
+  assert.equal(timers.length, 1, 'source-page mutations should schedule a fast sync');
+  timers.shift()();
+  assert.deepEqual(syncCalls, [{ force: true }]);
 });
 
 test('re-shuffle replaces a new playlist and resets hidden weighting', () => {
@@ -694,7 +737,73 @@ test('navigation queues a follow-up pass and retries delayed hub injection', () 
   const nav = extractFunction('onNav');
   assert.match(nav, /navPending = true/);
   assert.match(nav, /queueMicrotask\(\(\) => onNav\(\)\)/);
+  assert.match(nav, /cancelInternalNavigation\(\)/);
+  assert.match(nav, /_internalNavigationTarget/);
   assert.match(source, /!document\.getElementById\('tss-hub'\) && !injectRetryTimer/);
+  assert.match(source, /setInterval\(checkForNavigation, 250\)/);
+  assert.match(source, /window\.addEventListener\('popstate', checkForNavigation\)/);
+});
+
+test('all non-collection SoundCloud routes preserve queue ownership', () => {
+  const classify = Function(`
+    ${extractFunction('soundCloudPathParts')}
+    ${extractFunction('isSoundCloudPage')}
+    ${extractFunction('isCollectionPage')}
+    ${extractFunction('isPassiveBrowsePage')}
+    return { isSoundCloudPage, isCollectionPage, isPassiveBrowsePage };
+  `)();
+  const nav = extractFunction('onNav');
+
+  for (const url of [
+    'https://soundcloud.com/',
+    'https://soundcloud.com/feed',
+    'https://soundcloud.com/stream?ref=tabs',
+    'https://soundcloud.com/you/library',
+    'https://soundcloud.com/you/library/sets',
+    'https://soundcloud.com/search?q=test',
+    'https://soundcloud.com/discover',
+    'https://soundcloud.com/charts/top',
+    'https://soundcloud.com/example-user',
+    'https://soundcloud.com/example-user/example-track',
+  ]) {
+    assert.equal(classify.isSoundCloudPage(url), true, `${url} should be a SoundCloud page`);
+    assert.equal(classify.isCollectionPage(url), false, `${url} should not replace the queue`);
+    assert.equal(classify.isPassiveBrowsePage(url), true, `${url} should preserve queue ownership`);
+  }
+
+  for (const url of [
+    'https://soundcloud.com/user/sets/other',
+    'https://soundcloud.com/user/likes',
+    'https://soundcloud.com/user/tracks',
+    'https://soundcloud.com/user/reposts',
+    'https://soundcloud.com/you/likes',
+  ]) {
+    assert.equal(classify.isCollectionPage(url), true, `${url} should remain mergeable`);
+    assert.equal(classify.isPassiveBrowsePage(url), false, `${url} should enter collection navigation`);
+  }
+
+  assert.equal(classify.isSoundCloudPage('https://example.com/'), false);
+  assert.match(source, /const validPage\s*=\s*\(\)\s*=>\s*isSoundCloudPage\(location\.href\)/);
+  assert.match(nav, /if \(isPassiveBrowsePage\(location\.href\)\)/);
+  assert.match(nav, /state\.suspended = false;[\s\S]*syncLiveQueue\(\{ force: true \}\)/);
+  assert.match(nav, /different valid playlist:[\s\S]*state\.suspended = true;/);
+});
+
+test('user navigation cancels an in-flight internal source-page load', () => {
+  const loader = extractFunction('loadTrackSourcePage');
+  const cancel = extractFunction('cancelInternalNavigation');
+  assert.match(loader, /navigationToken = \+\+state\._internalNavigationToken/);
+  assert.match(loader, /state\._internalNavigationTarget = sourcePage/);
+  assert.match(loader, /navigationToken !== state\._internalNavigationToken/);
+  assert.match(loader, /playlistBase\(location\.href\) !== playlistBase\(sourcePage\)/);
+  assert.match(cancel, /state\._internalNavigationToken\+\+/);
+  assert.match(cancel, /state\._internalNavigation = false/);
+});
+
+test('cross-tab playlist changes are polled within ten seconds', () => {
+  assert.match(source, /const LIVE_SYNC_INTERVAL_MS = 10_000;/);
+  const watcher = extractFunction('startWatcher');
+  assert.match(watcher, /Date\.now\(\) - state\._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS/);
 });
 
 test('waveform resolver never guesses from an unrelated latest resource', () => {
@@ -745,6 +854,72 @@ test('Better SoundCloud Feed PiP receives custom-deck metadata and millisecond t
   assert.equal(sound.attributes.waveform_url, 'https://wave.sndcdn.com/test.json');
   assert.equal(sound.player.getPosition(), 12500);
   assert.equal(sound.player.getDuration(), 203250);
+});
+
+test('custom deck publishes the track title to Firefox tab and Media Session metadata', () => {
+  const state = {
+    active: true,
+    _deckTrack: 0,
+    queue: [0],
+    pos: 0,
+    meta: [{
+      title: 'Firefox Track',
+      artist: 'Firefox Artist',
+      artwork: 'https://i1.sndcdn.com/artworks-firefox-large.jpg',
+    }],
+    _tabTitleBeforePlayback: null,
+    _tabTitleValue: '',
+    _browserMetadataKey: '',
+  };
+  const document = { title: 'Playlist on SoundCloud' };
+  const mediaSession = { metadata: null, playbackState: 'none' };
+  function MediaMetadata(init) { Object.assign(this, init); }
+  const pageWindow = { navigator: { mediaSession }, MediaMetadata };
+  const syncBrowserNowPlaying = Function(
+    'state', 'document', 'pageWindow', 'paused',
+    `return (${extractFunction('syncBrowserNowPlaying')})`,
+  )(state, document, pageWindow, () => false);
+
+  assert.equal(syncBrowserNowPlaying(), true);
+  assert.equal(document.title, 'Firefox Track · Firefox Artist');
+  assert.equal(mediaSession.metadata.title, 'Firefox Track');
+  assert.equal(mediaSession.metadata.artist, 'Firefox Artist');
+  assert.equal(mediaSession.metadata.artwork[0].src, state.meta[0].artwork);
+  assert.equal(mediaSession.playbackState, 'playing');
+
+  document.title = 'SoundCloud changed this title';
+  syncBrowserNowPlaying();
+  assert.equal(document.title, 'Firefox Track · Firefox Artist');
+});
+
+test('browser tab title is restored when True Shuffle stops', () => {
+  const state = {
+    active: false,
+    _deckTrack: 0,
+    queue: [0],
+    pos: 0,
+    meta: [{ title: 'Finished Track', artist: 'Artist' }],
+    _tabTitleBeforePlayback: 'Playlist on SoundCloud',
+    _tabTitleValue: 'Finished Track · Artist',
+    _browserMetadataKey: 'owned',
+  };
+  const document = { title: 'Finished Track · Artist' };
+  const syncBrowserNowPlaying = Function(
+    'state', 'document', 'pageWindow', 'paused',
+    `return (${extractFunction('syncBrowserNowPlaying')})`,
+  )(state, document, { navigator: {} }, () => true);
+
+  assert.equal(syncBrowserNowPlaying(), false);
+  assert.equal(document.title, 'Playlist on SoundCloud');
+  assert.equal(state._tabTitleBeforePlayback, null);
+  assert.equal(state._browserMetadataKey, '');
+});
+
+test('Firefox PiP window title shows the playing track and a clean idle label', () => {
+  const ownPipWindowTitle = Function(`return (${extractFunction('ownPipWindowTitle')})`)();
+  assert.equal(ownPipWindowTitle({ title: 'Window Track' }, false), 'Playing: Window Track');
+  assert.equal(ownPipWindowTitle({ title: 'Window Track' }, true), 'True Shuffle');
+  assert.equal(ownPipWindowTitle(null, false), 'True Shuffle');
 });
 
 test('PiP scPlayer bridge controls True Shuffle only while its custom deck is active', async () => {
@@ -882,6 +1057,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     'tss-pip-crossfade-value', 'tss-pip-auto-level', 'tss-pip-processing', 'tss-pip-waveform',
   ].forEach(node);
   const pipDocument = {
+    title: 'True Shuffle',
     documentElement: { style: { setProperty() {} } },
     getElementById: id => nodes.get(id) || null,
   };
@@ -906,7 +1082,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     'state', 'ownPipIsOpen', 'closeOwnPip', 'playbackTiming', 'getComputedStyle',
     'document', 'playerTitle', 'paused', 'SVG', 'trackId', 'waveformCache',
     'DEFAULT_WAVE_HEIGHTS', 'formatPlaybackClock', 'drawOwnPipWaveform', 'renderOwnPipQueue',
-    'upcomingTrackIndex',
+    'upcomingTrackIndex', 'ownPipWindowTitle',
     `return (${extractFunction('syncOwnPipWindow')})`,
   )(
     state, () => true, () => {}, () => ({ current: 63, duration: 91 }),
@@ -915,9 +1091,11 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     new Map(), [50], seconds => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`,
     (...args) => drawn.push(args), () => {},
     () => state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1],
+    (meta, isPaused) => meta?.title && !isPaused ? `Playing: ${meta.title}` : 'True Shuffle',
   );
 
   assert.equal(syncOwnPipWindow(), true);
+  assert.equal(pipDocument.title, 'Playing: Current');
   assert.equal(nodes.get('tss-pip-title').textContent, 'Current');
   assert.equal(nodes.get('tss-pip-artist').textContent, 'Artist A');
   assert.equal(nodes.get('tss-pip-position').textContent, '3 / 10');
@@ -1141,6 +1319,8 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   assert.match(mount, /renderOwnPipQueue/);
   assert.match(mount, /tss-pip-tab-history/);
   assert.match(mount, /tss-pip-queue-search/);
+  assert.match(mount, /tss-pip-like/);
+  assert.match(mount, /toggleCurrentTrackLike/);
   assert.match(mount, /showOwnPipSoundMenu/);
   assert.match(extractFunction('renderOwnPipQueue'), /showOwnPipTrackMenu/);
   assert.match(extractFunction('showOwnPipTrackMenu'), /Shuffle priority/);
@@ -1151,6 +1331,29 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   assert.match(mount, /void toggle\(\)/);
   assert.match(stop, /closeOwnPip\(\)/);
   assert.match(hub, /id="tss-hub-pip"/);
+});
+
+test('PiP like state follows SoundCloud selected and aria states', () => {
+  const soundCloudLikeButtonState = Function(`return (${extractFunction('soundCloudLikeButtonState')})`)();
+  const button = (selected, label) => ({
+    classList: { contains: name => name === 'sc-button-selected' && selected },
+    getAttribute: name => name === 'aria-label' ? label : null,
+  });
+  assert.equal(soundCloudLikeButtonState(button(false, 'Like')), false);
+  assert.equal(soundCloudLikeButtonState(button(true, 'Unlike')), true);
+  assert.equal(soundCloudLikeButtonState(button(false, 'Unlike')), true);
+});
+
+test('PiP like control uses the native authenticated SoundCloud button', () => {
+  const finder = extractFunction('findSoundCloudLikeButton');
+  const toggleLike = extractFunction('toggleCurrentTrackLike');
+  const syncPip = extractFunction('syncOwnPipWindow');
+  assert.match(finder, /\.playbackSoundBadge__like/);
+  assert.match(finder, /bound\.querySelector\('\.sc-button-like'\)/);
+  assert.match(toggleLike, /button\.click\(\)/);
+  assert.match(toggleLike, /state\._likeBusy/);
+  assert.match(syncPip, /like\.setAttribute\('aria-pressed'/);
+  assert.match(syncPip, /SVG\.heartFilled/);
 });
 
 test('PiP fallbacks cover native video and an interactive in-page player', () => {
@@ -1501,17 +1704,17 @@ test('live queue application preserves current playback and updates the round on
   assert.equal(calls[4], '2 new tracks added to this round');
 });
 
-test('live sync baselines existing ids then resolves only newly added tracks', async () => {
+test('first live snapshot resolves and applies a track added after initial collection', async () => {
   const state = {
     active: true, loading: false, busy: false, suspended: false,
     playlistUrl: 'https://soundcloud.com/user/sets/list',
     _liveSyncKnownIds: new Set(), _liveSyncInFlight: false,
-    _liveSyncLastCheck: 0, _liveSyncSource: '', meta: [{}, {}],
+    _liveSyncLastCheck: 0, _liveSyncSource: '',
+    meta: [
+      { soundcloudId: 1, sourcePage: 'https://soundcloud.com/user/sets/list' },
+      { soundcloudId: 2, sourcePage: 'https://soundcloud.com/user/sets/list' },
+    ],
   };
-  const snapshots = [
-    { tracks: [{ id: 1 }, { id: 2 }] },
-    { tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] },
-  ];
   const resolved = [];
   const applied = [];
   const syncLiveQueue = Function(
@@ -1520,27 +1723,33 @@ test('live sync baselines existing ids then resolves only newly added tracks', a
     'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
     `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
   )(
-    state, 30_000, async () => snapshots.shift(),
-    async track => { resolved.push(track.id); return { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track' }; },
+    state, 30_000, async () => ({ complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
+    async track => {
+      resolved.push(track.id);
+      return { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track', sourcePage: state.playlistUrl };
+    },
     value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
-    metas => { applied.push(...metas); return metas.length; },
+    metas => { applied.push(...metas); state.meta.push(...metas); return metas.length; },
     () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
   );
-  assert.equal(await syncLiveQueue({ force: true }), 0);
-  assert.deepEqual([...state._liveSyncKnownIds], [1, 2]);
   assert.equal(await syncLiveQueue({ force: true }), 1);
   assert.deepEqual(resolved, [3]);
   assert.equal(applied.length, 1);
+  assert.deepEqual([...state._liveSyncKnownIds], [1, 2, 3]);
   assert.ok(state._liveSyncKnownIds.has(3));
   assert.equal(state._liveSyncInFlight, false);
 });
 
-test('live sync retries newly added tracks that could not be resolved yet', async () => {
+test('unresolved first-snapshot candidates remain retryable', async () => {
   const state = {
     active: true, loading: false, busy: false, suspended: false,
     playlistUrl: 'https://soundcloud.com/user/sets/list',
-    _liveSyncKnownIds: new Set([1, 2]), _liveSyncInFlight: false,
-    _liveSyncLastCheck: 0, _liveSyncSource: 'https://soundcloud.com/user/sets/list', meta: [{}, {}],
+    _liveSyncKnownIds: new Set(), _liveSyncInFlight: false,
+    _liveSyncLastCheck: 0, _liveSyncSource: '',
+    meta: [
+      { soundcloudId: 1, sourcePage: 'https://soundcloud.com/user/sets/list' },
+      { soundcloudId: 2, sourcePage: 'https://soundcloud.com/user/sets/list' },
+    ],
   };
   let resolveAttempts = 0;
   const applied = [];
@@ -1550,15 +1759,15 @@ test('live sync retries newly added tracks that could not be resolved yet', asyn
     'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
     `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
   )(
-    state, 30_000, async () => ({ tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
+    state, 30_000, async () => ({ complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
     async track => {
       resolveAttempts++;
       return resolveAttempts === 1
         ? null
-        : { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track' };
+        : { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track', sourcePage: state.playlistUrl };
     },
     value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
-    metas => { applied.push(...metas); return metas.length; },
+    metas => { applied.push(...metas); state.meta.push(...metas); return metas.length; },
     () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
   );
 
