@@ -1,5 +1,41 @@
 # Changelog
 
+## v6.1.2 - 2026-07-24
+
+### Firefox playback
+
+- Fixed crossfades getting stuck on `mixing` after several tracks.
+- Replaced incompatible Web Audio curve events with Firefox-safe audio timeline ramps.
+- Added background-safe recovery for paused or frozen crossfades.
+- Prevented SoundCloud's native player from starting behind a True Shuffle crossfade.
+- Improved recovery when a progressive stream stalls or expires.
+- Added a copyable playback diagnostics report for unexpected audio failures.
+
+### Audio and Auto Level
+
+- Reworked Auto Level around the selected volume target.
+- Kept Auto Level at unity gain when the volume is set to 100%.
+- Allowed safe per-track boosting and attenuation at lower volumes to reduce loudness differences.
+- Added peak and master-headroom limits to prevent clipping.
+- Cached stable per-track RMS and peak measurements instead of continuously changing gain.
+- Added a true unity path when Auto Level and the equalizer are disabled.
+- Kept the optional safety clipper disabled by default.
+
+### Queue and metadata
+
+- Fixed the visible round position after skipping forward and returning to the previous track.
+- Kept queue order, history and round counters synchronized.
+- Improved exact waveform resolution in Firefox.
+- Prevented native or advertisement audio from changing True Shuffle's volume.
+- Limited native playback fallback permission to the requested track and a short expiry.
+
+### Verification
+
+- Added Firefox-specific regression coverage for Web Audio cleanup, stream fallback, waveform identity and volume ownership.
+- Added regression coverage for Auto Level target gain, clipping protection, stable per-track caching and the neutral processing path.
+- Added a queue regression for the Next then Previous sequence.
+- Passed the complete Firefox, crossfade and True Shuffle test suites.
+
 ## v6.0.0 - 2026-07-20
 
 ### Highlights

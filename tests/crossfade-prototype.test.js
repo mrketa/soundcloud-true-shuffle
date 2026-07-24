@@ -26,9 +26,9 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('release metadata identifies the v6.1.1 stable userscript', () => {
+test('release metadata identifies the v6.1.2 userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.1\.1/);
+  assert.match(source, /@version\s+6\.1\.2/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {
@@ -110,33 +110,94 @@ test('Spotify-style controls expose compact progressive settings accessibly', ()
   assert.ok(source.indexOf('id="tss-auto-level"') < source.indexOf('id="tss-crossfade-card"'));
 });
 
-test('Auto Level is opt-in, persistent and never boosts a track', () => {
+test('Auto Level targets stable per-track loudness with a unity bypass at 100%', () => {
   assert.match(source, /autoLevel:\s*localStorage\.getItem\('tss_auto_level'\) === 'true'/);
   assert.match(source, /localStorage\.setItem\('tss_auto_level'/);
   const gainSource = extractFunction('calculateAutoLevelGain');
   const calculate = Function(`return (${gainSource})`)();
-  assert.equal(calculate(0, 1), 1);
-  assert.equal(calculate(0.01, 0.7), 0.7);
-  assert.ok(calculate(0.5, 1, true) < 0.5);
-  assert.ok(calculate(0.5, 1, true) >= 0.2);
-  assert.equal(calculate(0.05, 0.7), 0.7);
-  const sequence = [0.22, 0.08, 0.35, 0.04, 0.28];
-  const gains = sequence.reduce((all, rms, index) => {
-    all.push(calculate(rms, all.at(-1) ?? 1, index < 2));
-    return all;
-  }, []);
-  assert.ok(gains.every((gain, index) => index === 0 || gain <= gains[index - 1]));
-  assert.match(source, /tss_auto_level_cache_v2/);
+  assert.equal(calculate(0.08, 0.5, 1), 1);
+  assert.equal(calculate(0.5, 0.95, 1), 1);
+
+  const quietGain = calculate(0.1, 0.45, 0.4);
+  const loudGain = calculate(0.45, 0.95, 0.4);
+  assert.ok(quietGain > 1, `expected quiet-track boost, got ${quietGain}`);
+  assert.ok(loudGain < 1, `expected loud-track attenuation, got ${loudGain}`);
+  assert.ok(Math.abs(0.4 * 0.1 * quietGain - 0.4 * 0.45 * loudGain) < 1e-12);
+
+  assert.match(source, /tss_auto_level_cache_v4/);
 });
 
-test('Auto Level uses a per-deck analyser, smooth gain and shared peak limiter', () => {
+test('Auto Level caps boost using master headroom and measured peak', () => {
+  const gainSource = extractFunction('calculateAutoLevelGain');
+  const calculate = Function(`return (${gainSource})`)();
+  const master = 0.4;
+  const gain = calculate(0.02, 0.9, master);
+  assert.ok(gain <= 1 / master);
+  assert.ok(master * 0.9 * gain <= 1 + 1e-12);
+  assert.equal(calculate(0, 0, master), 1);
+  assert.match(source, /tss_auto_level_cache_v4/);
+  assert.doesNotMatch(source, /tss_auto_level_cache_v3/);
+});
+
+test('Auto Off and flat EQ route each deck through a browser-neutral unity path', () => {
+  const graph = extractFunction('ensureAutoLevelAudioGraph');
+  const routing = extractFunction('syncDeckProcessingRouting');
+  assert.match(graph, /syncDeckProcessingRouting\(\)/);
+  assert.match(routing, /if \(!state\.eqEnabled && !state\.autoLevel\)/);
+  assert.match(routing, /graph\.source\.connect\(graph\.mixGain\)/);
+  assert.match(routing, /graph\.autoGain\.gain/);
+  assert.doesNotMatch(routing, /mixGain\.gain\.(?:setValueAtTime|setTargetAtTime|linearRampToValueAtTime|setValueCurveAtTime)/);
+
+  const node = () => ({
+    connections: [],
+    connect(target) { this.connections.push(target); },
+    disconnect() { this.connections = []; },
+  });
+  const sourceNode = node();
+  const analyserNode = node();
+  const autoGainNode = { ...node(), gain: {} };
+  const mixGainNode = node();
+  const state = {
+    eqEnabled: false,
+    autoLevel: false,
+    _audioContext: { currentTime: 4 },
+    _deckAudioGraphs: [{
+      source: sourceNode,
+      eqFilters: [node(), node(), node(), node(), node()],
+      analyser: analyserNode,
+      autoGain: autoGainNode,
+      mixGain: mixGainNode,
+      currentGain: 0.7,
+    }],
+  };
+  const immediateWrites = [];
+  const runRouting = Function(
+    'state', 'setAudioParamImmediately',
+    `${routing}; return syncDeckProcessingRouting;`,
+  )(state, (param, value, now) => immediateWrites.push({ param, value, now }));
+
+  runRouting();
+  assert.deepEqual(sourceNode.connections, [mixGainNode]);
+  assert.equal(immediateWrites.at(-1).value, 1);
+
+  state.autoLevel = true;
+  runRouting();
+  assert.deepEqual(sourceNode.connections, [analyserNode]);
+  assert.deepEqual(analyserNode.connections, [autoGainNode]);
+  assert.deepEqual(autoGainNode.connections, [mixGainNode]);
+  assert.equal(immediateWrites.at(-1).value, 0.7);
+});
+
+test('Auto Level settles one per-track measurement and reuses its cached stable gain', () => {
   const graph = extractFunction('ensureAutoLevelAudioGraph');
   const process = extractFunction('processAutoLevel');
   const sync = extractFunction('syncCrossfadeVolume');
   assert.match(graph, /createMediaElementSource\(audio\)/);
   assert.match(graph, /createAnalyser\(\)/);
-  assert.match(graph, /createDynamicsCompressor\(\)/);
-  assert.match(graph, /limiter\.threshold\.value = -2/);
+  assert.match(graph, /createWaveShaper\(\)/);
+  assert.match(graph, /clipper\.curve = new Float32Array\(\[-1, 1\]\)/);
+  assert.match(graph, /clipper\.oversample = '4x'/);
+  assert.doesNotMatch(graph, /createDynamicsCompressor|\.attack|\.release|\.ratio/);
   assert.match(graph, /if \(state\._deckAudioGraphs\[index\]\) return/);
   assert.match(process, /getFloatTimeDomainData/);
   assert.match(process, /calculateAutoLevelGain/);
@@ -144,9 +205,26 @@ test('Auto Level uses a per-deck analyser, smooth gain and shared peak limiter',
   assert.match(sync, /state\._audioMaster\.gain/);
   assert.match(sync, /state\.autoLevel \? graph\.currentGain : 1/);
   assert.match(source, /audio\.crossOrigin = 'anonymous'/);
-  assert.match(process, /graph\.peakRms = Math\.max/);
-  assert.match(process, /graph\.samples <= 12/);
+  assert.match(process, /graph\.measuredPeak = Math\.max/);
+  assert.match(process, /graph\.samples < 12/);
+  assert.match(process, /graph\.settled = true/);
+  assert.match(process, /if \(graph\.settled\) return/);
+  assert.match(process, /rms:\s*graph\.peakRms/);
+  assert.match(process, /peak:\s*graph\.measuredPeak/);
   assert.match(process, /now - state\._autoLevelLastTick < 60/);
+});
+
+test('safety clipper is optional, persisted, off by default and exposed accessibly in EQ', () => {
+  const graph = extractFunction('ensureAutoLevelAudioGraph');
+  const popup = extractFunction('showEqualizer');
+  const update = extractFunction('updateEqualizerPopup');
+  assert.match(source, /safetyClipper:\s*localStorage\.getItem\('tss_safety_clipper'\) === 'true'/);
+  assert.match(source, /localStorage\.setItem\('tss_safety_clipper', String\(state\.safetyClipper\)\)/);
+  assert.match(graph, /state\.safetyClipper \? clipper : context\.destination/);
+  assert.match(popup, /id="tss-safety-clipper" type="checkbox"/);
+  assert.match(popup, /aria-describedby="tss-safety-clipper-help"/);
+  assert.match(popup, /id="tss-safety-clipper-help"/);
+  assert.match(update, /clipper\.checked = state\.safetyClipper/);
 });
 
 test('Auto Level state is readable without relying on artwork-derived color', () => {
@@ -390,14 +468,15 @@ test('all upcoming-order mutation paths invalidate standby preparation', () => {
 
 test('five-band equalizer is persistent and inserted before loudness analysis', () => {
   const graph = extractFunction('ensureAutoLevelAudioGraph');
+  const routing = extractFunction('syncDeckProcessingRouting');
   const sync = extractFunction('syncEqualizer');
   assert.match(source, /eqEnabled:\s*localStorage\.getItem\('tss_eq_enabled'\) === 'true'/);
   assert.match(source, /localStorage\.getItem\('tss_eq_bands'\)/);
   assert.match(source, /const EQ_BANDS = \[/);
   assert.equal((source.match(/type: '(?:lowshelf|peaking|highshelf)'/g) || []).length, 5);
   assert.match(graph, /createBiquadFilter\(\)/);
-  assert.match(graph, /source\.connect\(eqFilters\[0\]\)/);
-  assert.match(graph, /eqFilters\[filterIndex \+ 1\] \|\| analyser/);
+  assert.match(routing, /for \(const filter of graph\.eqFilters\)/);
+  assert.match(routing, /tail\.connect\(graph\.analyser\)/);
   assert.match(sync, /state\.eqEnabled \? state\.eqBands\[index\] : 0/);
   assert.match(source, /localStorage\.setItem\('tss_eq_bands'/);
 });
@@ -487,6 +566,138 @@ test('custom mix curves preserve endpoints and never add overlap gain', () => {
   }
 });
 
+test('Firefox crossfade clock stalls hard-settle into the incoming deck', async () => {
+  const waitForSchedule = extractFunction('waitForCrossfadeSchedule');
+  const fade = extractFunction('animateDeckCrossfade');
+  const toggle = extractFunction('toggle');
+  assert.match(waitForSchedule, /lastClockAdvanceAt/);
+  assert.match(waitForSchedule, /Date\.now\(\) - lastClockAdvanceAt >= 2500/);
+  assert.match(waitForSchedule, /crossfade-clock-stall/);
+  assert.match(waitForSchedule, /state\._crossfadePausedByUser/);
+  assert.match(fade, /incoming\.play\(\)/);
+  assert.match(fade, /state\._deckGains\[incomingIndex\] = 1/);
+  assert.match(fade, /setCrossfadeStatus\('ready'\)/);
+  assert.match(toggle, /state\._crossfadePausedByUser = true/);
+  assert.match(toggle, /state\._crossfadePausedByUser = false/);
+
+  let now = 0;
+  const diagnostics = [];
+  const stalledState = {
+    _audioContext: { currentTime: 1, state: 'suspended' },
+    _crossfadeToken: 9,
+    _crossfadePausedByUser: false,
+  };
+  const stalledSchedule = { startTime: 1, endTime: 13, duration: 12 };
+  stalledState._crossfadeSchedule = stalledSchedule;
+  const waitForStall = Function(
+    'state', 'Date', 'setTimeout', 'recordPlaybackDiagnostic',
+    `return (${waitForSchedule})`,
+  )(
+    stalledState,
+    { now: () => { now += 1000; return now; } },
+    fn => fn(),
+    (event, details) => diagnostics.push({ event, details }),
+  );
+  assert.equal(await waitForStall(stalledSchedule, 9), false);
+  assert.equal(diagnostics[0]?.event, 'crossfade-clock-stall');
+
+  now = 0;
+  let polls = 0;
+  const pausedState = {
+    _audioContext: { currentTime: 1, state: 'suspended' },
+    _crossfadeToken: 4,
+    _crossfadePausedByUser: true,
+  };
+  const pausedSchedule = { startTime: 1, endTime: 13, duration: 12 };
+  pausedState._crossfadeSchedule = pausedSchedule;
+  const waitWhilePaused = Function(
+    'state', 'Date', 'setTimeout', 'recordPlaybackDiagnostic',
+    `return (${waitForSchedule})`,
+  )(
+    pausedState,
+    { now: () => { now += 1000; return now; } },
+    fn => {
+      if (++polls === 5) {
+        pausedState._crossfadePausedByUser = false;
+        pausedState._audioContext.currentTime = 13;
+      }
+      fn();
+    },
+    () => { throw new Error('an intentional pause must not time out'); },
+  );
+  assert.equal(await waitWhilePaused(pausedSchedule, 4), true);
+});
+
+test('background worker resolves paused or frozen Firefox crossfades', () => {
+  const settleSource = extractFunction('settleScheduledCrossfade');
+  assert.match(settleSource, /crossfade-deck-paused/);
+  assert.match(settleSource, /clockStalledFor >= 2500 && mediaStalledFor >= 2500/);
+  assert.match(settleSource, /playbackDiagnosticSnapshot/);
+
+  const events = [];
+  let resolution = null;
+  const incoming = { paused: true, ended: false, currentTime: 0 };
+  const state = {
+    _audioContext: { currentTime: 1 },
+    _decks: [null, incoming],
+    _crossfadePausedByUser: false,
+    _crossfadeSchedule: {
+      incomingIndex: 1,
+      endTime: 13,
+      createdAt: 100,
+      lastClockValue: 1,
+      lastClockAdvanceAt: 100,
+      lastIncomingTime: 0,
+      lastIncomingAdvanceAt: 100,
+      resolve(value) { resolution = value; },
+    },
+  };
+  const settle = Function(
+    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot',
+    `return (${settleSource})`,
+  )(
+    state,
+    { now: () => 500 },
+    event => events.push(event),
+    reason => ({ reason }),
+  );
+  settle();
+  assert.equal(resolution, false);
+  assert.deepEqual(events, ['crossfade-deck-paused']);
+
+  resolution = null;
+  events.length = 0;
+  incoming.paused = false;
+  state._crossfadeSchedule.faultRecorded = false;
+  state._crossfadeSchedule.createdAt = 100;
+  state._crossfadeSchedule.lastClockAdvanceAt = 100;
+  state._crossfadeSchedule.lastIncomingAdvanceAt = 100;
+  const settleFrozen = Function(
+    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot',
+    `return (${settleSource})`,
+  )(
+    state,
+    { now: () => 3000 },
+    event => events.push(event),
+    reason => ({ reason }),
+  );
+  settleFrozen();
+  assert.equal(resolution, false);
+  assert.deepEqual(events, ['crossfade-clock-stall']);
+});
+
+test('playback faults persist a user-copyable sanitized report', () => {
+  const snapshot = extractFunction('playbackDiagnosticSnapshot');
+  const dialog = extractFunction('showPlaybackDiagnostics');
+  assert.match(source, /function recordPlaybackDiagnostic[\s\S]*?tss_playback_diagnostics/);
+  assert.match(source, /function recordPlaybackDiagnostic[\s\S]*?_playbackDiagnosticFault = true/);
+  assert.match(snapshot, /safeMediaUrl/);
+  assert.match(snapshot, /diagnostics: state\._playbackDiagnostics\.slice/);
+  assert.match(dialog, /navigator\.clipboard\.writeText/);
+  assert.match(source, /id="tss-playback-debug"/);
+  assert.match(source, /Playback issue detected/);
+});
+
 test('crossfade gain automation follows the audio clock instead of the render loop', () => {
   const curveSource = extractFunction('crossfadeGains');
   const scheduledSource = extractFunction('scheduledCrossfadeGain');
@@ -509,16 +720,44 @@ test('crossfade gain automation follows the audio clock instead of the render lo
   const param = {
     cancelScheduledValues: value => calls.push(['cancel', value]),
     setValueAtTime: (value, time) => calls.push(['set', value, time]),
-    setValueCurveAtTime: (values, time, duration) => calls.push(['curve', [...values], time, duration]),
+    linearRampToValueAtTime: (value, time) => calls.push(['ramp', value, time]),
   };
   Function('param', 'values', `${scheduleSource}; scheduleAudioParamCurve(param, values, 2, 8);`)(param, new Float32Array([1, 0.5, 0]));
-  assert.deepEqual(calls.map(call => call[0]), ['cancel', 'set', 'curve']);
-  assert.equal(calls[2][2], 2);
-  assert.equal(calls[2][3], 8);
+  assert.deepEqual(calls.map(call => call[0]), ['cancel', 'set', 'ramp', 'ramp']);
+  assert.equal(calls[0][1], 0);
+  assert.deepEqual(calls[2], ['ramp', 0.5, 6]);
+  assert.deepEqual(calls[3], ['ramp', 0, 10]);
+  assert.doesNotMatch(scheduleSource, /param\.setValueCurveAtTime\s*\(/);
   assert.match(source, /state\._crossfadeSchedule = schedule/);
   assert.match(source, /state\._audioContext\?\.currentTime >= schedule\.endTime/);
   assert.match(extractFunction('startWatcher'), /settleScheduledCrossfade\(\)/);
   assert.match(extractFunction('settleScheduledCrossfade'), /schedule\.resolve\(true\)/);
+});
+
+test('Firefox crossfade cleanup clears active automation before setting gain', () => {
+  const immediateSource = extractFunction('setAudioParamImmediately');
+  const calls = [];
+  let clearedFromStart = false;
+  const param = {
+    value: -1,
+    cancelScheduledValues: time => {
+      calls.push(['cancel', time]);
+      clearedFromStart = time === 0;
+    },
+    setValueAtTime: (value, time) => {
+      if (!clearedFromStart) {
+        throw new DOMException("AudioParam.setValueAtTime: Can't add events during a curve event");
+      }
+      calls.push(['set', value, time]);
+    },
+  };
+
+  const result = Function('param', `${immediateSource}; return setAudioParamImmediately(param, 0.75, 12);`)(param);
+  assert.equal(result, true);
+  assert.deepEqual(calls, [['cancel', 0], ['set', 0.75, 12]]);
+  assert.match(extractFunction('syncCrossfadeVolume'), /setAudioParamImmediately/);
+  assert.match(extractFunction('resetDeck'), /setAudioParamImmediately/);
+  assert.doesNotMatch(source, /mixGain\.gain\.cancelScheduledValues\(now\)/);
 });
 
 test('manual skips can opt out of the short transition', () => {
@@ -573,9 +812,9 @@ test('saved volume initializes SoundCloud and external SoundCloud changes flow b
 
   nativeVolume = 0.47;
   Function(
-    'state', 'soundCloudVolume', 'initializePlaybackVolume', 'syncPlaybackVolumeControls', 'syncCrossfadeVolume', 'localStorage',
+    'state', 'currentDeckAudio', 'soundCloudVolume', 'initializePlaybackVolume', 'syncPlaybackVolumeControls', 'syncCrossfadeVolume', 'localStorage',
     `${followSource}; syncPlaybackVolumeFromSoundCloud();`,
-  )(state, () => nativeVolume, () => true, () => {}, () => {}, localStorage);
+  )(state, () => null, () => nativeVolume, () => true, () => {}, () => {}, localStorage);
   assert.equal(state.playbackVolume, 0.47);
   assert.deepEqual(writes.at(-1), ['tss_playback_volume', '0.47']);
 });

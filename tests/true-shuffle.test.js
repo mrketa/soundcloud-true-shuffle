@@ -273,6 +273,7 @@ test('track sleep timer remains transition-count based', () => {
 });
 
 function createWatcherHarness() {
+  let now = 100_000;
   let title = 'Track A';
   let timing = { current: 0, duration: 2000, ended: false, source: 'audio' };
   let isPaused = false;
@@ -282,12 +283,15 @@ function createWatcherHarness() {
   let pauseCalls = 0;
   let navigationClicks = 0;
   let deadlineChecks = 0;
+  let deck = null;
+  let deckPlayCalls = 0;
   const events = [];
   const storage = new Map();
 
   const state = {
     active: true,
     busy: false,
+    loading: false,
     suspended: false,
     manualAction: false,
     lastProgress: 0,
@@ -308,6 +312,9 @@ function createWatcherHarness() {
     ],
     playNext: [],
     stopAfterRound: false,
+    crossfadeSeconds: 0,
+    _crossfading: false,
+    _crossfadePending: false,
     roundPlayed: 0,
     roundTotal: 3,
   };
@@ -365,7 +372,8 @@ function createWatcherHarness() {
     'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker', 'settleScheduledCrossfade',
     'installBetterFeedPipBridge', 'syncOwnPipWindow', 'syncBetterFeedPipWindow',
     'consumeCurrentQueueTrack', 'sessionStorage', 'trackId', 'currentDeckAudio',
-    'checkSleepTimerDeadline',
+    'checkSleepTimerDeadline', 'resumeAudioGraph', 'Date', 'syncPlaybackVolumeFromSoundCloud', 'recoverCurrentDeckStream',
+    'recordPlaybackDiagnostic',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -388,8 +396,18 @@ function createWatcherHarness() {
     consumeCurrentQueueTrack,
     sessionStorage,
     trackId,
-    () => null,
+    () => deck,
     () => { deadlineChecks++; return false; },
+    async () => true,
+    { now: () => now },
+    () => {},
+    async activeDeck => {
+      activeDeck.currentTime = (Number(activeDeck.currentTime) || timing.current) + 0.01;
+      const playAttempt = activeDeck.play();
+      if (playAttempt?.catch) playAttempt.catch(() => {});
+      return true;
+    },
+    () => {},
   );
   startWatcher();
 
@@ -401,6 +419,22 @@ function createWatcherHarness() {
     setPaused: value => { isPaused = value; },
     setTitle: value => { title = value; },
     setPageElementsPresent: value => { pageElementsPresent = value; },
+    setDeck: overrides => {
+      deck = {
+        paused: false,
+        ended: false,
+        seeking: false,
+        readyState: 4,
+        playbackRate: 1,
+        currentTime: timing.current,
+        buffered: { length: 1, start: () => 0, end: () => timing.duration },
+        async play() { deckPlayCalls++; },
+        ...overrides,
+      };
+      return deck;
+    },
+    advanceTime: ms => { now += ms; },
+    deckPlayCalls: () => deckPlayCalls,
     nextCalls: () => nextCalls,
     pauseCalls: () => pauseCalls,
     navigationClicks: () => navigationClicks,
@@ -542,6 +576,123 @@ test('a paused long track slightly before its endpoint is not advanced', async (
   assert.equal(h.nextCalls(), 0);
 });
 
+test('custom deck stall watchdog recovers once before advancing a confirmed stall', async () => {
+  const h = createWatcherHarness();
+  h.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
+  const deck = h.setDeck({ currentTime: 600 });
+
+  await h.worker.onmessage();
+  for (let i = 0; i < 6; i++) {
+    h.advanceTime(3000);
+    await h.worker.onmessage();
+    await Promise.resolve();
+  }
+  assert.equal(h.deckPlayCalls(), 1);
+  assert.equal(h.nextCalls(), 0);
+  assert.ok(deck.currentTime > 600);
+
+  for (let i = 0; i < 13; i++) {
+    h.advanceTime(3000);
+    await h.worker.onmessage();
+    await Promise.resolve();
+  }
+  assert.equal(h.nextCalls(), 1);
+});
+
+test('custom deck stall recovery never blocks the background watcher on a pending play promise', async () => {
+  const h = createWatcherHarness();
+  h.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
+  h.setDeck({
+    currentTime: 600,
+    play() { return new Promise(() => {}); },
+  });
+
+  await h.worker.onmessage();
+  for (let i = 0; i < 5; i++) {
+    h.advanceTime(3000);
+    await h.worker.onmessage();
+  }
+
+  assert.equal(h.nextCalls(), 0);
+});
+
+test('custom deck stall recovery refreshes the same track URL near the saved position', () => {
+  const resolver = extractFunction('resolveCrossfadeStream');
+  const recovery = extractFunction('recoverCurrentDeckStream');
+  assert.match(resolver, /options\.forceRefresh/);
+  assert.match(resolver, /state\._streamCache\.delete\(key\)/);
+  assert.match(recovery, /resolveCrossfadeStream\(state\.meta\[ti\], \{ forceRefresh: true \}\)/);
+  assert.match(recovery, /const savedTime = Math\.max\(0, Number\(position\) \|\| 0\)/);
+  assert.match(recovery, /audio\.currentTime = Math\.min\([\s\S]*savedTime/);
+  assert.match(recovery, /cancelCrossfadeForRecovery\(index\)/);
+  assert.match(recovery, /await audio\.play\(\)/);
+});
+
+test('stall watchdog covers both buffered decoder and depleted network stalls with bounded refresh attempts', () => {
+  const watcher = extractFunction('startWatcher');
+  assert.match(watcher, /deckHasBufferedAhead/);
+  assert.match(watcher, /stallKind = bufferedAhead \? 'decoder' : 'network'/);
+  assert.doesNotMatch(watcher, /&& deck\.readyState >= 3[\s\S]*&& deckHasBufferedAhead/);
+  assert.match(watcher, /recoveryAttempts >= 2/);
+  assert.match(watcher, /recoverCurrentDeckStream\(deck, timing\.current/);
+  assert.match(watcher, /await advanceAtNaturalEnd\(\)/);
+});
+
+test('crossfade recovery cancels scheduled automation without resetting the active deck', () => {
+  const cancel = extractFunction('cancelCrossfadeForRecovery');
+  assert.match(cancel, /state\._crossfadeToken\+\+/);
+  assert.match(cancel, /state\._crossfadeSchedule\?\.resolve\?\.\(false\)/);
+  assert.match(cancel, /state\._deckGains\[activeIndex\] = 1/);
+  assert.match(cancel, /resetDeck\(audio, index\)/);
+  assert.doesNotMatch(cancel, /resetDeck\([^,]+, activeIndex\)/);
+});
+
+test('custom deck stall watchdog ignores unsafe states and throttled observation gaps', async () => {
+  const cases = [
+    { paused: true },
+    { seeking: true },
+    { readyState: 2 },
+    { buffered: { length: 0, start: () => 0, end: () => 0 } },
+  ];
+  for (const overrides of cases) {
+    const h = createWatcherHarness();
+    h.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
+    h.setDeck({ currentTime: 600, ...overrides });
+    await h.worker.onmessage();
+    h.advanceTime(40000);
+    await h.worker.onmessage();
+    assert.equal(h.deckPlayCalls(), 0);
+    assert.equal(h.nextCalls(), 0);
+  }
+
+  for (const stateOverride of [
+    { busy: true },
+    { loading: true },
+    { suspended: true },
+    { _crossfading: true },
+    { _crossfadePending: true },
+  ]) {
+    const h = createWatcherHarness();
+    Object.assign(h.state, stateOverride);
+    h.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
+    h.setDeck({ currentTime: 600 });
+    await h.worker.onmessage();
+    h.advanceTime(40000);
+    await h.worker.onmessage();
+    assert.equal(h.deckPlayCalls(), 0);
+    assert.equal(h.nextCalls(), 0);
+  }
+
+  const throttled = createWatcherHarness();
+  throttled.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
+  throttled.setDeck({ currentTime: 600 });
+  await throttled.worker.onmessage();
+  throttled.advanceTime(30000);
+  await throttled.worker.onmessage();
+  assert.equal(throttled.deckPlayCalls(), 0);
+  assert.equal(throttled.nextCalls(), 0);
+});
+
 test('an unrelated title change away from the end suspends instead of skipping', async () => {
   const h = createWatcherHarness();
   h.setTiming({ current: 1000, duration: 2000, ended: false });
@@ -681,6 +832,49 @@ test('re-shuffle replaces a new playlist and resets hidden weighting', () => {
 });
 
 if (source.includes('function moveSelectedTrackToCurrent(')) {
+test('previous restores the queue position after advancing once', async () => {
+  const state = {
+    active: true,
+    busy: false,
+    manualAction: false,
+    _manualActionAt: 0,
+    queue: [0, 1, 2],
+    playNext: [],
+    pos: 0,
+    history: [],
+    meta: [{}, {}, {}],
+    stopAfterRound: false,
+    roundPlayed: 0,
+    roundTotal: 3,
+  };
+  const consumeCurrentQueueTrack = Function(
+    'state', 'trackAvailable', 'buildBalancedRound',
+    `return (${extractFunction('consumeCurrentQueueTrack')})`,
+  )(state, () => true, items => items.slice());
+  const played = [];
+  const prevTrack = Function(
+    'state', 'currentSec', 'seekTo', 'Date',
+    'refreshUpcomingCrossfadePreparation', 'playAt', 'badges', 'renderList',
+    `return (${extractFunction('prevTrack').replace(/^function /, 'async function ')})`,
+  )(
+    state, () => 0, () => {}, Date,
+    () => {}, async (ti, countPlay) => played.push([ti, countPlay]), () => {}, () => {},
+  );
+
+  consumeCurrentQueueTrack();
+  assert.deepEqual(state.queue, [1, 2]);
+  assert.deepEqual(state.history, [0]);
+  assert.equal(state.roundPlayed, 1);
+
+  await prevTrack();
+
+  assert.deepEqual(state.queue, [0, 1, 2]);
+  assert.equal(state.queue[state.pos], 0);
+  assert.deepEqual(state.history, []);
+  assert.deepEqual(played, [[0, false]]);
+  assert.equal(state.roundPlayed, 0);
+});
+
 test('jumping to a searched track keeps skipped upcoming tracks in the round', () => {
   const state = {
     queue: [0, 1, 2, 3],
@@ -1379,7 +1573,7 @@ test('watcher retries the PiP bridge after Better SoundCloud Feed discovers scPl
   assert.match(watcher, /syncBetterFeedPipWindow\(\)/);
 });
 
-test('native playback pause aligns the transport once without touching True Shuffle decks', () => {
+test('native playback pause never toggles the transport or touches True Shuffle decks', () => {
   const ownDeck = { paused: false, dataset: { tssCrossfadeDeck: '0' }, pauseCalls: 0, pause() { this.pauseCalls++; } };
   const nativeAudio = { paused: false, dataset: {}, pauseCalls: 0, pause() { this.paused = true; this.pauseCalls++; } };
   const button = {
@@ -1388,10 +1582,8 @@ test('native playback pause aligns the transport once without touching True Shuf
     getAttribute: () => 'Pause current track',
     click() { this.clickCalls++; this.title = 'Play current track'; },
   };
-  const timers = [];
   const state = {
     _decks: [ownDeck],
-    _nativePauseSyncPending: false,
     _nativeGuardButtonAction: false,
   };
   const document = {
@@ -1408,32 +1600,19 @@ test('native playback pause aligns the transport once without touching True Shuf
     'state',
     `return (${extractFunction('isTrueShuffleAudio')})`,
   )(state);
-  const soundCloudPaused = Function(
-    'document',
-    `return (${extractFunction('soundCloudPaused')})`,
-  )(document);
-  const alignSoundCloudPlayButtonPaused = Function(
-    'state',
-    'document',
-    'soundCloudPaused',
-    'setTimeout',
-    `return (${extractFunction('alignSoundCloudPlayButtonPaused')})`,
-  )(state, document, soundCloudPaused, (fn, delay) => timers.push({ fn, delay }));
   const pauseSoundCloud = Function(
     'document',
     'isTrueShuffleAudio',
-    'alignSoundCloudPlayButtonPaused',
     `return (${extractFunction('pauseSoundCloud')})`,
-  )(document, isTrueShuffleAudio, alignSoundCloudPlayButtonPaused);
+  )(document, isTrueShuffleAudio);
 
   pauseSoundCloud();
   pauseSoundCloud();
 
   assert.equal(ownDeck.pauseCalls, 0);
   assert.equal(nativeAudio.pauseCalls, 1);
-  assert.equal(button.clickCalls, 1);
+  assert.equal(button.clickCalls, 0);
   assert.equal(state._nativeGuardButtonAction, false);
-  assert.deepEqual(timers.map(timer => timer.delay), [250]);
 });
 
 test('native playback guard blocks autoplay and manual transport starts outside fallback only', () => {
@@ -1442,6 +1621,8 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   const microtasks = [];
   const state = {
     active: true,
+    queue: [7],
+    pos: 0,
     _decks: [],
     _nativePlaybackFallback: null,
     _nativePlaybackGuardInstalled: false,
@@ -1451,9 +1632,9 @@ test('native playback guard blocks autoplay and manual transport starts outside 
     addEventListener(type, handler, capture) { listeners[type] = { handler, capture }; },
   };
   const nativePlaybackFallbackActive = Function(
-    'state',
+    'state', 'clearNativePlaybackFallback',
     `return (${extractFunction('nativePlaybackFallbackActive')})`,
-  )(state);
+  )(state, () => { state._nativePlaybackFallback = null; });
   let pauseSoundCloudCalls = 0;
   const installNativePlaybackGuard = Function(
     'state',
@@ -1517,7 +1698,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   listeners.play.handler({ target: ownDeck });
   assert.equal(ownDeck.pauseCalls, 0);
 
-  state._nativePlaybackFallback = { trackIndex: 7 };
+  state._nativePlaybackFallback = { trackIndex: 7, expiresAt: Date.now() + 3000 };
   const fallbackClick = {
     target: transport,
     prevented: false,

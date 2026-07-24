@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.1
+// @version      6.1.2
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -115,6 +115,7 @@ const state = {
     return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.1;
   })(),
   autoLevel: localStorage.getItem('tss_auto_level') === 'true',
+  safetyClipper: localStorage.getItem('tss_safety_clipper') === 'true',
   eqEnabled: localStorage.getItem('tss_eq_enabled') === 'true',
   eqBands: (() => {
     try {
@@ -129,6 +130,7 @@ const state = {
   crossfadeStatus: 'off',
   _crossfadePending: false,
   _crossfading: false,
+  _crossfadePausedByUser: false,
   _crossfadeSchedule: null,
   _crossfadeToken: 0,
   _deckIndex: -1,
@@ -140,11 +142,12 @@ const state = {
   _deckGains: [0, 0],
   _audioContext: null,
   _audioMaster: null,
+  _audioClipper: null,
   _deckAudioGraphs: [null, null],
   _autoLevelLastTick: 0,
   _autoLevelCache: (() => {
     try {
-      const parsed = JSON.parse(localStorage.getItem('tss_auto_level_cache_v2') || '{}');
+      const parsed = JSON.parse(localStorage.getItem('tss_auto_level_cache_v4') || '{}');
       return parsed && typeof parsed === 'object' ? parsed : {};
     } catch (_) { return {}; }
   })(),
@@ -154,7 +157,6 @@ const state = {
   _lastSoundCloudVolume: null,
   _soundCloudVolumeModel: null,
   _nativePlaybackFallback: null,
-  _nativePauseSyncPending: false,
   _nativeGuardButtonAction: false,
   _pipBridgePlayer: null,
   _ownPipWindow: null,
@@ -169,6 +171,18 @@ const state = {
   _liveSyncLastCheck: 0,
   _liveSyncSource: '',
   _liveSyncTimer: null,
+  _playbackDiagnostics: (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('tss_playback_diagnostics') || '[]');
+      return Array.isArray(saved) ? saved.slice(-80) : [];
+    } catch (_) { return []; }
+  })(),
+  _playbackDiagnosticFault: (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('tss_playback_diagnostics') || '[]');
+      return Array.isArray(saved) && saved.some(entry => ['crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed', 'recovery-exhausted', 'recovery-failed'].includes(entry?.event));
+    } catch (_) { return false; }
+  })(),
   _tabTitleBeforePlayback: null,
   _tabTitleValue: '',
   _browserMetadataKey: '',
@@ -320,32 +334,31 @@ function isTrueShuffleAudio(audio) {
 }
 
 function nativePlaybackFallbackActive() {
-  return Boolean(state._nativePlaybackFallback);
+  const fallback = state._nativePlaybackFallback;
+  const trackIndex = state.queue[state.pos];
+  const active = Boolean(
+    fallback
+    && Date.now() < fallback.expiresAt
+    && fallback.trackIndex === trackIndex
+  );
+  if (!active && fallback) clearNativePlaybackFallback();
+  return active;
 }
 
 function beginNativePlaybackFallback(trackIndex) {
-  state._nativePlaybackFallback = { trackIndex };
+  state._nativePlaybackFallback = {
+    trackIndex,
+    expiresAt: Date.now() + 3000,
+  };
 }
 
 function clearNativePlaybackFallback() {
   state._nativePlaybackFallback = null;
 }
 
-function alignSoundCloudPlayButtonPaused() {
-  const button = document.querySelector('.playControls__play');
-  if (!button || soundCloudPaused() || state._nativePauseSyncPending) return;
-
-  state._nativePauseSyncPending = true;
-  state._nativeGuardButtonAction = true;
-  try { button.click(); } catch (_) {}
-  state._nativeGuardButtonAction = false;
-  setTimeout(() => { state._nativePauseSyncPending = false; }, 250);
-}
-
 function pauseSoundCloud() {
   const nativeAudios = [...document.querySelectorAll('audio')]
     .filter(audio => !isTrueShuffleAudio(audio));
-  alignSoundCloudPlayButtonPaused();
   nativeAudios.forEach(audio => {
     if (!audio.paused) {
       try { audio.pause(); } catch (_) {}
@@ -400,9 +413,11 @@ async function toggle() {
       );
       const shouldResume = mixingDecks.length > 0 && mixingDecks.every(audio => audio.paused);
       if (shouldResume) {
+        state._crossfadePausedByUser = false;
         await resumeAudioGraph();
         await Promise.all(mixingDecks.map(audio => audio.play().catch(() => {})));
       } else {
+        state._crossfadePausedByUser = true;
         mixingDecks.forEach(audio => { if (!audio.paused) audio.pause(); });
         await suspendAudioGraph();
       }
@@ -591,6 +606,130 @@ const SVG = {
   heartFilled:`<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M8 14.2l-.42-.25C5.62 12.78 1.5 9.86 1.5 5.77A3.82 3.82 0 018 3.04a3.82 3.82 0 016.5 2.73c0 4.09-4.12 7.01-6.08 8.18L8 14.2z"/></svg>`,
 };
 
+function recordPlaybackDiagnostic(event, details = {}) {
+  const entry = {
+    at: new Date().toISOString(),
+    event,
+    track: Number.isInteger(state._deckTrack) ? (state.meta[state._deckTrack]?.title || '') : '',
+    ...details,
+  };
+  state._playbackDiagnostics.push(entry);
+  if (state._playbackDiagnostics.length > 80) state._playbackDiagnostics.splice(0, state._playbackDiagnostics.length - 80);
+  if (['crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed', 'recovery-exhausted', 'recovery-failed'].includes(event)) {
+    state._playbackDiagnosticFault = true;
+  }
+  try { localStorage.setItem('tss_playback_diagnostics', JSON.stringify(state._playbackDiagnostics)); } catch (_) {}
+  updatePlaybackDiagnosticButton();
+  try { console.info('[True Shuffle][playback]', entry); } catch (_) {}
+}
+
+function safeMediaUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch (_) { return ''; }
+}
+
+function playbackDiagnosticSnapshot(reason = 'manual') {
+  const schedule = state._crossfadeSchedule;
+  return {
+    at: new Date().toISOString(),
+    reason,
+    page: location.href.split(/[?#]/)[0],
+    state: {
+      active: state.active,
+      busy: state.busy,
+      suspended: state.suspended,
+      crossfading: state._crossfading,
+      crossfadePausedByUser: state._crossfadePausedByUser,
+      crossfadeStatus: state.crossfadeStatus,
+      crossfadeSeconds: state.crossfadeSeconds,
+      queuePosition: state.pos,
+      queueLength: state.queue.length,
+      deckIndex: state._deckIndex,
+      deckTrack: state._deckTrack,
+      currentTrack: Number.isInteger(state._deckTrack) ? state.meta[state._deckTrack]?.title || '' : '',
+    },
+    audioContext: state._audioContext ? {
+      state: state._audioContext.state,
+      currentTime: Number(state._audioContext.currentTime) || 0,
+      sampleRate: Number(state._audioContext.sampleRate) || 0,
+    } : null,
+    schedule: schedule ? {
+      token: schedule.token,
+      startTime: schedule.startTime,
+      endTime: schedule.endTime,
+      duration: schedule.duration,
+      outgoingIndex: schedule.outgoingIndex,
+      incomingIndex: schedule.incomingIndex,
+      lastClockValue: schedule.lastClockValue,
+      lastClockAdvanceAt: schedule.lastClockAdvanceAt,
+      lastIncomingTime: schedule.lastIncomingTime,
+      lastIncomingAdvanceAt: schedule.lastIncomingAdvanceAt,
+    } : null,
+    decks: state._decks.map((audio, index) => audio ? {
+      index,
+      trackIndex: state._deckTracks[index],
+      title: Number.isInteger(state._deckTracks[index]) ? state.meta[state._deckTracks[index]]?.title || '' : '',
+      paused: audio.paused,
+      ended: audio.ended,
+      seeking: audio.seeking,
+      currentTime: Number(audio.currentTime) || 0,
+      duration: Number(audio.duration) || 0,
+      readyState: Number(audio.readyState) || 0,
+      networkState: Number(audio.networkState) || 0,
+      errorCode: Number(audio.error?.code) || 0,
+      source: safeMediaUrl(audio.currentSrc || audio.src),
+      deckGain: state._deckGains[index],
+      mixGain: state._deckAudioGraphs[index]?.mixGain?.gain?.value,
+      autoGain: state._deckAudioGraphs[index]?.autoGain?.gain?.value,
+    } : null),
+    diagnostics: state._playbackDiagnostics.slice(-40).map(entry => {
+      const { diagnostics, ...summary } = entry;
+      return summary;
+    }),
+  };
+}
+
+function updatePlaybackDiagnosticButton() {
+  const button = document.getElementById('tss-playback-debug');
+  if (button) button.hidden = !state._playbackDiagnosticFault;
+}
+
+function showPlaybackDiagnostics() {
+  document.getElementById('tss-debug-overlay')?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'tss-debug-overlay';
+  const report = JSON.stringify(playbackDiagnosticSnapshot('user-opened-report'), null, 2);
+  overlay.innerHTML = `
+    <div class="tss-debug-dialog" role="dialog" aria-modal="true" aria-labelledby="tss-debug-title">
+      <div class="tss-debug-head"><div><strong id="tss-debug-title">Playback report</strong><span>Firefox diagnostics</span></div><button id="tss-debug-close" type="button" aria-label="Close">${SVG.close}</button></div>
+      <p>Copy this report if playback stops again. Stream tokens and URL parameters are removed.</p>
+      <pre id="tss-debug-report"></pre>
+      <div class="tss-debug-actions"><button id="tss-debug-clear" type="button">Clear</button><button id="tss-debug-copy" type="button">Copy report</button></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#tss-debug-report').textContent = report;
+  const close = () => overlay.remove();
+  overlay.querySelector('#tss-debug-close').onclick = close;
+  overlay.onclick = event => { if (event.target === overlay) close(); };
+  overlay.querySelector('#tss-debug-clear').onclick = () => {
+    state._playbackDiagnostics = [];
+    state._playbackDiagnosticFault = false;
+    try { localStorage.removeItem('tss_playback_diagnostics'); } catch (_) {}
+    updatePlaybackDiagnosticButton();
+    close();
+  };
+  overlay.querySelector('#tss-debug-copy').onclick = async event => {
+    try {
+      await navigator.clipboard.writeText(report);
+      event.currentTarget.textContent = 'Copied';
+    } catch (_) {
+      event.currentTarget.textContent = 'Copy failed';
+    }
+  };
+}
+
 const EQ_BANDS = [
   { label: '60',  frequency: 60,    type: 'lowshelf',  q: 0.7 },
   { label: '250', frequency: 250,   type: 'peaking',   q: 0.9 },
@@ -627,11 +766,8 @@ function hydrationWaveformUrl(meta) {
   if (!Array.isArray(roots)) return null;
 
   const wantedUrl = normalizeTrackUrl(meta?.link);
-  const wantedTitle = String(meta?.title || '').trim().toLowerCase();
-  const wantedArtist = String(meta?.artist || '').trim().toLowerCase();
   const seen = new WeakSet();
   const stack = [...roots];
-  let titleMatch = null;
 
   while (stack.length) {
     const value = stack.pop();
@@ -641,28 +777,38 @@ function hydrationWaveformUrl(meta) {
     const wave = value.waveform_url || value.waveformUrl;
     if (wave) {
       const candidateUrl = normalizeTrackUrl(value.permalink_url || value.permalinkUrl || '');
-      const candidateTitle = String(value.title || '').trim().toLowerCase();
-      const candidateArtist = String(value.user?.username || value.publisher_metadata?.artist || '').trim().toLowerCase();
       if (wantedUrl && candidateUrl === wantedUrl) return wave;
-      if (wantedTitle && candidateTitle === wantedTitle && (!wantedArtist || !candidateArtist || candidateArtist === wantedArtist)) {
-        titleMatch = titleMatch || wave;
-      }
     }
 
     for (const child of Object.values(value)) {
       if (child && typeof child === 'object') stack.push(child);
     }
   }
-  return titleMatch;
+  return null;
 }
 
 async function resolveWaveformUrl(meta) {
   const direct = meta?.waveform || hydrationWaveformUrl(meta);
   if (direct) return direct;
 
-  // Never guess from the most recently requested SoundCloud waveform. Feed and
-  // playlist scrolling can load unrelated waveform resources in parallel.
-  return null;
+  // Firefox often exposes less playlist hydration than Chromium. Resolve the
+  // exact track through SoundCloud's API instead of reusing a title match or a
+  // recently observed waveform resource from another track.
+  const wantedUrl = normalizeTrackUrl(meta?.link);
+  if (!wantedUrl) return null;
+  const clientId = await discoverSoundCloudClientIdFromBundle();
+  if (!clientId) return null;
+  try {
+    const response = await fetch(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`);
+    if (!response.ok) return null;
+    const track = await response.json();
+    const candidateUrl = normalizeTrackUrl(track?.permalink_url || track?.permalinkUrl || '');
+    const resolved = candidateUrl === wantedUrl ? (track?.waveform_url || track?.waveformUrl) : null;
+    if (resolved) meta.waveform = resolved;
+    return resolved || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function downsampleWaveform(samples, count = DEFAULT_WAVE_HEIGHTS.length) {
@@ -2214,14 +2360,22 @@ function autoLevelTrackKey(ti) {
   return trackId(meta) || normalizeTrackUrl(meta?.link) || '';
 }
 
-function calculateAutoLevelGain(rms, currentGain = 1, calibrating = false) {
+function calculateAutoLevelGain(rms, peak, masterVolume) {
   const level = Number(rms);
-  const current = Math.max(0.2, Math.min(1, Number(currentGain) || 1));
-  if (!Number.isFinite(level) || level < 0.015) return current;
-  const desired = Math.max(0.2, Math.min(1, 0.13 / level));
-  if (desired >= current) return current;
-  const speed = calibrating ? 0.72 : 0.12;
-  return Math.max(0.2, current + (desired - current) * speed);
+  const measuredPeak = Number(peak);
+  const master = Math.max(0, Math.min(1, Number(masterVolume)));
+  if (!Number.isFinite(level) || level < 0.015 || !Number.isFinite(master) || master <= 0) return 1;
+  // Full master volume is a strict unity path: Auto must never make 100%
+  // quieter than the browser-native output.
+  if (master >= 0.999) return 1;
+
+  const targetRms = 0.225;
+  const desired = targetRms / level;
+  const masterHeadroom = 1 / master;
+  const peakHeadroom = Number.isFinite(measuredPeak) && measuredPeak > 0
+    ? 1 / (master * measuredPeak)
+    : masterHeadroom;
+  return Math.max(0.125, Math.min(desired, masterHeadroom, peakHeadroom));
 }
 
 function saveAutoLevelCacheSoon() {
@@ -2231,7 +2385,7 @@ function saveAutoLevelCacheSoon() {
       .sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
       .slice(0, 300);
     state._autoLevelCache = Object.fromEntries(entries);
-    try { localStorage.setItem('tss_auto_level_cache_v2', JSON.stringify(state._autoLevelCache)); } catch (_) {}
+    try { localStorage.setItem('tss_auto_level_cache_v4', JSON.stringify(state._autoLevelCache)); } catch (_) {}
   }, 800);
 }
 
@@ -2277,6 +2431,7 @@ function syncEqualizer() {
       filter.gain.setTargetAtTime(value, now, 0.025);
     });
   });
+  syncDeckProcessingRouting();
 
   const button = document.getElementById('tss-hub-eq');
   if (button) {
@@ -2295,17 +2450,19 @@ function ensureAutoLevelAudioGraph() {
     if (!state._audioContext) {
       const context = new AudioContextCtor();
       const master = context.createGain();
-      const limiter = context.createDynamicsCompressor();
+      const clipper = context.createWaveShaper();
       master.gain.value = state.playbackVolume;
-      limiter.threshold.value = -2;
-      limiter.knee.value = 0;
-      limiter.ratio.value = 20;
-      limiter.attack.value = 0.003;
-      limiter.release.value = 0.25;
-      master.connect(limiter);
-      limiter.connect(context.destination);
+      // A two-point identity curve is linear inside full scale and WaveShaper
+      // clamps only samples that exceed it. Unlike a compressor, this has no
+      // envelope or release tail, so EQ/crossfade overs are contained without
+      // turning musical peaks into program-dependent volume pumping.
+      clipper.curve = new Float32Array([-1, 1]);
+      clipper.oversample = '4x';
+      master.connect(state.safetyClipper ? clipper : context.destination);
+      clipper.connect(context.destination);
       state._audioContext = context;
       state._audioMaster = master;
+      state._audioClipper = clipper;
     }
 
     decks.forEach((audio, index) => {
@@ -2326,12 +2483,6 @@ function ensureAutoLevelAudioGraph() {
       analyser.smoothingTimeConstant = 0.72;
       autoGain.gain.value = 1;
       mixGain.gain.value = state._deckGains[index] || 0;
-      source.connect(eqFilters[0]);
-      eqFilters.forEach((filter, filterIndex) => {
-        filter.connect(eqFilters[filterIndex + 1] || analyser);
-      });
-      analyser.connect(autoGain);
-      autoGain.connect(mixGain);
       mixGain.connect(state._audioMaster);
       audio.volume = 1;
       state._deckAudioGraphs[index] = {
@@ -2339,17 +2490,60 @@ function ensureAutoLevelAudioGraph() {
         buffer: new Float32Array(analyser.fftSize),
         smoothedRms: 0,
         peakRms: 0,
+        measuredPeak: 0,
         currentGain: 1,
         samples: 0,
+        settled: false,
         trackKey: '',
       };
     });
+    syncDeckProcessingRouting();
     syncEqualizer();
     if (state._audioContext.state === 'suspended') void state._audioContext.resume();
     return true;
   } catch (_) {
     return false;
   }
+}
+
+function syncDeckProcessingRouting() {
+  state._deckAudioGraphs.forEach(graph => {
+    if (!graph) return;
+    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain]) {
+      try { node.disconnect(); } catch (_) {}
+    }
+
+    if (!state.eqEnabled && !state.autoLevel) {
+      graph.source.connect(graph.mixGain);
+      setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
+      return;
+    }
+
+    let tail = graph.source;
+    if (state.eqEnabled) {
+      for (const filter of graph.eqFilters) {
+        tail.connect(filter);
+        tail = filter;
+      }
+    }
+    if (state.autoLevel) {
+      tail.connect(graph.analyser);
+      graph.analyser.connect(graph.autoGain);
+      graph.autoGain.connect(graph.mixGain);
+      setAudioParamImmediately(graph.autoGain.gain, graph.currentGain, state._audioContext.currentTime);
+    } else {
+      tail.connect(graph.mixGain);
+      setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
+    }
+  });
+}
+
+function syncSafetyClipper() {
+  if (!state._audioMaster || !state._audioContext) return;
+  try {
+    state._audioMaster.disconnect();
+    state._audioMaster.connect(state.safetyClipper ? state._audioClipper : state._audioContext.destination);
+  } catch (_) {}
 }
 
 async function resumeAudioGraph() {
@@ -2379,13 +2573,18 @@ function applyCachedAutoLevel(index, ti) {
   const graph = state._deckAudioGraphs[index];
   if (!graph) return;
   const key = autoLevelTrackKey(ti);
-  const cached = Number(state._autoLevelCache[key]?.gain);
+  const cachedRms = Number(state._autoLevelCache[key]?.rms);
+  const cachedPeak = Number(state._autoLevelCache[key]?.peak);
+  const hasCachedMeasurement = Number.isFinite(cachedRms) && cachedRms >= 0.015
+    && Number.isFinite(cachedPeak) && cachedPeak > 0;
   graph.trackKey = key;
   graph.samples = 0;
   graph.smoothedRms = 0;
-  graph.peakRms = 0;
-  graph.currentGain = state.autoLevel && Number.isFinite(cached)
-    ? Math.max(0.2, Math.min(1, cached))
+  graph.peakRms = hasCachedMeasurement ? cachedRms : 0;
+  graph.measuredPeak = hasCachedMeasurement ? cachedPeak : 0;
+  graph.settled = hasCachedMeasurement;
+  graph.currentGain = state.autoLevel && hasCachedMeasurement
+    ? calculateAutoLevelGain(cachedRms, cachedPeak, state.playbackVolume)
     : 1;
   graph.autoGain.gain.setValueAtTime(graph.currentGain, state._audioContext.currentTime);
 }
@@ -2399,27 +2598,40 @@ function processAutoLevel() {
   state._deckAudioGraphs.forEach((graph, index) => {
     const audio = state._decks[index];
     if (!graph || !audio || audio.paused || !audio.currentSrc || state._deckGains[index] <= 0.001) return;
+    if (graph.settled) return;
     graph.analyser.getFloatTimeDomainData(graph.buffer);
     let sum = 0;
-    for (const sample of graph.buffer) sum += sample * sample;
+    let peak = 0;
+    for (const sample of graph.buffer) {
+      sum += sample * sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
     const rms = Math.sqrt(sum / graph.buffer.length);
     if (rms < 0.015) return;
     graph.smoothedRms = graph.smoothedRms
       ? graph.smoothedRms * 0.55 + rms * 0.45
       : rms;
     graph.peakRms = Math.max(graph.peakRms, graph.smoothedRms);
+    graph.measuredPeak = Math.max(graph.measuredPeak, peak);
     graph.samples++;
-    const calibrating = graph.samples <= 12;
-    const nextGain = calculateAutoLevelGain(graph.peakRms, graph.currentGain, calibrating);
-    const reduced = nextGain < graph.currentGain - 0.001;
-    graph.currentGain = nextGain;
+    if (graph.samples < 12) return;
+    graph.settled = true;
+    graph.currentGain = calculateAutoLevelGain(
+      graph.peakRms,
+      graph.measuredPeak,
+      state.playbackVolume,
+    );
     graph.autoGain.gain.setTargetAtTime(
       graph.currentGain,
       state._audioContext.currentTime,
-      calibrating ? 0.035 : 0.35,
+      0.08,
     );
-    if (graph.trackKey && (graph.samples === 12 || (reduced && graph.samples % 8 === 0))) {
-      state._autoLevelCache[graph.trackKey] = { gain: graph.currentGain, ts: Date.now() };
+    if (graph.trackKey) {
+      state._autoLevelCache[graph.trackKey] = {
+        rms: graph.peakRms,
+        peak: graph.measuredPeak,
+        ts: Date.now(),
+      };
       saveAutoLevelCacheSoon();
     }
   });
@@ -2552,6 +2764,7 @@ function initializePlaybackVolume() {
 }
 
 function syncPlaybackVolumeFromSoundCloud() {
+  if (currentDeckAudio()) return;
   if (!state._playbackVolumeInitialized && !initializePlaybackVolume()) return;
   const nativeVolume = soundCloudVolume();
   if (!Number.isFinite(nativeVolume)) return;
@@ -2581,11 +2794,17 @@ function syncCrossfadeVolume() {
     const graph = state._deckAudioGraphs?.[index];
     if (graph) {
       audio.volume = 1;
+      if (state.autoLevel && graph.settled) {
+        graph.currentGain = calculateAutoLevelGain(
+          graph.peakRms,
+          graph.measuredPeak,
+          master,
+        );
+      }
       // The audio clock owns mixGain while a crossfade is scheduled. Rewriting
       // it from the UI watcher would destroy background-safe automation.
       if (automatedGain === null) {
-        graph.mixGain.gain.cancelScheduledValues(state._audioContext.currentTime);
-        graph.mixGain.gain.setValueAtTime(gain, state._audioContext.currentTime);
+        setAudioParamImmediately(graph.mixGain.gain, gain, state._audioContext.currentTime);
       }
       graph.autoGain.gain.setTargetAtTime(state.autoLevel ? graph.currentGain : 1, state._audioContext.currentTime, 0.08);
     } else {
@@ -2636,6 +2855,7 @@ function setAutoLevelEnabled(enabled) {
   state.autoLevel = nextValue;
   localStorage.setItem('tss_auto_level', String(state.autoLevel));
   if (state.autoLevel && state._audioContext?.state === 'suspended') void state._audioContext.resume();
+  syncDeckProcessingRouting();
   state._deckTracks.forEach((ti, index) => {
     if (Number.isInteger(ti)) applyCachedAutoLevel(index, ti);
   });
@@ -2782,9 +3002,11 @@ async function discoverSoundCloudClientIdFromBundle() {
   return '';
 }
 
-async function resolveCrossfadeStream(meta) {
+async function resolveCrossfadeStream(meta, options) {
+  options = options || {};
   const key = normalizeTrackUrl(meta?.link);
   if (!key) return null;
+  if (options.forceRefresh) state._streamCache.delete(key);
   const cached = state._streamCache.get(key);
   if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached.url;
 
@@ -2829,10 +3051,8 @@ function resetDeck(audio, index) {
       graph.smoothedRms = 0;
       graph.peakRms = 0;
       graph.currentGain = 1;
-      graph.autoGain.gain.cancelScheduledValues(now);
-      graph.autoGain.gain.setValueAtTime(1, now);
-      graph.mixGain.gain.cancelScheduledValues(now);
-      graph.mixGain.gain.setValueAtTime(0, now);
+      setAudioParamImmediately(graph.autoGain.gain, 1, now);
+      setAudioParamImmediately(graph.mixGain.gain, 0, now);
     }
   }
   audio.volume = state._deckAudioGraphs[index] ? 1 : 0;
@@ -2843,6 +3063,7 @@ function stopCrossfadeDecks() {
   state._crossfadePrefetchToken++;
   state._deckPrepareTokens = state._deckPrepareTokens.map(token => token + 1);
   state._crossfading = false;
+  state._crossfadePausedByUser = false;
   state._crossfadePending = false;
   state._crossfadeSchedule?.resolve?.(false);
   state._crossfadeSchedule = null;
@@ -2874,6 +3095,74 @@ async function prepareCrossfadeDeck(index, ti) {
   syncCrossfadeVolume();
   audio.load();
   return audio;
+}
+
+function cancelCrossfadeForRecovery(activeIndex) {
+  state._crossfadeToken++;
+  state._crossfadePrefetchToken++;
+  state._crossfadeSchedule?.resolve?.(false);
+  state._crossfadeSchedule = null;
+  state._crossfading = false;
+  state._crossfadePausedByUser = false;
+  state._crossfadePending = false;
+  state._decks.forEach((audio, index) => {
+    if (!audio || index === activeIndex) return;
+    resetDeck(audio, index);
+  });
+  state._deckGains[activeIndex] = 1;
+  syncCrossfadeVolume();
+  setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'loading' : 'off');
+}
+
+async function recoverCurrentDeckStream(audio, position, reason = 'unknown', attempt = 1) {
+  const index = state._decks.indexOf(audio);
+  const ti = index >= 0 ? state._deckTracks[index] : null;
+  if (index < 0 || !Number.isInteger(ti) || ti !== state._deckTrack || !state.meta[ti]) return false;
+  const savedTime = Math.max(0, Number(position) || 0);
+  recordPlaybackDiagnostic('recovery-start', {
+    reason,
+    attempt,
+    position: Math.round(savedTime * 10) / 10,
+    readyState: Number(audio.readyState) || 0,
+    networkState: Number(audio.networkState) || 0,
+  });
+  cancelCrossfadeForRecovery(index);
+  const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
+  state._deckPrepareTokens[index] = requestToken;
+  const streamUrl = await resolveCrossfadeStream(state.meta[ti], { forceRefresh: true });
+  if (!streamUrl || state._deckPrepareTokens[index] !== requestToken
+      || state._deckTracks[index] !== ti || state._deckTrack !== ti) {
+    recordPlaybackDiagnostic('recovery-aborted', { reason, attempt, freshStream: Boolean(streamUrl) });
+    return false;
+  }
+  try {
+    audio.pause();
+    audio.src = streamUrl;
+    audio.preload = 'auto';
+    audio.load();
+    if (!await waitForDeck(audio, 8000)) return false;
+    const duration = Number(audio.duration);
+    audio.currentTime = Math.min(Number.isFinite(duration) ? Math.max(0, duration - 0.1) : savedTime, savedTime);
+    await resumeAudioGraph();
+    await audio.play();
+    state._deckGains[index] = 1;
+    syncCrossfadeVolume();
+    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+    setTimeout(() => { void prefetchUpcomingCrossfadeTrack(); }, 0);
+    recordPlaybackDiagnostic('recovery-success', {
+      reason,
+      attempt,
+      resumedAt: Math.round((Number(audio.currentTime) || 0) * 10) / 10,
+    });
+    return true;
+  } catch (error) {
+    recordPlaybackDiagnostic('recovery-failed', {
+      reason,
+      attempt,
+      error: String(error?.name || error || 'unknown').slice(0, 80),
+    });
+    return false;
+  }
 }
 
 async function waitForDeck(audio, timeout = 5000) {
@@ -2920,15 +3209,35 @@ function scheduledCrossfadeGain(index) {
   return index === schedule.outgoingIndex ? gains[0] : gains[1];
 }
 
-function scheduleAudioParamCurve(param, values, startTime, duration) {
-  param.cancelScheduledValues(startTime);
-  param.setValueAtTime(values[0], startTime);
-  if (typeof param.setValueCurveAtTime === 'function') {
-    param.setValueCurveAtTime(values, startTime, duration);
-    return;
+function setAudioParamImmediately(param, value, now) {
+  if (!param) return false;
+  const target = Number.isFinite(Number(value)) ? Number(value) : 0;
+  const time = Math.max(0, Number(now) || 0);
+  try {
+    // Firefox cannot insert setValueAtTime into an already-running
+    // setValueCurveAtTime event. Clear the whole automation timeline first,
+    // including events that started before `now`.
+    param.cancelScheduledValues(0);
+    param.setValueAtTime(target, time);
+    return true;
+  } catch (_) {
+    // Direct assignment is a last-resort recovery for partial Web Audio
+    // implementations. Future fades no longer create curve events.
+    try {
+      param.value = target;
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
-  // Very old Web Audio implementations: approximate the same shape with
-  // short linear ramps. The audio timeline still runs independently of UI.
+}
+
+function scheduleAudioParamCurve(param, values, startTime, duration) {
+  // Use timeline ramps instead of setValueCurveAtTime. Firefox rejects
+  // setValueAtTime/cancel operations while a curve event is active, which can
+  // reject the transition promise and leave the player stuck on `mixing`.
+  param.cancelScheduledValues(0);
+  param.setValueAtTime(values[0], startTime);
   for (let i = 1; i < values.length; i++) {
     param.linearRampToValueAtTime(values[i], startTime + duration * (i / (values.length - 1)));
   }
@@ -2937,6 +3246,8 @@ function scheduleAudioParamCurve(param, values, startTime, duration) {
 function waitForCrossfadeSchedule(schedule, token) {
   return new Promise(resolve => {
     let settled = false;
+    let lastClockValue = Number(state._audioContext?.currentTime) || 0;
+    let lastClockAdvanceAt = Date.now();
     const finish = completed => {
       if (settled) return;
       settled = true;
@@ -2945,12 +3256,29 @@ function waitForCrossfadeSchedule(schedule, token) {
     };
     schedule.resolve = finish;
     const poll = () => {
+      if (settled) return;
       if (token !== state._crossfadeToken || state._crossfadeSchedule !== schedule) {
         finish(false);
         return;
       }
       if (state._audioContext?.currentTime >= schedule.endTime - 0.005) {
         finish(true);
+        return;
+      }
+      const clockValue = Number(state._audioContext?.currentTime) || 0;
+      if (state._crossfadePausedByUser) {
+        lastClockValue = clockValue;
+        lastClockAdvanceAt = Date.now();
+      } else if (clockValue > lastClockValue + 0.005) {
+        lastClockValue = clockValue;
+        lastClockAdvanceAt = Date.now();
+      } else if (Date.now() - lastClockAdvanceAt >= 2500) {
+        recordPlaybackDiagnostic('crossfade-clock-stall', {
+          elapsed: Math.round(Math.max(0, clockValue - schedule.startTime) * 10) / 10,
+          duration: schedule.duration,
+          contextState: state._audioContext?.state || 'missing',
+        });
+        finish(false);
         return;
       }
       setTimeout(poll, 80);
@@ -2962,18 +3290,64 @@ function waitForCrossfadeSchedule(schedule, token) {
 function settleScheduledCrossfade() {
   const schedule = state._crossfadeSchedule;
   if (!schedule || typeof schedule.resolve !== 'function') return;
-  if (state._audioContext?.currentTime >= schedule.endTime - 0.005) schedule.resolve(true);
+  const now = Date.now();
+  const clockValue = Number(state._audioContext?.currentTime) || 0;
+  const incoming = state._decks[schedule.incomingIndex];
+  const incomingTime = Number(incoming?.currentTime) || 0;
+
+  if (state._crossfadePausedByUser) {
+    schedule.lastClockValue = clockValue;
+    schedule.lastClockAdvanceAt = now;
+    schedule.lastIncomingTime = incomingTime;
+    schedule.lastIncomingAdvanceAt = now;
+    return;
+  }
+
+  if (incoming?.paused && !incoming.ended && now - (schedule.createdAt || now) >= 350) {
+    if (!schedule.faultRecorded) {
+      schedule.faultRecorded = true;
+      recordPlaybackDiagnostic('crossfade-deck-paused', playbackDiagnosticSnapshot('incoming-deck-paused'));
+    }
+    schedule.resolve(false);
+    return;
+  }
+
+  if (clockValue >= schedule.endTime - 0.005) {
+    schedule.resolve(true);
+    return;
+  }
+
+  if (clockValue > (schedule.lastClockValue ?? clockValue) + 0.005) {
+    schedule.lastClockValue = clockValue;
+    schedule.lastClockAdvanceAt = now;
+  }
+  if (incomingTime > (schedule.lastIncomingTime ?? incomingTime) + 0.02) {
+    schedule.lastIncomingTime = incomingTime;
+    schedule.lastIncomingAdvanceAt = now;
+  }
+
+  const clockStalledFor = now - (schedule.lastClockAdvanceAt || schedule.createdAt || now);
+  const mediaStalledFor = now - (schedule.lastIncomingAdvanceAt || schedule.createdAt || now);
+  if (clockStalledFor >= 2500 && mediaStalledFor >= 2500) {
+    if (!schedule.faultRecorded) {
+      schedule.faultRecorded = true;
+      recordPlaybackDiagnostic('crossfade-clock-stall', playbackDiagnosticSnapshot('worker-clock-stall'));
+    }
+    schedule.resolve(false);
+  }
 }
 
 function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
   const duration = Math.max(0.25, seconds);
   const startedAt = Number(incoming.currentTime) || 0;
+  const startedWallAt = Date.now();
   const outgoingIndex = state._decks.indexOf(outgoing);
   const incomingIndex = state._decks.indexOf(incoming);
   const curve = state.crossfadeCurve;
   return new Promise(resolve => {
     const poll = () => {
       if (token !== state._crossfadeToken) { resolve(false); return; }
+      if (Date.now() - startedWallAt > (duration + 5) * 1000) { resolve(false); return; }
       const elapsed = Math.max(0, (Number(incoming.currentTime) || startedAt) - startedAt);
       const t = Math.max(0, Math.min(1, elapsed / duration));
       const [outgoingGain, incomingGain] = crossfadeGains(t, curve);
@@ -2993,6 +3367,7 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
   const incomingIndex = state._decks.indexOf(incoming);
   const curve = state.crossfadeCurve;
   state._crossfading = true;
+  state._crossfadePausedByUser = false;
   setCrossfadeStatus('mixing');
 
   const graphReady = ensureAutoLevelAudioGraph()
@@ -3015,6 +3390,12 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
     const schedule = {
       token, outgoingIndex, incomingIndex, curve,
       startTime, duration, endTime: startTime + duration,
+      createdAt: Date.now(),
+      lastClockValue: context.currentTime,
+      lastClockAdvanceAt: Date.now(),
+      lastIncomingTime: Number(incoming.currentTime) || 0,
+      lastIncomingAdvanceAt: Date.now(),
+      faultRecorded: false,
     };
     state._crossfadeSchedule = schedule;
     scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
@@ -3024,13 +3405,52 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
     completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
   }
 
-  if (!completed || token !== state._crossfadeToken) return false;
+  if (!completed || token !== state._crossfadeToken) {
+    if (token !== state._crossfadeToken) return false;
+
+    // Firefox can leave a running media element attached to a suspended Web
+    // Audio clock. Never leave next() waiting forever: promote the incoming
+    // deck to full gain and resume it instead of dropping into native playback.
+    state._crossfadeSchedule = null;
+    const context = state._audioContext;
+    const now = context?.currentTime || 0;
+    const outgoingGraph = state._deckAudioGraphs[outgoingIndex];
+    const incomingGraph = state._deckAudioGraphs[incomingIndex];
+    setAudioParamImmediately(outgoingGraph?.mixGain.gain, 0, now);
+    setAudioParamImmediately(incomingGraph?.mixGain.gain, 1, now);
+    state._deckGains[outgoingIndex] = 0;
+    state._deckGains[incomingIndex] = 1;
+    outgoing.pause();
+    if (!state._crossfadePausedByUser && incoming.paused) {
+      await resumeAudioGraph();
+      try { await incoming.play(); } catch (_) {
+        recordPlaybackDiagnostic('crossfade-handoff-failed', playbackDiagnosticSnapshot('incoming-resume-rejected'));
+        const recovered = await recoverCurrentDeckStream(
+          incoming,
+          Number(incoming.currentTime) || 0,
+          'crossfade-handoff',
+          1,
+        );
+        if (!recovered) {
+          state._crossfading = false;
+          setCrossfadeStatus('fallback');
+          return false;
+        }
+      }
+    }
+    syncCrossfadeVolume();
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    setCrossfadeStatus('ready');
+    return true;
+  }
   state._crossfadeSchedule = null;
   outgoing.pause();
   state._deckGains[outgoingIndex] = 0;
   state._deckGains[incomingIndex] = 1;
   syncCrossfadeVolume();
   state._crossfading = false;
+  state._crossfadePausedByUser = false;
   setCrossfadeStatus('ready');
   return true;
 }
@@ -3448,6 +3868,7 @@ async function prevTrack() {
     if (existingIdx < state.pos) state.pos--;
   }
   state.queue.splice(state.pos, 0, prevTi);
+  state.roundPlayed = Math.max(0, state.roundPlayed - 1);
   refreshUpcomingCrossfadePreparation();
 
   await playAt(state.queue[state.pos], false);
@@ -4201,6 +4622,25 @@ function startWatcher() {
   let lastRemaining = Infinity;
   let endpointTicks = 0;
   let uiTicks = 0;
+  const deckStall = { deck: null, current: 0, observedAt: 0, stalledSince: 0, recoveryAttempts: 0, recovering: false };
+  const resetDeckStall = (deck = null, current = 0, now = Date.now()) => {
+    deckStall.deck = deck;
+    deckStall.current = current;
+    deckStall.observedAt = now;
+    deckStall.stalledSince = 0;
+    deckStall.recoveryAttempts = 0;
+    deckStall.recovering = false;
+  };
+
+  const deckHasBufferedAhead = (deck, current, seconds = 1) => {
+    try {
+      for (let i = 0; i < deck.buffered.length; i++) {
+        if (deck.buffered.start(i) <= current + 0.05
+            && deck.buffered.end(i) >= current + seconds) return true;
+      }
+    } catch (_) {}
+    return false;
+  };
 
   const resetEndGuard = async () => {
     lastTitle = playerTitle();
@@ -4356,6 +4796,66 @@ function startWatcher() {
         await resetEndGuard();
       }
       return;
+    }
+
+    // A custom media element can remain "playing" with either decoded audio
+    // buffered ahead or a depleted/failed progressive response. Both cases
+    // need a fresh authorized URL; replaying the expired URL is insufficient.
+    const deck = currentDeckAudio();
+    const stallNow = Date.now();
+    const bufferedAhead = deck ? deckHasBufferedAhead(deck, timing.current) : false;
+    const stallKind = bufferedAhead ? 'decoder' : 'network';
+    const stallEligible = Boolean(deck
+      && timing.source === 'audio'
+      && !state.loading
+      && !state.suspended
+      && !state.manualAction
+      && !nearEnd
+      && !deck.paused
+      && !deck.ended
+      && !deck.seeking
+      && (Number(deck.playbackRate) || 1) > 0
+      && timing.current >= 1
+      && timing.duration - timing.current > Math.max(2, state.crossfadeSeconds + 1));
+    const observationGap = deckStall.observedAt ? stallNow - deckStall.observedAt : 0;
+    const progressed = deck !== deckStall.deck || Math.abs(timing.current - deckStall.current) >= 0.05;
+    if (!stallEligible || progressed || observationGap > 4000) {
+      resetDeckStall(deck, timing.current, stallNow);
+    } else if (!deckStall.recovering) {
+      deckStall.observedAt = stallNow;
+      if (!deckStall.stalledSince) deckStall.stalledSince = stallNow;
+      const stalledFor = stallNow - deckStall.stalledSince;
+      const stallThreshold = stallKind === 'decoder' ? 15000 : 12000;
+      if (stalledFor >= stallThreshold && deckStall.recoveryAttempts >= 2) {
+        recordPlaybackDiagnostic('recovery-exhausted', {
+          reason: stallKind,
+          attempts: deckStall.recoveryAttempts,
+          position: Math.round(timing.current * 10) / 10,
+        });
+        resetDeckStall();
+        await advanceAtNaturalEnd();
+        return;
+      }
+      if (stalledFor >= stallThreshold) {
+        deckStall.recoveryAttempts++;
+        deckStall.recovering = true;
+        const attempts = deckStall.recoveryAttempts;
+        void recoverCurrentDeckStream(deck, timing.current, stallKind, attempts).then(recovered => {
+          if (deckStall.deck !== deck) return;
+          deckStall.recovering = false;
+          deckStall.recoveryAttempts = attempts;
+          deckStall.current = Number(deck.currentTime) || timing.current;
+          deckStall.observedAt = Date.now();
+          deckStall.stalledSince = recovered ? 0 : deckStall.observedAt - stallThreshold;
+        }).catch(() => {
+          if (deckStall.deck !== deck) return;
+          deckStall.recovering = false;
+          deckStall.recoveryAttempts = attempts;
+          deckStall.observedAt = Date.now();
+          deckStall.stalledSince = deckStall.observedAt - stallThreshold;
+        });
+        return;
+      }
     }
 
     // SoundCloud can leave a completed stream parked at its exact endpoint
@@ -4720,6 +5220,8 @@ function updateEqualizerPopup() {
     power.setAttribute('aria-pressed', String(state.eqEnabled));
     power.textContent = state.eqEnabled ? 'EQ ON' : 'EQ OFF';
   }
+  const clipper = overlay.querySelector('#tss-safety-clipper');
+  if (clipper) clipper.checked = state.safetyClipper;
   overlay.querySelectorAll('.tss-eq-preset').forEach(button => {
     button.dataset.active = String(button.dataset.preset === state.eqPreset);
   });
@@ -4784,6 +5286,10 @@ function showEqualizer() {
           <text class="tss-eq-axis-label" x="1" y="194">-12</text>
         </svg>
       </div>
+      <label class="tss-eq-safety" for="tss-safety-clipper">
+        <span><strong>Safety clipper</strong><small id="tss-safety-clipper-help">Contain peaks above full scale. Off by default for transparent playback.</small></span>
+        <input id="tss-safety-clipper" type="checkbox" aria-describedby="tss-safety-clipper-help">
+      </label>
       <div class="tss-eq-footer"><span>Drag points to fine-tune</span><button id="tss-eq-reset" type="button">Reset</button></div>
     </div>
   `;
@@ -4797,6 +5303,12 @@ function showEqualizer() {
     state.eqEnabled = enabling;
     persistEqualizer({ immediate: true });
     syncEqualizer();
+    updateEqualizerPopup();
+  };
+  overlay.querySelector('#tss-safety-clipper').onchange = event => {
+    state.safetyClipper = event.currentTarget.checked;
+    localStorage.setItem('tss_safety_clipper', String(state.safetyClipper));
+    if (ensureAutoLevelAudioGraph()) syncSafetyClipper();
     updateEqualizerPopup();
   };
   const presets = overlay.querySelector('.tss-eq-presets');
@@ -5114,6 +5626,24 @@ function mkHub() {
       .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:1px; }
       .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.42);font-size:8px;cursor:pointer; }
       .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#ff5500);cursor:pointer; }
+      #tss-playback-debug {
+        width:100%;margin-top:6px;padding:7px 10px;border:1px solid rgba(255,118,82,.24);border-radius:8px;
+        background:rgba(255,92,54,.07);color:#ff9a7d;font:750 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;
+        letter-spacing:.08em;text-transform:uppercase;cursor:pointer;
+      }
+      #tss-playback-debug:hover { background:rgba(255,92,54,.12);border-color:rgba(255,118,82,.38); }
+      #tss-playback-debug[hidden] { display:none!important; }
+      #tss-debug-overlay { position:fixed;inset:0;z-index:1000002;display:flex;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.72);backdrop-filter:blur(10px); }
+      .tss-debug-dialog { width:min(620px,calc(100vw - 28px));max-height:min(680px,calc(100vh - 28px));display:flex;flex-direction:column;gap:10px;padding:15px;border:1px solid rgba(255,255,255,.11);border-radius:13px;background:#0b0b0b;box-shadow:0 22px 70px rgba(0,0,0,.75);color:#eee;font-family:-apple-system,'Segoe UI',system-ui,sans-serif; }
+      .tss-debug-head { display:flex;align-items:center;justify-content:space-between;gap:15px; }
+      .tss-debug-head strong { display:block;font-size:13px;letter-spacing:.02em; }
+      .tss-debug-head span { display:block;margin-top:2px;color:rgba(255,255,255,.38);font-size:9px; }
+      .tss-debug-head button { width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.65);cursor:pointer; }
+      .tss-debug-dialog p { margin:0;color:rgba(255,255,255,.45);font-size:10px;line-height:1.45; }
+      #tss-debug-report { min-height:180px;max-height:460px;margin:0;padding:11px;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#050505;color:#b7c3cc;font:9px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word; }
+      .tss-debug-actions { display:flex;justify-content:flex-end;gap:7px; }
+      .tss-debug-actions button { min-width:92px;padding:8px 11px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#151515;color:#ddd;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      #tss-debug-copy { border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.35);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.13);color:#fff; }
       @media (prefers-reduced-motion:reduce) {
         .tss-crossfade-reveal,#tss-crossfade-chevron { transition:none; }
       }
@@ -5367,6 +5897,11 @@ function mkHub() {
       #tss-eq-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:#171717;color:rgba(255,255,255,.5); }
       #tss-eq-save-error { grid-column:1/-1;min-height:0;color:#ff805f;font-size:8px; }
       .tss-eq-graph-wrap { border-top:1px solid rgba(255,255,255,.055);border-bottom:1px solid rgba(255,255,255,.055);padding:4px 0 1px; }
+      .tss-eq-safety { display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px 2px 0;color:#ddd;cursor:pointer; }
+      .tss-eq-safety span { display:grid;gap:3px; }
+      .tss-eq-safety strong { font-size:10px;font-weight:750; }
+      .tss-eq-safety small { color:rgba(255,255,255,.38);font-size:8px;line-height:1.35; }
+      .tss-eq-safety input { width:15px;height:15px;flex:0 0 auto;accent-color:var(--tss-a,#ff5500); }
       .tss-eq-graph { display:block;width:100%;height:auto;overflow:visible;touch-action:none; }
       .tss-eq-grid line { stroke:rgba(255,255,255,.105);stroke-width:1;stroke-dasharray:3 4; }
       .tss-eq-grid .tss-eq-zero { stroke:rgba(255,255,255,.28);stroke-dasharray:none; }
@@ -5538,6 +6073,7 @@ function mkHub() {
               </div>
             </div>
           </div>
+          <button id="tss-playback-debug" type="button" hidden>Playback issue detected · open report</button>
 
         </div>
 
@@ -5613,6 +6149,8 @@ function mkHub() {
     crossfadeCard.dataset.open = open ? 'true' : 'false';
     crossfadeSummary.setAttribute('aria-expanded', open ? 'true' : 'false');
   };
+  document.getElementById('tss-playback-debug').onclick = showPlaybackDiagnostics;
+  updatePlaybackDiagnosticButton();
 
   const crossfadeSlider = document.getElementById('tss-hub-crossfade');
   crossfadeSlider.oninput = e => {
