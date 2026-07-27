@@ -764,6 +764,48 @@ test('queue search refresh keeps the current query when no filter is passed', ()
   assert.match(renderList, /getElementById\('tss-search'\)\?\.value/);
 });
 
+test('closed sidebar defers queue DOM rebuilds until it is opened', () => {
+  const renderList = extractFunction('renderList');
+  assert.match(renderList, /if \(!state\.sidebarOpen\) \{\s*state\._sidebarDirty = true;\s*return;/);
+
+  const state = { sidebarOpen: false, _sidebarDirty: true };
+  const sidebar = { dataset: {} };
+  const hub = { dataset: {} };
+  const document = {
+    getElementById(id) {
+      if (id === 'tss-sidebar') return sidebar;
+      if (id === 'tss-hub') return hub;
+      return null;
+    },
+  };
+  let renders = 0;
+  let syncs = 0;
+  let hubUpdates = 0;
+  const toggleSidebar = Function(
+    'state', 'document', 'renderList', 'syncSidebarToHub', 'updateHub',
+    `return (${extractFunction('toggleSidebar')})`,
+  )(
+    state,
+    document,
+    () => { renders++; state._sidebarDirty = false; },
+    () => { syncs++; },
+    () => { hubUpdates++; },
+  );
+
+  toggleSidebar();
+  assert.equal(state.sidebarOpen, true);
+  assert.equal(sidebar.dataset.open, 'true');
+  assert.equal(renders, 1);
+  assert.equal(syncs, 1);
+
+  toggleSidebar();
+  assert.equal(state.sidebarOpen, false);
+  assert.equal(sidebar.dataset.open, 'false');
+  assert.equal(renders, 1);
+  assert.equal(syncs, 1);
+  assert.equal(hubUpdates, 2);
+});
+
 test('track-row mutations fast-sync only on the active source collection', () => {
   const mutation = extractFunction('mutationChangesPlaylistTracks');
   const schedule = extractFunction('scheduleLiveQueueSync');
@@ -1621,6 +1663,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   const microtasks = [];
   const state = {
     active: true,
+    loading: false,
     queue: [7],
     pos: 0,
     _decks: [],
@@ -1674,6 +1717,14 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.equal(inactiveClick.prevented, false);
   assert.equal(inactiveAudio.pauseCalls, 0);
   assert.equal(pauseSoundCloudCalls, 0);
+
+  state.loading = true;
+  const startingAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  listeners.play.handler({ target: startingAudio });
+  assert.equal(startingAudio.pauseCalls, 1);
+  microtasks.shift()();
+  assert.equal(pauseSoundCloudCalls, 1);
+  state.loading = false;
   state.active = true;
 
   const transport = { closest: selector => selector === '.playControls__play' ? transport : null };
@@ -1688,7 +1739,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.equal(manualClick.prevented, true);
   assert.equal(manualClick.stopped, true);
   microtasks.shift()();
-  assert.equal(pauseSoundCloudCalls, 1);
+  assert.equal(pauseSoundCloudCalls, 2);
 
   const nativeAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
   listeners.play.handler({ target: nativeAudio });
@@ -1712,7 +1763,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
 
   state._nativePlaybackFallback = null;
   timers.forEach(timer => timer.fn());
-  assert.equal(pauseSoundCloudCalls, 6);
+  assert.equal(pauseSoundCloudCalls, 7);
 
   const guard = extractFunction('installNativePlaybackGuard');
   assert.match(guard, /addEventListener\('click'/);
@@ -1720,6 +1771,16 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.match(guard, /isTrueShuffleAudio\(audio\)/);
   assert.match(guard, /\[0, 100, 500, 1500, 3000\]/);
   assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
+});
+test('shuffle startup immediately suppresses native SoundCloud playback', () => {
+  assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloud\(\);/);
+});
+
+test('True Shuffle UI mutations bypass playlist and navigation work', () => {
+  const ownMutation = extractFunction('mutationsAreTrueShuffleOnly');
+  assert.match(ownMutation, /records\.every/);
+  assert.match(ownMutation, /closest\?\.\('#tss-hub, #tss-sidebar, #tss-stats-overlay, #tss-eq-overlay'\)/);
+  assert.match(source, /new MutationObserver\(records => \{\s*if \(mutationsAreTrueShuffleOnly\(records\)\) return;/);
 });
 
 test('build copies the canonical userscript byte-for-byte without using legacy modules', () => {

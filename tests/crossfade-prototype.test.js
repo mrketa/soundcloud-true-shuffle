@@ -26,9 +26,9 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('release metadata identifies the v6.1.2 userscript', () => {
+test('release metadata identifies the v6.1.3 userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.1\.2/);
+  assert.match(source, /@version\s+6\.1\.3/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {
@@ -120,9 +120,9 @@ test('Auto Level targets stable per-track loudness with a unity bypass at 100%',
 
   const quietGain = calculate(0.1, 0.45, 0.4);
   const loudGain = calculate(0.45, 0.95, 0.4);
-  assert.ok(quietGain > 1, `expected quiet-track boost, got ${quietGain}`);
+  assert.ok(quietGain > 1, `expected a modest quiet-track boost, got ${quietGain}`);
+  assert.ok(quietGain <= 1.25, `quiet-track boost must stay bounded, got ${quietGain}`);
   assert.ok(loudGain < 1, `expected loud-track attenuation, got ${loudGain}`);
-  assert.ok(Math.abs(0.4 * 0.1 * quietGain - 0.4 * 0.45 * loudGain) < 1e-12);
 
   assert.match(source, /tss_auto_level_cache_v4/);
 });
@@ -135,6 +135,7 @@ test('Auto Level caps boost using master headroom and measured peak', () => {
   assert.ok(gain <= 1 / master);
   assert.ok(master * 0.9 * gain <= 1 + 1e-12);
   assert.equal(calculate(0, 0, master), 1);
+  assert.ok(calculate(0.02, 0.2, 0.1) <= 1.25, 'low Chrome RMS must not create an extreme boost');
   assert.match(source, /tss_auto_level_cache_v4/);
   assert.doesNotMatch(source, /tss_auto_level_cache_v3/);
 });
@@ -212,6 +213,22 @@ test('Auto Level settles one per-track measurement and reuses its cached stable 
   assert.match(process, /rms:\s*graph\.peakRms/);
   assert.match(process, /peak:\s*graph\.measuredPeak/);
   assert.match(process, /now - state\._autoLevelLastTick < 60/);
+});
+
+test('steady playback avoids redundant Web Audio parameter writes', () => {
+  const sync = extractFunction('syncCrossfadeVolume');
+  assert.match(sync, /graph\.appliedMixGain/);
+  assert.match(sync, /graph\.appliedAutoGain/);
+  assert.match(sync, /Math\.abs\(graph\.appliedMixGain - gain\)/);
+  assert.match(sync, /Math\.abs\(graph\.appliedAutoGain - targetAutoGain\)/);
+});
+
+test('waveform progress updates only bars that crossed the playhead', () => {
+  const update = extractFunction('updateProgressBar');
+  assert.match(update, /state\._lastWaveformPlayed/);
+  assert.match(update, /for \(let index = previous; index < played; index\+\+\)/);
+  assert.match(update, /for \(let index = played; index < previous; index\+\+\)/);
+  assert.doesNotMatch(update, /bars\.forEach/);
 });
 
 test('safety clipper is optional, persisted, off by default and exposed accessibly in EQ', () => {
@@ -760,9 +777,10 @@ test('Firefox crossfade cleanup clears active automation before setting gain', (
   assert.doesNotMatch(source, /mixGain\.gain\.cancelScheduledValues\(now\)/);
 });
 
-test('manual skips can opt out of the short transition', () => {
+test('manual transitions use the configured crossfade duration', () => {
   const playAt = extractFunction('playAt');
-  assert.match(playAt, /state\.crossfadeManual \? Math\.min\(1\.25, state\.crossfadeSeconds\) : 0/);
+  assert.match(playAt, /state\.crossfadeManual \? state\.crossfadeSeconds : 0/);
+  assert.doesNotMatch(playAt, /Math\.min\(1\.25, state\.crossfadeSeconds\)/);
 });
 
 test('play button pauses and resumes both decks while mixing', () => {
