@@ -370,6 +370,18 @@ function pauseSoundCloud() {
   });
 }
 
+function pauseSoundCloudTransport() {
+  const button = document.querySelector('.playControls__play');
+  if (!button || soundCloudPaused()) return false;
+  state._nativeGuardButtonAction = true;
+  try {
+    button.click();
+    return true;
+  } finally {
+    state._nativeGuardButtonAction = false;
+  }
+}
+
 function installNativePlaybackGuard() {
   if (state._nativePlaybackGuardInstalled) return;
   state._nativePlaybackGuardInstalled = true;
@@ -4542,6 +4554,7 @@ async function start() {
   }
 
   state.loading = true;
+  pauseSoundCloudTransport();
   pauseSoundCloud();
   updateHub();
 
@@ -4919,6 +4932,10 @@ function startWatcher() {
       return;
     }
     endpointTicks = 0;
+    const queuedDeckActive = Number.isInteger(state._deckTrack)
+      && state.queue[state.pos] === state._deckTrack;
+    if (state.suspended && queuedDeckActive) state.suspended = false;
+
 
     if (state.suspended) {
       if (title && title !== lastTitle) lastTitle = title;
@@ -4929,6 +4946,16 @@ function startWatcher() {
     }
 
     if (title && lastTitle && title !== lastTitle) {
+      // Custom-deck metadata changes are internal queue transitions. The native
+      // SoundCloud title-change heuristic must never classify them as external
+      // playback, especially after a long manual crossfade clears its guard.
+      if (queuedDeckActive) {
+        titleTicks = 0;
+        lastTitle = title;
+        state.lastTitle = title;
+        state.manualAction = false;
+        return;
+      }
       const naturalEndTitleChange = lastRemaining <= 5 || state.lastProgress >= 0.999;
       if (!state.manualAction && naturalEndTitleChange) {
         titleTicks = 0;

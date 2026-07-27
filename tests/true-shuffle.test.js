@@ -373,7 +373,7 @@ function createWatcherHarness() {
     'installBetterFeedPipBridge', 'syncOwnPipWindow', 'syncBetterFeedPipWindow',
     'consumeCurrentQueueTrack', 'sessionStorage', 'trackId', 'currentDeckAudio',
     'checkSleepTimerDeadline', 'resumeAudioGraph', 'Date', 'syncPlaybackVolumeFromSoundCloud', 'recoverCurrentDeckStream',
-    'recordPlaybackDiagnostic',
+    'syncCrossfadeVolume', 'processAutoLevel', 'recordPlaybackDiagnostic',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -407,6 +407,8 @@ function createWatcherHarness() {
       if (playAttempt?.catch) playAttempt.catch(() => {});
       return true;
     },
+    () => {},
+    () => {},
     () => {},
   );
   startWatcher();
@@ -448,6 +450,18 @@ function createWatcherHarness() {
     },
   };
 }
+
+test('custom deck title changes never suspend a track that is still current in the queue', async () => {
+  const h = createWatcherHarness();
+  h.state._deckTrack = h.state.queue[h.state.pos];
+  h.setTitle('Track B');
+
+  await h.worker.onmessage();
+  await h.worker.onmessage();
+
+  assert.equal(h.state.suspended, false);
+  assert.equal(h.state.lastTitle, 'Track B');
+});
 
 test('a long track is not advanced with 30 seconds remaining', async () => {
   const h = createWatcherHarness();
@@ -1657,6 +1671,31 @@ test('native playback pause never toggles the transport or touches True Shuffle 
   assert.equal(state._nativeGuardButtonAction, false);
 });
 
+test('native SoundCloud transport is paused through its own stateful control', () => {
+  const button = {
+    title: 'Pause current track',
+    clickCalls: 0,
+    getAttribute() { return this.title; },
+    click() { this.clickCalls++; this.title = 'Play current track'; },
+  };
+  const state = { _nativeGuardButtonAction: false };
+  const document = { querySelector: () => button };
+  const soundCloudPaused = Function(
+    'document',
+    `return (${extractFunction('soundCloudPaused')})`,
+  )(document);
+  const pauseSoundCloudTransport = Function(
+    'state', 'document', 'soundCloudPaused',
+    `return (${extractFunction('pauseSoundCloudTransport')})`,
+  )(state, document, soundCloudPaused);
+
+  assert.equal(pauseSoundCloudTransport(), true);
+  assert.equal(button.clickCalls, 1);
+  assert.equal(state._nativeGuardButtonAction, false);
+  assert.equal(pauseSoundCloudTransport(), false);
+  assert.equal(button.clickCalls, 1);
+});
+
 test('native playback guard blocks autoplay and manual transport starts outside fallback only', () => {
   const listeners = {};
   const timers = [];
@@ -1773,7 +1812,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
 });
 test('shuffle startup immediately suppresses native SoundCloud playback', () => {
-  assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloud\(\);/);
+  assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloudTransport\(\);\s*pauseSoundCloud\(\);/);
 });
 
 test('True Shuffle UI mutations bypass playlist and navigation work', () => {

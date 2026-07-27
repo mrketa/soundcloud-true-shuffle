@@ -8,8 +8,9 @@
 - Updated only waveform bars that cross the current playhead instead of rewriting every bar on each UI tick.
 - Skipped redundant Web Audio master, mix and Auto Level gain writes during steady playback.
 - Ignored MutationObserver batches generated entirely by True Shuffle's own interface.
-- Stopped SoundCloud playback immediately when shuffle loading begins and blocked delayed native autoplay during startup.
+- Stopped SoundCloud through its own transport control when shuffle loading begins and blocked delayed native autoplay during startup.
 - Applied the configured crossfade duration to manual Next and Previous transitions instead of capping them at 1.25 seconds.
+- Prevented custom-deck title changes after long transitions from falsely showing `not in queue` and clearing the current artwork.
 - Limited Auto Level's quiet-track boost to 1.25× to prevent excessive volume in Chromium.
 
 ## v6.1.2 - 2026-07-24
