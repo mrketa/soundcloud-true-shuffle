@@ -1,5 +1,21 @@
 # Changelog
 
+## v6.1.4 - 2026-08-03
+
+### Playback reliability
+
+- Fixed rare cases where SoundCloud's native player could start a different track alongside the active True Shuffle deck.
+- Restricted native fallback authorization to a single playback start instead of allowing every native playback event during a timed window.
+- Made an active True Shuffle deck take priority over SoundCloud's native player.
+- Blocked SoundCloud transport starts while True Shuffle owns playback.
+- Synchronized native audio suppression with SoundCloud's internal transport state to prevent delayed restarts.
+- Preserved native fallback playback and True Shuffle play/pause controls when a progressive stream cannot be loaded.
+
+### Verification
+
+- Added regression coverage for overlapping native playback, one-shot fallback authorization and fallback transport controls.
+- Passed the complete True Shuffle, crossfade and Firefox audio fallback test suites.
+
 ## v6.1.3 - 2026-07-28
 
 ### Performance and playback

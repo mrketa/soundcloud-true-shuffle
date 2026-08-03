@@ -1696,7 +1696,7 @@ test('native SoundCloud transport is paused through its own stateful control', (
   assert.equal(button.clickCalls, 1);
 });
 
-test('native playback guard blocks autoplay and manual transport starts outside fallback only', () => {
+test('native playback guard prevents SoundCloud overlap and grants fallback once', () => {
   const listeners = {};
   const timers = [];
   const microtasks = [];
@@ -1718,12 +1718,14 @@ test('native playback guard blocks autoplay and manual transport starts outside 
     `return (${extractFunction('nativePlaybackFallbackActive')})`,
   )(state, () => { state._nativePlaybackFallback = null; });
   let pauseSoundCloudCalls = 0;
+  let pauseSoundCloudTransportCalls = 0;
   const installNativePlaybackGuard = Function(
     'state',
     'document',
     'isTrueShuffleAudio',
     'nativePlaybackFallbackActive',
     'pauseSoundCloud',
+    'pauseSoundCloudTransport',
     'queueMicrotask',
     'setTimeout',
     `return (${extractFunction('installNativePlaybackGuard')})`,
@@ -1733,6 +1735,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
     audio => state._decks.includes(audio) || audio.dataset?.tssCrossfadeDeck !== undefined,
     nativePlaybackFallbackActive,
     () => { pauseSoundCloudCalls++; },
+    () => { pauseSoundCloudTransportCalls++; },
     fn => microtasks.push(fn),
     (fn, delay) => timers.push({ fn, delay }),
   );
@@ -1756,6 +1759,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.equal(inactiveClick.prevented, false);
   assert.equal(inactiveAudio.pauseCalls, 0);
   assert.equal(pauseSoundCloudCalls, 0);
+  assert.equal(pauseSoundCloudTransportCalls, 0);
 
   state.loading = true;
   const startingAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
@@ -1763,6 +1767,7 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.equal(startingAudio.pauseCalls, 1);
   microtasks.shift()();
   assert.equal(pauseSoundCloudCalls, 1);
+  assert.equal(pauseSoundCloudTransportCalls, 1);
   state.loading = false;
   state.active = true;
 
@@ -1778,13 +1783,20 @@ test('native playback guard blocks autoplay and manual transport starts outside 
   assert.equal(manualClick.prevented, true);
   assert.equal(manualClick.stopped, true);
   microtasks.shift()();
-  assert.equal(pauseSoundCloudCalls, 2);
 
   const nativeAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
   listeners.play.handler({ target: nativeAudio });
   assert.equal(nativeAudio.pauseCalls, 1);
+  microtasks.shift()();
 
-  const ownDeck = { tagName: 'AUDIO', dataset: { tssCrossfadeDeck: '1' }, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  const ownDeck = {
+    tagName: 'AUDIO',
+    dataset: { tssCrossfadeDeck: '1' },
+    paused: false,
+    ended: false,
+    pauseCalls: 0,
+    pause() { this.pauseCalls++; },
+  };
   listeners.play.handler({ target: ownDeck });
   assert.equal(ownDeck.pauseCalls, 0);
 
@@ -1796,23 +1808,80 @@ test('native playback guard blocks autoplay and manual transport starts outside 
     stopImmediatePropagation() {},
   };
   listeners.click.handler(fallbackClick);
-  listeners.play.handler({ target: nativeAudio });
-  assert.equal(fallbackClick.prevented, false);
-  assert.equal(nativeAudio.pauseCalls, 1);
+  assert.equal(fallbackClick.prevented, true);
+  microtasks.shift()();
 
-  state._nativePlaybackFallback = null;
+  listeners.play.handler({ target: nativeAudio });
+  assert.equal(nativeAudio.pauseCalls, 1);
+  assert.equal(state._nativePlaybackFallback, null);
+
+  state._decks = [ownDeck];
+  state._nativePlaybackFallback = { trackIndex: 7, expiresAt: Date.now() + 3000 };
+  listeners.play.handler({ target: nativeAudio });
+  assert.equal(nativeAudio.pauseCalls, 2);
+  assert.equal(ownDeck.pauseCalls, 0);
+  assert.equal(state._nativePlaybackFallback, null);
+  microtasks.shift()();
+
   timers.forEach(timer => timer.fn());
-  assert.equal(pauseSoundCloudCalls, 7);
+  assert.equal(pauseSoundCloudCalls, 10);
+  assert.equal(pauseSoundCloudTransportCalls, 10);
 
   const guard = extractFunction('installNativePlaybackGuard');
   assert.match(guard, /addEventListener\('click'/);
   assert.match(guard, /addEventListener\('play'/);
-  assert.match(guard, /isTrueShuffleAudio\(audio\)/);
+  assert.match(guard, /nativePlaybackFallbackActive\(audio\)/);
   assert.match(guard, /\[0, 100, 500, 1500, 3000\]/);
   assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
 });
 test('shuffle startup immediately suppresses native SoundCloud playback', () => {
   assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloudTransport\(\);\s*pauseSoundCloud\(\);/);
+});
+
+test('True Shuffle transport keeps one-shot native fallback controls usable', async () => {
+  const state = {
+    queue: [7],
+    pos: 0,
+    _nativeGuardButtonAction: false,
+    _nativePlaybackFallback: null,
+  };
+  const button = {
+    clickCalls: 0,
+    guardedDuringClick: false,
+    click() {
+      this.clickCalls++;
+      this.guardedDuringClick = state._nativeGuardButtonAction;
+    },
+  };
+  let paused = true;
+  let grantedTrack = null;
+  let clearCalls = 0;
+  const toggleSource = extractFunction('toggle').replace(/^function /, 'async function ');
+  const toggle = Function(
+    'state', 'currentDeckAudio', 'soundCloudPaused', 'beginNativePlaybackFallback',
+    'clearNativePlaybackFallback', 'document', 'setTimeout', 'refreshPlayBtn',
+    `return (${toggleSource})`,
+  )(
+    state,
+    () => null,
+    () => paused,
+    trackIndex => { grantedTrack = trackIndex; },
+    () => { clearCalls++; },
+    { querySelector: () => button },
+    () => {},
+    () => {},
+  );
+
+  await toggle();
+  assert.equal(grantedTrack, 7);
+  assert.equal(button.guardedDuringClick, true);
+  assert.equal(state._nativeGuardButtonAction, false);
+
+  paused = false;
+  await toggle();
+  assert.equal(clearCalls, 1);
+  assert.equal(button.clickCalls, 2);
+  assert.equal(state._nativeGuardButtonAction, false);
 });
 
 test('True Shuffle UI mutations bypass playlist and navigation work', () => {

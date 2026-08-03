@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.3
+// @version      6.1.4
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -337,15 +337,23 @@ function isTrueShuffleAudio(audio) {
   ));
 }
 
-function nativePlaybackFallbackActive() {
+function nativePlaybackFallbackActive(audio = null) {
   const fallback = state._nativePlaybackFallback;
   const trackIndex = state.queue[state.pos];
+  const deckPlaying = state._decks?.some(deck => deck && !deck.paused && !deck.ended);
   const active = Boolean(
     fallback
     && Date.now() < fallback.expiresAt
     && fallback.trackIndex === trackIndex
+    && !deckPlaying
   );
-  if (!active && fallback) clearNativePlaybackFallback();
+  if (!active && fallback) {
+    clearNativePlaybackFallback();
+    return false;
+  }
+  // The fallback grant authorizes exactly one native play event. Leaving a
+  // time-wide exemption lets unrelated SoundCloud autoplay overlap our decks.
+  if (active && audio) clearNativePlaybackFallback();
   return active;
 }
 
@@ -388,24 +396,34 @@ function installNativePlaybackGuard() {
 
   document.addEventListener('click', event => {
     const button = event.target?.closest?.('.playControls__play');
-    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction || nativePlaybackFallbackActive()) return;
+    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    queueMicrotask(() => pauseSoundCloud());
+    queueMicrotask(() => {
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    });
   }, true);
 
   document.addEventListener('play', event => {
     const audio = event.target;
-    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio) || nativePlaybackFallbackActive()) return;
+    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio)) return;
+    if (nativePlaybackFallbackActive(audio)) return;
     try { audio.pause(); } catch (_) {}
-    queueMicrotask(() => pauseSoundCloud());
+    queueMicrotask(() => {
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    });
   }, true);
 
   // SoundCloud may restore its native player shortly after a hard reload.
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
-      if ((state.active || state.loading) && !nativePlaybackFallbackActive()) pauseSoundCloud();
+      if ((state.active || state.loading) && !nativePlaybackFallbackActive()) {
+        pauseSoundCloudTransport();
+        pauseSoundCloud();
+      }
     }, delay);
   });
 }
@@ -449,7 +467,15 @@ async function toggle() {
     setTimeout(refreshPlayBtn, 80);
     return;
   }
-  document.querySelector('.playControls__play')?.click();
+  const nativeWasPaused = soundCloudPaused();
+  if (nativeWasPaused) beginNativePlaybackFallback(state.queue[state.pos]);
+  else clearNativePlaybackFallback();
+  state._nativeGuardButtonAction = true;
+  try {
+    document.querySelector('.playControls__play')?.click();
+  } finally {
+    state._nativeGuardButtonAction = false;
+  }
   setTimeout(refreshPlayBtn, 150);
 }
 
@@ -3577,6 +3603,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
     state._deckGains[outgoingIndex] = 0;
   }
   syncCrossfadeVolume();
+  pauseSoundCloudTransport();
   pauseSoundCloud();
   await resumeAudioGraph();
   try {

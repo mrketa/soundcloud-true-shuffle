@@ -39,7 +39,7 @@ test('custom deck playback never imports a Firefox native-media volume fallback'
   assert.equal(state.playbackVolume, 0.8);
 });
 
-test('native playback fallback permission expires and is limited to its requested track', () => {
+test('native playback fallback permission is track-scoped, deck-safe, and one-shot', () => {
   const begin = extractFunction('beginNativePlaybackFallback');
   const active = extractFunction('nativePlaybackFallbackActive');
   assert.match(begin, /expiresAt/);
@@ -47,7 +47,7 @@ test('native playback fallback permission expires and is limited to its requeste
   assert.match(active, /trackIndex/);
 
   let now = 1000;
-  const state = { queue: [7], pos: 0, _nativePlaybackFallback: null };
+  const state = { queue: [7], pos: 0, _decks: [], _nativePlaybackFallback: null };
   const clear = () => { state._nativePlaybackFallback = null; };
   const beginFallback = Function('state', 'Date', `return (${begin})`)(state, { now: () => now });
   const fallbackActive = Function(
@@ -56,6 +56,16 @@ test('native playback fallback permission expires and is limited to its requeste
 
   beginFallback(7);
   assert.equal(fallbackActive(), true);
+  assert.equal(fallbackActive({ tagName: 'AUDIO' }), true);
+  assert.equal(state._nativePlaybackFallback, null);
+
+  beginFallback(7);
+  state._decks = [{ paused: false, ended: false }];
+  assert.equal(fallbackActive({ tagName: 'AUDIO' }), false);
+  assert.equal(state._nativePlaybackFallback, null);
+
+  state._decks = [];
+  beginFallback(7);
   state.queue[0] = 8;
   assert.equal(fallbackActive(), false);
   assert.equal(state._nativePlaybackFallback, null);

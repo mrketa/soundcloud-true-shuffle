@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.2
+// @version      6.1.4
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -74,6 +74,7 @@ const state = {
   lastTitle:    '',
   lastProgress: 0,
   sidebarOpen:  false,
+  _sidebarDirty: true,
   sidebarTab:   'queue',
   sidebarWidth: 320,
   sidebarHeight: 0,
@@ -92,6 +93,8 @@ const state = {
   _lifetimeBase: null,
   _lastAccentArtwork: '',
   _lastWaveformKey: '',
+  _waveformBars: null,
+  _lastWaveformPlayed: 0,
   _endedHandler: null,
   _manualActionAt: 0,
   _internalNavigation: false,
@@ -144,6 +147,7 @@ const state = {
   _audioMaster: null,
   _audioClipper: null,
   _deckAudioGraphs: [null, null],
+  _appliedMasterGain: null,
   _autoLevelLastTick: 0,
   _autoLevelCache: (() => {
     try {
@@ -333,15 +337,23 @@ function isTrueShuffleAudio(audio) {
   ));
 }
 
-function nativePlaybackFallbackActive() {
+function nativePlaybackFallbackActive(audio = null) {
   const fallback = state._nativePlaybackFallback;
   const trackIndex = state.queue[state.pos];
+  const deckPlaying = state._decks?.some(deck => deck && !deck.paused && !deck.ended);
   const active = Boolean(
     fallback
     && Date.now() < fallback.expiresAt
     && fallback.trackIndex === trackIndex
+    && !deckPlaying
   );
-  if (!active && fallback) clearNativePlaybackFallback();
+  if (!active && fallback) {
+    clearNativePlaybackFallback();
+    return false;
+  }
+  // The fallback grant authorizes exactly one native play event. Leaving a
+  // time-wide exemption lets unrelated SoundCloud autoplay overlap our decks.
+  if (active && audio) clearNativePlaybackFallback();
   return active;
 }
 
@@ -366,30 +378,52 @@ function pauseSoundCloud() {
   });
 }
 
+function pauseSoundCloudTransport() {
+  const button = document.querySelector('.playControls__play');
+  if (!button || soundCloudPaused()) return false;
+  state._nativeGuardButtonAction = true;
+  try {
+    button.click();
+    return true;
+  } finally {
+    state._nativeGuardButtonAction = false;
+  }
+}
+
 function installNativePlaybackGuard() {
   if (state._nativePlaybackGuardInstalled) return;
   state._nativePlaybackGuardInstalled = true;
 
   document.addEventListener('click', event => {
     const button = event.target?.closest?.('.playControls__play');
-    if (!button || !state.active || state._nativeGuardButtonAction || nativePlaybackFallbackActive()) return;
+    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    queueMicrotask(() => pauseSoundCloud());
+    queueMicrotask(() => {
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    });
   }, true);
 
   document.addEventListener('play', event => {
     const audio = event.target;
-    if (audio?.tagName !== 'AUDIO' || !state.active || isTrueShuffleAudio(audio) || nativePlaybackFallbackActive()) return;
+    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio)) return;
+    if (nativePlaybackFallbackActive(audio)) return;
     try { audio.pause(); } catch (_) {}
-    queueMicrotask(() => pauseSoundCloud());
+    queueMicrotask(() => {
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    });
   }, true);
 
   // SoundCloud may restore its native player shortly after a hard reload.
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
-      if (state.active && !nativePlaybackFallbackActive()) pauseSoundCloud();
+      if ((state.active || state.loading) && !nativePlaybackFallbackActive()) {
+        pauseSoundCloudTransport();
+        pauseSoundCloud();
+      }
     }, delay);
   });
 }
@@ -433,7 +467,15 @@ async function toggle() {
     setTimeout(refreshPlayBtn, 80);
     return;
   }
-  document.querySelector('.playControls__play')?.click();
+  const nativeWasPaused = soundCloudPaused();
+  if (nativeWasPaused) beginNativePlaybackFallback(state.queue[state.pos]);
+  else clearNativePlaybackFallback();
+  state._nativeGuardButtonAction = true;
+  try {
+    document.querySelector('.playControls__play')?.click();
+  } finally {
+    state._nativeGuardButtonAction = false;
+  }
   setTimeout(refreshPlayBtn, 150);
 }
 
@@ -465,9 +507,19 @@ function updateProgressBar() {
   const ratio = Math.max(0, Math.min(1, progress()));
   const p = document.getElementById('tss-hub-prog');
   if (p) p.style.width = `${(ratio * 100).toFixed(1)}%`;
-  const bars = document.querySelectorAll('#tss-wave-bars i');
+  if (!state._waveformBars?.[0]?.isConnected) {
+    state._waveformBars = [...document.querySelectorAll('#tss-wave-bars i')];
+  }
+  const bars = state._waveformBars;
   const played = Math.round(ratio * bars.length);
-  bars.forEach((bar, index) => { bar.dataset.played = index < played ? 'true' : 'false'; });
+  const previous = Math.max(0, Math.min(bars.length, state._lastWaveformPlayed || 0));
+  for (let index = previous; index < played; index++) {
+    bars[index].dataset.played = 'true';
+  }
+  for (let index = played; index < previous; index++) {
+    bars[index].dataset.played = 'false';
+  }
+  state._lastWaveformPlayed = played;
 }
 
 function artwork(el) {
@@ -2371,11 +2423,15 @@ function calculateAutoLevelGain(rms, peak, masterVolume) {
 
   const targetRms = 0.225;
   const desired = targetRms / level;
+  // Chromium can report unusually low analyser RMS values for some streams.
+  // Keep quiet-track correction subtle so Auto Level cannot overpower the
+  // user's master-volume setting while still attenuating genuinely loud tracks.
+  const maxBoost = 1.25;
   const masterHeadroom = 1 / master;
   const peakHeadroom = Number.isFinite(measuredPeak) && measuredPeak > 0
     ? 1 / (master * measuredPeak)
     : masterHeadroom;
-  return Math.max(0.125, Math.min(desired, masterHeadroom, peakHeadroom));
+  return Math.max(0.125, Math.min(desired, maxBoost, masterHeadroom, peakHeadroom));
 }
 
 function saveAutoLevelCacheSoon() {
@@ -2495,6 +2551,9 @@ function ensureAutoLevelAudioGraph() {
         samples: 0,
         settled: false,
         trackKey: '',
+        appliedAutoGain: 1,
+        appliedMixGain: state._deckGains[index] || 0,
+        autoGainMaster: null,
       };
     });
     syncDeckProcessingRouting();
@@ -2516,6 +2575,7 @@ function syncDeckProcessingRouting() {
     if (!state.eqEnabled && !state.autoLevel) {
       graph.source.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
+      graph.appliedAutoGain = 1;
       return;
     }
 
@@ -2531,9 +2591,11 @@ function syncDeckProcessingRouting() {
       graph.analyser.connect(graph.autoGain);
       graph.autoGain.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, graph.currentGain, state._audioContext.currentTime);
+      graph.appliedAutoGain = graph.currentGain;
     } else {
       tail.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
+      graph.appliedAutoGain = 1;
     }
   });
 }
@@ -2586,7 +2648,9 @@ function applyCachedAutoLevel(index, ti) {
   graph.currentGain = state.autoLevel && hasCachedMeasurement
     ? calculateAutoLevelGain(cachedRms, cachedPeak, state.playbackVolume)
     : 1;
+  graph.autoGainMaster = hasCachedMeasurement ? state.playbackVolume : null;
   graph.autoGain.gain.setValueAtTime(graph.currentGain, state._audioContext.currentTime);
+  graph.appliedAutoGain = graph.currentGain;
 }
 
 function processAutoLevel() {
@@ -2621,11 +2685,13 @@ function processAutoLevel() {
       graph.measuredPeak,
       state.playbackVolume,
     );
+    graph.autoGainMaster = state.playbackVolume;
     graph.autoGain.gain.setTargetAtTime(
       graph.currentGain,
       state._audioContext.currentTime,
       0.08,
     );
+    graph.appliedAutoGain = graph.currentGain;
     if (graph.trackKey) {
       state._autoLevelCache[graph.trackKey] = {
         rms: graph.peakRms,
@@ -2781,8 +2847,12 @@ function syncPlaybackVolumeFromSoundCloud() {
 function syncCrossfadeVolume() {
   if (!state._decks.length) return;
   const master = state.playbackVolume;
-  if (state._audioMaster) {
+  if (state._audioMaster && (
+    !Number.isFinite(state._appliedMasterGain)
+    || Math.abs(state._appliedMasterGain - master) > 0.0001
+  )) {
     state._audioMaster.gain.setTargetAtTime(master, state._audioContext.currentTime, 0.015);
+    state._appliedMasterGain = master;
   }
   state._decks.forEach((audio, index) => {
     if (!audio) return;
@@ -2794,19 +2864,32 @@ function syncCrossfadeVolume() {
     const graph = state._deckAudioGraphs?.[index];
     if (graph) {
       audio.volume = 1;
-      if (state.autoLevel && graph.settled) {
+      if (state.autoLevel && graph.settled && (
+        !Number.isFinite(graph.autoGainMaster)
+        || Math.abs(graph.autoGainMaster - master) > 0.0001
+      )) {
         graph.currentGain = calculateAutoLevelGain(
           graph.peakRms,
           graph.measuredPeak,
           master,
         );
+        graph.autoGainMaster = master;
       }
       // The audio clock owns mixGain while a crossfade is scheduled. Rewriting
       // it from the UI watcher would destroy background-safe automation.
-      if (automatedGain === null) {
+      if (automatedGain === null && (
+        !Number.isFinite(graph.appliedMixGain)
+        || Math.abs(graph.appliedMixGain - gain) > 0.0001
+      )) {
         setAudioParamImmediately(graph.mixGain.gain, gain, state._audioContext.currentTime);
+        graph.appliedMixGain = gain;
       }
-      graph.autoGain.gain.setTargetAtTime(state.autoLevel ? graph.currentGain : 1, state._audioContext.currentTime, 0.08);
+      const targetAutoGain = state.autoLevel ? graph.currentGain : 1;
+      if (!Number.isFinite(graph.appliedAutoGain)
+          || Math.abs(graph.appliedAutoGain - targetAutoGain) > 0.0001) {
+        graph.autoGain.gain.setTargetAtTime(targetAutoGain, state._audioContext.currentTime, 0.08);
+        graph.appliedAutoGain = targetAutoGain;
+      }
     } else {
       audio.volume = Math.max(0, Math.min(1, master * gain));
     }
@@ -3051,8 +3134,11 @@ function resetDeck(audio, index) {
       graph.smoothedRms = 0;
       graph.peakRms = 0;
       graph.currentGain = 1;
+      graph.autoGainMaster = null;
       setAudioParamImmediately(graph.autoGain.gain, 1, now);
       setAudioParamImmediately(graph.mixGain.gain, 0, now);
+      graph.appliedAutoGain = 1;
+      graph.appliedMixGain = 0;
     }
   }
   audio.volume = state._deckAudioGraphs[index] ? 1 : 0;
@@ -3517,6 +3603,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
     state._deckGains[outgoingIndex] = 0;
   }
   syncCrossfadeVolume();
+  pauseSoundCloudTransport();
   pauseSoundCloud();
   await resumeAudioGraph();
   try {
@@ -3703,7 +3790,7 @@ async function playAt(idx, countPlay = true) {
     const requestedFade = currentDeckAudio()
       ? (state._crossfadePending
         ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
-        : (state.crossfadeManual ? Math.min(1.25, state.crossfadeSeconds) : 0))
+        : (state.crossfadeManual ? state.crossfadeSeconds : 0))
       : 0;
     if (await playWithCrossfadeDeck(idx, countPlay, requestedFade)) return;
   }
@@ -3743,7 +3830,7 @@ async function playAt(idx, countPlay = true) {
     const requestedFade = currentDeckAudio()
       ? (state._crossfadePending
         ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
-        : (state.crossfadeManual ? Math.min(1.25, state.crossfadeSeconds) : 0))
+        : (state.crossfadeManual ? state.crossfadeSeconds : 0))
       : 0;
     if (await playWithCrossfadeDeck(idx, countPlay, requestedFade)) return;
     stopCrossfadeDecks();
@@ -4494,6 +4581,8 @@ async function start() {
   }
 
   state.loading = true;
+  pauseSoundCloudTransport();
+  pauseSoundCloud();
   updateHub();
 
   const pageUrl = location.href.split(/[?#]/)[0].replace(/\/+$/, '');
@@ -4870,6 +4959,10 @@ function startWatcher() {
       return;
     }
     endpointTicks = 0;
+    const queuedDeckActive = Number.isInteger(state._deckTrack)
+      && state.queue[state.pos] === state._deckTrack;
+    if (state.suspended && queuedDeckActive) state.suspended = false;
+
 
     if (state.suspended) {
       if (title && title !== lastTitle) lastTitle = title;
@@ -4880,6 +4973,16 @@ function startWatcher() {
     }
 
     if (title && lastTitle && title !== lastTitle) {
+      // Custom-deck metadata changes are internal queue transitions. The native
+      // SoundCloud title-change heuristic must never classify them as external
+      // playback, especially after a long manual crossfade clears its guard.
+      if (queuedDeckActive) {
+        titleTicks = 0;
+        lastTitle = title;
+        state.lastTitle = title;
+        state.manualAction = false;
+        return;
+      }
       const naturalEndTitleChange = lastRemaining <= 5 || state.lastProgress >= 0.999;
       if (!state.manualAction && naturalEndTitleChange) {
         titleTicks = 0;
@@ -6604,7 +6707,10 @@ function toggleSidebar() {
   const s = document.getElementById('tss-sidebar');
   if (s) {
     s.dataset.open = state.sidebarOpen ? 'true' : 'false';
-    if (state.sidebarOpen) syncSidebarToHub();
+    if (state.sidebarOpen) {
+      if (state._sidebarDirty) renderList();
+      syncSidebarToHub();
+    }
   }
   if (!state.sidebarOpen) {
     const hub = document.getElementById('tss-hub');
@@ -6616,6 +6722,11 @@ function toggleSidebar() {
 // ── list ──────────────────────────────────────────────────────────────────────
 
 function renderList(filter) {
+  if (!state.sidebarOpen) {
+    state._sidebarDirty = true;
+    return;
+  }
+  state._sidebarDirty = false;
   // no explicit filter → keep whatever is currently typed in the search box
   if (filter === undefined) filter = document.getElementById('tss-search')?.value || '';
 
@@ -7060,6 +7171,11 @@ function mutationChangesPlaylistTracks(records) {
     node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))));
 }
 
+function mutationsAreTrueShuffleOnly(records) {
+  return records.length > 0 && records.every(record =>
+    record.target?.closest?.('#tss-hub, #tss-sidebar, #tss-stats-overlay, #tss-eq-overlay'));
+}
+
 function scheduleLiveQueueSyncFromMutation(records) {
   if (playlistBase(location.href) !== playlistBase(state.playlistUrl)
       || !mutationChangesPlaylistTracks(records)) return false;
@@ -7068,6 +7184,7 @@ function scheduleLiveQueueSyncFromMutation(records) {
 }
 
 new MutationObserver(records => {
+  if (mutationsAreTrueShuffleOnly(records)) return;
   if (checkForNavigation()) return;
   else if (validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
     injectRetryTimer = setTimeout(() => {
