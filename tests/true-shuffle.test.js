@@ -989,7 +989,7 @@ test('navigation queues a follow-up pass and retries delayed hub injection', () 
   assert.match(nav, /queueMicrotask\(\(\) => onNav\(\)\)/);
   assert.match(nav, /cancelInternalNavigation\(\)/);
   assert.match(nav, /_internalNavigationTarget/);
-  assert.match(source, /!document\.getElementById\('tss-hub'\) && !injectRetryTimer/);
+  assert.match(source, /!navLock && validPage\(\) && !document\.getElementById\('tss-hub'\) && !injectRetryTimer/);
   assert.match(source, /setInterval\(checkForNavigation, 250\)/);
   assert.match(source, /window\.addEventListener\('popstate', checkForNavigation\)/);
 });
@@ -1048,6 +1048,51 @@ test('user navigation cancels an in-flight internal source-page load', () => {
   assert.match(loader, /playlistBase\(location\.href\) !== playlistBase\(sourcePage\)/);
   assert.match(cancel, /state\._internalNavigationToken\+\+/);
   assert.match(cancel, /state\._internalNavigation = false/);
+});
+
+test('internal Firefox navigation waits for route DOM replacement', async () => {
+  const state = { active: true, _internalNavigationToken: 4 };
+  const location = { href: 'https://soundcloud.com/user/sets/target' };
+  const document = { body: { contains: node => node.connected } };
+  const playlistBase = url => url.split(/[?#]/)[0].replace(/\/+$/, '');
+  const routeNodeConnected = Function(
+    'document',
+    `return (${extractFunction('routeNodeConnected')})`,
+  )(document);
+  const waitSource = extractFunction('waitForRouteCommit').replace(/^function /, 'async function ');
+  let waits = 0;
+  const previousNode = { connected: true };
+  const waitForRouteCommit = Function(
+    'state', 'location', 'playlistBase', 'routeNodeConnected', 'wait',
+    `return (${waitSource})`,
+  )(
+    state,
+    location,
+    playlistBase,
+    routeNodeConnected,
+    async () => {
+      waits++;
+      if (waits === 2) previousNode.connected = false;
+    },
+  );
+
+  assert.equal(await waitForRouteCommit(previousNode, location.href, 4), true);
+  assert.equal(waits, 2, 'the old playlist DOM must disconnect before loading target tracks');
+
+  previousNode.connected = true;
+  waits = 0;
+  location.href = 'https://soundcloud.com/example-user';
+  assert.equal(
+    await waitForRouteCommit(previousNode, 'https://soundcloud.com/user/sets/target', 4),
+    false,
+  );
+  assert.equal(waits, 0, 'a newer user navigation must cancel the stale route wait immediately');
+
+  const loader = extractFunction('loadTrackSourcePage');
+  assert.ok(
+    loader.indexOf('await waitForRouteCommit') < loader.indexOf('await loadTracks()'),
+    'target tracks must not be read before Firefox commits the new route DOM',
+  );
 });
 
 test('cross-tab playlist changes are polled within ten seconds', () => {
@@ -1770,6 +1815,19 @@ test('native playback guard prevents SoundCloud overlap and grants fallback once
   assert.equal(pauseSoundCloudTransportCalls, 1);
   state.loading = false;
   state.active = true;
+
+  const routeClick = {
+    target: { closest: () => null },
+    prevented: false,
+    stopped: false,
+    preventDefault() { this.prevented = true; },
+    stopImmediatePropagation() { this.stopped = true; },
+  };
+  const microtasksBeforeRouteClick = microtasks.length;
+  listeners.click.handler(routeClick);
+  assert.equal(routeClick.prevented, false);
+  assert.equal(routeClick.stopped, false);
+  assert.equal(microtasks.length, microtasksBeforeRouteClick);
 
   const transport = { closest: selector => selector === '.playControls__play' ? transport : null };
   const manualClick = {

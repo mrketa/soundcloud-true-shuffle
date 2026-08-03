@@ -1,5 +1,21 @@
 # Changelog
 
+## v6.1.5 - 2026-08-03
+
+### Firefox navigation
+
+- Fixed SoundCloud URLs changing while the previous playlist remained visible during active True Shuffle playback.
+- Waited for Firefox to replace the old route DOM before reading or rebinding tracks from an internally requested source page.
+- Cancelled stale route work immediately when the user navigates somewhere else.
+- Prevented delayed True Shuffle injection from mutating SoundCloud's page while a route transition is still in progress.
+- Preserved background deck playback and normal SoundCloud link handling during navigation.
+
+### Verification
+
+- Added regression coverage for Firefox history updates that happen before the new route DOM is rendered.
+- Added coverage proving ordinary SoundCloud navigation clicks are not intercepted by the native playback guard.
+- Passed the complete True Shuffle, crossfade and Firefox audio fallback test suites.
+
 ## v6.1.4 - 2026-08-03
 
 ### Playback reliability

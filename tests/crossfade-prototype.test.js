@@ -26,9 +26,9 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('release metadata identifies the v6.1.4 userscript', () => {
+test('release metadata identifies the v6.1.5 userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.1\.4/);
+  assert.match(source, /@version\s+6\.1\.5/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {

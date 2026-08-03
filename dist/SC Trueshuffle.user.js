@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.4
+// @version      6.1.5
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -3746,6 +3746,24 @@ function cancelInternalNavigation() {
   state._internalNavigationTarget = '';
 }
 
+function routeNodeConnected(node) {
+  if (!node) return false;
+  if (typeof node.isConnected === 'boolean') return node.isConnected;
+  return document.body.contains(node);
+}
+
+async function waitForRouteCommit(previousNode, targetUrl, navigationToken) {
+  const target = playlistBase(targetUrl);
+  for (let i = 0; i < 60; i++) {
+    if (!state.active
+        || navigationToken !== state._internalNavigationToken
+        || playlistBase(location.href) !== target) return false;
+    if (!routeNodeConnected(previousNode)) return true;
+    await wait(100);
+  }
+  return false;
+}
+
 async function loadTrackSourcePage(idx) {
   const sourcePage = state.meta[idx]?.sourcePage;
   if (!sourcePage || playlistBase(sourcePage) === playlistBase(location.href)) return false;
@@ -3755,6 +3773,7 @@ async function loadTrackSourcePage(idx) {
   state._internalNavigationTarget = sourcePage;
   state.suspended = true;
   updateHub();
+  const previousRouteNode = document.querySelector('.trackList__item, .soundList__item, li.sc-list-item');
   navigateToPage(sourcePage);
 
   try {
@@ -3764,6 +3783,7 @@ async function loadTrackSourcePage(idx) {
       await wait(250);
     }
     if (playlistBase(location.href) !== playlistBase(sourcePage)) return false;
+    if (!await waitForRouteCommit(previousRouteNode, sourcePage, navigationToken)) return false;
 
     const pageEls = await loadTracks();
     if (!state.active || navigationToken !== state._internalNavigationToken
@@ -7148,6 +7168,10 @@ let injectRetryTimer = null;
 function checkForNavigation() {
   if (location.href === lastUrl) return false;
   lastUrl = location.href;
+  if (injectRetryTimer) {
+    clearTimeout(injectRetryTimer);
+    injectRetryTimer = null;
+  }
   void onNav();
   return true;
 }
@@ -7186,7 +7210,7 @@ function scheduleLiveQueueSyncFromMutation(records) {
 new MutationObserver(records => {
   if (mutationsAreTrueShuffleOnly(records)) return;
   if (checkForNavigation()) return;
-  else if (validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
+  else if (!navLock && validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
     injectRetryTimer = setTimeout(() => {
       injectRetryTimer = null;
       inject();
