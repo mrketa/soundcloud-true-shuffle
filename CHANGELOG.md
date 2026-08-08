@@ -1,5 +1,45 @@
 # Changelog
 
+## v6.1.7 - 2026-08-08
+
+### Shuffle sources and sequencing
+
+- Added True Shuffle support for current SoundCloud liked-song cards, including lazy-loaded likes collected while scrolling.
+- Prevented any tracks with matching normalized titles from playing back-to-back across initial shuffles, merges, re-shuffles, restored queues and automatic round boundaries whenever a valid arrangement exists.
+- Added the hidden `[TSS-BUMPER]` title marker so differently named station IDs can share one spacing group without a hardcoded UID list or official UI.
+
+### Verification
+
+- Added regression coverage for general matching-title spacing, multiple duplicate-title groups, hidden-marker grouping across renamed bumpers, impossible layouts and round-boundary separation.
+- Passed the complete True Shuffle, crossfade and Firefox audio fallback test suites.
+
+## v6.1.6 - 2026-08-03
+
+### Picture in Picture
+
+- Added a PiP artwork-layout toggle so both the original compact player and a full-picture design remain available.
+- Added a larger BSF-style layout with track details above full-width artwork while keeping the waveform and playback controls visible.
+- Automatically resized Document PiP and the floating fallback for the selected layout.
+- Remembered the selected artwork layout between PiP sessions.
+- Loaded higher-resolution artwork for the full-picture layout.
+- Kept the queue accessible from both layouts and hid only the compact Up Next row while full artwork is displayed.
+
+### Firefox playback reliability
+
+- Removed active True Shuffle's native SoundCloud playback fallback; SoundCloud audio is now always blocked while True Shuffle owns playback.
+- Retained exact SoundCloud track authorization and progressive transcoding metadata for the private audio decks.
+- Added ordered progressive-stream candidates, MPEG preference, stale signed-URL eviction and one client-ID refresh after authorization failures.
+- Retried failed deck preparation and playback with a freshly resolved stream before deferring the track.
+- Deferred an exhausted track to the end of the current round, tried the next custom-playable track, and scheduled a bounded five-second retry if every track was temporarily unavailable.
+- Removed hidden SoundCloud route navigation previously used only by the native-player fallback.
+
+### Verification
+
+- Added regression coverage for layout switching, persistence, accessible toggle state, PiP sizing and artwork resolution.
+- Added Firefox regressions for native-player exclusion, ordered progressive candidates, candidate failover, authorization forwarding, rejected client-ID replacement and custom-only queue failover.
+- Visually verified both layouts at their default dimensions with no overflow in full-picture mode.
+- Passed the complete True Shuffle, crossfade and Firefox audio fallback test suites.
+
 ## v6.1.5 - 2026-08-03
 
 ### Firefox navigation

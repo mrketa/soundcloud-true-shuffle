@@ -26,9 +26,9 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('release metadata identifies the v6.1.5 userscript', () => {
+test('release metadata identifies the v6.1.7 userscript', () => {
   assert.match(source, /@name\s+SoundCloud True Shuffle/);
-  assert.match(source, /@version\s+6\.1\.5/);
+  assert.match(source, /@version\s+6\.1\.7/);
 });
 
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {
@@ -302,19 +302,18 @@ test('master volume is continuous, persistent and synchronized outside crossfade
 });
 
 test('stream resolver only accepts progressive media and forwards track authorization', () => {
-  const resolver = extractFunction('resolveCrossfadeStream');
+  const resolver = extractFunction('resolveProgressiveStreams');
   assert.match(resolver, /protocol === 'progressive'/);
   assert.match(resolver, /track_authorization/);
-  assert.match(resolver, /return null/);
+  assert.match(resolver, /return \{ urls, authFailed \}/);
 });
 
-test('playback always retains the normal SoundCloud fallback', () => {
+test('playback remains custom-deck-only after stream resolution failure', () => {
   const playAt = extractFunction('playAt');
   assert.match(playAt, /if \(await playWithCrossfadeDeck\(idx, countPlay, requestedFade\)\) return/);
   assert.match(playAt, /setCrossfadeStatus\('fallback'\)/);
-  assert.match(playAt, /beginNativePlaybackFallback\(idx\);\s*btn\.click\(\)/);
-  assert.match(playAt, /clearNativePlaybackFallback\(\)/);
-  assert.ok(playAt.indexOf('playWithCrossfadeDeck') < playAt.indexOf('btn.click()'));
+  assert.match(playAt, /custom-start-exhausted/);
+  assert.doesNotMatch(playAt, /document|\.click\(|nativePlaybackFallback/);
 });
 
 test('custom two-deck player is the default even without optional processing', () => {
@@ -348,13 +347,14 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
   const deferred = new Map();
   const prepareCrossfadeDeck = Function(
     'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
-    'resolveCrossfadeStream', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
+    'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
+    'waitForDeck', 'normalizeTrackUrl',
     `return (${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')})`,
   )(
     state,
     () => state._decks,
     () => {},
-    meta => new Promise(resolve => deferred.set(meta.id, resolve)),
+    meta => new Promise(resolve => deferred.set(meta.id, urls => resolve(urls))),
     (audio, index) => {
       audio.pause();
       audio.removeAttribute('src');
@@ -363,18 +363,20 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
     },
     () => {},
     () => {},
+    async () => true,
+    value => String(value || ''),
   );
 
   const oldRequest = prepareCrossfadeDeck(1, 0);
   const newRequest = prepareCrossfadeDeck(1, 1);
-  deferred.get('new')('stream-new');
+  deferred.get('new')(['stream-new']);
   assert.equal(await newRequest, standby);
   assert.equal(state._deckTracks[1], 1);
   assert.equal(standby.src, 'stream-new');
   assert.equal(standby.pauseCalls, 1);
   assert.equal(standby.loadCalls, 1);
 
-  deferred.get('old')('stream-old');
+  deferred.get('old')(['stream-old']);
   assert.equal(await oldRequest, null);
   assert.equal(state._deckTracks[1], 1);
   assert.equal(standby.src, 'stream-new');
@@ -419,8 +421,8 @@ test('play-next and reorder invalidation prepare the authoritative standby track
   };
   const functions = Function(
     'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
-    'resolveCrossfadeStream', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
-    'currentDeckAudio', 'setCrossfadeStatus',
+    'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
+    'waitForDeck', 'normalizeTrackUrl', 'currentDeckAudio', 'setCrossfadeStatus',
     `${extractFunction('upcomingTrackIndex')};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
@@ -430,14 +432,18 @@ test('play-next and reorder invalidation prepare the authoritative standby track
     state,
     () => state._decks,
     () => {},
-    async meta => { resolved.push(meta.id); return `stream-${meta.id}`; },
+    async meta => { resolved.push(meta.id); return [`stream-${meta.id}`]; },
     resetDeck,
     () => {},
     () => {},
+    async () => true,
+    value => String(value || ''),
     () => active,
     () => {},
   );
   const settlePrefetch = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
   };

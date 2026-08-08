@@ -39,42 +39,95 @@ test('custom deck playback never imports a Firefox native-media volume fallback'
   assert.equal(state.playbackVolume, 0.8);
 });
 
-test('native playback fallback permission is track-scoped, deck-safe, and one-shot', () => {
-  const begin = extractFunction('beginNativePlaybackFallback');
-  const active = extractFunction('nativePlaybackFallbackActive');
-  assert.match(begin, /expiresAt/);
-  assert.match(active, /Date\.now\(\)\s*<\s*fallback\.expiresAt/);
-  assert.match(active, /trackIndex/);
+test('active True Shuffle playback never authorizes or clicks the native player', async () => {
+  assert.doesNotMatch(source, /beginNativePlaybackFallback|nativePlaybackFallbackActive|_nativePlaybackFallback/);
+  const playAtSource = extractFunction('playAt');
+  assert.doesNotMatch(playAtSource, /document|\.click\(/);
 
-  let now = 1000;
-  const state = { queue: [7], pos: 0, _decks: [], _nativePlaybackFallback: null };
-  const clear = () => { state._nativePlaybackFallback = null; };
-  const beginFallback = Function('state', 'Date', `return (${begin})`)(state, { now: () => now });
-  const fallbackActive = Function(
-    'state', 'Date', 'clearNativePlaybackFallback', `return (${active})`,
-  )(state, { now: () => now }, clear);
+  const state = {
+    active: true,
+    meta: [{ title: 'Failed track' }, { title: 'Working track' }],
+    queue: [0, 1],
+    pos: 0,
+    crossfadeSeconds: 0,
+    crossfadeManual: false,
+    _crossfadePending: false,
+    _customPlaybackRetryTimer: null,
+    suspended: false,
+    busy: true,
+  };
+  const attempted = [];
+  const playWithCrossfadeDeck = async ti => {
+    attempted.push(ti);
+    return ti === 1;
+  };
+  const playAt = Function(
+    'state', 'currentDeckAudio', 'playWithCrossfadeDeck', 'stopCrossfadeDecks',
+    'setCrossfadeStatus', 'recordPlaybackDiagnostic', 'trackAvailable',
+    'showMergeToast', 'updateHub', 'clearTimeout', 'setTimeout',
+    `return (${playAtSource.replace(/^function /, 'async function ')})`,
+  )(
+    state, () => null, playWithCrossfadeDeck, () => {}, () => {}, () => {},
+    () => true, () => {}, () => {}, () => {}, () => 1,
+  );
 
-  beginFallback(7);
-  assert.equal(fallbackActive(), true);
-  assert.equal(fallbackActive({ tagName: 'AUDIO' }), true);
-  assert.equal(state._nativePlaybackFallback, null);
+  await playAt(0);
+  assert.deepEqual(attempted, [0, 1]);
+  assert.deepEqual(state.queue, [1, 0]);
+  assert.equal(state.suspended, false);
+});
 
-  beginFallback(7);
-  state._decks = [{ paused: false, ended: false }];
-  assert.equal(fallbackActive({ tagName: 'AUDIO' }), false);
-  assert.equal(state._nativePlaybackFallback, null);
+test('Firefox stream candidates prefer MPEG and continue after a failed endpoint', async () => {
+  const resolverSource = extractFunction('resolveProgressiveStreams');
+  const calls = [];
+  const fetch = async endpoint => {
+    calls.push(String(endpoint));
+    if (calls.length === 1) return { ok: false, status: 500 };
+    return { ok: true, status: 200, json: async () => ({ url: 'https://media.example/working' }) };
+  };
+  const resolveProgressiveStreams = Function(
+    'fetch',
+    `return (${resolverSource.replace(/^function /, 'async function ')})`,
+  )(fetch);
+  const track = {
+    track_authorization: 'track-token',
+    media: {
+      transcodings: [
+        { url: 'https://api.example/ogg', format: { protocol: 'progressive', mime_type: 'audio/ogg' } },
+        { url: 'https://api.example/mp3', format: { protocol: 'progressive', mime_type: 'audio/mpeg' } },
+        { url: 'https://api.example/hls', format: { protocol: 'hls', mime_type: 'audio/mpeg' } },
+      ],
+    },
+  };
 
-  state._decks = [];
-  beginFallback(7);
-  state.queue[0] = 8;
-  assert.equal(fallbackActive(), false);
-  assert.equal(state._nativePlaybackFallback, null);
+  const result = await resolveProgressiveStreams(track, 'client-token');
+  assert.match(calls[0], /^https:\/\/api\.example\/mp3/);
+  assert.match(calls[1], /^https:\/\/api\.example\/ogg/);
+  assert.equal(calls.some(url => url.includes('/hls')), false);
+  assert.match(calls[0], /client_id=client-token/);
+  assert.match(calls[0], /track_authorization=track-token/);
+  assert.deepEqual(result, { urls: ['https://media.example/working'], authFailed: false });
+});
 
-  state.queue[0] = 7;
-  beginFallback(7);
-  now = 4000;
-  assert.equal(fallbackActive(), false);
-  assert.equal(state._nativePlaybackFallback, null);
+test('authorization recovery excludes the rejected SoundCloud client ID', () => {
+  const state = { _clientId: 'rejected-client' };
+  const performance = {
+    getEntriesByType: () => [
+      { name: 'https://api-v2.soundcloud.com/tracks?client_id=fresh-client' },
+      { name: 'https://api-v2.soundcloud.com/resolve?client_id=rejected-client' },
+    ],
+  };
+  const discover = Function(
+    'state', 'performance',
+    `return (${extractFunction('discoverSoundCloudClientId')})`,
+  )(state, performance);
+
+  assert.equal(discover('rejected-client'), 'fresh-client');
+  assert.equal(state._clientId, 'fresh-client');
+  const resolver = extractFunction('resolveCrossfadeStreams');
+  assert.match(resolver, /credentialAttempt < 2/);
+  assert.match(resolver, /discoverSoundCloudClientIdFromBundle\(rejectedClientId\)/);
+  assert.match(resolver, /rejectedClientId = clientId/);
 });
 
 test('waveform hydration requires exact track identity and never reuses a title match', () => {
@@ -99,21 +152,23 @@ test('missing Firefox hydration resolves the exact waveform through the track AP
   assert.doesNotMatch(resolver, /performance\.getEntriesByType|titleMatch/);
 });
 
-let failures = 0;
-for (const { name, fn } of tests) {
-  try {
-    fn();
-    console.log(`ok - ${name}`);
-  } catch (error) {
-    failures++;
-    console.error(`not ok - ${name}`);
-    console.error(error.stack || error);
+(async () => {
+  let failures = 0;
+  for (const { name, fn } of tests) {
+    try {
+      await fn();
+      console.log(`ok - ${name}`);
+    } catch (error) {
+      failures++;
+      console.error(`not ok - ${name}`);
+      console.error(error.stack || error);
+    }
   }
-}
 
-if (failures) {
-  console.error(`\n${failures} Firefox audio fallback regression test(s) failed.`);
-  process.exitCode = 1;
-} else {
-  console.log('\nAll Firefox audio fallback regression tests passed.');
-}
+  if (failures) {
+    console.error(`\n${failures} Firefox audio fallback regression test(s) failed.`);
+    process.exitCode = 1;
+  } else {
+    console.log('\nAll Firefox audio fallback regression tests passed.');
+  }
+})();

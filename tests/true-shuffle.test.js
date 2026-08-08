@@ -30,22 +30,33 @@ const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
 const parseTimeText = Function(`return (${extractFunction('parseTimeText')})`)();
+const trackSpacingKey = Function(`return (${extractFunction('trackSpacingKey')})`)();
+const spaceDuplicateTitles = Function(
+  'trackSpacingKey',
+  `return (${extractFunction('spaceDuplicateTitles')})`,
+)(trackSpacingKey);
 const buildReshuffledQueue = Function(
-  'fisherYates',
+  'state', 'fisherYates', 'spaceDuplicateTitles',
   `return (${extractFunction('buildReshuffledQueue')})`,
-)(items => items.slice().reverse());
+)(
+  { meta: [] },
+  items => items.slice().reverse(),
+  items => items,
+);
 
 function createBalancedRoundHarness() {
-  const state = { roundStarts: {}, priority: {} };
+  const state = { roundStarts: {}, priority: {}, meta: [] };
   const buildBalancedRound = Function(
     'state',
     'fisherYates',
     'weightedShuffle',
+    'spaceDuplicateTitles',
     `return (${extractFunction('buildBalancedRound')})`,
   )(
     state,
     items => items.slice().reverse(),
     items => items.slice(),
+    items => items,
   );
   return { state, buildBalancedRound };
 }
@@ -77,6 +88,100 @@ test('manual re-shuffle keeps the current track and randomizes every other track
 
 test('new-playlist re-shuffle creates a fresh queue without a pinned track', () => {
   assert.deepEqual(buildReshuffledQueue([0, 1, 2, 3]), [3, 2, 1, 0]);
+});
+
+test('matching titles are separated without dropping or duplicating tracks', () => {
+  const meta = [
+    { title: 'Station Ident' },
+    { title: '  STATION   ident  ' },
+    { title: 'Weather' },
+    { title: 'weather' },
+    { title: 'Song A' },
+  ];
+  const queue = [0, 1, 2, 3, 4];
+
+  assert.equal(spaceDuplicateTitles(queue, meta), queue);
+  assert.deepEqual(queue, [0, 2, 1, 3, 4]);
+  assert.deepEqual([...queue].sort(), [0, 1, 2, 3, 4]);
+});
+
+test('the hidden bumper marker groups renamed station IDs together', () => {
+  const meta = [
+    { title: '[TSS-BUMPER] 24.7 Jam Radio' },
+    { title: 'Song A' },
+    { title: '[tss-bumper] ABox FM Summer Ident' },
+    { title: 'Song B' },
+  ];
+  const queue = [0, 2, 1, 3];
+
+  spaceDuplicateTitles(queue, meta);
+  assert.deepEqual(queue, [0, 1, 2, 3]);
+});
+
+test('matching-title spacing respects the previous-round boundary', () => {
+  const meta = [
+    { title: 'New Station Name' },
+    { title: 'Song A' },
+    { title: ' new   station name ' },
+    { title: 'Song B' },
+  ];
+  const queue = [2, 1, 3];
+
+  spaceDuplicateTitles(queue, meta, 0);
+  assert.deepEqual(queue, [1, 2, 3]);
+});
+
+test('automatic rounds separate matching titles across rounds', () => {
+  const state = {
+    roundStarts: {},
+    priority: {},
+    meta: [
+      { title: 'Any Future Bumper Name' },
+      { title: 'Song A' },
+      { title: 'Any Future Bumper Name' },
+      { title: 'Song B' },
+    ],
+  };
+  const buildBalancedRound = Function(
+    'state', 'fisherYates', 'weightedShuffle', 'spaceDuplicateTitles',
+    `return (${extractFunction('buildBalancedRound')})`,
+  )(state, items => items.slice(), items => items.slice(), spaceDuplicateTitles);
+
+  assert.deepEqual(buildBalancedRound([2, 1, 3], 0), [1, 2, 3]);
+  assert.equal(state.roundStarts[1], 1);
+  assert.equal(state.roundStarts[2], undefined);
+});
+
+test('an impossible matching-title layout is left intact', () => {
+  const meta = [
+    { title: 'Renamed Bumper' },
+    { title: 'Song A' },
+    { title: 'Renamed Bumper' },
+    { title: 'Renamed Bumper' },
+  ];
+  const queue = [0, 2, 3, 1];
+
+  spaceDuplicateTitles(queue, meta);
+  assert.deepEqual(queue, [0, 2, 3, 1]);
+});
+
+test('liked-song grid cards join the existing collection pipeline', () => {
+  const legacy = { id: 'legacy' };
+  const card = { id: 'grid-card' };
+  const control = { closest: selector => selector === '.sound' ? card : null };
+  const document = {
+    querySelectorAll(selector) {
+      if (selector.includes('.trackList__item')) return [legacy];
+      if (selector.includes('.sc-button-more')) return [control];
+      return [];
+    },
+  };
+  const currentPageTrackElements = Function(
+    'document', 'isLikedTracksPage', 'getLink',
+    `return (${extractFunction('currentPageTrackElements')})`,
+  )(document, () => true, element => element === card ? '/artist/track' : null);
+
+  assert.deepEqual(currentPageTrackElements(), [legacy, card]);
 });
 
 if (source.includes('function normalizeAccentColor(')) {
@@ -521,11 +626,12 @@ test('a suspended external end consumes and caches the source queue exactly once
 
 test('restoring a consumed suspended queue does not reinsert played tracks into the round', () => {
   const remapCachedQueue = Function(
-    'trackId', 'fisherYates',
+    'trackId', 'fisherYates', 'spaceDuplicateTitles',
     `return (${extractFunction('remapCachedQueue')})`,
   )(
     meta => meta?.link || '',
     items => items.slice().reverse(),
+    spaceDuplicateTitles,
   );
   const restored = remapCachedQueue({
     queue: [1, 2],
@@ -550,6 +656,37 @@ test('restoring a consumed suspended queue does not reinsert played tracks into 
   assert.equal(restored.roundTotal, 3);
   assert.equal(restored.queue.includes(1), false);
   assert.equal(new Set(restored.queue).size, restored.queue.length);
+});
+
+test('cached queue spacing never moves tracks across a nonzero current position', () => {
+  const remapCachedQueue = Function(
+    'trackId', 'fisherYates', 'spaceDuplicateTitles',
+    `return (${extractFunction('remapCachedQueue')})`,
+  )(
+    meta => meta?.link || '',
+    items => items.slice(),
+    spaceDuplicateTitles,
+  );
+  const meta = [
+    { link: 'a-1', title: 'A' },
+    { link: 'a-2', title: 'A' },
+    { link: 'b-1', title: 'B' },
+    { link: 'b-2', title: 'B' },
+    { link: 'c-1', title: 'C' },
+  ];
+  const restored = remapCachedQueue({
+    queue: [0, 1, 2, 3, 4],
+    pos: 2,
+    history: [],
+    priority: {},
+    metaKeys: meta.map(item => item.link),
+    roundPlayed: 2,
+    roundTotal: 5,
+  }, meta);
+
+  assert.deepEqual(restored.queue, [0, 1, 2, 4, 3]);
+  assert.equal(restored.pos, 2);
+  assert.deepEqual(restored.queue.slice(0, restored.pos + 1), [0, 1, 2]);
 });
 
 test('a suspended end on the last stop-after-round track returns without caching a replay', async () => {
@@ -631,7 +768,7 @@ test('custom deck stall recovery never blocks the background watcher on a pendin
 });
 
 test('custom deck stall recovery refreshes the same track URL near the saved position', () => {
-  const resolver = extractFunction('resolveCrossfadeStream');
+  const resolver = extractFunction('resolveCrossfadeStreams');
   const recovery = extractFunction('recoverCurrentDeckStream');
   assert.match(resolver, /options\.forceRefresh/);
   assert.match(resolver, /state\._streamCache\.delete\(key\)/);
@@ -951,22 +1088,22 @@ test('jumping to a searched track keeps skipped upcoming tracks in the round', (
   assert.equal(state.roundTotal, 4);
 });
 
-test('cross-playlist tracks retain a source page and reload detached DOM entries', () => {
+test('cross-playlist tracks retain source metadata and play without route navigation', () => {
   const meta = extractFunction('getMeta');
+  const hydratedMeta = extractFunction('metaFromSoundCloudTrack');
   const playAt = extractFunction('playAt');
-  const loader = extractFunction('loadTrackSourcePage');
   assert.match(meta, /sourcePage:/);
-  assert.match(playAt, /reconnectTrackElement\(idx\)/);
-  assert.match(playAt, /await loadTrackSourcePage\(idx\)/);
-  assert.match(loader, /bindCurrentPageElements\(pageEls\)/);
-  assert.match(loader, /state\._internalNavigation = true/);
+  assert.match(hydratedMeta, /soundcloudId:/);
+  assert.match(hydratedMeta, /trackAuthorization:/);
+  assert.match(hydratedMeta, /transcodings:/);
+  assert.match(playAt, /playWithCrossfadeDeck\(idx, countPlay, requestedFade\)/);
+  assert.doesNotMatch(playAt, /reconnectTrackElement|loadTrackSourcePage|navigateToPage/);
 });
 
-test('feed playback never falls back to clicking track or profile links', () => {
+test('feed playback never falls back to SoundCloud links or native play buttons', () => {
   const playAt = extractFunction('playAt');
-  assert.doesNotMatch(playAt, /\.sc-link-primary/);
-  assert.doesNotMatch(playAt, /\.trackItem__trackTitle/);
-  assert.match(playAt, /button\[aria-label\*="Play"\]/);
+  assert.doesNotMatch(playAt, /\.sc-link-primary|\.trackItem__trackTitle/);
+  assert.doesNotMatch(playAt, /document|\.click\(/);
 });
 
 test('manual transition guard expires for different tracks with identical titles', () => {
@@ -987,8 +1124,7 @@ test('navigation queues a follow-up pass and retries delayed hub injection', () 
   const nav = extractFunction('onNav');
   assert.match(nav, /navPending = true/);
   assert.match(nav, /queueMicrotask\(\(\) => onNav\(\)\)/);
-  assert.match(nav, /cancelInternalNavigation\(\)/);
-  assert.match(nav, /_internalNavigationTarget/);
+  assert.doesNotMatch(nav, /cancelInternalNavigation|_internalNavigationTarget/);
   assert.match(source, /!navLock && validPage\(\) && !document\.getElementById\('tss-hub'\) && !injectRetryTimer/);
   assert.match(source, /setInterval\(checkForNavigation, 250\)/);
   assert.match(source, /window\.addEventListener\('popstate', checkForNavigation\)/);
@@ -1039,60 +1175,10 @@ test('all non-collection SoundCloud routes preserve queue ownership', () => {
   assert.match(nav, /different valid playlist:[\s\S]*state\.suspended = true;/);
 });
 
-test('user navigation cancels an in-flight internal source-page load', () => {
-  const loader = extractFunction('loadTrackSourcePage');
-  const cancel = extractFunction('cancelInternalNavigation');
-  assert.match(loader, /navigationToken = \+\+state\._internalNavigationToken/);
-  assert.match(loader, /state\._internalNavigationTarget = sourcePage/);
-  assert.match(loader, /navigationToken !== state\._internalNavigationToken/);
-  assert.match(loader, /playlistBase\(location\.href\) !== playlistBase\(sourcePage\)/);
-  assert.match(cancel, /state\._internalNavigationToken\+\+/);
-  assert.match(cancel, /state\._internalNavigation = false/);
-});
-
-test('internal Firefox navigation waits for route DOM replacement', async () => {
-  const state = { active: true, _internalNavigationToken: 4 };
-  const location = { href: 'https://soundcloud.com/user/sets/target' };
-  const document = { body: { contains: node => node.connected } };
-  const playlistBase = url => url.split(/[?#]/)[0].replace(/\/+$/, '');
-  const routeNodeConnected = Function(
-    'document',
-    `return (${extractFunction('routeNodeConnected')})`,
-  )(document);
-  const waitSource = extractFunction('waitForRouteCommit').replace(/^function /, 'async function ');
-  let waits = 0;
-  const previousNode = { connected: true };
-  const waitForRouteCommit = Function(
-    'state', 'location', 'playlistBase', 'routeNodeConnected', 'wait',
-    `return (${waitSource})`,
-  )(
-    state,
-    location,
-    playlistBase,
-    routeNodeConnected,
-    async () => {
-      waits++;
-      if (waits === 2) previousNode.connected = false;
-    },
-  );
-
-  assert.equal(await waitForRouteCommit(previousNode, location.href, 4), true);
-  assert.equal(waits, 2, 'the old playlist DOM must disconnect before loading target tracks');
-
-  previousNode.connected = true;
-  waits = 0;
-  location.href = 'https://soundcloud.com/example-user';
-  assert.equal(
-    await waitForRouteCommit(previousNode, 'https://soundcloud.com/user/sets/target', 4),
-    false,
-  );
-  assert.equal(waits, 0, 'a newer user navigation must cancel the stale route wait immediately');
-
-  const loader = extractFunction('loadTrackSourcePage');
-  assert.ok(
-    loader.indexOf('await waitForRouteCommit') < loader.indexOf('await loadTracks()'),
-    'target tracks must not be read before Firefox commits the new route DOM',
-  );
+test('custom-only playback never initiates hidden SoundCloud route changes', () => {
+  const playAt = extractFunction('playAt');
+  assert.doesNotMatch(source, /function (?:loadTrackSourcePage|navigateToPage|waitForRouteCommit|reconnectTrackElement)\(/);
+  assert.doesNotMatch(playAt, /location\.href|document\.createElement|loadTracks\(/);
 });
 
 test('cross-tab playlist changes are polled within ten seconds', () => {
@@ -1377,7 +1463,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     'state', 'ownPipIsOpen', 'closeOwnPip', 'playbackTiming', 'getComputedStyle',
     'document', 'playerTitle', 'paused', 'SVG', 'trackId', 'waveformCache',
     'DEFAULT_WAVE_HEIGHTS', 'formatPlaybackClock', 'drawOwnPipWaveform', 'renderOwnPipQueue',
-    'upcomingTrackIndex', 'ownPipWindowTitle',
+    'upcomingTrackIndex', 'ownPipWindowTitle', 'ownPipArtworkSource',
     `return (${extractFunction('syncOwnPipWindow')})`,
   )(
     state, () => true, () => {}, () => ({ current: 63, duration: 91 }),
@@ -1387,6 +1473,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     (...args) => drawn.push(args), () => {},
     () => state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1],
     (meta, isPaused) => meta?.title && !isPaused ? `Playing: ${meta.title}` : 'True Shuffle',
+    url => url || '',
   );
 
   assert.equal(syncOwnPipWindow(), true);
@@ -1405,6 +1492,65 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
   assert.equal(nodes.get('tss-pip-auto-level').dataset.active, 'true');
   assert.equal(drawn.length, 1);
   assert.equal(drawn[0][1].title, 'Current');
+});
+
+test('PiP artwork toggle preserves compact and full-picture layouts', () => {
+  const nodes = new Map();
+  const node = id => {
+    const value = {
+      id,
+      dataset: {},
+      attributes: {},
+      title: '',
+      setAttribute(name, entry) { this.attributes[name] = entry; },
+    };
+    nodes.set(id, value);
+    return value;
+  };
+  node('tss-pip-player');
+  node('tss-pip-artwork-toggle');
+  const pipDocument = { getElementById: id => nodes.get(id) || null };
+  const stored = [];
+  const state = {
+    pipArtworkMode: 'compact',
+    _ownPipMode: null,
+    _ownPipWindow: { document: pipDocument },
+    _ownPipHost: null,
+  };
+  const ownPipDimensions = Function(
+    'state',
+    `return (${extractFunction('ownPipDimensions')})`,
+  )(state);
+  const setOwnPipArtworkMode = Function(
+    'state', 'localStorage', 'ownPipDimensions',
+    `return (${extractFunction('setOwnPipArtworkMode')})`,
+  )(state, { setItem: (key, value) => stored.push([key, value]) }, ownPipDimensions);
+  const ownPipArtworkSource = Function(
+    'state',
+    `return (${extractFunction('ownPipArtworkSource')})`,
+  )(state);
+
+  assert.equal(setOwnPipArtworkMode('full', pipDocument), 'full');
+  assert.equal(state.pipArtworkMode, 'full');
+  assert.equal(nodes.get('tss-pip-player').dataset.artworkMode, 'full');
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-pressed'], 'true');
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use compact artwork layout');
+  assert.deepEqual(stored.at(-1), ['tss_pip_artwork_mode', 'full']);
+  assert.equal(
+    ownPipArtworkSource('https://i1.sndcdn.com/artworks-test-t200x200.jpg'),
+    'https://i1.sndcdn.com/artworks-test-t500x500.jpg',
+  );
+  assert.deepEqual(ownPipDimensions(), { width: 360, height: 600 });
+
+  assert.equal(setOwnPipArtworkMode('compact', pipDocument), 'compact');
+  assert.equal(nodes.get('tss-pip-player').dataset.artworkMode, 'compact');
+  assert.deepEqual(ownPipDimensions(), { width: 390, height: 330 });
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-pressed'], 'false');
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use full artwork layout');
+  assert.equal(
+    ownPipArtworkSource('https://i1.sndcdn.com/artworks-test-t200x200.jpg'),
+    'https://i1.sndcdn.com/artworks-test-t200x200.jpg',
+  );
 });
 
 test('native PiP queue puts play-next requests directly after the current track', () => {
@@ -1601,7 +1747,7 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   assert.equal(Boolean(supportedResolver()), true);
   assert.equal(wrappedResolver()?.requestWindow instanceof Function, true);
   assert.match(apiResolverSource, /wrappedJSObject/);
-  assert.match(open, /requestWindow\(\{ width: 390, height: 330 \}\)/);
+  assert.match(open, /requestWindow\(ownPipDimensions\(\)\)/);
   assert.match(open, /openVideoPipFallback/);
   assert.match(open, /openInPagePipFallback/);
   assert.match(mount, /tss-pip-waveform/);
@@ -1617,6 +1763,13 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   assert.match(mount, /tss-pip-like/);
   assert.match(mount, /toggleCurrentTrackLike/);
   assert.match(mount, /showOwnPipSoundMenu/);
+  assert.match(mount, /tss-pip-artwork-toggle/);
+  assert.match(mount, /setOwnPipArtworkMode/);
+  assert.match(mount, /data-artwork-mode="full"/);
+  assert.match(mount, /tss-pip-up-next\{display:none\}/);
+  assert.match(mount, /aspect-ratio:1/);
+  assert.match(mount, /border-radius:0;background:transparent;box-shadow:none/);
+  assert.match(mount, /tss-pip-art img\{object-fit:cover\}/);
   assert.match(extractFunction('renderOwnPipQueue'), /showOwnPipTrackMenu/);
   assert.match(extractFunction('showOwnPipTrackMenu'), /Shuffle priority/);
   assert.match(extractFunction('showOwnPipTrackMenu'), /Remove from queue/);
@@ -1741,34 +1894,26 @@ test('native SoundCloud transport is paused through its own stateful control', (
   assert.equal(button.clickCalls, 1);
 });
 
-test('native playback guard prevents SoundCloud overlap and grants fallback once', () => {
+test('native playback guard blocks every SoundCloud start while True Shuffle owns playback', () => {
   const listeners = {};
   const timers = [];
   const microtasks = [];
   const state = {
     active: true,
     loading: false,
-    queue: [7],
-    pos: 0,
     _decks: [],
-    _nativePlaybackFallback: null,
     _nativePlaybackGuardInstalled: false,
     _nativeGuardButtonAction: false,
   };
   const document = {
     addEventListener(type, handler, capture) { listeners[type] = { handler, capture }; },
   };
-  const nativePlaybackFallbackActive = Function(
-    'state', 'clearNativePlaybackFallback',
-    `return (${extractFunction('nativePlaybackFallbackActive')})`,
-  )(state, () => { state._nativePlaybackFallback = null; });
   let pauseSoundCloudCalls = 0;
   let pauseSoundCloudTransportCalls = 0;
   const installNativePlaybackGuard = Function(
     'state',
     'document',
     'isTrueShuffleAudio',
-    'nativePlaybackFallbackActive',
     'pauseSoundCloud',
     'pauseSoundCloudTransport',
     'queueMicrotask',
@@ -1778,7 +1923,6 @@ test('native playback guard prevents SoundCloud overlap and grants fallback once
     state,
     document,
     audio => state._decks.includes(audio) || audio.dataset?.tssCrossfadeDeck !== undefined,
-    nativePlaybackFallbackActive,
     () => { pauseSoundCloudCalls++; },
     () => { pauseSoundCloudTransportCalls++; },
     fn => microtasks.push(fn),
@@ -1858,37 +2002,15 @@ test('native playback guard prevents SoundCloud overlap and grants fallback once
   listeners.play.handler({ target: ownDeck });
   assert.equal(ownDeck.pauseCalls, 0);
 
-  state._nativePlaybackFallback = { trackIndex: 7, expiresAt: Date.now() + 3000 };
-  const fallbackClick = {
-    target: transport,
-    prevented: false,
-    preventDefault() { this.prevented = true; },
-    stopImmediatePropagation() {},
-  };
-  listeners.click.handler(fallbackClick);
-  assert.equal(fallbackClick.prevented, true);
-  microtasks.shift()();
-
-  listeners.play.handler({ target: nativeAudio });
-  assert.equal(nativeAudio.pauseCalls, 1);
-  assert.equal(state._nativePlaybackFallback, null);
-
-  state._decks = [ownDeck];
-  state._nativePlaybackFallback = { trackIndex: 7, expiresAt: Date.now() + 3000 };
-  listeners.play.handler({ target: nativeAudio });
-  assert.equal(nativeAudio.pauseCalls, 2);
-  assert.equal(ownDeck.pauseCalls, 0);
-  assert.equal(state._nativePlaybackFallback, null);
-  microtasks.shift()();
 
   timers.forEach(timer => timer.fn());
-  assert.equal(pauseSoundCloudCalls, 10);
-  assert.equal(pauseSoundCloudTransportCalls, 10);
+  assert.equal(pauseSoundCloudCalls, 8);
+  assert.equal(pauseSoundCloudTransportCalls, 8);
 
   const guard = extractFunction('installNativePlaybackGuard');
   assert.match(guard, /addEventListener\('click'/);
   assert.match(guard, /addEventListener\('play'/);
-  assert.match(guard, /nativePlaybackFallbackActive\(audio\)/);
+  assert.doesNotMatch(guard, /nativePlaybackFallback|expiresAt/);
   assert.match(guard, /\[0, 100, 500, 1500, 3000\]/);
   assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
 });
@@ -1896,12 +2018,14 @@ test('shuffle startup immediately suppresses native SoundCloud playback', () => 
   assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloudTransport\(\);\s*pauseSoundCloud\(\);/);
 });
 
-test('True Shuffle transport keeps one-shot native fallback controls usable', async () => {
+test('True Shuffle transport retries custom playback and leaves inactive SoundCloud usable', async () => {
   const state = {
+    active: true,
+    loading: false,
+    busy: false,
     queue: [7],
     pos: 0,
     _nativeGuardButtonAction: false,
-    _nativePlaybackFallback: null,
   };
   const button = {
     clickCalls: 0,
@@ -1911,34 +2035,29 @@ test('True Shuffle transport keeps one-shot native fallback controls usable', as
       this.guardedDuringClick = state._nativeGuardButtonAction;
     },
   };
-  let paused = true;
-  let grantedTrack = null;
-  let clearCalls = 0;
+  const playCalls = [];
   const toggleSource = extractFunction('toggle').replace(/^function /, 'async function ');
   const toggle = Function(
-    'state', 'currentDeckAudio', 'soundCloudPaused', 'beginNativePlaybackFallback',
-    'clearNativePlaybackFallback', 'document', 'setTimeout', 'refreshPlayBtn',
+    'state', 'currentDeckAudio', 'playAt', 'document', 'setTimeout', 'refreshPlayBtn',
     `return (${toggleSource})`,
   )(
     state,
     () => null,
-    () => paused,
-    trackIndex => { grantedTrack = trackIndex; },
-    () => { clearCalls++; },
+    async (trackIndex, countPlay) => { playCalls.push([trackIndex, countPlay]); },
     { querySelector: () => button },
     () => {},
     () => {},
   );
 
   await toggle();
-  assert.equal(grantedTrack, 7);
-  assert.equal(button.guardedDuringClick, true);
+  assert.deepEqual(playCalls, [[7, false]]);
+  assert.equal(button.clickCalls, 0);
   assert.equal(state._nativeGuardButtonAction, false);
 
-  paused = false;
+  state.active = false;
   await toggle();
-  assert.equal(clearCalls, 1);
-  assert.equal(button.clickCalls, 2);
+  assert.equal(button.clickCalls, 1);
+  assert.equal(button.guardedDuringClick, true);
   assert.equal(state._nativeGuardButtonAction, false);
 });
 
@@ -1970,13 +2089,15 @@ test('build copies the canonical userscript byte-for-byte without using legacy m
   }
 });
 
-test('playAt scopes native fallback permission and clears it on the next path or stop', () => {
+test('playAt exhausts custom candidates and schedules a bounded retry without native playback', () => {
   const playAt = extractFunction('playAt');
   const stop = extractFunction('stop');
-  assert.match(playAt, /if \(!state\.active\) return;\s*clearNativePlaybackFallback\(\);/);
-  assert.match(playAt, /beginNativePlaybackFallback\(idx\);\s*btn\.click\(\);/);
-  assert.match(playAt, /if \(!btn\) \{\s*clearNativePlaybackFallback\(\);/);
-  assert.match(stop, /clearNativePlaybackFallback\(\);/);
+  assert.match(playAt, /attemptedCustomTracks \|\| new Set\(\)/);
+  assert.match(playAt, /state\.queue\.push\(idx\)/);
+  assert.match(playAt, /custom-start-exhausted/);
+  assert.match(playAt, /\}, 5000\)/);
+  assert.doesNotMatch(playAt, /document|\.click\(|nativePlaybackFallback/);
+  assert.match(stop, /clearTimeout\(state\._customPlaybackRetryTimer\)/);
 });
 
 test('playlist hydration parser exposes the complete stable track id list', () => {
@@ -2002,8 +2123,9 @@ test('playlist hydration parser exposes the complete stable track id list', () =
 
 test('live tracks are inserted only into the unplayed part of the round', () => {
   const insertTracksRandomlyAfterCurrent = Function(
+    'spaceUpcomingDuplicateTitles',
     `return (${extractFunction('insertTracksRandomlyAfterCurrent')})`,
-  )();
+  )(items => items);
   const queue = [0, 1, 2, 3];
   const values = [0, 0.999999];
   insertTracksRandomlyAfterCurrent(queue, 1, [4, 5], () => values.shift());
@@ -2067,12 +2189,10 @@ test('playlist metadata is batch-resolved in bounded requests and keeps playlist
   assert.equal(metas[116].playlistPosition, 117);
 });
 
-test('metadata-only playlist tracks try the custom player before DOM fallback', () => {
+test('metadata-only playlist tracks stay on the custom player without DOM fallback', () => {
   const playAt = extractFunction('playAt');
-  const customAttempt = playAt.indexOf('playWithCrossfadeDeck(idx, countPlay, requestedFade)');
-  const reconnectAttempt = playAt.indexOf('reconnectTrackElement(idx)');
-  assert.ok(customAttempt >= 0);
-  assert.ok(reconnectAttempt > customAttempt);
+  assert.match(playAt, /playWithCrossfadeDeck\(idx, countPlay, requestedFade\)/);
+  assert.doesNotMatch(playAt, /reconnectTrackElement|querySelector|\.click\(/);
 });
 
 test('live queue application preserves current playback and updates the round once', () => {
