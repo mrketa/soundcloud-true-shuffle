@@ -144,6 +144,32 @@ test('marked bumpers stay evenly distributed across the full merged queue', () =
   assert.ok(Math.max(...bumperFreeRuns) <= 2, `unexpected bumper-free run: ${Math.max(...bumperFreeRuns)}`);
 });
 
+test('identical unmarked bumpers span the full queue instead of leaving a music-only tail', () => {
+  const bumperCount = 28;
+  const musicCount = 79;
+  const meta = [
+    ...Array.from({ length: bumperCount }, () => ({ title: '24.7 Jam Radio' })),
+    ...Array.from({ length: musicCount }, (_, index) => ({ title: `Jam ${index + 1}` })),
+  ];
+  const queue = Array.from({ length: bumperCount + musicCount }, (_, index) => index);
+
+  spaceDuplicateTitles(queue, meta);
+
+  const bumperPositions = queue
+    .map((ti, position) => trackSpacingKey(ti, meta) === '24.7 jam radio' ? position : -1)
+    .filter(position => position >= 0);
+  const bumperFreeRuns = [
+    bumperPositions[0],
+    ...bumperPositions.slice(1).map((position, index) => position - bumperPositions[index] - 1),
+    queue.length - bumperPositions.at(-1) - 1,
+  ];
+
+  assert.equal(queue.length, bumperCount + musicCount);
+  assert.equal(new Set(queue).size, queue.length);
+  assert.equal(bumperPositions.length, bumperCount);
+  assert.ok(Math.max(...bumperFreeRuns) <= Math.ceil(musicCount / (bumperCount + 1)));
+});
+
 test('matching-title spacing respects the previous-round boundary', () => {
   const meta = [
     { title: 'New Station Name' },

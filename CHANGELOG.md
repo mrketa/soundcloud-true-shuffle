@@ -1,5 +1,19 @@
 # Changelog
 
+## v6.1.9 - 2026-08-09
+
+### Unmarked bumper distribution
+
+- Evenly spread repeated unmarked bumper titles, such as `24.7 Jam Radio`, across the complete shuffled round.
+- Fixed queues that alternated bumpers near the beginning but left a long music-only tail.
+- Kept `[TSS-BUMPER]` support for grouping differently named station IDs without hardcoded names or track IDs.
+
+### Verification
+
+- Added a 107-track regression scenario with 28 identical unmarked bumpers and 79 unique music tracks.
+- Limited every bumper-free run in that scenario to at most three music tracks.
+- Passed the complete True Shuffle regression suite against both the canonical and built userscripts.
+
 ## v6.1.8 - 2026-08-09
 
 ### Bumper distribution

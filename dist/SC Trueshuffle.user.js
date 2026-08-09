@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.8
+// @version      6.1.9
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -296,22 +296,37 @@ function spaceDuplicateTitles(queue, meta = state.meta, previousTi = null) {
   };
 
   const bumperKey = '\u0000group:tss-bumper';
-  const bumpers = [];
-  const otherTracks = [];
-  for (const ti of queue) {
-    (trackSpacingKey(ti, meta) === bumperKey ? bumpers : otherTracks).push(ti);
-  }
+  const groupsByKey = new Map();
+  queue.forEach((ti, order) => {
+    const key = trackSpacingKey(ti, meta);
+    if (!groupsByKey.has(key)) groupsByKey.set(key, { key, items: [], order });
+    groupsByKey.get(key).items.push(ti);
+  });
 
-  // A no-adjacency heap naturally alternates the largest group until it runs
-  // out. Bumpers need a stronger guarantee: distribute the non-bumpers across
-  // every gap so the bumper group spans the complete shuffled round.
-  if (bumpers.length > 1) {
-    const requiredSeparators = bumpers.length - 1 + (previousKey === bumperKey ? 1 : 0);
+  const markedBumpers = groupsByKey.get(bumperKey);
+  const repeatedTitles = [...groupsByKey.values()]
+    .filter(group => group.key !== bumperKey && group.items.length > 1)
+    .sort((a, b) => b.items.length - a.items.length || a.order - b.order);
+  const dominantRepeatedTitle = repeatedTitles.length === 1
+    || repeatedTitles[0]?.items.length > repeatedTitles[1]?.items.length
+    ? repeatedTitles[0]
+    : null;
+  const spreadGroup = markedBumpers?.items.length > 1
+    ? markedBumpers
+    : dominantRepeatedTitle;
+
+  // A no-adjacency heap naturally alternates a repeated group until it runs
+  // out. Explicitly marked bumpers and an unambiguously dominant repeated
+  // title need a stronger guarantee: span the complete shuffled round.
+  if (spreadGroup) {
+    const repeatedTracks = spreadGroup.items;
+    const otherTracks = queue.filter(ti => trackSpacingKey(ti, meta) !== spreadGroup.key);
+    const requiredSeparators = repeatedTracks.length - 1 + (previousKey === spreadGroup.key ? 1 : 0);
     if (otherTracks.length >= requiredSeparators) {
       const arrangedOthers = arrangeAdjacentGroups(otherTracks, previousKey);
-      const gaps = new Array(bumpers.length + 1).fill(0);
-      for (let i = 1; i < bumpers.length; i++) gaps[i] = 1;
-      if (previousKey === bumperKey) gaps[0] = 1;
+      const gaps = new Array(repeatedTracks.length + 1).fill(0);
+      for (let i = 1; i < repeatedTracks.length; i++) gaps[i] = 1;
+      if (previousKey === spreadGroup.key) gaps[0] = 1;
 
       const mandatory = gaps.reduce((sum, count) => sum + count, 0);
       const extras = arrangedOthers.length - mandatory;
@@ -322,10 +337,10 @@ function spaceDuplicateTitles(queue, meta = state.meta, previousTi = null) {
 
       const spaced = [];
       let otherIndex = 0;
-      for (let i = 0; i < bumpers.length; i++) {
+      for (let i = 0; i < repeatedTracks.length; i++) {
         spaced.push(...arrangedOthers.slice(otherIndex, otherIndex + gaps[i]));
         otherIndex += gaps[i];
-        spaced.push(bumpers[i]);
+        spaced.push(repeatedTracks[i]);
       }
       spaced.push(...arrangedOthers.slice(otherIndex));
       queue.splice(0, queue.length, ...spaced);
