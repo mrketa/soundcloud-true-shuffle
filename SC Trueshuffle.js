@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.7
+// @version      6.1.8
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -225,75 +225,116 @@ function trackSpacingKey(ti, meta = state.meta) {
 }
 
 function spaceDuplicateTitles(queue, meta = state.meta, previousTi = null) {
-  let previousKey = previousTi === null || previousTi === undefined
+  const previousKey = previousTi === null || previousTi === undefined
     ? null
     : trackSpacingKey(previousTi, meta);
-  let hasAdjacentDuplicates = false;
-  for (const ti of queue) {
-    const key = trackSpacingKey(ti, meta);
-    hasAdjacentDuplicates ||= key === previousKey;
-    previousKey = key;
-  }
-  if (!hasAdjacentDuplicates) return queue;
-
-  const byTitle = new Map();
-  queue.forEach((ti, order) => {
-    const key = trackSpacingKey(ti, meta);
-    if (!byTitle.has(key)) byTitle.set(key, { key, items: [], next: 0, order });
-    byTitle.get(key).items.push(ti);
-  });
-
-  const remaining = group => group.items.length - group.next;
-  const higherPriority = (a, b) => remaining(a) > remaining(b)
-    || (remaining(a) === remaining(b) && a.order < b.order);
-  const heap = [];
-  const push = group => {
-    heap.push(group);
-    for (let child = heap.length - 1; child > 0;) {
-      const parent = Math.floor((child - 1) / 2);
-      if (!higherPriority(heap[child], heap[parent])) break;
-      [heap[parent], heap[child]] = [heap[child], heap[parent]];
-      child = parent;
+  const arrangeAdjacentGroups = (items, boundaryKey = null) => {
+    let lastKey = boundaryKey;
+    let hasAdjacentDuplicates = false;
+    for (const ti of items) {
+      const key = trackSpacingKey(ti, meta);
+      hasAdjacentDuplicates ||= key === lastKey;
+      lastKey = key;
     }
-  };
-  const pop = () => {
-    const top = heap[0];
-    const last = heap.pop();
-    if (heap.length && last) {
-      heap[0] = last;
-      for (let parent = 0;;) {
-        const left = parent * 2 + 1;
-        const right = left + 1;
-        let best = parent;
-        if (left < heap.length && higherPriority(heap[left], heap[best])) best = left;
-        if (right < heap.length && higherPriority(heap[right], heap[best])) best = right;
-        if (best === parent) break;
-        [heap[parent], heap[best]] = [heap[best], heap[parent]];
-        parent = best;
+    if (!hasAdjacentDuplicates) return items;
+
+    const byTitle = new Map();
+    items.forEach((ti, order) => {
+      const key = trackSpacingKey(ti, meta);
+      if (!byTitle.has(key)) byTitle.set(key, { key, items: [], next: 0, order });
+      byTitle.get(key).items.push(ti);
+    });
+
+    const remaining = group => group.items.length - group.next;
+    const higherPriority = (a, b) => remaining(a) > remaining(b)
+      || (remaining(a) === remaining(b) && a.order < b.order);
+    const heap = [];
+    const push = group => {
+      heap.push(group);
+      for (let child = heap.length - 1; child > 0;) {
+        const parent = Math.floor((child - 1) / 2);
+        if (!higherPriority(heap[child], heap[parent])) break;
+        [heap[parent], heap[child]] = [heap[child], heap[parent]];
+        child = parent;
       }
-    }
-    return top;
-  };
-  byTitle.forEach(push);
+    };
+    const pop = () => {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length && last) {
+        heap[0] = last;
+        for (let parent = 0;;) {
+          const left = parent * 2 + 1;
+          const right = left + 1;
+          let best = parent;
+          if (left < heap.length && higherPriority(heap[left], heap[best])) best = left;
+          if (right < heap.length && higherPriority(heap[right], heap[best])) best = right;
+          if (best === parent) break;
+          [heap[parent], heap[best]] = [heap[best], heap[parent]];
+          parent = best;
+        }
+      }
+      return top;
+    };
+    byTitle.forEach(push);
 
-  const spaced = [];
-  previousKey = previousTi === null || previousTi === undefined
-    ? null
-    : trackSpacingKey(previousTi, meta);
-  while (heap.length) {
-    let group = pop();
-    if (group.key === previousKey) {
-      const alternative = pop();
-      if (!alternative) return queue;
-      push(group);
-      group = alternative;
+    const spaced = [];
+    lastKey = boundaryKey;
+    while (heap.length) {
+      let group = pop();
+      if (group.key === lastKey) {
+        const alternative = pop();
+        if (!alternative) return items;
+        push(group);
+        group = alternative;
+      }
+      spaced.push(group.items[group.next++]);
+      lastKey = group.key;
+      if (remaining(group)) push(group);
     }
-    spaced.push(group.items[group.next++]);
-    previousKey = group.key;
-    if (remaining(group)) push(group);
+    return spaced;
+  };
+
+  const bumperKey = '\u0000group:tss-bumper';
+  const bumpers = [];
+  const otherTracks = [];
+  for (const ti of queue) {
+    (trackSpacingKey(ti, meta) === bumperKey ? bumpers : otherTracks).push(ti);
   }
 
-  queue.splice(0, queue.length, ...spaced);
+  // A no-adjacency heap naturally alternates the largest group until it runs
+  // out. Bumpers need a stronger guarantee: distribute the non-bumpers across
+  // every gap so the bumper group spans the complete shuffled round.
+  if (bumpers.length > 1) {
+    const requiredSeparators = bumpers.length - 1 + (previousKey === bumperKey ? 1 : 0);
+    if (otherTracks.length >= requiredSeparators) {
+      const arrangedOthers = arrangeAdjacentGroups(otherTracks, previousKey);
+      const gaps = new Array(bumpers.length + 1).fill(0);
+      for (let i = 1; i < bumpers.length; i++) gaps[i] = 1;
+      if (previousKey === bumperKey) gaps[0] = 1;
+
+      const mandatory = gaps.reduce((sum, count) => sum + count, 0);
+      const extras = arrangedOthers.length - mandatory;
+      for (let i = 0; i < gaps.length; i++) {
+        gaps[i] += Math.floor(((i + 1) * extras) / gaps.length)
+          - Math.floor((i * extras) / gaps.length);
+      }
+
+      const spaced = [];
+      let otherIndex = 0;
+      for (let i = 0; i < bumpers.length; i++) {
+        spaced.push(...arrangedOthers.slice(otherIndex, otherIndex + gaps[i]));
+        otherIndex += gaps[i];
+        spaced.push(bumpers[i]);
+      }
+      spaced.push(...arrangedOthers.slice(otherIndex));
+      queue.splice(0, queue.length, ...spaced);
+      return queue;
+    }
+  }
+
+  const spaced = arrangeAdjacentGroups(queue, previousKey);
+  if (spaced !== queue) queue.splice(0, queue.length, ...spaced);
   return queue;
 }
 

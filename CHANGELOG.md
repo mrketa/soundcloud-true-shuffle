@@ -1,5 +1,16 @@
 # Changelog
 
+## v6.1.8 - 2026-08-09
+
+### Bumper distribution
+
+- Spread `[TSS-BUMPER]` tracks evenly across the complete shuffled round instead of alternating them only until the bumper playlist runs out.
+- Preserved the no-back-to-back guarantee whenever enough non-bumper tracks exist, including at automatic round boundaries and after playlist merges.
+
+### Verification
+
+- Added a regression scenario matching 107 bumpers merged into 193 music tracks and limited every bumper-free run to at most two music tracks.
+
 ## v6.1.7 - 2026-08-08
 
 ### Shuffle sources and sequencing

@@ -118,6 +118,32 @@ test('the hidden bumper marker groups renamed station IDs together', () => {
   assert.deepEqual(queue, [0, 1, 2, 3]);
 });
 
+test('marked bumpers stay evenly distributed across the full merged queue', () => {
+  const bumperCount = 107;
+  const musicCount = 193;
+  const meta = [
+    ...Array.from({ length: bumperCount }, (_, index) => ({ title: `[TSS-BUMPER] Ident ${index}` })),
+    ...Array.from({ length: musicCount }, (_, index) => ({ title: `Song ${index}` })),
+  ];
+  const queue = Array.from({ length: meta.length }, (_, index) => index);
+
+  spaceDuplicateTitles(queue, meta);
+
+  const bumperPositions = queue
+    .map((ti, position) => trackSpacingKey(ti, meta) === '\u0000group:tss-bumper' ? position : -1)
+    .filter(position => position >= 0);
+  const bumperFreeRuns = [
+    bumperPositions[0],
+    ...bumperPositions.slice(1).map((position, index) => position - bumperPositions[index] - 1),
+    queue.length - bumperPositions.at(-1) - 1,
+  ];
+
+  assert.equal(bumperPositions.length, bumperCount);
+  assert.equal(new Set(queue).size, bumperCount + musicCount);
+  assert.ok(bumperPositions.every((position, index) => index === 0 || position - bumperPositions[index - 1] > 1));
+  assert.ok(Math.max(...bumperFreeRuns) <= 2, `unexpected bumper-free run: ${Math.max(...bumperFreeRuns)}`);
+});
+
 test('matching-title spacing respects the previous-round boundary', () => {
   const meta = [
     { title: 'New Station Name' },
