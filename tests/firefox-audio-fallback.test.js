@@ -39,10 +39,9 @@ test('custom deck playback never imports a Firefox native-media volume fallback'
   assert.equal(state.playbackVolume, 0.8);
 });
 
-test('active True Shuffle playback never authorizes or clicks the native player', async () => {
-  assert.doesNotMatch(source, /beginNativePlaybackFallback|nativePlaybackFallbackActive|_nativePlaybackFallback/);
+test('generic failures rotate custom decks while preview tracks may use SoundCloud session playback', async () => {
   const playAtSource = extractFunction('playAt');
-  assert.doesNotMatch(playAtSource, /document|\.click\(/);
+  assert.match(playAtSource, /playWithSoundCloudSession/);
 
   const state = {
     active: true,
@@ -57,24 +56,94 @@ test('active True Shuffle playback never authorizes or clicks the native player'
     busy: true,
   };
   const attempted = [];
+  const nativeAttempts = [];
   const playWithCrossfadeDeck = async ti => {
     attempted.push(ti);
     return ti === 1;
   };
   const playAt = Function(
     'state', 'currentDeckAudio', 'playWithCrossfadeDeck', 'stopCrossfadeDecks',
-    'setCrossfadeStatus', 'recordPlaybackDiagnostic', 'trackAvailable',
-    'showMergeToast', 'updateHub', 'clearTimeout', 'setTimeout',
+    'setCrossfadeStatus', 'playWithSoundCloudSession', 'recordPlaybackDiagnostic',
+    'trackAvailable', 'showMergeToast', 'updateHub', 'clearTimeout', 'setTimeout',
     `return (${playAtSource.replace(/^function /, 'async function ')})`,
   )(
-    state, () => null, playWithCrossfadeDeck, () => {}, () => {}, () => {},
+    state, () => null, playWithCrossfadeDeck, () => {}, () => {},
+    async ti => { nativeAttempts.push(ti); return false; }, () => {},
     () => true, () => {}, () => {}, () => {}, () => 1,
   );
 
   await playAt(0);
   assert.deepEqual(attempted, [0, 1]);
+  assert.deepEqual(nativeAttempts, []);
   assert.deepEqual(state.queue, [1, 0]);
   assert.equal(state.suspended, false);
+});
+
+test('SoundCloud access metadata distinguishes previews from entitled streams', () => {
+  const syncTrackPlaybackAccess = Function(
+    `return (${extractFunction('syncTrackPlaybackAccess')})`,
+  )();
+  const preview = {};
+  const playable = { requiresNativePlayback: true };
+
+  assert.equal(syncTrackPlaybackAccess(preview, {
+    access: 'preview',
+    duration: 240000,
+    media: { transcodings: [] },
+  }), true);
+  assert.equal(preview.requiresNativePlayback, true);
+  assert.equal(preview.durationMs, 240000);
+
+  assert.equal(syncTrackPlaybackAccess(playable, {
+    access: 'playable',
+    duration: 240000,
+    media: { transcodings: [] },
+  }), false);
+  assert.equal(playable.requiresNativePlayback, false);
+});
+
+test('preview fallback delegates the exact queued row to the signed-in SoundCloud player', async () => {
+  const button = { clickCalls: 0, click() { this.clickCalls++; } };
+  const row = {
+    scrollIntoView() {},
+    dispatchEvent() {},
+    querySelector() { return button; },
+  };
+  const nativeAudio = { tagName: 'AUDIO', paused: false, currentSrc: 'entitled-stream' };
+  const state = {
+    meta: [{ title: 'Premium track', requiresNativePlayback: true }],
+    els: [row],
+    stats: { played: 0, playCounts: {} },
+    _nativeTrack: null,
+    _nativeSessionNoticeShown: false,
+    suspended: true,
+  };
+  const document = {
+    body: { contains: value => value === row },
+    querySelectorAll: selector => selector === 'audio' ? [nativeAudio] : [],
+  };
+  const notices = [];
+  const playWithSoundCloudSession = Function(
+    'state', 'document', 'MouseEvent', 'wait', 'stopCrossfadeDecks',
+    'isTrueShuffleAudio', 'soundCloudPaused', 'playerTitle', 'trackPlayed',
+    'showMergeToast', 'setTimeout', 'refreshPlayBtn', 'updateProgressBar', 'updateHub',
+    `return (${extractFunction('playWithSoundCloudSession').replace(/^function /, 'async function ')})`,
+  )(
+    state, document, function MouseEvent() {}, async () => {},
+    () => { state._nativeTrack = null; }, () => false, () => false, () => 'Premium track',
+    ti => {
+      state.stats.played++;
+      state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
+    },
+    message => notices.push(message), fn => fn(), () => {}, () => {}, () => {},
+  );
+
+  assert.equal(await playWithSoundCloudSession(0), true);
+  assert.equal(button.clickCalls, 1);
+  assert.equal(state._nativeTrack, 0);
+  assert.equal(state.stats.played, 1);
+  assert.equal(state.suspended, false);
+  assert.match(notices[0], /using your SoundCloud session/);
 });
 
 test('Firefox stream candidates prefer MPEG and continue after a failed endpoint', async () => {

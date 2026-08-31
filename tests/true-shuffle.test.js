@@ -1152,10 +1152,13 @@ test('cross-playlist tracks retain source metadata and play without route naviga
   assert.doesNotMatch(playAt, /reconnectTrackElement|loadTrackSourcePage|navigateToPage/);
 });
 
-test('feed playback never falls back to SoundCloud links or native play buttons', () => {
+test('feed playback uses SoundCloud controls only for preview-restricted tracks', () => {
   const playAt = extractFunction('playAt');
-  assert.doesNotMatch(playAt, /\.sc-link-primary|\.trackItem__trackTitle/);
-  assert.doesNotMatch(playAt, /document|\.click\(/);
+  const sessionFallback = extractFunction('playWithSoundCloudSession');
+  assert.match(playAt, /requiresNativePlayback/);
+  assert.match(playAt, /playWithSoundCloudSession/);
+  assert.match(sessionFallback, /\.trackItem__trackTitle|\.sc-link-primary/);
+  assert.match(sessionFallback, /\.click\(\)/);
 });
 
 test('manual transition guard expires for different tracks with identical titles', () => {
@@ -1482,8 +1485,8 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     return value;
   };
   [
-    'tss-pip-player', 'tss-pip-title', 'tss-pip-artist', 'tss-pip-position',
-    'tss-pip-current', 'tss-pip-remaining', 'tss-pip-artwork',
+    'tss-pip-player', 'tss-pip-title', 'tss-pip-title-text', 'tss-pip-artist',
+    'tss-pip-position', 'tss-pip-current', 'tss-pip-remaining', 'tss-pip-artwork',
     'tss-pip-artwork-fallback', 'tss-pip-play', 'tss-pip-up-next-row',
     'tss-pip-next-title', 'tss-pip-next-artist', 'tss-pip-next-number',
     'tss-pip-next-artwork', 'tss-pip-next-fallback', 'tss-pip-next-settings', 'tss-pip-crossfade',
@@ -1515,7 +1518,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     'state', 'ownPipIsOpen', 'closeOwnPip', 'playbackTiming', 'getComputedStyle',
     'document', 'playerTitle', 'paused', 'SVG', 'trackId', 'waveformCache',
     'DEFAULT_WAVE_HEIGHTS', 'formatPlaybackClock', 'drawOwnPipWaveform', 'renderOwnPipQueue',
-    'upcomingTrackIndex', 'ownPipWindowTitle', 'ownPipArtworkSource',
+    'upcomingTrackIndex', 'ownPipWindowTitle', 'ownPipArtworkSource', 'syncOwnPipMarquee',
     `return (${extractFunction('syncOwnPipWindow')})`,
   )(
     state, () => true, () => {}, () => ({ current: 63, duration: 91 }),
@@ -1525,12 +1528,12 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     (...args) => drawn.push(args), () => {},
     () => state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1],
     (meta, isPaused) => meta?.title && !isPaused ? `Playing: ${meta.title}` : 'True Shuffle',
-    url => url || '',
+    url => url || '', () => {},
   );
 
   assert.equal(syncOwnPipWindow(), true);
   assert.equal(pipDocument.title, 'Playing: Current');
-  assert.equal(nodes.get('tss-pip-title').textContent, 'Current');
+  assert.equal(nodes.get('tss-pip-title-text').textContent, 'Current');
   assert.equal(nodes.get('tss-pip-artist').textContent, 'Artist A');
   assert.equal(nodes.get('tss-pip-position').textContent, '3 / 10');
   assert.equal(nodes.get('tss-pip-current').textContent, '1:03');
@@ -1546,7 +1549,7 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
   assert.equal(drawn[0][1].title, 'Current');
 });
 
-test('PiP artwork toggle preserves compact and full-picture layouts', () => {
+test('PiP artwork toggle preserves compact, full-picture and focus layouts', () => {
   const nodes = new Map();
   const node = id => {
     const value = {
@@ -1573,36 +1576,84 @@ test('PiP artwork toggle preserves compact and full-picture layouts', () => {
     'state',
     `return (${extractFunction('ownPipDimensions')})`,
   )(state);
+  const nextOwnPipArtworkMode = Function(
+    'state',
+    `return (${extractFunction('nextOwnPipArtworkMode')})`,
+  )(state);
   const setOwnPipArtworkMode = Function(
-    'state', 'localStorage', 'ownPipDimensions',
+    'state', 'localStorage', 'ownPipDimensions', 'nextOwnPipArtworkMode',
     `return (${extractFunction('setOwnPipArtworkMode')})`,
-  )(state, { setItem: (key, value) => stored.push([key, value]) }, ownPipDimensions);
+  )(state, { setItem: (key, value) => stored.push([key, value]) }, ownPipDimensions, nextOwnPipArtworkMode);
   const ownPipArtworkSource = Function(
     'state',
     `return (${extractFunction('ownPipArtworkSource')})`,
   )(state);
 
+  assert.equal(nextOwnPipArtworkMode(), 'full');
   assert.equal(setOwnPipArtworkMode('full', pipDocument), 'full');
   assert.equal(state.pipArtworkMode, 'full');
   assert.equal(nodes.get('tss-pip-player').dataset.artworkMode, 'full');
   assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-pressed'], 'true');
-  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use compact artwork layout');
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use focus artwork layout');
   assert.deepEqual(stored.at(-1), ['tss_pip_artwork_mode', 'full']);
   assert.equal(
     ownPipArtworkSource('https://i1.sndcdn.com/artworks-test-t200x200.jpg'),
     'https://i1.sndcdn.com/artworks-test-t500x500.jpg',
   );
-  assert.deepEqual(ownPipDimensions(), { width: 360, height: 600 });
+  assert.deepEqual(ownPipDimensions(), { width: 420, height: 660 });
 
+  assert.equal(nextOwnPipArtworkMode(), 'focus');
+  assert.equal(setOwnPipArtworkMode('focus', pipDocument), 'focus');
+  assert.equal(nodes.get('tss-pip-player').dataset.artworkMode, 'focus');
+  assert.deepEqual(ownPipDimensions(), { width: 380, height: 460 });
+  assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use compact artwork layout');
+  assert.equal(
+    ownPipArtworkSource('https://i1.sndcdn.com/artworks-test-t200x200.jpg'),
+    'https://i1.sndcdn.com/artworks-test-t500x500.jpg',
+  );
+
+  assert.equal(nextOwnPipArtworkMode(), 'compact');
   assert.equal(setOwnPipArtworkMode('compact', pipDocument), 'compact');
   assert.equal(nodes.get('tss-pip-player').dataset.artworkMode, 'compact');
-  assert.deepEqual(ownPipDimensions(), { width: 390, height: 330 });
+  assert.deepEqual(ownPipDimensions(), { width: 440, height: 360 });
   assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-pressed'], 'false');
   assert.equal(nodes.get('tss-pip-artwork-toggle').attributes['aria-label'], 'Use full artwork layout');
   assert.equal(
     ownPipArtworkSource('https://i1.sndcdn.com/artworks-test-t200x200.jpg'),
     'https://i1.sndcdn.com/artworks-test-t200x200.jpg',
   );
+  assert.match(source, /\[data-artwork-mode="focus"\][^{]*\.tss-pip-header/);
+  assert.match(source, /\[data-artwork-mode="focus"\][^{]*\.tss-pip-wave[^}]*display:none/);
+  assert.match(source, /\[data-artwork-mode="focus"\][^{]*\.tss-pip-track-copy[^}]*order:-1[^}]*align-items:center[^}]*text-align:center/);
+  assert.match(source, /\[data-artwork-mode="focus"\][^{]*\.tss-pip-title[^}]*text-align:center/);
+});
+
+test('PiP marquee activates only when the full title overflows its viewport', () => {
+  const properties = {};
+  const viewport = {
+    clientWidth: 120,
+    dataset: {},
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; },
+  };
+  const text = {
+    textContent: 'A deliberately long track title',
+    scrollWidth: 260,
+    style: { setProperty(name, value) { properties[name] = value; } },
+  };
+  const syncOwnPipMarquee = Function(
+    `return (${extractFunction('syncOwnPipMarquee')})`,
+  )();
+
+  assert.equal(syncOwnPipMarquee(viewport, text), true);
+  assert.equal(viewport.dataset.overflow, 'true');
+  assert.equal(viewport.attributes['aria-label'], text.textContent);
+  assert.equal(properties['--tss-pip-marquee-distance'], '-140px');
+  assert.match(source, /@media\(prefers-reduced-motion:reduce\)[^{]*\{[^}]*\.tss-pip-title-text/);
+
+  text.scrollWidth = 118;
+  assert.equal(syncOwnPipMarquee(viewport, text), false);
+  assert.equal(viewport.dataset.overflow, 'false');
 });
 
 test('native PiP queue puts play-next requests directly after the current track', () => {
@@ -1956,6 +2007,7 @@ test('native playback guard blocks every SoundCloud start while True Shuffle own
     _decks: [],
     _nativePlaybackGuardInstalled: false,
     _nativeGuardButtonAction: false,
+    _nativeTrack: null,
   };
   const document = {
     addEventListener(type, handler, capture) { listeners[type] = { handler, capture }; },
@@ -2053,6 +2105,20 @@ test('native playback guard blocks every SoundCloud start while True Shuffle own
   };
   listeners.play.handler({ target: ownDeck });
   assert.equal(ownDeck.pauseCalls, 0);
+
+  state._nativeTrack = 7;
+  const entitledAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
+  listeners.play.handler({ target: entitledAudio });
+  assert.equal(entitledAudio.pauseCalls, 0);
+  const entitledClick = {
+    target: transport,
+    prevented: false,
+    stopImmediatePropagation() {},
+    preventDefault() { this.prevented = true; },
+  };
+  listeners.click.handler(entitledClick);
+  assert.equal(entitledClick.prevented, false);
+  state._nativeTrack = null;
 
 
   timers.forEach(timer => timer.fn());

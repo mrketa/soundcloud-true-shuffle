@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.1.9
+// @version      6.2.0
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -135,6 +135,8 @@ const state = {
   _crossfadeToken: 0,
   _deckIndex: -1,
   _deckTrack: null,
+  _nativeTrack: null,
+  _nativeSessionNoticeShown: false,
   _decks: [],
   _deckTracks: [null, null],
   _deckPrepareTokens: [0, 0],
@@ -161,7 +163,9 @@ const state = {
   _pipBridgePlayer: null,
   _ownPipWindow: null,
   _ownPipMode: null,
-  pipArtworkMode: localStorage.getItem('tss_pip_artwork_mode') === 'full' ? 'full' : 'compact',
+  pipArtworkMode: ['compact', 'full', 'focus'].includes(localStorage.getItem('tss_pip_artwork_mode'))
+    ? localStorage.getItem('tss_pip_artwork_mode')
+    : 'compact',
   _ownPipHost: null,
   _videoPip: null,
   _playTimeLastAt: null,
@@ -508,7 +512,8 @@ function installNativePlaybackGuard() {
 
   document.addEventListener('click', event => {
     const button = event.target?.closest?.('.playControls__play');
-    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction) return;
+    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction
+        || Number.isInteger(state._nativeTrack)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     queueMicrotask(() => {
@@ -519,9 +524,11 @@ function installNativePlaybackGuard() {
 
   document.addEventListener('play', event => {
     const audio = event.target;
-    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio)) return;
-    // True Shuffle owns playback while active. Native SoundCloud audio never
-    // receives an exemption; failed custom starts are retried on our decks.
+    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio)
+        || Number.isInteger(state._nativeTrack)) return;
+    // Private decks own ordinary queue playback. A preview-restricted track is
+    // the only exception: SoundCloud's player must enforce the signed-in
+    // listener's entitlement instead of our public stream resolver.
     try { audio.pause(); } catch (_) {}
     queueMicrotask(() => {
       pauseSoundCloudTransport();
@@ -533,7 +540,7 @@ function installNativePlaybackGuard() {
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
-      if (state.active || state.loading) {
+      if ((state.active || state.loading) && !Number.isInteger(state._nativeTrack)) {
         pauseSoundCloudTransport();
         pauseSoundCloud();
       }
@@ -578,6 +585,16 @@ async function toggle() {
       deck.pause();
     }
     setTimeout(refreshPlayBtn, 80);
+    return;
+  }
+  if (Number.isInteger(state._nativeTrack)) {
+    state._nativeGuardButtonAction = true;
+    try {
+      document.querySelector('.playControls__play')?.click();
+    } finally {
+      state._nativeGuardButtonAction = false;
+    }
+    setTimeout(refreshPlayBtn, 150);
     return;
   }
   if (state.active || state.loading) {
@@ -722,10 +739,31 @@ function playlistSnapshotFromHtml(html) {
   }
 }
 
+function syncTrackPlaybackAccess(meta, track) {
+  if (!meta || !track) return false;
+  const access = String(track.access || '').toLowerCase();
+  const policy = String(track.policy || '').toUpperCase();
+  const durationMs = Number(track.duration || track.full_duration);
+  const transcodings = Array.isArray(track.media?.transcodings)
+    ? track.media.transcodings
+    : (Array.isArray(track.transcodings) ? track.transcodings : []);
+  const preview = access === 'preview'
+    || policy === 'SNIP'
+    || transcodings.some(item => item?.snipped === true
+      || item?.is_snipped === true
+      || /(?:^|[\/_-])preview(?:[\/_-]|$)/i.test(String(item?.url || '')));
+
+  if (Number.isFinite(durationMs) && durationMs > 0) meta.durationMs = durationMs;
+  if (access) meta.access = access;
+  if (policy) meta.policy = policy;
+  if (access || policy || preview) meta.requiresNativePlayback = preview;
+  return preview;
+}
+
 function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
   if (!track?.permalink_url || !track?.title) return null;
   const artworkUrl = track.artwork_url || track.user?.avatar_url || null;
-  return {
+  const meta = {
     soundcloudId: Number(track.id) || null,
     title: track.title || '—',
     artist: track.user?.username || track.publisher_metadata?.artist || '—',
@@ -739,12 +777,15 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
         url: item?.url || '',
         protocol: item?.format?.protocol || '',
         mimeType: item?.format?.mime_type || '',
+        snipped: item?.snipped === true || item?.is_snipped === true,
       })).filter(item => item.url)
       : [],
     liked: typeof track.user_favorite === 'boolean' ? track.user_favorite : null,
     sourcePage,
     playlistPosition: Number.isFinite(Number(playlistPosition)) ? Number(playlistPosition) : null,
   };
+  syncTrackPlaybackAccess(meta, track);
+  return meta;
 }
 
 function spaceUpcomingDuplicateTitles(queue, pos, meta = state.meta) {
@@ -1849,21 +1890,46 @@ function ownPipWindowTitle(meta, isPaused) {
 }
 
 function ownPipArtworkSource(url, mode = state.pipArtworkMode) {
-  if (!url || mode !== 'full') return url || '';
+  if (!url || !['full', 'focus'].includes(mode)) return url || '';
   return String(url).replace(/-t\d+x\d+(?=\.(?:jpg|png)(?:$|\?))/i, '-t500x500');
 }
 
 function ownPipDimensions(mode = state.pipArtworkMode) {
-  return mode === 'full' ? { width: 360, height: 600 } : { width: 390, height: 330 };
+  if (mode === 'focus') return { width: 380, height: 460 };
+  return mode === 'full' ? { width: 420, height: 660 } : { width: 440, height: 360 };
+}
+
+function nextOwnPipArtworkMode(mode = state.pipArtworkMode) {
+  return mode === 'compact' ? 'full' : mode === 'full' ? 'focus' : 'compact';
 }
 
 function setOwnPipArtworkMode(mode, pipDocument = state._ownPipWindow?.document) {
-  const nextMode = mode === 'full' ? 'full' : 'compact';
+  const nextMode = ['compact', 'full', 'focus'].includes(mode) ? mode : 'compact';
   state.pipArtworkMode = nextMode;
   try { localStorage.setItem('tss_pip_artwork_mode', nextMode); } catch (_) {}
 
   const player = pipDocument?.getElementById('tss-pip-player');
   if (player) player.dataset.artworkMode = nextMode;
+  if (nextMode === 'focus') {
+    const stage = pipDocument?.getElementById('tss-pip-stage');
+    const nowView = pipDocument?.getElementById('tss-pip-now-view');
+    const queueView = pipDocument?.getElementById('tss-pip-queue-view');
+    const viewToggle = pipDocument?.getElementById('tss-pip-view-toggle');
+    if (stage) stage.dataset.view = 'player';
+    if (nowView) {
+      nowView.setAttribute('aria-hidden', 'false');
+      if ('inert' in nowView) nowView.inert = false;
+    }
+    if (queueView) {
+      queueView.setAttribute('aria-hidden', 'true');
+      if ('inert' in queueView) queueView.inert = true;
+    }
+    if (viewToggle) {
+      viewToggle.dataset.active = 'false';
+      viewToggle.setAttribute('aria-pressed', 'false');
+    }
+  }
+
   const dimensions = ownPipDimensions(nextMode);
   if (state._ownPipMode === 'document') {
     try { state._ownPipWindow?.resizeTo?.(dimensions.width, dimensions.height); } catch (_) {}
@@ -1873,13 +1939,32 @@ function setOwnPipArtworkMode(mode, pipDocument = state._ownPipWindow?.document)
   }
   const toggle = pipDocument?.getElementById('tss-pip-artwork-toggle');
   if (toggle) {
-    const full = nextMode === 'full';
-    toggle.dataset.active = full ? 'true' : 'false';
-    toggle.setAttribute('aria-pressed', full ? 'true' : 'false');
-    toggle.setAttribute('aria-label', full ? 'Use compact artwork layout' : 'Use full artwork layout');
-    toggle.title = full ? 'Use compact artwork layout' : 'Use full artwork layout';
+    const followingMode = nextOwnPipArtworkMode(nextMode);
+    const label = followingMode === 'full' ? 'Use full artwork layout'
+      : followingMode === 'focus' ? 'Use focus artwork layout'
+      : 'Use compact artwork layout';
+    toggle.dataset.active = nextMode === 'compact' ? 'false' : 'true';
+    toggle.setAttribute('aria-pressed', nextMode === 'compact' ? 'false' : 'true');
+    toggle.setAttribute('aria-label', label);
+    toggle.title = label;
   }
   return nextMode;
+}
+
+function syncOwnPipMarquee(viewport, text) {
+  if (!viewport || !text) return false;
+  const value = text.textContent || '—';
+  viewport.title = value;
+  viewport.setAttribute('aria-label', value);
+  const width = Math.max(0, Number(viewport.clientWidth) || 0);
+  const overflow = Math.max(0, (Number(text.scrollWidth) || 0) - width);
+  const active = width > 0 && overflow > 2;
+  viewport.dataset.overflow = active ? 'true' : 'false';
+  if (active) {
+    text.style.setProperty('--tss-pip-marquee-distance', `${-overflow}px`);
+    text.style.setProperty('--tss-pip-marquee-duration', `${Math.max(7, Math.min(18, 5 + overflow / 18)).toFixed(1)}s`);
+  }
+  return active;
 }
 
 function syncOwnPipWindow() {
@@ -1911,12 +1996,14 @@ function syncOwnPipWindow() {
 
   pipDocument.title = ownPipWindowTitle(meta, paused());
   pipDocument.documentElement.style.setProperty('--accent', accent);
-  const title = pipDocument.getElementById('tss-pip-title');
+  const titleViewport = pipDocument.getElementById('tss-pip-title');
+  const title = pipDocument.getElementById('tss-pip-title-text');
   const artist = pipDocument.getElementById('tss-pip-artist');
   const position = pipDocument.getElementById('tss-pip-position');
   const currentTime = pipDocument.getElementById('tss-pip-current');
   const remaining = pipDocument.getElementById('tss-pip-remaining');
   if (title) title.textContent = meta?.title || playerTitle() || '—';
+  syncOwnPipMarquee(titleViewport, title);
   if (artist) artist.textContent = meta?.artist || '—';
   if (position) position.textContent = `${inRound} / ${total}`;
   if (currentTime) currentTime.textContent = formatPlaybackClock(timing.current);
@@ -2151,7 +2238,8 @@ function openInPagePipFallback() {
   host.id = 'tss-inline-pip';
   host.setAttribute('role', 'dialog');
   host.setAttribute('aria-label', 'True Shuffle floating player');
-  host.style.cssText = 'position:fixed;right:20px;bottom:90px;width:390px;height:330px;min-width:330px;min-height:280px;max-width:min(92vw,680px);max-height:min(86vh,720px);z-index:999999;resize:both;overflow:hidden;border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.72);background:#080808';
+  const dimensions = ownPipDimensions();
+  host.style.cssText = `position:fixed;right:20px;bottom:90px;width:${dimensions.width}px;height:${dimensions.height}px;min-width:330px;min-height:280px;max-width:min(92vw,760px);max-height:min(86vh,820px);z-index:999999;resize:both;overflow:hidden;border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.72);background:#080808`;
   const iframe = document.createElement('iframe');
   iframe.title = 'True Shuffle floating player';
   iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;background:#080808';
@@ -2268,6 +2356,19 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-wave{margin-top:8px}
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-controls{margin:6px 0 7px}
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-up-next{display:none}
+    #tss-pip-player[data-artwork-mode="focus"]{padding:12px;background:#080808}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header{position:absolute;top:8px;right:8px;z-index:12;width:68px;height:32px;padding:1px;gap:2px;border:1px solid rgba(255,255,255,.14);border-radius:9px;background:#111;opacity:0;transform:translateY(-4px);transition:opacity .18s ease,transform .18s cubic-bezier(.22,1,.36,1)}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header:hover,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-header:focus-within{opacity:1;transform:none}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header>*{display:none}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header #tss-pip-artwork-toggle,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-header #tss-pip-close{display:flex}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-stage{margin-top:0}
+    #tss-pip-player[data-artwork-mode="focus"] #tss-pip-now-view{display:flex}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-track{height:100%;min-height:0;display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:12px}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-art{flex:0 0 auto;width:100%;height:auto;min-height:0;aspect-ratio:1;border-radius:12px;background:#111;box-shadow:0 12px 34px rgba(0,0,0,.52),0 0 0 1px rgba(255,255,255,.08)}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-track-copy{order:-1;flex:0 0 auto;width:100%;padding:1px 2px 0;display:flex;flex-direction:column;align-items:center;text-align:center}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-artist{order:-1;margin:0 0 5px;color:var(--accent);font-size:11px;font-weight:650;text-align:center}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-title{width:100%;font-size:19px;line-height:1.18;text-align:center}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-track-meta,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-wave,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-controls,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-up-next{display:none}
     .tss-pip-close{width:29px;height:29px;border:0;border-radius:8px;background:transparent;color:rgba(255,255,255,.58)}
     .tss-pip-close:hover{color:#fff;background:rgba(255,255,255,.07)}
     .tss-pip-stage{flex:1;min-height:0;position:relative;margin-top:10px}
@@ -2276,13 +2377,15 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     #tss-pip-queue-view{display:flex;flex-direction:column;transform:translateX(34px);opacity:0;pointer-events:none}
     .tss-pip-stage[data-view="queue"] #tss-pip-now-view{transform:translateX(-34px);opacity:0;pointer-events:none}
     .tss-pip-stage[data-view="queue"] #tss-pip-queue-view{transform:translateX(0);opacity:1;pointer-events:auto}
-    .tss-pip-track{display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:13px;min-height:76px}
-    .tss-pip-art{width:76px;height:76px;border-radius:12px;overflow:hidden;position:relative;background:#151515;box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
+    .tss-pip-track{display:grid;grid-template-columns:clamp(96px,28vw,124px) minmax(0,1fr);align-items:center;gap:15px;min-height:96px}
+    .tss-pip-art{width:100%;height:auto;aspect-ratio:1;border-radius:12px;overflow:hidden;position:relative;background:#151515;box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
     .tss-pip-art img{display:block;width:100%;height:100%;object-fit:cover}
     .tss-pip-art-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.26)}
     .tss-pip-art-fallback[hidden],.tss-pip-art img[hidden]{display:none}
-    .tss-pip-title{font-size:17px;line-height:1.15;font-weight:720;letter-spacing:-.025em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .tss-pip-artist{margin-top:4px;color:rgba(255,255,255,.48);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tss-pip-title{min-width:0;overflow:hidden;white-space:nowrap;font-size:18px;line-height:1.2;font-weight:720;letter-spacing:-.025em}
+    .tss-pip-title-text{display:inline-block;min-width:100%;width:max-content;will-change:transform}
+    .tss-pip-title[data-overflow="true"] .tss-pip-title-text{animation:tssPipMarquee var(--tss-pip-marquee-duration,9s) ease-in-out infinite alternate}
+    .tss-pip-artist{margin-top:5px;color:rgba(255,255,255,.58);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .tss-pip-track-meta{display:flex;align-items:center;gap:8px;margin-top:7px;min-width:0}.tss-pip-position{color:rgba(255,255,255,.68);font-size:9px;font-weight:620;letter-spacing:.08em;white-space:nowrap}
     .tss-pip-processing{display:flex;align-items:center;gap:5px;min-width:0;color:rgba(255,255,255,.27);font-size:8px;font-weight:560;white-space:nowrap}.tss-pip-processing[hidden],.tss-pip-processing span[hidden]{display:none}.tss-pip-processing::before{content:'·';color:rgba(255,255,255,.18)}.tss-pip-processing span+span::before{content:'·';margin-right:5px;color:rgba(255,255,255,.18)}
     .tss-pip-wave{margin-top:11px}
@@ -2339,9 +2442,10 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:rgba(255,255,255,.025);color:rgba(255,255,255,.58);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(255,255,255,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.58);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
     .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.72);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#151515}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.38);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
     .tss-pip-stage[data-view="queue"] .tss-pip-queue-row{animation:tssPipRowIn .26s both cubic-bezier(.22,1,.36,1);animation-delay:calc(var(--row-index) * 18ms)}
+    @keyframes tssPipMarquee{0%,15%{transform:translateX(0)}85%,100%{transform:translateX(var(--tss-pip-marquee-distance,0))}}
     @keyframes tssPipRowIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}@keyframes tssPipMenuIn{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
-    @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu{transition:none!important;animation:none!important}}
-    @media(max-width:420px){.tss-pip-brand{display:none}.tss-pip-header{gap:6px}.tss-pip-state{max-width:58px}.tss-pip-live span{display:none}}
+    @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu,.tss-pip-title-text{transition:none!important;animation:none!important}.tss-pip-title{overflow:hidden;text-overflow:ellipsis}}
+    @media(max-width:420px){.tss-pip-brand{display:none}.tss-pip-header{gap:6px}.tss-pip-state{max-width:58px}.tss-pip-live span{display:none}.tss-pip-track{grid-template-columns:88px minmax(0,1fr);min-height:88px}}
     @media(max-height:300px){#tss-pip-player{min-height:280px;padding:10px 13px}.tss-pip-stage{margin-top:6px}.tss-pip-track{grid-template-columns:70px minmax(0,1fr);min-height:70px}.tss-pip-art{width:70px;height:70px}.tss-pip-wave{margin-top:7px}#tss-pip-waveform{height:24px}.tss-pip-controls{margin:5px 0 7px}.tss-pip-control-primary{width:47px;height:47px}.tss-pip-up-next{padding-top:6px}.tss-pip-next-row{grid-template-columns:34px minmax(0,1fr) auto 28px;min-height:34px;margin-top:5px}.tss-pip-next-art{width:34px;height:34px}}
   `;
   pipDocument.head.appendChild(style);
@@ -2366,7 +2470,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
           <span id="tss-pip-artwork-fallback" class="tss-pip-art-fallback">${SVG.note}</span>
         </div>
         <div class="tss-pip-track-copy" style="min-width:0">
-          <div id="tss-pip-title" class="tss-pip-title">—</div>
+          <div id="tss-pip-title" class="tss-pip-title"><span id="tss-pip-title-text" class="tss-pip-title-text">—</span></div>
           <div id="tss-pip-artist" class="tss-pip-artist">—</div>
           <div class="tss-pip-track-meta">
             <span id="tss-pip-position" class="tss-pip-position">—</span>
@@ -2414,7 +2518,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   soundButton.onclick = () => showOwnPipSoundMenu(pipDocument, soundButton);
   const artworkToggle = pipDocument.getElementById('tss-pip-artwork-toggle');
   artworkToggle.onclick = () => {
-    setOwnPipArtworkMode(state.pipArtworkMode === 'full' ? 'compact' : 'full', pipDocument);
+    setOwnPipArtworkMode(nextOwnPipArtworkMode(), pipDocument);
     const artwork = pipDocument.getElementById('tss-pip-artwork');
     if (artwork) artwork.dataset.src = '';
     syncOwnPipWindow();
@@ -2496,6 +2600,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     if (event.key === 'ArrowLeft') seekTo(Math.max(0, progress() - 0.03));
     if (event.key === 'ArrowRight') seekTo(Math.min(1, progress() + 0.03));
   };
+  pipWindow.addEventListener('resize', syncOwnPipWindow);
   if (mode === 'document') {
     pipWindow.addEventListener('pagehide', () => {
       if (state._ownPipWindow === pipWindow) {
@@ -3363,6 +3468,7 @@ async function resolveCrossfadeStreams(meta, options) {
     let authFailed = false;
     const resolveTrack = async track => {
       if (!track) return [];
+      if (syncTrackPlaybackAccess(meta, track)) return [];
       const result = await resolveProgressiveStreams(track, clientId);
       authFailed = authFailed || result.authFailed;
       if (result.urls.length) {
@@ -3375,6 +3481,7 @@ async function resolveCrossfadeStreams(meta, options) {
       || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null);
     let urls = await resolveTrack(embedded);
     if (urls.length) return urls;
+    if (meta.requiresNativePlayback) return [];
 
     if (Number.isFinite(Number(meta.soundcloudId)) && Number(meta.soundcloudId) > 0) {
       const endpoint = new URL(`https://api-v2.soundcloud.com/tracks/${Number(meta.soundcloudId)}`);
@@ -3384,6 +3491,7 @@ async function resolveCrossfadeStreams(meta, options) {
       authFailed = authFailed || result.authFailed;
       urls = await resolveTrack(result.track);
       if (urls.length) return urls;
+      if (meta.requiresNativePlayback) return [];
     }
 
     const resolveEndpoint = new URL('https://api-v2.soundcloud.com/resolve');
@@ -3393,6 +3501,7 @@ async function resolveCrossfadeStreams(meta, options) {
     authFailed = authFailed || resolved.authFailed;
     urls = await resolveTrack(resolved.track);
     if (urls.length) return urls;
+    if (meta.requiresNativePlayback) return [];
 
     if (!authFailed) break;
     rejectedClientId = clientId;
@@ -3433,6 +3542,15 @@ function resetDeck(audio, index) {
   audio.volume = state._deckAudioGraphs[index] ? 1 : 0;
 }
 
+
+function deckIsPreviewLimited(meta, audio) {
+  if (meta?.requiresNativePlayback) return true;
+  const expected = Number(meta?.durationMs) / 1000;
+  const actual = Number(audio?.duration);
+  return Number.isFinite(expected) && expected >= 60
+    && Number.isFinite(actual) && actual > 0 && actual <= 31.5
+    && expected - actual >= 15;
+}
 function stopCrossfadeDecks() {
   state._crossfadeToken++;
   state._crossfadePrefetchToken++;
@@ -3445,6 +3563,7 @@ function stopCrossfadeDecks() {
   state._decks.forEach((audio, index) => resetDeck(audio, index));
   state._deckIndex = -1;
   state._deckTrack = null;
+  state._nativeTrack = null;
   setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'armed' : 'off');
 }
 
@@ -3475,7 +3594,13 @@ async function prepareCrossfadeDeck(index, ti, options) {
     applyCachedAutoLevel(index, ti);
     syncCrossfadeVolume();
     audio.load();
-    if (await waitForDeck(audio, options.timeout || 5000)) return audio;
+    if (await waitForDeck(audio, options.timeout || 5000)) {
+      if (!deckIsPreviewLimited(state.meta[ti], audio)) return audio;
+      state.meta[ti].requiresNativePlayback = true;
+      state._streamCache.delete(normalizeTrackUrl(state.meta[ti]?.link));
+      resetDeck(audio, index);
+      return null;
+    }
   }
   state._streamCache.delete(normalizeTrackUrl(state.meta[ti]?.link));
   resetDeck(audio, index);
@@ -3885,6 +4010,7 @@ function refreshUpcomingCrossfadePreparation() {
 
 async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   const outgoing = currentDeckAudio();
+  if (state.meta[ti]?.requiresNativePlayback) return false;
   const outgoingIndex = state._deckIndex;
   const incomingIndex = outgoingIndex === 0 ? 1 : 0;
   const canMix = Boolean(outgoing && !outgoing.paused && !outgoing.ended && requestedFade > 0);
@@ -3925,6 +4051,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   }
   state._deckIndex = incomingIndex;
   state._deckTrack = ti;
+  state._nativeTrack = null;
   installBetterFeedPipBridge();
   state.lastTitle = state.meta[ti]?.title || '';
   state.lastProgress = 0;
@@ -4063,6 +4190,53 @@ function trackAvailable(ti) {
   return Boolean(meta && !meta.unavailable && (meta.sourcePage || state.els[ti]));
 }
 
+async function playWithSoundCloudSession(ti, countPlay = true) {
+  const meta = state.meta[ti];
+  const el = state.els[ti];
+  if (!meta?.requiresNativePlayback || !el || !document.body.contains(el)) return false;
+
+  stopCrossfadeDecks();
+  state._nativeTrack = ti;
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+  await wait(80);
+
+  const button = el.querySelector(
+    'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
+  ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
+  if (!button) {
+    state._nativeTrack = null;
+    return false;
+  }
+
+  button.click();
+  let started = false;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await wait(150);
+    const nativeAudio = [...document.querySelectorAll('audio')]
+      .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
+    if (nativeAudio || !soundCloudPaused()) {
+      started = true;
+      break;
+    }
+  }
+  if (!started) {
+    state._nativeTrack = null;
+    return false;
+  }
+
+  state.lastTitle = meta.title || playerTitle();
+  state.lastProgress = 0;
+  state.suspended = false;
+  if (countPlay) trackPlayed(ti);
+  if (!state._nativeSessionNoticeShown) {
+    state._nativeSessionNoticeShown = true;
+    showMergeToast('Premium track: using your SoundCloud session (crossfade and EQ paused)');
+  }
+  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 80);
+  return true;
+}
+
 
 async function playAt(idx, countPlay = true, attemptedCustomTracks = null) {
   if (!state.active || !state.meta[idx]) return;
@@ -4075,6 +4249,8 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null) {
 
   stopCrossfadeDecks();
   setCrossfadeStatus('fallback');
+  if (state.meta[idx]?.requiresNativePlayback
+      && await playWithSoundCloudSession(idx, countPlay)) return;
   const attempted = attemptedCustomTracks || new Set();
   attempted.add(idx);
   recordPlaybackDiagnostic('custom-start-exhausted', {
@@ -4917,6 +5093,10 @@ function stop() {
   closeOwnPip();
   clearTimeout(state._customPlaybackRetryTimer);
   state._customPlaybackRetryTimer = null;
+  if (Number.isInteger(state._nativeTrack)) {
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
+  }
   stopCrossfadeDecks();
   state.active     = false;
   state.busy       = false;
@@ -5210,7 +5390,10 @@ function startWatcher() {
     endpointTicks = 0;
     const queuedDeckActive = Number.isInteger(state._deckTrack)
       && state.queue[state.pos] === state._deckTrack;
-    if (state.suspended && queuedDeckActive) state.suspended = false;
+    const queuedNativeActive = Number.isInteger(state._nativeTrack)
+      && state.queue[state.pos] === state._nativeTrack;
+    const queuedPlaybackActive = queuedDeckActive || queuedNativeActive;
+    if (state.suspended && queuedPlaybackActive) state.suspended = false;
 
 
     if (state.suspended) {
@@ -5222,10 +5405,9 @@ function startWatcher() {
     }
 
     if (title && lastTitle && title !== lastTitle) {
-      // Custom-deck metadata changes are internal queue transitions. The native
-      // SoundCloud title-change heuristic must never classify them as external
-      // playback, especially after a long manual crossfade clears its guard.
-      if (queuedDeckActive) {
+      // Deck and intentional native-session changes are internal queue
+      // transitions, not external SoundCloud playback.
+      if (queuedPlaybackActive) {
         titleTicks = 0;
         lastTitle = title;
         state.lastTitle = title;
