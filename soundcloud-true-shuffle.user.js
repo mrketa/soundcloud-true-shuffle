@@ -45,7 +45,6 @@
     return worker;
   }
 
-  // Fisher-Yates shuffle
   function shuffle(array) {
     const a = [...array];
     for (let i = a.length - 1; i > 0; i--) {
@@ -82,7 +81,6 @@
     return el ? el.textContent.trim() : '';
   }
 
-  // Scroll to bottom repeatedly to force-load all lazy tracks
   async function loadAllTracks(statusEl) {
     let lastCount = 0;
     let stableRounds = 0;
@@ -191,7 +189,6 @@
       const timePassed = getTimePassed();
       const duration = getDuration();
 
-      // SoundCloud switched track on its own — override with our queue
       if (currentTitle && lastTitle && currentTitle !== lastTitle) {
         titleChangeTicks++;
         if (titleChangeTicks >= 2) {
@@ -205,7 +202,6 @@
         titleChangeTicks = 0;
       }
 
-      // Track finished (position == duration)
       if (duration && timePassed && duration === timePassed && duration !== '0:00') {
         endTicks++;
         if (endTicks >= 2) {

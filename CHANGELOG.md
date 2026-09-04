@@ -1,5 +1,61 @@
 # Changelog
 
+## v6.2.1 - 2026-09-04
+
+### Collaborator names and merged playlist updates
+
+- Match SoundCloud's artist byline by preferring publisher artist metadata over the uploader name, preserving collaborator names.
+- Recover missing artist names from playlist metadata even when every track is already rendered on the page, without overwriting useful DOM metadata.
+- Keep automatic updates active for every merged playlist instead of only the most recently merged source.
+- Track shared playlist membership so tracks are queued once and remain available until removed from their last source.
+- Preserve the current track during updates and reject stale responses after stopping or replacing the queue.
+
+### Playback and lifecycle bughunt
+
+- Bound network requests, response-body decoding, media playback and audio-context operations so a never-settling promise cannot permanently lock the controls.
+- Give foreground operations, deck preparation and recovery explicit ownership; stopping or replacing a session prevents old callbacks from resetting, pausing or publishing its replacement.
+- Keep Stop Shuffle and Cancel loading visible and usable during pending work, release state before teardown, and retain access to playback reports after Stop.
+- Rebuild failed or closed Web Audio contexts together with their bound media elements; a failed resume remains retryable from Play or Next.
+- Recover frozen playback at startup and near track boundaries, cap recovery attempts, and preserve intentional pause and newer seek requests through delayed recovery.
+- Detect failed or silent background workers, install one timer fallback, and release worker, timer and listener resources on stop.
+- Rotate rejected client IDs without globally blacklisting a valid ID for a track-specific authorization failure; expire and bound the signed-stream cache.
+- Require exact native track identity before accepting a preview fallback as successful playback.
+- Cancel stale collection work across navigation, preserve merged sources and Play Next through cache restoration, and reconcile removals, re-additions, history and round totals without duplicate replay.
+- Clear warmed decks when replacing the metadata universe, but preserve current-track identity during merges so playback recovery continues.
+- Isolate storage failures, sanitize diagnostic snapshots and stored statistics and loudness measurements, preserve unsaved statistics deltas, and expose failed EQ preset persistence for retry.
+- Relearn Auto Level after EQ changes and initialize audio processing when only the safety clipper is enabled.
+- Dispose late PiP acquisitions and stale menu listeners, resolve queue actions by identity, and make native player bridge installation and MediaSession restoration ownership-safe.
+
+### Native autoplay and comment cleanup
+
+- Install the native playback guard at document-start, before SoundCloud can restore playback; defer DOM-dependent UI and navigation setup until the document is ready.
+- Block native autoplay and transport starts even when True Shuffle is idle or stopped. Permit only the current explicitly selected native fallback, preserving its pause/resume controls.
+- Recheck fallback permission before deferred cleanup and stop failed or revoked native fallbacks without letting stale requests pause a newer session.
+- Revoke native fallback ownership when navigating to an unrelated collection instead of allowing the watcher to restore a suspended native session.
+- Remove redundant banners, obsolete version notes and comments that restate the code across project-owned sources. Retain userscript metadata and useful browser, concurrency and algorithm rationale; leave vendored skills and historical generated releases untouched.
+
+### Current-session diagnostics and browser compatibility
+
+- Keep diagnostic events only in memory for the current page session; remove previously saved diagnostic data without loading it, and never persist new reports.
+- Replace the full-width report/history control with a red exclamation icon beside PiP. It appears only after a new failure, remains accessible after Stop, and disappears on Clear or reload.
+- Add a separate How to report tutorial covering copying before reload, browser/userscript-manager details and reproduction steps, with a direct new-tab link to this script's Greasy Fork feedback page and a public-posting privacy reminder. Include keyboard focus containment, Escape and return-to-report behavior.
+- Replace the Firefox-only report subtitle with browser-neutral diagnostics.
+- Capture the Copy report button before awaiting clipboard access so both success and rejection can update the control after DOM event dispatch ends.
+- Document Tampermonkey and Violentmonkey compatibility targets, Safari manager availability, and capability-based PiP/background fallbacks without claiming every combination has been tested.
+
+### Verification
+
+- Passed all nine regression files with `node --test`, including playback lifecycle, deadlines, clock recovery, queue lifecycle, interface lifecycle and audio persistence.
+- Passed JavaScript syntax validation.
+- Verified artist-name recovery and music-to-bumpers merge updates in a metadata-only Chromium fixture.
+- Exercised real Chromium audio playback with a generated WAV: canceled a never-settling playlist response body, restarted playback, closed the active AudioContext, and verified Next rebuilt a new running context with advancing media time and a nonzero measured audio signal.
+- Verified Stop-to-Start recovery and current-session report access after Stop.
+- Verified legacy-data removal, a hidden initial indicator, red header icon placement, a separate reporting tutorial, keyboard focus/Tab/Escape, Clear and a new failure, and a clean real page reload in Chromium. Visually checked the player and tutorial at desktop and 360-pixel viewport widths.
+- Exercised asynchronous Copy report with real DOM dispatch and a controlled clipboard promise; regression coverage also checks successful and rejected clipboard access.
+- Verified full userscript initialization before a document root existed in Chromium, then actual playlist opening/navigation/reload with generated WAV media: native audio stayed paused while marked private audio could play. The real native fallback path played, respected pause/resume, stopped on navigation or failed acknowledgement, and remained blocked after Stop and reload.
+- Compared comment-cleanup changes against pre-cleanup executable output; no executable changes resulted from comment removal. Updated test fixtures to use code boundaries rather than a removed comment marker and to include the shared native-permission predicate.
+- Browser verification used fixture metadata, not an authenticated SoundCloud account. Native Firefox runtime and its protected window compartments were not exercised; the original reported incident cannot be uniquely identified without its diagnostics.
+
 ## v6.1.9 - 2026-08-09
 
 ### Unmarked bumper distribution

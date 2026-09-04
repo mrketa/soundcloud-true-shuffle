@@ -3,10 +3,8 @@ function trackPlayed(ti) {
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
 }
 
-// Scroll the page until the track list stops growing, then return all elements.
 async function loadTracks() {
   const sel = '.trackList__item, .soundList__item, li.sc-list-item';
-  // Wait up to 10 s for at least one track to appear before scrolling.
   for (let i = 0; i < 20; i++) {
     if (document.querySelectorAll(sel).length > 0) break;
     await wait(500);
@@ -97,7 +95,6 @@ async function next(fromWatcher = false) {
         const insertAt   = state.pos + 1 + rangeStart + Math.floor(Math.random() * span);
         state.queue.splice(Math.min(insertAt, state.queue.length), 0, justPlayed);
       } else {
-        // End of queue — start a fresh cycle, avoid immediate repeat.
         state.queue = fisherYates([...Array(state.meta.length).keys()]);
         state.pos   = 0;
         if (state.queue[0] === justPlayed && state.queue.length > 1) {
@@ -135,7 +132,6 @@ async function prevTrack() {
   if (!state.active) return;
   if (state.busy) return;
 
-  // > 3 s into current track → restart it; otherwise go back in history.
   if (currentSec() > 3 || !state.history.length) {
     seekTo(0);
     return;

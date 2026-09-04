@@ -14,7 +14,6 @@ async function onNav() {
       }
 
       if (playlistBase(location.href) === playlistBase(state.playlistUrl)) {
-        // Same playlist re-navigation — refresh DOM references.
         state.suspended = false;
         await wait(1500);
         inject();

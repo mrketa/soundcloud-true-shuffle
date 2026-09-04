@@ -1,6 +1,4 @@
-// ── Mini player ───────────────────────────────────────────────────────────────
 
-// Build the floating mini-player widget and attach all its event handlers.
 function mkMiniPlayer() {
   if (document.getElementById('tss-mini')) return;
 
@@ -63,7 +61,6 @@ function mkMiniPlayer() {
     seekTo((e.clientX - rect.left) / rect.width);
   };
 
-  // Collapse to a small tab when closed.
   document.getElementById('tss-mini-close').onclick = () => {
     mini.style.display = 'none';
     let tab = document.getElementById('tss-mini-tab');
@@ -91,7 +88,6 @@ function mkMiniPlayer() {
     tab.style.display = 'flex';
   };
 
-  // Drag — only on the player body, not on buttons or resize handles.
   mini.onmousedown = e => {
     const ignore = ['BUTTON', 'SPAN', 'INPUT'];
     if (ignore.includes(e.target.tagName)) return;
@@ -105,7 +101,6 @@ function mkMiniPlayer() {
     mini.style.top    = curTop  + 'px';
     mini.style.right  = 'auto';
     mini.style.bottom = 'auto';
-    // If the user drags manually, clear the auto-shifted flag.
     delete mini.dataset.autoShifted;
 
     const startX = e.clientX, startY = e.clientY;
@@ -123,7 +118,6 @@ function mkMiniPlayer() {
     document.addEventListener('mouseup',   up);
   };
 
-  // Resize handles — change width only, never position.
   const addResize = (handleId, growLeft) => {
     const handle = document.getElementById(handleId);
     if (!handle) return;
@@ -152,11 +146,9 @@ function mkMiniPlayer() {
   addResize('tss-mini-rzr', false);
 }
 
-// Sync mini-player display with current playback state.
 function updateMiniPlayer() {
   const mini = document.getElementById('tss-mini');
 
-  // If the player is hidden, just update the collapsed tab title.
   if (!mini || mini.style.display === 'none') {
     const tab = document.getElementById('tss-mini-tab');
     const m   = state.meta[state.queue?.[state.pos]];
@@ -169,8 +161,6 @@ function updateMiniPlayer() {
   const el = id => document.getElementById(id);
 
   if (state.suspended) {
-    // An external (non-queue) track is playing.  Show what SC is actually
-    // playing and indicate where the queue will resume.
     const extTitle = playerTitle() || '—';
     const nextTi   = state.queue[state.pos];
     const nextM    = nextTi !== undefined ? state.meta[nextTi] : null;
@@ -181,7 +171,6 @@ function updateMiniPlayer() {
     if (el('tss-mini-nextup'))   el('tss-mini-nextup').textContent   = nextM ? `${nextM.artist} — ${nextM.title}` : '—';
     if (el('tss-mini-queuepos')) el('tss-mini-queuepos').textContent = `resume at ${state.stats.played + 1} / ${state.queue.length}`;
 
-    // Show artwork from SC's player bar (the external track's artwork).
     const extArtwork = playerArtwork();
     const art = el('tss-mini-art');
     if (art) {
@@ -230,9 +219,6 @@ function updateMiniPlayer() {
   updateHub();
 }
 
-// Shift the mini-player left when the sidebar opens so they don't overlap;
-// restore its anchored position when the sidebar closes.
-// Uses data-autoShifted to distinguish auto-moved elements from user-dragged ones.
 function shiftMiniPlayer(sidebarOpen) {
   const mini = document.getElementById('tss-mini');
   const tab  = document.getElementById('tss-mini-tab');

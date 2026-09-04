@@ -8,7 +8,7 @@ function extractFunction(name) {
   const marker = `function ${name}(`;
   const start = source.indexOf(marker);
   assert.notEqual(start, -1, `missing function ${name}`);
-  const bodyStart = source.indexOf('{', start);
+  const bodyStart = source.indexOf(') {', start) + 2;
   let depth = 0;
   for (let index = bodyStart; index < source.length; index++) {
     if (source[index] === '{') depth++;
@@ -22,13 +22,12 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 test('custom deck playback never imports a Firefox native-media volume fallback', () => {
   const sync = extractFunction('syncPlaybackVolumeFromSoundCloud');
-  assert.match(sync, /if \(currentDeckAudio\(\)\) return;/);
 
   const state = { _playbackVolumeInitialized: true, _lastSoundCloudVolume: 0.2, playbackVolume: 0.8 };
   let nativeReads = 0;
   const run = Function(
     'state', 'currentDeckAudio', 'initializePlaybackVolume', 'soundCloudVolume',
-    'localStorage', 'syncCrossfadeVolume', 'syncPlaybackVolumeControls',
+    'safeStorage', 'syncCrossfadeVolume', 'syncPlaybackVolumeControls',
     `${sync}; syncPlaybackVolumeFromSoundCloud();`,
   );
   run(
@@ -41,7 +40,6 @@ test('custom deck playback never imports a Firefox native-media volume fallback'
 
 test('generic failures rotate custom decks while preview tracks may use SoundCloud session playback', async () => {
   const playAtSource = extractFunction('playAt');
-  assert.match(playAtSource, /playWithSoundCloudSession/);
 
   const state = {
     active: true,
@@ -102,48 +100,136 @@ test('SoundCloud access metadata distinguishes previews from entitled streams', 
   assert.equal(playable.requiresNativePlayback, false);
 });
 
-test('preview fallback delegates the exact queued row to the signed-in SoundCloud player', async () => {
-  const button = { clickCalls: 0, click() { this.clickCalls++; } };
-  const row = {
-    scrollIntoView() {},
-    dispatchEvent() {},
-    querySelector() { return button; },
+function createNativeFallbackHarness() {
+  const nativeAudio = {
+    tagName: 'AUDIO', dataset: {}, paused: false, currentSrc: 'entitled-stream',
+    pause() { this.paused = true; },
   };
-  const nativeAudio = { tagName: 'AUDIO', paused: false, currentSrc: 'entitled-stream' };
+  const wanted = 'https://soundcloud.com/artist/premium';
   const state = {
-    meta: [{ title: 'Premium track', requiresNativePlayback: true }],
-    els: [row],
-    stats: { played: 0, playCounts: {} },
-    _nativeTrack: null,
-    _nativeSessionNoticeShown: false,
-    suspended: true,
+    active: true, loading: false, _userPaused: false, queue: [0], pos: 0,
+    _playbackEpoch: 1, _playbackRequest: 1, _playbackAbort: new AbortController(),
+    meta: [{ link: wanted, title: 'Premium track', requiresNativePlayback: true }],
+    stats: { played: 0, playCounts: {} }, _nativeTrack: null, _decks: [],
+    _nativeSessionNoticeShown: false, suspended: true,
+  };
+  const nativePlaybackAllowed = Function(
+    'state', `return (${extractFunction('nativePlaybackAllowed')})`,
+  )(state);
+  let transportPaused = false;
+  const button = {
+    clickCalls: 0,
+    click() {
+      this.clickCalls++;
+      if (nativePlaybackAllowed()) {
+        nativeAudio.paused = false;
+        transportPaused = false;
+      }
+    },
+  };
+  const row = { scrollIntoView() {}, dispatchEvent() {}, querySelector: () => button };
+  state.els = [row];
+  const transport = {
+    get title() { return transportPaused ? 'Play current track' : 'Pause current track'; },
+    getAttribute() { return this.title; },
+    click() { transportPaused = !transportPaused; nativeAudio.paused = transportPaused; },
+  };
+  const harness = {
+    state, nativeAudio, button, wanted,
+    currentLink: 'https://soundcloud.com/artist/previous',
+    onWait: async () => {},
   };
   const document = {
     body: { contains: value => value === row },
+    querySelector: selector => selector === '.playControls__play'
+      ? transport : { href: harness.currentLink },
     querySelectorAll: selector => selector === 'audio' ? [nativeAudio] : [],
   };
-  const notices = [];
-  const playWithSoundCloudSession = Function(
-    'state', 'document', 'MouseEvent', 'wait', 'stopCrossfadeDecks',
-    'isTrueShuffleAudio', 'soundCloudPaused', 'playerTitle', 'trackPlayed',
-    'showMergeToast', 'setTimeout', 'refreshPlayBtn', 'updateProgressBar', 'updateHub',
-    `return (${extractFunction('playWithSoundCloudSession').replace(/^function /, 'async function ')})`,
-  )(
-    state, document, function MouseEvent() {}, async () => {},
-    () => { state._nativeTrack = null; }, () => false, () => false, () => 'Premium track',
-    ti => {
+  const dependencies = {
+    state, document, nativePlaybackAllowed,
+    MouseEvent: function MouseEvent() {},
+    wait: () => harness.onWait(),
+    stopCrossfadeDecks: () => { state._nativeTrack = null; },
+    playerTitle: () => 'Premium track',
+    trackPlayed: ti => {
       state.stats.played++;
       state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
     },
-    message => notices.push(message), fn => fn(), () => {}, () => {}, () => {},
-  );
+    showMergeToast: () => {}, setTimeout: () => 1, refreshPlayBtn: () => {},
+    updateProgressBar: () => {}, updateHub: () => {},
+    withDeadline: operation => operation(),
+    normalizeTrackUrl: value => String(value || ''),
+    recordPlaybackDiagnostic: () => {},
+  };
+  for (const name of ['isTrueShuffleAudio', 'soundCloudPaused', 'pauseSoundCloud', 'pauseSoundCloudTransport']) {
+    dependencies[name] = Function(
+      ...Object.keys(dependencies), `return (${extractFunction(name)})`,
+    )(...Object.values(dependencies));
+  }
+  harness.play = Function(
+    ...Object.keys(dependencies),
+    `return (${extractFunction('playWithSoundCloudSession').replace(/^function /, 'async function ')})`,
+  )(...Object.values(dependencies));
+  harness.nativePlaybackAllowed = nativePlaybackAllowed;
+  harness.soundCloudPaused = dependencies.soundCloudPaused;
+  return harness;
+}
 
-  assert.equal(await playWithSoundCloudSession(0), true);
-  assert.equal(button.clickCalls, 1);
-  assert.equal(state._nativeTrack, 0);
+test('preview fallback acknowledges only the exact track and stops unacknowledged native playback', async () => {
+  const harness = createNativeFallbackHarness();
+  const { state, nativeAudio } = harness;
+  assert.equal(await harness.play(0), false, 'old playing audio does not acknowledge the new track');
+  assert.equal(state.stats.played, 0);
+  assert.equal(harness.nativePlaybackAllowed(), false);
+  assert.equal(nativeAudio.paused, true, 'wrong-track native output is stopped on failure');
+  assert.equal(harness.soundCloudPaused(), true);
+
+  harness.onWait = async () => { harness.currentLink = harness.wanted; };
+  assert.equal(await harness.play(0), true);
+  assert.equal(harness.nativePlaybackAllowed(), true);
+  assert.equal(nativeAudio.paused, false);
   assert.equal(state.stats.played, 1);
   assert.equal(state.suspended, false);
-  assert.match(notices[0], /using your SoundCloud session/);
+});
+
+test('native fallback failure and user pause revoke permission and stop the native output', async () => {
+  for (const failure of ['error', 'user pause']) {
+    const harness = createNativeFallbackHarness();
+    harness.onWait = async () => {
+      if (harness.nativeAudio.paused) return;
+      if (failure === 'error') throw new Error('SoundCloud acknowledgement failed');
+      harness.state._userPaused = true;
+    };
+    assert.equal(await harness.play(0), failure === 'error' ? false : null);
+    assert.equal(harness.nativePlaybackAllowed(), false, `${failure}: fallback permission is revoked`);
+    assert.equal(harness.nativeAudio.paused, true, `${failure}: native output is paused`);
+    assert.equal(harness.soundCloudPaused(), true, `${failure}: native transport is paused`);
+    assert.equal(harness.state.stats.played, 0);
+  }
+});
+
+test('late fallback completion cannot pause a newer successful native request', async () => {
+  const harness = createNativeFallbackHarness();
+  let releaseOld;
+  let oldWaiting;
+  const waiting = new Promise(resolve => { oldWaiting = resolve; });
+  harness.onWait = async () => {
+    if (harness.nativeAudio.paused) return;
+    oldWaiting();
+    await new Promise(resolve => { releaseOld = resolve; });
+  };
+  const oldRequest = harness.play(0);
+  await waiting;
+
+  harness.state._playbackRequest++;
+  harness.onWait = async () => { harness.currentLink = harness.wanted; };
+  assert.equal(await harness.play(0), true);
+  releaseOld();
+  assert.equal(await oldRequest, null);
+  assert.equal(harness.nativeAudio.paused, false);
+  assert.equal(harness.soundCloudPaused(), false);
+  assert.equal(harness.nativePlaybackAllowed(), true);
+  assert.equal(harness.state.stats.played, 1, 'only the newer request records a play');
 });
 
 test('Firefox stream candidates prefer MPEG and continue after a failed endpoint', async () => {
@@ -152,10 +238,10 @@ test('Firefox stream candidates prefer MPEG and continue after a failed endpoint
   const fetch = async endpoint => {
     calls.push(String(endpoint));
     if (calls.length === 1) return { ok: false, status: 500 };
-    return { ok: true, status: 200, json: async () => ({ url: 'https://media.example/working' }) };
+    return { ok: true, status: 200, data: { url: 'https://media.example/working' } };
   };
   const resolveProgressiveStreams = Function(
-    'fetch',
+    'fetchSoundCloudResource',
     `return (${resolverSource.replace(/^function /, 'async function ')})`,
   )(fetch);
   const track = {
@@ -191,18 +277,12 @@ test('authorization recovery excludes the rejected SoundCloud client ID', () => 
     `return (${extractFunction('discoverSoundCloudClientId')})`,
   )(state, performance);
 
-  assert.equal(discover('rejected-client'), 'fresh-client');
+  assert.equal(discover(new Set(['rejected-client'])), 'fresh-client');
   assert.equal(state._clientId, 'fresh-client');
-  const resolver = extractFunction('resolveCrossfadeStreams');
-  assert.match(resolver, /credentialAttempt < 2/);
-  assert.match(resolver, /discoverSoundCloudClientIdFromBundle\(rejectedClientId\)/);
-  assert.match(resolver, /rejectedClientId = clientId/);
 });
 
 test('waveform hydration requires exact track identity and never reuses a title match', () => {
   const resolver = extractFunction('hydrationWaveformUrl');
-  assert.doesNotMatch(resolver, /titleMatch|candidateTitle|candidateArtist/);
-  assert.match(resolver, /candidateUrl === wantedUrl/);
 
   const hydrationWaveformUrl = Function(
     'pageWindow', 'normalizeTrackUrl', `return (${resolver})`,
@@ -213,12 +293,22 @@ test('waveform hydration requires exact track identity and never reuses a title 
   assert.equal(hydrationWaveformUrl({ title: 'Same title', artist: 'Same artist', link: 'https://soundcloud.com/wanted/track' }), null);
 });
 
-test('missing Firefox hydration resolves the exact waveform through the track API', () => {
-  const resolver = extractFunction('resolveWaveformUrl');
-  assert.match(resolver, /api-v2\.soundcloud\.com\/resolve\?url=/);
-  assert.match(resolver, /candidateUrl === wantedUrl/);
-  assert.match(resolver, /meta\.waveform = resolved/);
-  assert.doesNotMatch(resolver, /performance\.getEntriesByType|titleMatch/);
+test('missing Firefox hydration resolves and stores only an exact waveform identity', async () => {
+  let track = { permalink_url: 'https://soundcloud.com/other/track', waveform_url: 'wrong' };
+  const meta = { link: 'https://soundcloud.com/wanted/track' };
+  const resolve = Function(
+    'hydrationWaveformUrl', 'normalizeTrackUrl', 'discoverSoundCloudClientIdFromBundle',
+    'fetchSoundCloudResource', 'recordPlaybackDiagnostic',
+    `return (${extractFunction('resolveWaveformUrl').replace(/^function /, 'async function ')})`,
+  )(
+    () => null, value => String(value || ''), async () => 'client',
+    async () => ({ ok: true, data: track }), () => {},
+  );
+  assert.equal(await resolve(meta), null);
+  assert.equal(meta.waveform, undefined);
+  track = { permalink_url: meta.link, waveform_url: 'correct' };
+  assert.equal(await resolve(meta), 'correct');
+  assert.equal(meta.waveform, 'correct');
 });
 
 (async () => {

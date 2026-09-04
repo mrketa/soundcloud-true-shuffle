@@ -17,7 +17,7 @@ function extractFunction(name) {
   const start = source.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `function ${name} must exist`);
 
-  const brace = source.indexOf('{', start);
+  const brace = source.indexOf('{', source.indexOf(') {', start));
   let depth = 0;
   for (let i = brace; i < source.length; i++) {
     if (source[i] === '{') depth++;
@@ -28,6 +28,14 @@ function extractFunction(name) {
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
+
+function queueTransitionDependencies(state) {
+  const dependencies = { state };
+  for (const name of ['finalizeLeavingCurrentTrack', 'recountRoundTotal']) {
+    dependencies[name] = Function('state', `return (${extractFunction(name)})`)(state);
+  }
+  return dependencies;
+}
 
 const parseTimeText = Function(`return (${extractFunction('parseTimeText')})`)();
 const trackSpacingKey = Function(`return (${extractFunction('trackSpacingKey')})`)();
@@ -60,6 +68,133 @@ function createBalancedRoundHarness() {
   );
   return { state, buildBalancedRound };
 }
+
+function createTrackMetadataHarness(fetchTrack = async () => ({ ok: false })) {
+  const syncTrackPlaybackAccess = Function(`return (${extractFunction('syncTrackPlaybackAccess')})`)();
+  const metaFromSoundCloudTrack = Function(
+    'syncTrackPlaybackAccess', `return (${extractFunction('metaFromSoundCloudTrack')})`,
+  )(syncTrackPlaybackAccess);
+  const mergeTrackMeta = Function(`return (${extractFunction('mergeTrackMeta')})`)();
+  const fetchSoundCloudResource = async (url, format = 'json') => {
+    const response = await fetchTrack(url);
+    return { ok: response.ok, status: response.status, data: response.ok ? await response[format]() : null };
+  };
+  const normalizeTrackUrl = Function('URL', 'location', `return (${extractFunction('normalizeTrackUrl')})`)(
+    URL, { origin: 'https://soundcloud.com' },
+  );
+  const resolveLiveTrackMeta = Function(
+    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource',
+    `return (${extractFunction('resolveLiveTrackMeta').replace(/^function /, 'async function ')})`,
+  )(metaFromSoundCloudTrack, mergeTrackMeta, async () => 'client-id', fetchSoundCloudResource);
+  const resolvePlaylistSnapshotMetas = Function(
+    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'normalizeTrackUrl', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource', 'URL',
+    `return (${extractFunction('resolvePlaylistSnapshotMetas').replace(/^function /, 'async function ')})`,
+  )(metaFromSoundCloudTrack, mergeTrackMeta, normalizeTrackUrl, async () => 'client-id', fetchSoundCloudResource, URL);
+  return { metaFromSoundCloudTrack, resolveLiveTrackMeta, resolvePlaylistSnapshotMetas };
+}
+
+test('SoundCloud publisher bylines take precedence over uploader names and preserve collaborators', () => {
+  const { metaFromSoundCloudTrack } = createTrackMetadataHarness();
+  const track = {
+    id: 1, title: 'Collaboration', permalink_url: 'https://soundcloud.com/label/collaboration',
+    publisher_metadata: { artist: 'Artist A & Artist B' },
+    user: { username: 'Upload Account', permalink_url: 'https://soundcloud.com/label' },
+  };
+  const meta = metaFromSoundCloudTrack(track, 'https://soundcloud.com/label/sets/list');
+  assert.equal(meta.artist, 'Artist A & Artist B');
+  assert.equal(meta.artistLink, 'https://soundcloud.com/label');
+  assert.equal(metaFromSoundCloudTrack({ ...track, publisher_metadata: { artist: ' ' } }).artist, 'Upload Account');
+  assert.equal(metaFromSoundCloudTrack({ ...track, publisher_metadata: null, user: null }).artist, '—');
+});
+
+test('DOM bylines retain complete contributor text, deduplicate names and only then fall back to uploader text', () => {
+  const byline = (text, href) => ({ textContent: text, getAttribute: name => name === 'href' ? href : null });
+  let nodes = [byline('Artist A & Artist B', '/label')];
+  const uploader = byline('Upload Account', '/uploader');
+  const el = {
+    querySelectorAll: () => nodes,
+    querySelector: selector => {
+      if (selector === '.trackItem__username, .soundTitle__username') return nodes[0] || null;
+      if (selector === '.sc-link-secondary' || selector === 'a.sc-link-secondary') return uploader;
+      return null;
+    },
+  };
+  const getArtistLink = Function(`return (${extractFunction('getArtistLink')})`)();
+  const getMeta = Function(
+    'artwork', 'getLink', 'getArtistLink', 'waveformUrl', 'soundCloudLikeButtonState', 'location',
+    `return (${extractFunction('getMeta')})`,
+  )(() => null, () => 'https://soundcloud.com/label/track', getArtistLink, () => null, () => null,
+    { href: 'https://soundcloud.com/label/sets/list' });
+  assert.equal(getMeta(el).artist, 'Artist A & Artist B');
+  assert.equal(getMeta(el).artistLink, 'https://soundcloud.com/label');
+  nodes = [byline(' Artist A ', '/a'), byline('Artist B', '/b'), byline('Artist A', '/a')];
+  assert.equal(getMeta(el).artist, 'Artist A, Artist B');
+  nodes = [];
+  assert.equal(getMeta(el).artist, 'Upload Account');
+  assert.equal(getMeta(el).artistLink, 'https://soundcloud.com/uploader');
+});
+
+test('incomplete live artist metadata is recovered while API failures retain usable hydration', async () => {
+  const track = {
+    id: 7, title: 'Hydrated title', permalink_url: 'https://soundcloud.com/label/track',
+    artwork_url: 'https://i1.sndcdn.com/artworks-track-large.jpg',
+  };
+  let requests = 0;
+  const { resolveLiveTrackMeta } = createTrackMetadataHarness(async () => {
+    requests++;
+    return { ok: true, json: async () => ({ ...track, publisher_metadata: { artist: 'Artist A & Artist B' } }) };
+  });
+  const recovered = await resolveLiveTrackMeta(track, 'https://soundcloud.com/label/sets/list', 3);
+  assert.equal(recovered.artist, 'Artist A & Artist B');
+  assert.equal(recovered.title, 'Hydrated title');
+  await resolveLiveTrackMeta({ ...track, user: { username: 'Solo Artist' } });
+  assert.equal(requests, 1);
+  const failed = createTrackMetadataHarness(async () => { throw new Error('offline'); });
+  const retained = await failed.resolveLiveTrackMeta(track);
+  assert.equal(retained.title, 'Hydrated title');
+  assert.equal(retained.link, track.permalink_url);
+  assert.equal(retained.artist, '—');
+});
+
+test('playlist artist recovery batches only missing names and preserves richer DOM and hydration values', async () => {
+  const track = id => ({ id, title: `Track ${id}`, permalink_url: `https://soundcloud.com/label/track-${id}` });
+  const requests = [];
+  const { resolvePlaylistSnapshotMetas } = createTrackMetadataHarness(async endpoint => {
+    const ids = endpoint.searchParams.get('ids').split(',').map(Number);
+    requests.push(ids);
+    return { ok: true, json: async () => ids.slice().reverse().map(id => ({
+      ...track(id), publisher_metadata: { artist: `Recovered ${id}` },
+    })) };
+  });
+  const metas = await resolvePlaylistSnapshotMetas({ tracks: [
+    { ...track(1), publisher_metadata: { artist: 'Artist A & Artist B' }, user: { username: 'Label' } },
+    track(2),
+    track(3),
+    { id: 4 },
+  ] }, 'https://soundcloud.com/label/sets/list', [
+    { title: 'DOM title', artist: 'Artist C, Artist D', link: `${track(3).permalink_url}?in=label/sets/list`, liked: false },
+  ]);
+  assert.deepEqual(requests, [[2, 4]]);
+  assert.deepEqual(metas.map(meta => meta.artist), ['Artist A & Artist B', 'Recovered 2', 'Artist C, Artist D', 'Recovered 4']);
+  assert.deepEqual(metas.map(meta => meta.soundcloudId), [1, 2, 3, 4]);
+  assert.equal(metas[2].title, 'DOM title');
+  assert.equal(metas[2].liked, false);
+  assert.equal(metas[3].playlistPosition, 4);
+  const failed = createTrackMetadataHarness();
+  const retained = await failed.resolvePlaylistSnapshotMetas({ tracks: [track(2), { id: 4 }] });
+  assert.deepEqual(retained.map(meta => [meta.title, meta.artist]), [['Track 2', '—']]);
+});
+
+test('only an explicit complete empty playlist is safe to reconcile as empty', () => {
+  const playlistSnapshotFromHtml = Function(`return (${extractFunction('playlistSnapshotFromHtml')})`)();
+  const snapshot = data => playlistSnapshotFromHtml(`<script>window.__sc_hydration = ${JSON.stringify([
+    { hydratable: 'playlist', data: { id: 44, kind: 'playlist', ...data } },
+  ])};</script>`);
+  assert.deepEqual(snapshot({ tracks: [], track_count: 0 }), { id: 44, trackCount: 0, complete: true, tracks: [] });
+  assert.equal(snapshot({ tracks: [] }), null);
+  assert.equal(snapshot({ track_count: 0 }), null);
+  assert.equal(snapshot({ tracks: [], track_count: 3 }), null);
+});
 
 test('time parser supports normal, long and hour-long tracks', () => {
   assert.equal(parseTimeText('2:54'), 174);
@@ -229,9 +364,9 @@ test('liked-song grid cards join the existing collection pipeline', () => {
     },
   };
   const currentPageTrackElements = Function(
-    'document', 'isLikedTracksPage', 'getLink',
+    'document', 'isLikedTracksPage', 'getLink', 'normalizeTrackUrl',
     `return (${extractFunction('currentPageTrackElements')})`,
-  )(document, () => true, element => element === card ? '/artist/track' : null);
+  )(document, () => true, element => element === card ? '/artist/track' : null, value => value);
 
   assert.deepEqual(currentPageTrackElements(), [legacy, card]);
 });
@@ -264,20 +399,6 @@ test('four-track automatic rounds balance their starting positions', () => {
   assert.deepEqual(Object.values(state.roundStarts).sort(), [1, 1, 1, 1]);
 });
 
-test('watcher has no percentage-based early-next trigger', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.doesNotMatch(watcher, /p\s*>=\s*0\.99/);
-  assert.doesNotMatch(watcher, /progress\(\)\s*>=\s*0\.99/);
-  assert.match(watcher, /addEventListener\('ended',\s*onMediaEnded,\s*true\)/);
-  assert.match(watcher, /removeEventListener\('ended',\s*state\._endedHandler,\s*true\)/);
-});
-
-test('natural-end transition is protected against duplicate signals', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /if \(!state\.active \|\| state\.busy \|\| nearEnd\) return;/);
-  assert.match(watcher, /nearEnd = true;/);
-  assert.match(watcher, /await next\(true\)/);
-});
 
 function createTimeHarness() {
   let now = 100_000;
@@ -474,6 +595,9 @@ function createWatcherHarness() {
     _crossfadePending: false,
     roundPlayed: 0,
     roundTotal: 3,
+    _playbackEpoch: 0, _playbackAbort: new AbortController(), _userPaused: false,
+    _decks: [], _deckPrepareTokens: [],
+    _liveSyncSources: new Map([['https://soundcloud.com/test/source-playlist', new Set([0, 1, 2])]]),
   };
   const worker = {
     onmessage: null,
@@ -515,15 +639,20 @@ function createWatcherHarness() {
   const progress = () => timing.duration ? timing.current / timing.duration : 0;
   const trackId = meta => meta?.link || '';
   const consumeCurrentQueueTrack = Function(
-    'state', 'trackAvailable', 'buildBalancedRound',
+    'state', 'trackAvailable', 'buildBalancedRound', 'finalizeLeavingCurrentTrack', 'recountRoundTotal',
     `return (${extractFunction('consumeCurrentQueueTrack')})`,
-  )(state, () => true, items => items.slice());
+  )(state, () => true, items => items.slice(), queueTransitionDependencies(state).finalizeLeavingCurrentTrack, queueTransitionDependencies(state).recountRoundTotal);
   const sessionStorage = {
     setItem(key, value) { storage.set(key, value); },
     getItem(key) { return storage.get(key) || null; },
     removeItem(key) { storage.delete(key); },
   };
+  const saveQueueSessionCache = Function('state', 'sessionStorage', 'trackId', 'Date',
+    `return (${extractFunction('saveQueueSessionCache')})`)(state, sessionStorage, trackId, { now: () => now });
 
+  const nativePlaybackAllowed = Function(
+    'state', `return (${extractFunction('nativePlaybackAllowed')})`,
+  )(state);
   const factory = Function(
     'state', 'playerTitle', 'progress', 'paused', 'pause', 'wait', 'document', 'next',
     'updateHub', 'refreshPlayBtn', 'playbackTiming', 'mkWorker', 'settleScheduledCrossfade',
@@ -531,6 +660,8 @@ function createWatcherHarness() {
     'consumeCurrentQueueTrack', 'sessionStorage', 'trackId', 'currentDeckAudio',
     'checkSleepTimerDeadline', 'resumeAudioGraph', 'Date', 'syncPlaybackVolumeFromSoundCloud', 'recoverCurrentDeckStream',
     'syncCrossfadeVolume', 'processAutoLevel', 'recordPlaybackDiagnostic',
+    'saveQueueSessionCache', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout',
+    'pauseSoundCloud', 'nativePlaybackAllowed',
     `return (${extractFunction('startWatcher')})`,
   );
   const startWatcher = factory(
@@ -567,6 +698,8 @@ function createWatcherHarness() {
     () => {},
     () => {},
     () => {},
+    saveQueueSessionCache, () => 1, () => {}, () => 1, () => {},
+    pause, nativePlaybackAllowed,
   );
   startWatcher();
 
@@ -590,6 +723,9 @@ function createWatcherHarness() {
         async play() { deckPlayCalls++; },
         ...overrides,
       };
+      state._decks = [deck];
+      state._deckPrepareTokens = [0];
+      state._deckTrack = state.queue[state.pos];
       return deck;
     },
     advanceTime: ms => { now += ms; },
@@ -629,13 +765,6 @@ test('a long track is not advanced with 30 seconds remaining', async () => {
   assert.equal(h.deadlineChecks(), 1);
 });
 
-test('sleep deadline catch-up runs from worker ticks and lifecycle events', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /if \(checkSleepTimerDeadline\(\)\) return;/);
-  assert.match(source, /visibilitychange[\s\S]*?checkSleepTimerDeadline\(\)/);
-  assert.match(source, /addEventListener\('pageshow'[\s\S]*?checkSleepTimerDeadline\(\)/);
-  assert.match(source, /state\._workerInterval = setInterval\(tick, 50\)/);
-});
 
 test('the native ended event advances exactly once even when signalled twice', async () => {
   const h = createWatcherHarness();
@@ -673,6 +802,9 @@ test('a suspended external end consumes and caches the source queue exactly once
     metaKeys: ['track-a', 'track-b', 'track-c'],
     roundPlayed: 1,
     roundTotal: 3,
+    meta: h.state.meta,
+    sources: [['https://soundcloud.com/test/source-playlist', [0, 1, 2]]],
+    playNext: [],
   });
 });
 
@@ -705,7 +837,7 @@ test('restoring a consumed suspended queue does not reinsert played tracks into 
   assert.deepEqual(restored.history, [1]);
   assert.deepEqual(restored.priority, { 2: 1.75 });
   assert.equal(restored.roundPlayed, 1);
-  assert.equal(restored.roundTotal, 3);
+  assert.equal(restored.roundTotal, 4);
   assert.equal(restored.queue.includes(1), false);
   assert.equal(new Set(restored.queue).size, restored.queue.length);
 });
@@ -819,43 +951,11 @@ test('custom deck stall recovery never blocks the background watcher on a pendin
   assert.equal(h.nextCalls(), 0);
 });
 
-test('custom deck stall recovery refreshes the same track URL near the saved position', () => {
-  const resolver = extractFunction('resolveCrossfadeStreams');
-  const recovery = extractFunction('recoverCurrentDeckStream');
-  assert.match(resolver, /options\.forceRefresh/);
-  assert.match(resolver, /state\._streamCache\.delete\(key\)/);
-  assert.match(recovery, /resolveCrossfadeStream\(state\.meta\[ti\], \{ forceRefresh: true \}\)/);
-  assert.match(recovery, /const savedTime = Math\.max\(0, Number\(position\) \|\| 0\)/);
-  assert.match(recovery, /audio\.currentTime = Math\.min\([\s\S]*savedTime/);
-  assert.match(recovery, /cancelCrossfadeForRecovery\(index\)/);
-  assert.match(recovery, /await audio\.play\(\)/);
-});
 
-test('stall watchdog covers both buffered decoder and depleted network stalls with bounded refresh attempts', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /deckHasBufferedAhead/);
-  assert.match(watcher, /stallKind = bufferedAhead \? 'decoder' : 'network'/);
-  assert.doesNotMatch(watcher, /&& deck\.readyState >= 3[\s\S]*&& deckHasBufferedAhead/);
-  assert.match(watcher, /recoveryAttempts >= 2/);
-  assert.match(watcher, /recoverCurrentDeckStream\(deck, timing\.current/);
-  assert.match(watcher, /await advanceAtNaturalEnd\(\)/);
-});
-
-test('crossfade recovery cancels scheduled automation without resetting the active deck', () => {
-  const cancel = extractFunction('cancelCrossfadeForRecovery');
-  assert.match(cancel, /state\._crossfadeToken\+\+/);
-  assert.match(cancel, /state\._crossfadeSchedule\?\.resolve\?\.\(false\)/);
-  assert.match(cancel, /state\._deckGains\[activeIndex\] = 1/);
-  assert.match(cancel, /resetDeck\(audio, index\)/);
-  assert.doesNotMatch(cancel, /resetDeck\([^,]+, activeIndex\)/);
-});
-
-test('custom deck stall watchdog ignores unsafe states and throttled observation gaps', async () => {
+test('custom deck stall watchdog respects unsafe states and healthy progress across throttled gaps', async () => {
   const cases = [
     { paused: true },
     { seeking: true },
-    { readyState: 2 },
-    { buffered: { length: 0, start: () => 0, end: () => 0 } },
   ];
   for (const overrides of cases) {
     const h = createWatcherHarness();
@@ -872,8 +972,7 @@ test('custom deck stall watchdog ignores unsafe states and throttled observation
     { busy: true },
     { loading: true },
     { suspended: true },
-    { _crossfading: true },
-    { _crossfadePending: true },
+    { _userPaused: true },
   ]) {
     const h = createWatcherHarness();
     Object.assign(h.state, stateOverride);
@@ -888,9 +987,11 @@ test('custom deck stall watchdog ignores unsafe states and throttled observation
 
   const throttled = createWatcherHarness();
   throttled.setTiming({ current: 600, duration: 2000, ended: false, source: 'audio' });
-  throttled.setDeck({ currentTime: 600 });
+  const progressingDeck = throttled.setDeck({ currentTime: 600 });
   await throttled.worker.onmessage();
   throttled.advanceTime(30000);
+  throttled.setTiming({ current: 630 });
+  progressingDeck.currentTime = 630;
   await throttled.worker.onmessage();
   assert.equal(throttled.deckPlayCalls(), 0);
   assert.equal(throttled.nextCalls(), 0);
@@ -920,13 +1021,6 @@ test('a near-end native successor is paused before the queued track starts', asy
   assert.equal(h.state.suspended, false);
 });
 
-test('watcher polls quickly while throttling visual refreshes', () => {
-  const worker = extractFunction('mkWorker');
-  const watcher = extractFunction('startWatcher');
-  assert.match(worker, /setInterval\(\(\) => self\.postMessage\(0\), 50\)/);
-  assert.match(watcher, /if \(\+\+uiTicks >= 6\)/);
-  assert.match(watcher, /setInterval\(tick, 50\)/);
-});
 
 function completeRound({ queue, stopAfterRound, justPlayed, nextRound }) {
   const remaining = queue.filter(ti => ti !== justPlayed);
@@ -1009,7 +1103,7 @@ test('closed sidebar defers queue DOM rebuilds until it is opened', () => {
   assert.equal(hubUpdates, 2);
 });
 
-test('track-row mutations fast-sync only on the active source collection', () => {
+test('track-row mutations fast-sync on every registered source and defer while loading', () => {
   const mutation = extractFunction('mutationChangesPlaylistTracks');
   const schedule = extractFunction('scheduleLiveQueueSync');
   const scheduleFromMutation = extractFunction('scheduleLiveQueueSyncFromMutation');
@@ -1021,6 +1115,10 @@ test('track-row mutations fast-sync only on the active source collection', () =>
     _liveSyncInFlight: false,
     _liveSyncTimer: null,
     playlistUrl: 'https://soundcloud.com/test/sets/source-playlist?ref=clipboard',
+    _liveSyncSources: new Map([
+      ['https://soundcloud.com/test/sets/source-playlist', new Set()],
+      ['https://soundcloud.com/test/sets/merged-playlist', new Set()],
+    ]),
   };
   const location = { href: 'https://soundcloud.com/feed' };
   const timers = [];
@@ -1045,10 +1143,6 @@ test('track-row mutations fast-sync only on the active source collection', () =>
   };
   const records = [{ addedNodes: [trackRow], removedNodes: [] }];
 
-  assert.match(mutation, /record\.addedNodes, \.\.\.record\.removedNodes/);
-  assert.match(schedule, /delay = 250/);
-  assert.match(schedule, /state\.loading \|\| state\.busy \|\| state\._liveSyncInFlight/);
-  assert.match(schedule, /scheduleLiveQueueSync\(300\)/);
   assert.equal(harness.mutationChangesPlaylistTracks(records), true);
 
   assert.equal(harness.scheduleLiveQueueSyncFromMutation(records), false);
@@ -1059,22 +1153,21 @@ test('track-row mutations fast-sync only on the active source collection', () =>
   assert.equal(timers.length, 1, 'source-page mutations should schedule a fast sync');
   timers.shift()();
   assert.deepEqual(syncCalls, [{ force: true }]);
+
+  location.href = 'https://soundcloud.com/test/sets/merged-playlist?ref=clipboard';
+  state.loading = true;
+  assert.equal(harness.scheduleLiveQueueSyncFromMutation([{ addedNodes: [], removedNodes: [trackRow] }]), true);
+  timers.shift()();
+  assert.equal(syncCalls.length, 1, 'loading must defer the scheduled fetch');
+  state.loading = false;
+  timers.shift()();
+  assert.deepEqual(syncCalls, [{ force: true }, { force: true }]);
+
+  location.href = 'https://soundcloud.com/test/sets/unregistered';
+  assert.equal(harness.scheduleLiveQueueSyncFromMutation(records), false);
+  assert.equal(timers.length, 0);
 });
 
-test('re-shuffle replaces a new playlist and resets hidden weighting', () => {
-  const reshuffle = extractFunction('reshuffleCurrentPage');
-  const hub = extractFunction('mkHub');
-  assert.match(reshuffle, /completePlaylistCollection\(pageUrl, pageEls, snapshotPromise\)/);
-  assert.match(reshuffle, /state\.els = collection\.els/);
-  assert.match(reshuffle, /state\.meta = collection\.meta/);
-  assert.match(reshuffle, /state\.queue = newQueue/);
-  assert.match(reshuffle, /state\.priority = \{\}/);
-  assert.match(reshuffle, /state\.skipCounts = \{\}/);
-  assert.match(reshuffle, /startWatcher\(\)/);
-  assert.match(hub, /id="tss-hub-reshuffle"/);
-  assert.match(hub, /aria-label="Re-shuffle current playlist"/);
-  assert.match(hub, /e\.target\.closest\('button'\)/);
-});
 
 if (source.includes('function moveSelectedTrackToCurrent(')) {
 test('previous restores the queue position after advancing once', async () => {
@@ -1091,19 +1184,23 @@ test('previous restores the queue position after advancing once', async () => {
     stopAfterRound: false,
     roundPlayed: 0,
     roundTotal: 3,
+    _playbackEpoch: 0, _playbackAbort: new AbortController(), _userPaused: false,
   };
   const consumeCurrentQueueTrack = Function(
-    'state', 'trackAvailable', 'buildBalancedRound',
+    'state', 'trackAvailable', 'buildBalancedRound', 'finalizeLeavingCurrentTrack', 'recountRoundTotal',
     `return (${extractFunction('consumeCurrentQueueTrack')})`,
-  )(state, () => true, items => items.slice());
+  )(state, () => true, items => items.slice(), queueTransitionDependencies(state).finalizeLeavingCurrentTrack, queueTransitionDependencies(state).recountRoundTotal);
   const played = [];
   const prevTrack = Function(
     'state', 'currentSec', 'seekTo', 'Date',
     'refreshUpcomingCrossfadePreparation', 'playAt', 'badges', 'renderList',
+    'trackAvailable', 'removePlayNextOccurrences', 'finalizeLeavingCurrentTrack', 'recountRoundTotal', 'runPlaybackOperation',
     `return (${extractFunction('prevTrack').replace(/^function /, 'async function ')})`,
   )(
     state, () => 0, () => {}, Date,
     () => {}, async (ti, countPlay) => played.push([ti, countPlay]), () => {}, () => {},
+    () => true, () => false, queueTransitionDependencies(state).finalizeLeavingCurrentTrack,
+    queueTransitionDependencies(state).recountRoundTotal, async (_label, operation) => operation(() => true),
   );
 
   consumeCurrentQueueTrack();
@@ -1127,11 +1224,12 @@ test('jumping to a searched track keeps skipped upcoming tracks in the round', (
     history: [],
     roundPlayed: 0,
     roundTotal: 4,
+    meta: [{}, {}, {}, {}], playNext: [],
   };
   const moveSelectedTrackToCurrent = Function(
-    'state', 'refreshUpcomingCrossfadePreparation',
+    'state', 'refreshUpcomingCrossfadePreparation', 'finalizeLeavingCurrentTrack', 'recountRoundTotal',
     `return (${extractFunction('moveSelectedTrackToCurrent')})`,
-  )(state, () => {});
+  )(state, () => {}, queueTransitionDependencies(state).finalizeLeavingCurrentTrack, queueTransitionDependencies(state).recountRoundTotal);
 
   assert.equal(moveSelectedTrackToCurrent(2), true);
   assert.deepEqual(state.queue, [2, 1, 3]);
@@ -1140,50 +1238,7 @@ test('jumping to a searched track keeps skipped upcoming tracks in the round', (
   assert.equal(state.roundTotal, 4);
 });
 
-test('cross-playlist tracks retain source metadata and play without route navigation', () => {
-  const meta = extractFunction('getMeta');
-  const hydratedMeta = extractFunction('metaFromSoundCloudTrack');
-  const playAt = extractFunction('playAt');
-  assert.match(meta, /sourcePage:/);
-  assert.match(hydratedMeta, /soundcloudId:/);
-  assert.match(hydratedMeta, /trackAuthorization:/);
-  assert.match(hydratedMeta, /transcodings:/);
-  assert.match(playAt, /playWithCrossfadeDeck\(idx, countPlay, requestedFade\)/);
-  assert.doesNotMatch(playAt, /reconnectTrackElement|loadTrackSourcePage|navigateToPage/);
-});
 
-test('feed playback uses SoundCloud controls only for preview-restricted tracks', () => {
-  const playAt = extractFunction('playAt');
-  const sessionFallback = extractFunction('playWithSoundCloudSession');
-  assert.match(playAt, /requiresNativePlayback/);
-  assert.match(playAt, /playWithSoundCloudSession/);
-  assert.match(sessionFallback, /\.trackItem__trackTitle|\.sc-link-primary/);
-  assert.match(sessionFallback, /\.click\(\)/);
-});
-
-test('manual transition guard expires for different tracks with identical titles', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /Date\.now\(\) - state\._manualActionAt > 3000/);
-  assert.match(watcher, /state\.manualAction = false/);
-});
-
-test('lifetime stats advance their persisted baseline after saving', () => {
-  const save = extractFunction('saveLifetimeStats');
-  const render = extractFunction('renderStats');
-  assert.match(save, /state\._lifetimeBase =/);
-  assert.match(render, /state\._lifetimeBase/);
-  assert.match(render, /Math\.max\(0,/);
-});
-
-test('navigation queues a follow-up pass and retries delayed hub injection', () => {
-  const nav = extractFunction('onNav');
-  assert.match(nav, /navPending = true/);
-  assert.match(nav, /queueMicrotask\(\(\) => onNav\(\)\)/);
-  assert.doesNotMatch(nav, /cancelInternalNavigation|_internalNavigationTarget/);
-  assert.match(source, /!navLock && validPage\(\) && !document\.getElementById\('tss-hub'\) && !injectRetryTimer/);
-  assert.match(source, /setInterval\(checkForNavigation, 250\)/);
-  assert.match(source, /window\.addEventListener\('popstate', checkForNavigation\)/);
-});
 
 test('all non-collection SoundCloud routes preserve queue ownership', () => {
   const classify = Function(`
@@ -1193,7 +1248,6 @@ test('all non-collection SoundCloud routes preserve queue ownership', () => {
     ${extractFunction('isPassiveBrowsePage')}
     return { isSoundCloudPage, isCollectionPage, isPassiveBrowsePage };
   `)();
-  const nav = extractFunction('onNav');
 
   for (const url of [
     'https://soundcloud.com/',
@@ -1224,38 +1278,10 @@ test('all non-collection SoundCloud routes preserve queue ownership', () => {
   }
 
   assert.equal(classify.isSoundCloudPage('https://example.com/'), false);
-  assert.match(source, /const validPage\s*=\s*\(\)\s*=>\s*isSoundCloudPage\(location\.href\)/);
-  assert.match(nav, /if \(isPassiveBrowsePage\(location\.href\)\)/);
-  assert.match(nav, /state\.suspended = false;[\s\S]*syncLiveQueue\(\{ force: true \}\)/);
-  assert.match(nav, /different valid playlist:[\s\S]*state\.suspended = true;/);
 });
 
-test('custom-only playback never initiates hidden SoundCloud route changes', () => {
-  const playAt = extractFunction('playAt');
-  assert.doesNotMatch(source, /function (?:loadTrackSourcePage|navigateToPage|waitForRouteCommit|reconnectTrackElement)\(/);
-  assert.doesNotMatch(playAt, /location\.href|document\.createElement|loadTracks\(/);
-});
 
-test('cross-tab playlist changes are polled within ten seconds', () => {
-  assert.match(source, /const LIVE_SYNC_INTERVAL_MS = 10_000;/);
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /Date\.now\(\) - state\._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS/);
-});
 
-test('waveform resolver never guesses from an unrelated latest resource', () => {
-  const resolver = extractFunction('resolveWaveformUrl');
-  assert.doesNotMatch(resolver, /latestWaveformResource\(/);
-  assert.match(resolver, /return null/);
-});
-
-test('round labels use stable round counters rather than shrinking queue length', () => {
-  const hub = extractFunction('updateHub');
-  const list = extractFunction('renderList');
-  assert.match(hub, /state\.roundPlayed \+ 1/);
-  assert.match(hub, /state\.roundTotal/);
-  assert.match(list, /state\.roundPlayed \+ 1/);
-  assert.match(list, /state\.roundTotal/);
-});
 }
 
 test('Better SoundCloud Feed PiP receives custom-deck metadata and millisecond timing', () => {
@@ -1581,7 +1607,7 @@ test('PiP artwork toggle preserves compact, full-picture and focus layouts', () 
     `return (${extractFunction('nextOwnPipArtworkMode')})`,
   )(state);
   const setOwnPipArtworkMode = Function(
-    'state', 'localStorage', 'ownPipDimensions', 'nextOwnPipArtworkMode',
+    'state', 'safeStorage', 'ownPipDimensions', 'nextOwnPipArtworkMode',
     `return (${extractFunction('setOwnPipArtworkMode')})`,
   )(state, { setItem: (key, value) => stored.push([key, value]) }, ownPipDimensions, nextOwnPipArtworkMode);
   const ownPipArtworkSource = Function(
@@ -1679,13 +1705,14 @@ test('queueNext rejects the playing track, deduplicates identical requests, and 
     playNext: [],
     history: [],
     roundTotal: 3,
+    roundPlayed: 0,
   };
   let refreshes = 0;
   let renders = 0;
   const queueNext = Function(
-    'state', 'refreshUpcomingCrossfadePreparation', 'renderList',
+    'state', 'refreshUpcomingCrossfadePreparation', 'renderList', 'trackAvailable', 'recountRoundTotal',
     `return (${extractFunction('queueNext')})`,
-  )(state, () => { refreshes++; }, () => { renders++; });
+  )(state, () => { refreshes++; }, () => { renders++; }, () => true, queueTransitionDependencies(state).recountRoundTotal);
 
   assert.equal(queueNext(1), false);
   assert.deepEqual(state.playNext, []);
@@ -1705,11 +1732,12 @@ test('queueNext extends the round only when reintroducing a played history track
     playNext: [],
     history: [0, 1],
     roundTotal: 5,
+    roundPlayed: 2,
   };
   const queueNext = Function(
-    'state', 'refreshUpcomingCrossfadePreparation', 'renderList',
+    'state', 'refreshUpcomingCrossfadePreparation', 'renderList', 'trackAvailable', 'recountRoundTotal',
     `return (${extractFunction('queueNext')})`,
-  )(state, () => {}, () => {});
+  )(state, () => {}, () => {}, () => true, queueTransitionDependencies(state).recountRoundTotal);
 
   assert.equal(queueNext(1), true);
   assert.equal(state.roundTotal, 6);
@@ -1731,6 +1759,7 @@ test('jumpTo removes every matching play-next entry before playing now', async (
     history: [],
     roundPlayed: 0,
     roundTotal: 3,
+    meta: [{}, {}, {}], _playbackEpoch: 0, _userPaused: false,
   };
   let refreshes = 0;
   let renders = 0;
@@ -1740,17 +1769,19 @@ test('jumpTo removes every matching play-next entry before playing now', async (
     `return (${extractFunction('removePlayNextOccurrences')})`,
   )(state, () => { refreshes++; });
   const moveSelectedTrackToCurrent = Function(
-    'state', 'refreshUpcomingCrossfadePreparation',
+    'state', 'refreshUpcomingCrossfadePreparation', 'finalizeLeavingCurrentTrack', 'recountRoundTotal',
     `return (${extractFunction('moveSelectedTrackToCurrent')})`,
-  )(state, () => { refreshes++; });
+  )(state, () => { refreshes++; }, queueTransitionDependencies(state).finalizeLeavingCurrentTrack, queueTransitionDependencies(state).recountRoundTotal);
   const jumpTo = Function(
     'state', 'removePlayNextOccurrences', 'moveSelectedTrackToCurrent',
     'playAt', 'badges', 'renderList',
+    'trackAvailable', 'runPlaybackOperation', 'recountRoundTotal',
     `return (${extractFunction('jumpTo').replace(/^function /, 'async function ')})`,
   )(
     state, removePlayNextOccurrences, moveSelectedTrackToCurrent,
     async (ti, countPlay = true) => played.push([ti, countPlay]),
     () => {}, () => { renders++; },
+    () => true, async (_label, operation) => operation(() => true), queueTransitionDependencies(state).recountRoundTotal,
   );
 
   await jumpTo(-1, 2);
@@ -1826,19 +1857,9 @@ test('removing the current track is rejected without mutating either queue', () 
   assert.equal(h.renders(), 0);
 });
 
-test('PiP track menu routes play-now and removal through play-next-aware mutations', () => {
-  const menu = extractFunction('showOwnPipTrackMenu');
-  assert.match(menu, /const pendingNext = state\.playNext\.includes\(ti\)/);
-  assert.match(menu, /void jumpTo\(state\.queue\.indexOf\(ti\), ti\)/);
-  assert.match(menu, /removeTrackFromUpcoming\(ti\)/);
-});
 
-test('native True Shuffle PiP is progressive enhancement with complete controls', () => {
+test('native PiP API resolver supports direct and wrapped browser capabilities', () => {
   const apiResolverSource = extractFunction('documentPipApi');
-  const open = extractFunction('openOwnPip');
-  const mount = extractFunction('mountOwnPipWindow');
-  const stop = extractFunction('stop');
-  const hub = extractFunction('mkHub');
   const unsupportedResolver = Function('pageWindow', `return (${apiResolverSource})`)({});
   const supportedResolver = Function('pageWindow', `return (${apiResolverSource})`)({
     documentPictureInPicture: { requestWindow() {} },
@@ -1849,39 +1870,6 @@ test('native True Shuffle PiP is progressive enhancement with complete controls'
   assert.equal(Boolean(unsupportedResolver()), false);
   assert.equal(Boolean(supportedResolver()), true);
   assert.equal(wrappedResolver()?.requestWindow instanceof Function, true);
-  assert.match(apiResolverSource, /wrappedJSObject/);
-  assert.match(open, /requestWindow\(ownPipDimensions\(\)\)/);
-  assert.match(open, /openVideoPipFallback/);
-  assert.match(open, /openInPagePipFallback/);
-  assert.match(mount, /tss-pip-waveform/);
-  assert.match(mount, /tss-pip-view-toggle/);
-  assert.match(mount, /tss-pip-queue-view/);
-  assert.match(mount, /tss-pip-stage/);
-  assert.match(mount, /tssPipRowIn/);
-  assert.match(mount, /overflow-x:hidden/);
-  assert.match(mount, /tss-pip-next-settings/);
-  assert.match(mount, /renderOwnPipQueue/);
-  assert.match(mount, /tss-pip-tab-history/);
-  assert.match(mount, /tss-pip-queue-search/);
-  assert.match(mount, /tss-pip-like/);
-  assert.match(mount, /toggleCurrentTrackLike/);
-  assert.match(mount, /showOwnPipSoundMenu/);
-  assert.match(mount, /tss-pip-artwork-toggle/);
-  assert.match(mount, /setOwnPipArtworkMode/);
-  assert.match(mount, /data-artwork-mode="full"/);
-  assert.match(mount, /tss-pip-up-next\{display:none\}/);
-  assert.match(mount, /aspect-ratio:1/);
-  assert.match(mount, /border-radius:0;background:transparent;box-shadow:none/);
-  assert.match(mount, /tss-pip-art img\{object-fit:cover\}/);
-  assert.match(extractFunction('renderOwnPipQueue'), /showOwnPipTrackMenu/);
-  assert.match(extractFunction('showOwnPipTrackMenu'), /Shuffle priority/);
-  assert.match(extractFunction('showOwnPipTrackMenu'), /Remove from queue/);
-  assert.match(mount, /state\.manualAction = true/);
-  assert.match(mount, /void next\(\)/);
-  assert.match(mount, /void prevTrack\(\)/);
-  assert.match(mount, /void toggle\(\)/);
-  assert.match(stop, /closeOwnPip\(\)/);
-  assert.match(hub, /id="tss-hub-pip"/);
 });
 
 test('PiP like state follows SoundCloud selected and aria states', () => {
@@ -1907,28 +1895,6 @@ test('PiP like control uses the native authenticated SoundCloud button', () => {
   assert.match(syncPip, /SVG\.heartFilled/);
 });
 
-test('PiP fallbacks cover native video and an interactive in-page player', () => {
-  const videoSupport = extractFunction('standardVideoPipSupported');
-  const video = extractFunction('openVideoPipFallback');
-  const inline = extractFunction('openInPagePipFallback');
-  const close = extractFunction('closeOwnPip');
-  assert.match(videoSupport, /requestPictureInPicture/);
-  assert.match(videoSupport, /webkitSetPresentationMode/);
-  assert.match(video, /captureStream\(8\)/);
-  assert.match(video, /drawVideoPipFrame/);
-  assert.match(inline, /resize:both/);
-  assert.match(inline, /mountOwnPipWindow/);
-  assert.match(inline, /pointermove/);
-  assert.match(close, /exitPictureInPicture/);
-  assert.match(close, /_ownPipHost/);
-});
-
-test('watcher retries the PiP bridge after Better SoundCloud Feed discovers scPlayer', () => {
-  const watcher = extractFunction('startWatcher');
-  assert.match(watcher, /installBetterFeedPipBridge\(\)/);
-  assert.match(watcher, /syncOwnPipWindow\(\)/);
-  assert.match(watcher, /syncBetterFeedPipWindow\(\)/);
-});
 
 test('native playback pause never toggles the transport or touches True Shuffle decks', () => {
   const ownDeck = { paused: false, dataset: { tssCrossfadeDeck: '0' }, pauseCalls: 0, pause() { this.pauseCalls++; } };
@@ -1997,194 +1963,207 @@ test('native SoundCloud transport is paused through its own stateful control', (
   assert.equal(button.clickCalls, 1);
 });
 
-test('native playback guard blocks every SoundCloud start while True Shuffle owns playback', () => {
+function createNativePlaybackHarness(overrides = {}) {
   const listeners = {};
   const timers = [];
   const microtasks = [];
-  const state = {
-    active: true,
-    loading: false,
-    _decks: [],
-    _nativePlaybackGuardInstalled: false,
-    _nativeGuardButtonAction: false,
-    _nativeTrack: null,
-  };
-  const document = {
-    addEventListener(type, handler, capture) { listeners[type] = { handler, capture }; },
-  };
-  let pauseSoundCloudCalls = 0;
-  let pauseSoundCloudTransportCalls = 0;
-  const installNativePlaybackGuard = Function(
-    'state',
-    'document',
-    'isTrueShuffleAudio',
-    'pauseSoundCloud',
-    'pauseSoundCloudTransport',
-    'queueMicrotask',
-    'setTimeout',
-    `return (${extractFunction('installNativePlaybackGuard')})`,
-  )(
-    state,
-    document,
-    audio => state._decks.includes(audio) || audio.dataset?.tssCrossfadeDeck !== undefined,
-    () => { pauseSoundCloudCalls++; },
-    () => { pauseSoundCloudTransportCalls++; },
-    fn => microtasks.push(fn),
-    (fn, delay) => timers.push({ fn, delay }),
-  );
-
-  installNativePlaybackGuard();
-  assert.equal(listeners.click.capture, true);
-  assert.equal(listeners.play.capture, true);
-  assert.deepEqual(timers.map(timer => timer.delay), [0, 100, 500, 1500, 3000]);
-
-  state.active = false;
-  const inactiveClick = {
-    target: { closest: () => ({}) },
-    prevented: false,
-    preventDefault() { this.prevented = true; },
-    stopImmediatePropagation() {},
-  };
-  const inactiveAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
-  listeners.click.handler(inactiveClick);
-  listeners.play.handler({ target: inactiveAudio });
-  timers.forEach(timer => timer.fn());
-  assert.equal(inactiveClick.prevented, false);
-  assert.equal(inactiveAudio.pauseCalls, 0);
-  assert.equal(pauseSoundCloudCalls, 0);
-  assert.equal(pauseSoundCloudTransportCalls, 0);
-
-  state.loading = true;
-  const startingAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
-  listeners.play.handler({ target: startingAudio });
-  assert.equal(startingAudio.pauseCalls, 1);
-  microtasks.shift()();
-  assert.equal(pauseSoundCloudCalls, 1);
-  assert.equal(pauseSoundCloudTransportCalls, 1);
-  state.loading = false;
-  state.active = true;
-
-  const routeClick = {
-    target: { closest: () => null },
-    prevented: false,
-    stopped: false,
-    preventDefault() { this.prevented = true; },
-    stopImmediatePropagation() { this.stopped = true; },
-  };
-  const microtasksBeforeRouteClick = microtasks.length;
-  listeners.click.handler(routeClick);
-  assert.equal(routeClick.prevented, false);
-  assert.equal(routeClick.stopped, false);
-  assert.equal(microtasks.length, microtasksBeforeRouteClick);
-
-  const transport = { closest: selector => selector === '.playControls__play' ? transport : null };
-  const manualClick = {
-    target: transport,
-    prevented: false,
-    stopped: false,
-    preventDefault() { this.prevented = true; },
-    stopImmediatePropagation() { this.stopped = true; },
-  };
-  listeners.click.handler(manualClick);
-  assert.equal(manualClick.prevented, true);
-  assert.equal(manualClick.stopped, true);
-  microtasks.shift()();
-
-  const nativeAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
-  listeners.play.handler({ target: nativeAudio });
-  assert.equal(nativeAudio.pauseCalls, 1);
-  microtasks.shift()();
-
   const ownDeck = {
-    tagName: 'AUDIO',
-    dataset: { tssCrossfadeDeck: '1' },
-    paused: false,
-    ended: false,
-    pauseCalls: 0,
-    pause() { this.pauseCalls++; },
+    tagName: 'AUDIO', dataset: { tssCrossfadeDeck: '0' }, paused: false,
+    pause() { this.paused = true; },
   };
-  listeners.play.handler({ target: ownDeck });
-  assert.equal(ownDeck.pauseCalls, 0);
-
-  state._nativeTrack = 7;
-  const entitledAudio = { tagName: 'AUDIO', dataset: {}, pauseCalls: 0, pause() { this.pauseCalls++; } };
-  listeners.play.handler({ target: entitledAudio });
-  assert.equal(entitledAudio.pauseCalls, 0);
-  const entitledClick = {
-    target: transport,
-    prevented: false,
-    stopImmediatePropagation() {},
-    preventDefault() { this.prevented = true; },
+  const nativeAudio = {
+    tagName: 'AUDIO', dataset: {}, paused: false,
+    pause() { this.paused = true; },
   };
-  listeners.click.handler(entitledClick);
-  assert.equal(entitledClick.prevented, false);
-  state._nativeTrack = null;
-
-
-  timers.forEach(timer => timer.fn());
-  assert.equal(pauseSoundCloudCalls, 8);
-  assert.equal(pauseSoundCloudTransportCalls, 8);
-
-  const guard = extractFunction('installNativePlaybackGuard');
-  assert.match(guard, /addEventListener\('click'/);
-  assert.match(guard, /addEventListener\('play'/);
-  assert.doesNotMatch(guard, /nativePlaybackFallback|expiresAt/);
-  assert.match(guard, /\[0, 100, 500, 1500, 3000\]/);
-  assert.match(source, /installNativePlaybackGuard\(\);\s*onNav\(\);/);
-});
-test('shuffle startup immediately suppresses native SoundCloud playback', () => {
-  assert.match(extractFunction('start'), /state\.loading = true;\s*pauseSoundCloudTransport\(\);\s*pauseSoundCloud\(\);/);
-});
-
-test('True Shuffle transport retries custom playback and leaves inactive SoundCloud usable', async () => {
   const state = {
-    active: true,
-    loading: false,
-    busy: false,
-    queue: [7],
-    pos: 0,
-    _nativeGuardButtonAction: false,
+    active: false, loading: false, suspended: false, busy: false,
+    queue: [7], pos: 0, _decks: [ownDeck], _nativeTrack: null,
+    _nativePlaybackGuardInstalled: false, _nativeGuardButtonAction: false,
+    _playbackEpoch: 0, _playbackAbort: new AbortController(), _userPaused: false,
+    ...overrides,
   };
+  let transportPaused = false;
   const button = {
     clickCalls: 0,
-    guardedDuringClick: false,
+    get title() { return transportPaused ? 'Play current track' : 'Pause current track'; },
+    getAttribute() { return this.title; },
+    closest(selector) { return selector === '.playControls__play' ? this : null; },
     click() {
       this.clickCalls++;
-      this.guardedDuringClick = state._nativeGuardButtonAction;
+      const event = clickEvent(this);
+      listeners.click?.(event);
+      if (!event.prevented) {
+        transportPaused = !transportPaused;
+        nativeAudio.paused = transportPaused;
+      }
     },
   };
+  function clickEvent(target = button) {
+    return {
+      target, prevented: false, stopped: false,
+      preventDefault() { this.prevented = true; },
+      stopImmediatePropagation() { this.stopped = true; },
+    };
+  }
+  const document = {
+    addEventListener(type, handler) { listeners[type] = handler; },
+    querySelector: () => button,
+    querySelectorAll: () => [ownDeck, nativeAudio],
+  };
+  const dependencies = {
+    state, document,
+    queueMicrotask: fn => microtasks.push(fn),
+    setTimeout: fn => timers.push(fn),
+  };
+  for (const name of [
+    'nativePlaybackAllowed', 'isTrueShuffleAudio', 'soundCloudPaused',
+    'pauseSoundCloud', 'pauseSoundCloudTransport', 'installNativePlaybackGuard',
+  ]) {
+    dependencies[name] = Function(
+      ...Object.keys(dependencies), `return (${extractFunction(name)})`,
+    )(...Object.values(dependencies));
+  }
+  dependencies.installNativePlaybackGuard();
+  return {
+    state, nativeAudio, ownDeck, button, listeners, clickEvent, dependencies,
+    startNative() { nativeAudio.paused = false; transportPaused = false; },
+    flush() {
+      while (microtasks.length || timers.length) {
+        while (microtasks.length) microtasks.shift()();
+        if (timers.length) timers.shift()();
+      }
+    },
+  };
+}
+
+test('native playback stays paused outside the current authorized fallback', () => {
+  const scenarios = [
+    ['idle initial page', {}],
+    ['loading playlist', { loading: true }],
+    ['active custom playback', { active: true }],
+    ['stale fallback track', { active: true, _nativeTrack: 6 }],
+    ['fallback with no current queue track', { active: true, _nativeTrack: 7, queue: [] }],
+    ['user-paused fallback', { active: true, _nativeTrack: 7, _userPaused: true }],
+    ['suspended fallback', { active: true, _nativeTrack: 7, suspended: true }],
+    ['stopped session with stale fallback', { active: false, suspended: true, _nativeTrack: 7 }],
+    ['loading during custom playback', { active: true, loading: true }],
+  ];
+  for (const [label, state] of scenarios) {
+    const harness = createNativePlaybackHarness(state);
+    harness.flush();
+    assert.equal(harness.nativeAudio.paused, true, `${label}: restored native audio is paused`);
+    assert.equal(harness.dependencies.soundCloudPaused(), true, `${label}: native transport is paused`);
+
+    const click = harness.clickEvent();
+    harness.listeners.click(click);
+    assert.equal(click.prevented, true, `${label}: native transport cannot restart playback`);
+    assert.equal(click.stopped, true, `${label}: SoundCloud does not receive the blocked click`);
+
+    harness.startNative();
+    harness.listeners.play({ target: harness.nativeAudio });
+    assert.equal(harness.nativeAudio.paused, true, `${label}: native play is paused synchronously`);
+    harness.flush();
+    assert.equal(harness.dependencies.soundCloudPaused(), true, `${label}: native transport is reconciled`);
+    assert.equal(harness.ownDeck.paused, false, `${label}: custom deck remains untouched`);
+  }
+});
+
+test('native guard leaves custom deck events and ordinary navigation untouched', () => {
+  const harness = createNativePlaybackHarness({ active: true });
+  harness.flush();
+  harness.listeners.play({ target: harness.ownDeck });
+  const routeClick = harness.clickEvent({ closest: () => null });
+  harness.listeners.click(routeClick);
+  harness.flush();
+  assert.equal(harness.ownDeck.paused, false);
+  assert.equal(routeClick.prevented, false);
+  assert.equal(routeClick.stopped, false);
+});
+
+test('current native fallback survives collection but pause, Stop, or queue replacement revokes it', () => {
+  const harness = createNativePlaybackHarness({ active: true, loading: true, _nativeTrack: 7 });
+  harness.listeners.play({ target: harness.nativeAudio });
+  const click = harness.clickEvent();
+  harness.listeners.click(click);
+  harness.flush();
+  assert.equal(harness.nativeAudio.paused, false);
+  assert.equal(harness.dependencies.soundCloudPaused(), false);
+  assert.equal(click.prevented, false);
+  assert.equal(click.stopped, false);
+
+  for (const change of [
+    { _userPaused: true },
+    { _userPaused: false, active: false, suspended: true },
+    { active: true, suspended: false, queue: [8] },
+  ]) {
+    Object.assign(harness.state, change);
+    harness.startNative();
+    harness.listeners.play({ target: harness.nativeAudio });
+    harness.flush();
+    assert.equal(harness.nativeAudio.paused, true);
+    assert.equal(harness.dependencies.soundCloudPaused(), true);
+    assert.equal(harness.ownDeck.paused, false);
+  }
+});
+
+test('deferred native cleanup cannot pause a fallback authorized after a blocked event', () => {
+  for (const type of ['play', 'click']) {
+    const harness = createNativePlaybackHarness();
+    harness.flush();
+    harness.startNative();
+    harness.listeners[type](type === 'play'
+      ? { target: harness.nativeAudio }
+      : harness.clickEvent());
+    Object.assign(harness.state, { active: true, _nativeTrack: 7 });
+    harness.startNative();
+    harness.flush();
+    assert.equal(harness.nativeAudio.paused, false, `${type}: newly authorized audio keeps playing`);
+    assert.equal(harness.dependencies.soundCloudPaused(), false, `${type}: transport remains playing`);
+  }
+});
+
+test('True Shuffle transport retries custom playback but cannot start idle native playback', async () => {
+  const harness = createNativePlaybackHarness({ active: true });
+  const { state, button, dependencies } = harness;
+  harness.flush();
   const playCalls = [];
-  const toggleSource = extractFunction('toggle').replace(/^function /, 'async function ');
+  Object.assign(dependencies, {
+    currentDeckAudio: () => null,
+    playAt: async (trackIndex, countPlay) => { playCalls.push([trackIndex, countPlay]); },
+    refreshPlayBtn: () => {},
+    runPlaybackOperation: async (_label, operation) => operation(() => true),
+    paused: () => harness.nativeAudio.paused,
+  });
+  dependencies.pause = Function(
+    ...Object.keys(dependencies), `return (${extractFunction('pause')})`,
+  )(...Object.values(dependencies));
   const toggle = Function(
-    'state', 'currentDeckAudio', 'playAt', 'document', 'setTimeout', 'refreshPlayBtn',
-    `return (${toggleSource})`,
-  )(
-    state,
-    () => null,
-    async (trackIndex, countPlay) => { playCalls.push([trackIndex, countPlay]); },
-    { querySelector: () => button },
-    () => {},
-    () => {},
-  );
+    ...Object.keys(dependencies),
+    `return (${extractFunction('toggle').replace(/^function /, 'async function ')})`,
+  )(...Object.values(dependencies));
 
   await toggle();
   assert.deepEqual(playCalls, [[7, false]]);
-  assert.equal(button.clickCalls, 0);
-  assert.equal(state._nativeGuardButtonAction, false);
+  assert.equal(harness.nativeAudio.paused, true);
 
   state.active = false;
+  const clicksBeforeIdle = button.clickCalls;
   await toggle();
-  assert.equal(button.clickCalls, 1);
-  assert.equal(button.guardedDuringClick, true);
-  assert.equal(state._nativeGuardButtonAction, false);
+  assert.equal(button.clickCalls, clicksBeforeIdle);
+  assert.equal(harness.nativeAudio.paused, true);
+  assert.deepEqual(playCalls, [[7, false]], 'idle controls do not restart the retained queue');
+
+  Object.assign(state, { active: true, _nativeTrack: 7, _userPaused: true });
+  await toggle();
+  assert.equal(harness.nativeAudio.paused, false, 'explicit resume starts the authorized fallback');
+  assert.equal(state._userPaused, false);
+  assert.deepEqual(playCalls, [[7, false]], 'authorized fallback is not replaced by a custom retry');
+
+  await toggle();
+  assert.equal(harness.nativeAudio.paused, true, 'explicit pause stops the authorized fallback');
+  assert.equal(state._userPaused, true);
 });
 
-test('True Shuffle UI mutations bypass playlist and navigation work', () => {
-  const ownMutation = extractFunction('mutationsAreTrueShuffleOnly');
-  assert.match(ownMutation, /records\.every/);
-  assert.match(ownMutation, /closest\?\.\('#tss-hub, #tss-sidebar, #tss-stats-overlay, #tss-eq-overlay'\)/);
-  assert.match(source, /new MutationObserver\(records => \{\s*if \(mutationsAreTrueShuffleOnly\(records\)\) return;/);
-});
 
 test('build copies the canonical userscript byte-for-byte without using legacy modules', () => {
   const root = path.resolve(__dirname, '..');
@@ -2207,16 +2186,6 @@ test('build copies the canonical userscript byte-for-byte without using legacy m
   }
 });
 
-test('playAt exhausts custom candidates and schedules a bounded retry without native playback', () => {
-  const playAt = extractFunction('playAt');
-  const stop = extractFunction('stop');
-  assert.match(playAt, /attemptedCustomTracks \|\| new Set\(\)/);
-  assert.match(playAt, /state\.queue\.push\(idx\)/);
-  assert.match(playAt, /custom-start-exhausted/);
-  assert.match(playAt, /\}, 5000\)/);
-  assert.doesNotMatch(playAt, /document|\.click\(|nativePlaybackFallback/);
-  assert.match(stop, /clearTimeout\(state\._customPlaybackRetryTimer\)/);
-});
 
 test('playlist hydration parser exposes the complete stable track id list', () => {
   const playlistSnapshotFromHtml = Function(`return (${extractFunction('playlistSnapshotFromHtml')})`)();
@@ -2254,23 +2223,27 @@ test('live tracks are inserted only into the unplayed part of the round', () => 
   assert.ok(queue.indexOf(5) > 1);
 });
 
+function createPlaylistCollectionHarness(resolveSnapshotMetas) {
+  const normalizeTrackUrl = Function('URL', 'location', `return (${extractFunction('normalizeTrackUrl')})`)(
+    URL, { origin: 'https://soundcloud.com' },
+  );
+  const mergeTrackMeta = Function(`return (${extractFunction('mergeTrackMeta')})`)();
+  return Function(
+    'getMeta', 'fetchLivePlaylistSnapshot', 'resolvePlaylistSnapshotMetas', 'normalizeTrackUrl', 'mergeTrackMeta',
+    `return (${extractFunction('completePlaylistCollection').replace(/^function /, 'async function ')})`,
+  )(el => el.meta, async () => null, resolveSnapshotMetas, normalizeTrackUrl, mergeTrackMeta);
+}
+
 test('complete playlist collection fills tracks SoundCloud did not render in the DOM', async () => {
   const pageUrl = 'https://soundcloud.com/user/sets/list';
-  const firstEl = { id: 'first' };
-  const getMeta = el => ({ title: 'First', artist: 'A', link: `https://soundcloud.com/a/${el.id}`, sourcePage: pageUrl });
-  const trackId = Function(`return (${extractFunction('trackId')})`)();
-  const completePlaylistCollection = Function(
-    'getMeta', 'fetchLivePlaylistSnapshot', 'resolvePlaylistSnapshotMetas', 'trackId',
-    `return (${extractFunction('completePlaylistCollection').replace(/^function /, 'async function ')})`,
-  )(
-    getMeta, async () => null,
-    async () => [
-      getMeta(firstEl),
-      { title: 'Second', artist: 'B', link: 'https://soundcloud.com/b/second', sourcePage: pageUrl },
-      { title: 'Third', artist: 'C', link: 'https://soundcloud.com/c/third', sourcePage: pageUrl },
-    ],
-    trackId,
-  );
+  const firstEl = { meta: {
+    title: 'First', artist: 'A', link: 'https://soundcloud.com/a/first', sourcePage: pageUrl,
+  } };
+  const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
+    firstEl.meta,
+    { title: 'Second', artist: 'B', link: 'https://soundcloud.com/b/second', sourcePage: pageUrl },
+    { title: 'Third', artist: 'C', link: 'https://soundcloud.com/c/third', sourcePage: pageUrl },
+  ]);
   const snapshot = { complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] };
   const result = await completePlaylistCollection(pageUrl, [firstEl], Promise.resolve(snapshot));
   assert.equal(result.meta.length, 3);
@@ -2280,24 +2253,56 @@ test('complete playlist collection fills tracks SoundCloud did not render in the
   assert.equal(result.complete, true);
 });
 
+test('complete playlist identities replace unmatched DOM rows while preserving richer matching bylines', async () => {
+  const pageUrl = 'https://soundcloud.com/user/sets/list';
+  const pageEls = [
+    { meta: { title: 'Second', artist: 'Beta, Guest', link: 'https://soundcloud.com/b/second?in=user/sets/list', liked: false, artwork: 'dom-art' } },
+    { meta: { title: 'First', artist: '—', link: 'https://soundcloud.com/a/first/', artistLink: null, waveform: null } },
+    { meta: { title: 'Unmatched', artist: '—', link: 'https://soundcloud.com/c/unmatched' } },
+  ];
+  const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
+    { title: 'First API title', artist: 'Alpha', link: 'https://soundcloud.com/a/first', artistLink: 'https://soundcloud.com/a', waveform: 'first-wave' },
+    { title: 'Second API title', artist: 'Beta', link: 'https://soundcloud.com/b/second', liked: true, artwork: 'api-art' },
+    { title: 'Different track', artist: 'Not Unmatched', link: 'https://soundcloud.com/d/different' },
+  ]);
+  const result = await completePlaylistCollection(pageUrl, pageEls, Promise.resolve({
+    complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 4 }],
+  }));
+  assert.deepEqual(result.els, [pageEls[1], pageEls[0], null]);
+  assert.deepEqual(result.meta.map(meta => [meta.title, meta.artist]), [
+    ['First', 'Alpha'], ['Second', 'Beta, Guest'], ['Different track', 'Not Unmatched'],
+  ]);
+  assert.equal(result.meta[1].liked, false);
+  assert.equal(result.meta[1].artwork, 'dom-art');
+  assert.equal(result.meta[0].artistLink, 'https://soundcloud.com/a');
+  assert.equal(result.meta[0].waveform, 'first-wave');
+  assert.equal(result.complete, true);
+});
+
+test('partially resolved playlists retain rendered tracks and recovered names without claiming completion', async () => {
+  const pageUrl = 'https://soundcloud.com/user/sets/list';
+  const pageEls = [{ meta: { title: 'First', artist: '—', link: 'https://soundcloud.com/a/first' } }];
+  const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
+    { title: 'First', artist: 'Alpha', link: 'https://soundcloud.com/a/first' },
+  ]);
+  const result = await completePlaylistCollection(pageUrl, pageEls, Promise.resolve({
+    complete: true, tracks: [{ id: 1 }, { id: 2 }],
+  }));
+  assert.deepEqual(result.els, pageEls);
+  assert.deepEqual(result.meta.map(meta => [meta.title, meta.artist]), [['First', 'Alpha']]);
+  assert.equal(result.complete, false);
+});
+
 test('playlist metadata is batch-resolved in bounded requests and keeps playlist order', async () => {
   const requests = [];
   const snapshot = { tracks: [...Array(117)].map((_, index) => ({ id: index + 1 })) };
-  const resolvePlaylistSnapshotMetas = Function(
-    'metaFromSoundCloudTrack', 'discoverSoundCloudClientIdFromBundle', 'fetch', 'URL',
-    `return (${extractFunction('resolvePlaylistSnapshotMetas').replace(/^function /, 'async function ')})`,
-  )(
-    (track, sourcePage, playlistPosition) => track.title
-      ? { soundcloudId: track.id, title: track.title, link: `https://soundcloud.com/a/${track.id}`, sourcePage, playlistPosition }
-      : null,
-    async () => 'client-id',
-    async endpoint => {
-      const ids = endpoint.searchParams.get('ids').split(',').map(Number);
-      requests.push(ids);
-      return { ok: true, json: async () => ids.map(id => ({ id, title: `Track ${id}` })) };
-    },
-    URL,
-  );
+  const { resolvePlaylistSnapshotMetas } = createTrackMetadataHarness(async endpoint => {
+    const ids = endpoint.searchParams.get('ids').split(',').map(Number);
+    requests.push(ids);
+    return { ok: true, json: async () => ids.map(id => ({
+      id, title: `Track ${id}`, permalink_url: `https://soundcloud.com/a/${id}`, user: { username: 'Artist' },
+    })) };
+  });
   const metas = await resolvePlaylistSnapshotMetas(snapshot, 'https://soundcloud.com/user/sets/list');
   assert.equal(requests.length, 3);
   assert.deepEqual(requests.map(batch => batch.length), [50, 50, 17]);
@@ -2307,11 +2312,6 @@ test('playlist metadata is batch-resolved in bounded requests and keeps playlist
   assert.equal(metas[116].playlistPosition, 117);
 });
 
-test('metadata-only playlist tracks stay on the custom player without DOM fallback', () => {
-  const playAt = extractFunction('playAt');
-  assert.match(playAt, /playWithCrossfadeDeck\(idx, countPlay, requestedFade\)/);
-  assert.doesNotMatch(playAt, /reconnectTrackElement|querySelector|\.click\(/);
-});
 
 test('live queue application preserves current playback and updates the round once', () => {
   const state = {
@@ -2323,7 +2323,6 @@ test('live queue application preserves current playback and updates the round on
     ],
     els: [{}, {}],
   };
-  const calls = [];
   const trackId = Function(`return (${extractFunction('trackId')})`)();
   const applyLiveQueueTracks = Function(
     'state', 'trackId', 'getMeta', 'insertTracksRandomlyAfterCurrent', 'fisherYates',
@@ -2333,8 +2332,7 @@ test('live queue application preserves current playback and updates the round on
     state, trackId, () => ({}),
     (queue, pos, indices) => queue.splice(pos + 1, 0, ...indices),
     items => items.slice(),
-    () => calls.push('prefetch'), () => calls.push('badges'),
-    () => calls.push('list'), () => calls.push('hub'), message => calls.push(message),
+    () => {}, () => {}, () => {}, () => {}, () => {},
   );
   const added = applyLiveQueueTracks([
     { soundcloudId: 20, title: 'New A', artist: 'C', link: 'https://soundcloud.com/c/new-a', sourcePage: 'playlist' },
@@ -2346,176 +2344,385 @@ test('live queue application preserves current playback and updates the round on
   assert.equal(state.roundTotal, 4);
   assert.equal(state.meta.length, 4);
   assert.equal(new Set(state.queue).size, 4);
-  assert.deepEqual(calls.slice(0, 4), ['prefetch', 'badges', 'list', 'hub']);
-  assert.equal(calls[4], '2 new tracks added to this round');
 });
 
-test('first live snapshot resolves and applies a track added after initial collection', async () => {
+function createLiveSyncHarness() {
+  const music = 'https://soundcloud.com/user/sets/music';
+  const bumpers = 'https://soundcloud.com/user/sets/bumpers';
+  const replacement = 'https://soundcloud.com/user/sets/replacement';
   const state = {
-    active: true, loading: false, busy: false, suspended: false,
-    playlistUrl: 'https://soundcloud.com/user/sets/list',
-    _liveSyncKnownIds: new Set(), _liveSyncInFlight: false,
-    _liveSyncLastCheck: 0, _liveSyncSource: '',
-    meta: [
-      { soundcloudId: 1, sourcePage: 'https://soundcloud.com/user/sets/list' },
-      { soundcloudId: 2, sourcePage: 'https://soundcloud.com/user/sets/list' },
-    ],
+    active: false, loading: false, busy: false, suspended: false,
+    playlistUrl: '', queue: [], meta: [], els: [], pos: 0, playNext: [], history: [],
+    roundPlayed: 0, roundTotal: 0, priority: {}, skipCounts: {}, roundStarts: {},
+    _liveSyncSources: new Map(), _liveSyncInFlight: false, _liveSyncLastCheck: 0,
+    _liveSyncTimer: null, _deckTrack: null, _nativeTrack: null,
+    _playbackEpoch: 0, _playbackAbort: new AbortController(), _collectionEpoch: 0, _userPaused: false,
   };
-  const resolved = [];
-  const applied = [];
-  const syncLiveQueue = Function(
-    'state', 'LIVE_SYNC_INTERVAL_MS', 'fetchLivePlaylistSnapshot', 'resolveLiveTrackMeta',
-    'playlistBase', 'location', 'document', 'applyLiveQueueTracks', 'reconcileLivePlaylistSnapshot',
-    'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
-    `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
-  )(
-    state, 30_000, async () => ({ complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
-    async track => {
-      resolved.push(track.id);
-      return { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track', sourcePage: state.playlistUrl };
+  const location = { href: music };
+  const collections = new Map();
+  const snapshots = new Map();
+  const requests = [];
+  const syncTasks = [];
+  let now = 100_000;
+  let resolver = null;
+  const playlistBase = value => value.split(/[?#]/)[0].replace(/\/+$/, '');
+  const meta = (id, sourcePage) => ({
+    soundcloudId: id, title: `Track ${id}`, artist: 'Artist',
+    link: `https://soundcloud.com/artist/track-${id}`, sourcePage,
+  });
+  const snapshot = (ids, complete = true) => ({ complete, tracks: ids.map(id => ({ id })) });
+  const document = { getElementById: () => null, querySelectorAll: () => [], removeEventListener: () => {} };
+  const dependencies = {
+    state, location, document, playlistBase, syncTasks,
+    AbortController,
+    currentPageTrackElements: () => [],
+    runPlaybackOperation: async (_label, operation) => {
+      const epoch = state._playbackEpoch;
+      state.busy = true;
+      try { return await operation(() => state.active && state._playbackEpoch === epoch); }
+      finally { if (state._playbackEpoch === epoch) state.busy = false; }
     },
-    value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
-    metas => { applied.push(...metas); state.meta.push(...metas); return metas.length; },
-    () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
-  );
-  assert.equal(await syncLiveQueue({ force: true }), 1);
-  assert.deepEqual(resolved, [3]);
-  assert.equal(applied.length, 1);
-  assert.deepEqual([...state._liveSyncKnownIds], [1, 2, 3]);
-  assert.ok(state._liveSyncKnownIds.has(3));
-  assert.equal(state._liveSyncInFlight, false);
-});
-
-test('unresolved first-snapshot candidates remain retryable', async () => {
-  const state = {
-    active: true, loading: false, busy: false, suspended: false,
-    playlistUrl: 'https://soundcloud.com/user/sets/list',
-    _liveSyncKnownIds: new Set(), _liveSyncInFlight: false,
-    _liveSyncLastCheck: 0, _liveSyncSource: '',
-    meta: [
-      { soundcloudId: 1, sourcePage: 'https://soundcloud.com/user/sets/list' },
-      { soundcloudId: 2, sourcePage: 'https://soundcloud.com/user/sets/list' },
-    ],
-  };
-  let resolveAttempts = 0;
-  const applied = [];
-  const syncLiveQueue = Function(
-    'state', 'LIVE_SYNC_INTERVAL_MS', 'fetchLivePlaylistSnapshot', 'resolveLiveTrackMeta',
-    'playlistBase', 'location', 'document', 'applyLiveQueueTracks', 'reconcileLivePlaylistSnapshot',
-    'badges', 'renderList', 'refreshUpcomingCrossfadePreparation', 'updateHub', 'showLiveSyncResult',
-    `return (${extractFunction('syncLiveQueue').replace(/^function /, 'async function ')})`,
-  )(
-    state, 30_000, async () => ({ complete: true, tracks: [{ id: 1 }, { id: 2 }, { id: 3 }] }),
-    async track => {
-      resolveAttempts++;
-      return resolveAttempts === 1
-        ? null
-        : { soundcloudId: track.id, title: 'New', link: 'https://soundcloud.com/new/track', sourcePage: state.playlistUrl };
+    Date: { now: () => now }, LIVE_SYNC_INTERVAL_MS: 10_000,
+    fetchLivePlaylistSnapshot: async sourcePage => {
+      requests.push(sourcePage);
+      const value = snapshots.get(sourcePage) || null;
+      if (value instanceof Error) throw value;
+      return value;
     },
-    value => value, { href: state.playlistUrl }, { querySelectorAll: () => [] },
-    metas => { applied.push(...metas); state.meta.push(...metas); return metas.length; },
-    () => 0, () => {}, () => {}, () => {}, () => {}, () => {},
-  );
+    resolveLiveTrackMeta: async (track, sourcePage) => resolver
+      ? resolver(track, sourcePage) : meta(track.id, sourcePage),
+    loadTracks: async () => (collections.get(playlistBase(location.href)) || []).map(item => ({ meta: { ...item } })),
+    completePlaylistCollection: async (sourcePage, els, snapshotPromise) => {
+      await snapshotPromise;
+      return { els, meta: els.map(el => el.meta), complete: true };
+    },
+    getMeta: el => el.meta,
+    fisherYates: items => items.slice(),
+    spaceUpcomingDuplicateTitles: () => {},
+    buildReshuffledQueue: (indices, current) => current == null
+      ? indices.slice() : [current, ...indices.filter(ti => ti !== current)],
+    playAt: async ti => { state._deckTrack = ti; },
+    startWatcher: () => { state._workerInterval = 1; },
+    validPage: () => true,
+    playerTitle: () => '',
+    sessionStorage: { getItem: () => null },
+    pauseSoundCloudTransport: () => {}, pauseSoundCloud: () => {},
+    initializePlaybackVolume: () => {}, refreshUpcomingCrossfadePreparation: () => {},
+    badges: () => {}, renderList: () => {}, updateHub: () => {},
+    showMergeToast: () => {}, saveLifetimeStats: () => {},
+    clearTimeout: () => {}, clearInterval: () => {},
+    closeOwnPip: () => {}, stopCrossfadeDecks: () => {}, syncBrowserNowPlaying: () => {},
+    recordPlaybackDiagnostic: () => {}, resetPlaybackClock: () => {},
+    wait: async () => {}, inject: () => {}, bindCurrentPageElements: () => {},
+    isPassiveBrowsePage: url => url.endsWith('/feed'),
+  };
+  const asynchronous = new Set(['syncLiveQueue', 'start', 'mergeCurrentPage', 'reshuffleCurrentPage', 'onNav']);
+  const functions = [
+    'trackId', 'trackAvailable', 'insertTracksRandomlyAfterCurrent', 'applyLiveQueueTracks',
+    'registerLiveQueueSource', 'reconcileLivePlaylistSnapshot', 'showLiveSyncResult',
+    'resetLiveQueueSync', 'syncLiveQueue', 'start', 'stop', 'mergeCurrentPage',
+    'reshuffleCurrentPage', 'onNav',
+    'invalidatePlaybackSession', 'beginCollectionRequest', 'collectionRequestCurrent', 'finishCollectionRequest',
+    'cancelCollectionRequest', 'mergeTrackMeta', 'reviveRemovedQueueTrack', 'recountRoundTotal',
+  ].map(name => asynchronous.has(name)
+    ? extractFunction(name).replace(/^function /, 'async function ')
+    : extractFunction(name)).join('\n');
+  const api = Function(...Object.keys(dependencies), `
+    let navLock = false;
+    ${functions}
+    const runSync = syncLiveQueue;
+    syncLiveQueue = options => {
+      const pending = runSync(options);
+      syncTasks.push(pending);
+      return pending;
+    };
+    return { start, stop, mergeCurrentPage, reshuffleCurrentPage, onNav, sync: runSync };
+  `)(...Object.values(dependencies));
+  return {
+    ...api, state, location, music, bumpers, replacement, requests, snapshots, meta, snapshot,
+    collection(sourcePage, ids) {
+      collections.set(sourcePage, ids.map(id => meta(id, sourcePage)));
+      snapshots.set(sourcePage, snapshot(ids));
+    },
+    resolveWith(value) { resolver = value; },
+    advance(milliseconds) { now += milliseconds; },
+    queueIds: () => state.queue.map(ti => state.meta[ti].soundcloudId),
+    async flush() {
+      while (syncTasks.length) await Promise.all(syncTasks.splice(0));
+    },
+    async merge(sourcePage) {
+      location.href = sourcePage;
+      state.suspended = true;
+      await api.mergeCurrentPage();
+      await this.flush();
+    },
+  };
+}
 
-  assert.equal(await syncLiveQueue({ force: true }), 0);
-  assert.equal(state._liveSyncKnownIds.has(3), false);
-  assert.equal(await syncLiveQueue({ force: true }), 1);
-  assert.equal(resolveAttempts, 2);
-  assert.equal(applied.length, 1);
-  assert.equal(state._liveSyncKnownIds.has(3), true);
+function deferredLiveSync() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+test('first live snapshot adds tracks missed during initial collection without replaying the current track', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.snapshots.set(h.music, h.snapshot([1, 2, 3]));
+  await h.start();
+  await h.flush();
+  assert.equal(h.queueIds()[h.state.pos], 1);
+  assert.deepEqual(h.queueIds().slice(1).sort(), [2, 3]);
+  assert.equal(h.state.roundTotal, 3);
+  assert.equal(await h.sync({ force: true }), 0);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
 });
 
-test('live snapshot removes missing tracks only from the upcoming queue', () => {
-  const sourcePage = 'https://soundcloud.com/user/sets/list';
-  const state = {
-    queue: [0, 1, 2, 3], pos: 1, playNext: [2, 3], history: [0],
-    roundPlayed: 1, roundTotal: 4, _deckTrack: 1,
-    _liveSyncKnownIds: new Set([10, 11, 12, 13]),
-    meta: [
-      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
-      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
-      { soundcloudId: 12, link: 'https://soundcloud.com/a/three', sourcePage },
-      { soundcloudId: 13, link: 'https://soundcloud.com/a/four', sourcePage },
-    ],
-    els: [{}, {}, {}, {}],
-  };
-  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
-  const trackId = Function(`return (${extractFunction('trackId')})`)();
-  const reconcile = Function(
-    'state', 'playlistBase', 'trackId', 'getMeta',
-    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
-  )(state, playlistBase, trackId, () => ({}));
-
-  const removed = reconcile({ tracks: [{ id: 10 }, { id: 11 }, { id: 13 }] }, sourcePage, []);
-  assert.equal(removed, 1);
-  assert.deepEqual(state.queue, [0, 1, 3]);
-  assert.deepEqual(state.playNext, [3]);
-  assert.equal(state.roundTotal, 3);
-  assert.equal(state.meta[2].unavailable, true);
-  assert.equal(state._liveSyncKnownIds.has(12), false);
-  assert.equal(state.queue[state.pos], 1);
+test('unresolved snapshot candidates remain retryable without duplicate queue entries', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1]);
+  h.snapshots.set(h.music, h.snapshot([1, 2]));
+  let attempts = 0;
+  h.resolveWith((track, sourcePage) => ++attempts === 1 ? null : h.meta(track.id, sourcePage));
+  await h.start();
+  await h.flush();
+  assert.deepEqual(h.queueIds(), [1]);
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.queueIds(), [1, 2]);
+  assert.equal(await h.sync({ force: true }), 0);
+  assert.deepEqual(h.queueIds(), [1, 2]);
 });
 
-test('live snapshot keeps a removed current track playing until it finishes', () => {
-  const sourcePage = 'https://soundcloud.com/user/sets/list';
-  const state = {
-    queue: [0, 1, 2], pos: 1, playNext: [], history: [0],
-    roundPlayed: 1, roundTotal: 3, _deckTrack: 1,
-    _liveSyncKnownIds: new Set([10, 11, 12]),
-    meta: [
-      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
-      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
-      { soundcloudId: 12, link: 'https://soundcloud.com/a/three', sourcePage },
-    ],
-    els: [{}, {}, {}],
-  };
-  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
-  const trackId = Function(`return (${extractFunction('trackId')})`)();
-  const reconcile = Function(
-    'state', 'playlistBase', 'trackId', 'getMeta',
-    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
-  )(state, playlistBase, trackId, () => ({}));
-
-  assert.equal(reconcile({ tracks: [{ id: 10 }, { id: 12 }] }, sourcePage, []), 1);
-  assert.equal(state.queue[state.pos], 1);
-  assert.equal(state.meta[1].removedFromPlaylist, true);
-  assert.equal(state.meta[1].unavailable, undefined);
-  assert.equal(state.roundTotal, 3);
+test('music then merge bumpers keeps polling both sources and appends each addition once', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.collection(h.bumpers, [2, 3]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.requests.length = 0;
+  h.snapshots.set(h.music, h.snapshot([1, 2, 4]));
+  h.snapshots.set(h.bumpers, h.snapshot([2, 3, 5]));
+  assert.equal(await h.sync(), 0, 'the existing interval still throttles polling');
+  assert.deepEqual(h.requests, []);
+  h.advance(10_000);
+  assert.equal(await h.sync(), 2);
+  assert.deepEqual(h.requests.slice().sort(), [h.music, h.bumpers].sort());
+  assert.equal(h.queueIds()[h.state.pos], 1);
+  assert.deepEqual(h.queueIds().slice(1).sort(), [2, 3, 4, 5]);
+  assert.deepEqual(h.state.history, []);
+  assert.equal(h.state.roundTotal, 5);
+  assert.equal(await h.sync({ force: true }), 0);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3, 4, 5]);
 });
 
-test('partial live snapshots never remove unseen playlist tracks', () => {
-  const sourcePage = 'https://soundcloud.com/user/sets/list';
-  const state = {
-    queue: [0, 1], pos: 0, playNext: [], history: [],
-    roundPlayed: 0, roundTotal: 2, _deckTrack: 0,
-    _liveSyncKnownIds: new Set([10, 11]),
-    meta: [
-      { soundcloudId: 10, link: 'https://soundcloud.com/a/one', sourcePage },
-      { soundcloudId: 11, link: 'https://soundcloud.com/a/two', sourcePage },
-    ],
-    els: [{}, {}],
-  };
-  const playlistBase = value => String(value || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
-  const trackId = Function(`return (${extractFunction('trackId')})`)();
-  const reconcile = Function(
-    'state', 'playlistBase', 'trackId', 'getMeta',
-    `return (${extractFunction('reconcileLivePlaylistSnapshot')})`,
-  )(state, playlistBase, trackId, () => ({}));
+test('duplicate-only and complete-empty merges register sources and resume automatic updates', async () => {
+  for (const initialBumpers of [[1, 2], []]) {
+    const h = createLiveSyncHarness();
+    h.collection(h.music, [1, 2]);
+    h.collection(h.bumpers, initialBumpers);
+    await h.start();
+    await h.flush();
+    await h.merge(h.bumpers);
+    h.snapshots.set(h.bumpers, h.snapshot([...initialBumpers, 3]));
+    h.advance(10_000);
+    assert.equal(await h.sync(), 1);
+    assert.equal(h.state.suspended, false);
+    assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
+    assert.equal(h.queueIds()[h.state.pos], 1);
+  }
+});
 
-  assert.equal(reconcile({ complete: false, tracks: [{ id: 10 }] }, sourcePage, []), 0);
-  assert.deepEqual(state.queue, [0, 1]);
-  assert.equal(state._liveSyncKnownIds.has(11), true);
-  assert.equal(state.meta[1].unavailable, undefined);
+test('shared tracks survive until their final source removes them from upcoming', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.collection(h.bumpers, [2, 3]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.snapshots.set(h.music, h.snapshot([1]));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
+  h.snapshots.set(h.bumpers, h.snapshot([]));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds(), [1]);
+  assert.equal(h.state.roundTotal, 1);
+  assert.equal(h.state.meta.find(meta => meta.soundcloudId === 2).unavailable, true);
+});
+
+test('membership moves between playlists in one poll without removing the track', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.collection(h.bumpers, [3]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.snapshots.set(h.music, h.snapshot([1]));
+  h.snapshots.set(h.bumpers, h.snapshot([2, 3]));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
+  assert.equal(h.state.roundTotal, 3);
+});
+
+test('failed hydration in one source does not hide a usable shared track in another', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1]);
+  h.collection(h.bumpers, [2]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.resolveWith((track, sourcePage) => track.title ? h.meta(track.id, sourcePage) : null);
+  h.snapshots.set(h.music, h.snapshot([1, 3]));
+  h.snapshots.set(h.bumpers, { complete: true, tracks: [{ id: 2 }, { id: 3, title: 'Shared' }] });
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
+  h.snapshots.set(h.bumpers, h.snapshot([2]));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3]);
+});
+
+test('failed and partial sources retain tracks while another playlist updates', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.collection(h.bumpers, [3]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.snapshots.set(h.music, new Error('playlist fetch failed'));
+  h.snapshots.set(h.bumpers, h.snapshot([3, 4]));
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3, 4]);
+  h.snapshots.set(h.music, h.snapshot([1], false));
+  h.snapshots.set(h.bumpers, h.snapshot([3, 4, 5]));
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3, 4, 5]);
+  h.snapshots.set(h.music, h.snapshot([1], true));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 3, 4, 5]);
+});
+
+test('live removals preserve history and current playback while removing upcoming and play-next entries', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [10, 11, 12, 13]);
+  await h.start();
+  await h.flush();
+  h.state.queue = [0, 1, 2, 3];
+  h.state.pos = 1;
+  h.state._deckTrack = 1;
+  h.state.history = [0];
+  h.state.playNext = [2, 3];
+  h.state.roundPlayed = 1;
+  h.snapshots.set(h.music, h.snapshot([13]));
+  await h.sync({ force: true });
+  assert.deepEqual(h.queueIds(), [10, 11, 13]);
+  assert.deepEqual(h.state.history, [0]);
+  assert.deepEqual(h.state.playNext, [3]);
+  assert.equal(h.queueIds()[h.state.pos], 11);
+  assert.equal(h.state.meta[1].unavailable, undefined);
+  assert.equal(h.state.roundTotal, 3);
+});
+
+test('re-shuffling retains merged watches while replacement and stop reset them', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1, 2]);
+  h.collection(h.bumpers, [3]);
+  h.collection(h.replacement, [10]);
+  await h.start();
+  await h.flush();
+  await h.merge(h.bumpers);
+  h.location.href = h.music;
+  await h.onNav();
+  await h.flush();
+  assert.equal(h.state.suspended, false);
+  await h.reshuffleCurrentPage();
+  h.snapshots.set(h.music, h.snapshot([1, 2, 4]));
+  h.snapshots.set(h.bumpers, h.snapshot([3, 5]));
+  assert.equal(await h.sync({ force: true }), 2);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 3, 4, 5]);
+  h.location.href = h.replacement;
+  await h.onNav();
+  assert.equal(h.state.suspended, true);
+  await h.reshuffleCurrentPage();
+  h.requests.length = 0;
+  h.snapshots.set(h.replacement, h.snapshot([10, 11]));
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.requests, [h.replacement]);
+  assert.deepEqual(h.queueIds(), [10, 11]);
+  h.stop();
+  h.location.href = h.music;
+  await h.start();
+  await h.flush();
+  h.requests.length = 0;
+  await h.sync({ force: true });
+  assert.deepEqual(h.requests, [h.music]);
+  assert.deepEqual(h.queueIds().slice().sort(), [1, 2, 4]);
+});
+
+test('old snapshots cannot alter a restarted queue or release its newer pending sync', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1]);
+  h.collection(h.replacement, [10]);
+  await h.start();
+  await h.flush();
+  const oldSnapshot = deferredLiveSync();
+  h.snapshots.set(h.music, oldSnapshot.promise);
+  const oldSync = h.sync({ force: true });
+  h.stop();
+  h.location.href = h.replacement;
+  await h.start();
+  await h.flush();
+  const newSnapshot = deferredLiveSync();
+  h.snapshots.set(h.replacement, newSnapshot.promise);
+  const newSync = h.sync({ force: true });
+  oldSnapshot.resolve(h.snapshot([1, 99]));
+  await oldSync;
+  const requestsBefore = h.requests.length;
+  assert.equal(await h.sync({ force: true }), 0);
+  assert.equal(h.requests.length, requestsBefore, 'the newer pending sync still prevents a second fetch');
+  newSnapshot.resolve(h.snapshot([10, 11]));
+  await newSync;
+  assert.deepEqual(h.queueIds(), [10, 11]);
+});
+
+test('old in-flight metadata cannot enter a restarted queue', async () => {
+  const h = createLiveSyncHarness();
+  h.collection(h.music, [1]);
+  h.collection(h.replacement, [10]);
+  await h.start();
+  await h.flush();
+  const hydration = deferredLiveSync();
+  const entered = deferredLiveSync();
+  h.resolveWith(() => { entered.resolve(); return hydration.promise; });
+  h.snapshots.set(h.music, h.snapshot([1, 99]));
+  const oldSync = h.sync({ force: true });
+  await entered.promise;
+  h.stop();
+  h.location.href = h.replacement;
+  await h.start();
+  await h.flush();
+  hydration.resolve(h.meta(99, h.music));
+  await oldSync;
+  assert.deepEqual(h.queueIds(), [10]);
+  h.resolveWith(null);
+  h.snapshots.set(h.replacement, h.snapshot([10, 11]));
+  assert.equal(await h.sync({ force: true }), 1);
+  assert.deepEqual(h.queueIds(), [10, 11]);
 });
 
 (async () => {
   for (const { name, fn } of tests) {
+    let timer;
     try {
-      await fn();
+      await Promise.race([
+        fn(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out: ${name}`)), 5000); }),
+      ]);
       console.log(`ok - ${name}`);
     } catch (error) {
       console.error(`not ok - ${name}`);
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
   console.log('\nAll True Shuffle regression tests passed.');

@@ -1,4 +1,3 @@
-// Slide-in queue panel — toggled via the hub. No playback controls here.
 
 function mkSidebar() {
   if (document.getElementById('tss-sidebar')) return;

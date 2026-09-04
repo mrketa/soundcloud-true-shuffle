@@ -1,5 +1,3 @@
-// Hub — central floating panel. Draggable, collapsible sections.
-// Remove: delete file, remove mkHub() from inject.js, remove updateHub() call sites.
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;

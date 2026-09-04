@@ -100,7 +100,6 @@ function getLink(el) {
   return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
 }
 
-// Stable identity for a track across page reloads — prefers permalink URL.
 function trackId(m) {
   if (!m) return null;
   if (m.link) return m.link;

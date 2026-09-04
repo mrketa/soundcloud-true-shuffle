@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.0
+// @version      6.2.1
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -10,7 +10,7 @@
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @sandbox      raw
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -19,6 +19,100 @@
 const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
 const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
+const PLAYBACK_DIAGNOSTIC_FAULTS = new Set([
+  'crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed',
+  'recovery-exhausted', 'recovery-failed', 'playback-operation-failed',
+  'custom-start-exhausted', 'native-start-failed', 'native-track-not-acknowledged',
+  'stop-cleanup-failed',
+]);
+
+// Accessing localStorage itself can throw in restricted browser contexts.
+const safeStorage = {
+  getItem(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  },
+  setItem(key, value) {
+    try { localStorage.setItem(key, value); return true; } catch (_) { return false; }
+  },
+  removeItem(key) {
+    try { localStorage.removeItem(key); return true; } catch (_) { return false; }
+  },
+};
+
+function sanitizePlaybackDiagnostics(value) {
+  return Array.isArray(value) ? value.filter(entry =>
+    entry && typeof entry === 'object' && !Array.isArray(entry)
+      && typeof entry.event === 'string' && typeof entry.at === 'string'
+  ).slice(-80) : [];
+}
+
+function sanitizeAutoLevelCache(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([key, entry]) =>
+    !BLOCKED_EQ_PRESET_NAMES.has(key) && entry && typeof entry === 'object'
+      && Number.isFinite(entry.rms) && entry.rms >= 0.015
+      && Number.isFinite(entry.peak) && entry.peak >= entry.rms
+      && Number.isFinite(entry.ts) && entry.ts >= 0
+  ).sort((a, b) => b[1].ts - a[1].ts).slice(0, 300));
+}
+
+// Bound the complete operation, including response bodies and browser promises.
+// Aborting an old session must settle even if the underlying API ignores abort.
+function withDeadline(operation, timeoutMs = 10000, signal = null) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    let timer;
+    const finish = (ok, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (ok) resolve(value);
+      else reject(value);
+    };
+    const onAbort = () => {
+      const error = signal.reason || new DOMException('Operation cancelled', 'AbortError');
+      finish(false, error);
+      controller.abort(error);
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => {
+      const error = new DOMException('Operation timed out', 'TimeoutError');
+      finish(false, error);
+      controller.abort(error);
+    }, timeoutMs);
+    try {
+      Promise.resolve(operation(controller.signal)).then(
+        value => finish(true, value),
+        error => finish(false, error),
+      );
+    } catch (error) {
+      finish(false, error);
+    }
+  });
+}
+
+async function fetchSoundCloudResource(url, format = 'json', options = {}) {
+  const { signal, timeoutMs = 10000, ...requestOptions } = options;
+  return withDeadline(async requestSignal => {
+    const response = await fetch(url, { ...requestOptions, signal: requestSignal });
+    const data = response.ok ? await response[format]() : null;
+    return { ok: response.ok, status: response.status, data };
+  }, timeoutMs, signal);
+}
+
+function invalidatePlaybackSession() {
+  state._playbackEpoch++;
+  state._collectionEpoch++;
+  state._playbackAbort.abort();
+  state._playbackAbort = new AbortController();
+  return state._playbackEpoch;
+}
 
 function sanitizeCustomEqPresets(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
@@ -33,7 +127,7 @@ function sanitizeCustomEqPresets(value) {
 
 function localCustomEqPresets() {
   try {
-    return sanitizeCustomEqPresets(JSON.parse(localStorage.getItem('tss_eq_custom_presets') || '{}'));
+    return sanitizeCustomEqPresets(JSON.parse(safeStorage.getItem('tss_eq_custom_presets') || '{}'));
   } catch (_) {
     return {};
   }
@@ -52,13 +146,7 @@ function loadCustomEqPresets() {
   return localPresets;
 }
 
-// init accent CSS vars early so all CSS can reference them
-document.documentElement.style.setProperty('--tss-a',  '#ff5500');
-document.documentElement.style.setProperty('--tss-ar', '255');
-document.documentElement.style.setProperty('--tss-ag', '85');
-document.documentElement.style.setProperty('--tss-ab', '0');
 
-// ── state ─────────────────────────────────────────────────────────────────────
 
 const state = {
   active:       false,
@@ -71,6 +159,10 @@ const state = {
   worker:       null,
   busy:         false,
   loading:      false,
+  _playbackEpoch: 0,
+  _playbackAbort: new AbortController(),
+  _collectionEpoch: 0,
+  _userPaused: false,
   lastTitle:    '',
   lastProgress: 0,
   sidebarOpen:  false,
@@ -100,33 +192,34 @@ const state = {
   _likeBusy: false,
   _likeStateTrack: null,
   _likeStateLastCheck: 0,
-  crossfadeSeconds: Math.max(0, Math.min(12, Number(localStorage.getItem('tss_crossfade_seconds')) || 0)),
-  crossfadeCurve: ['smooth', 'clean', 'dj'].includes(localStorage.getItem('tss_crossfade_curve'))
-    ? localStorage.getItem('tss_crossfade_curve')
+  crossfadeSeconds: Math.max(0, Math.min(12, Number(safeStorage.getItem('tss_crossfade_seconds')) || 0)),
+  crossfadeCurve: ['smooth', 'clean', 'dj'].includes(safeStorage.getItem('tss_crossfade_curve'))
+    ? safeStorage.getItem('tss_crossfade_curve')
     : 'smooth',
-  crossfadeManual: localStorage.getItem('tss_crossfade_manual') !== 'false',
-  _playbackVolumeStored: localStorage.getItem('tss_playback_volume') !== null
-    || localStorage.getItem('tss_crossfade_output') !== null,
+  crossfadeManual: safeStorage.getItem('tss_crossfade_manual') !== 'false',
+  _playbackVolumeStored: safeStorage.getItem('tss_playback_volume') !== null
+    || safeStorage.getItem('tss_crossfade_output') !== null,
   _playbackVolumeInitialized: false,
   playbackVolume: (() => {
-    const saved = localStorage.getItem('tss_playback_volume') ?? localStorage.getItem('tss_crossfade_output');
+    const saved = safeStorage.getItem('tss_playback_volume') ?? safeStorage.getItem('tss_crossfade_output');
     if (saved === null) return 0.1;
     const value = Number(saved);
     return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.1;
   })(),
-  autoLevel: localStorage.getItem('tss_auto_level') === 'true',
-  safetyClipper: localStorage.getItem('tss_safety_clipper') === 'true',
-  eqEnabled: localStorage.getItem('tss_eq_enabled') === 'true',
+  autoLevel: safeStorage.getItem('tss_auto_level') === 'true',
+  safetyClipper: safeStorage.getItem('tss_safety_clipper') === 'true',
+  eqEnabled: safeStorage.getItem('tss_eq_enabled') === 'true',
   eqBands: (() => {
     try {
-      const values = JSON.parse(localStorage.getItem('tss_eq_bands') || '[]');
+      const values = JSON.parse(safeStorage.getItem('tss_eq_bands') || '[]');
       return Array.isArray(values) && values.length === 5
         ? values.map(value => Math.max(-12, Math.min(12, Number(value) || 0)))
         : [0, 0, 0, 0, 0];
     } catch (_) { return [0, 0, 0, 0, 0]; }
   })(),
-  eqPreset: localStorage.getItem('tss_eq_preset') || 'Flat',
+  eqPreset: safeStorage.getItem('tss_eq_preset') || 'Flat',
   customEqPresets: loadCustomEqPresets(),
+  _equalizerSaveFailed: false,
   crossfadeStatus: 'off',
   _crossfadePending: false,
   _crossfading: false,
@@ -143,6 +236,7 @@ const state = {
   _crossfadePrefetchToken: 0,
   _deckGains: [0, 0],
   _audioContext: null,
+  _audioGraphFailed: false,
   _audioMaster: null,
   _audioClipper: null,
   _deckAudioGraphs: [null, null],
@@ -150,8 +244,8 @@ const state = {
   _autoLevelLastTick: 0,
   _autoLevelCache: (() => {
     try {
-      const parsed = JSON.parse(localStorage.getItem('tss_auto_level_cache_v4') || '{}');
-      return parsed && typeof parsed === 'object' ? parsed : {};
+      const parsed = JSON.parse(safeStorage.getItem('tss_auto_level_cache_v4') || '{}');
+      return sanitizeAutoLevelCache(parsed);
     } catch (_) { return {}; }
   })(),
   _autoLevelCacheTimer: null,
@@ -163,31 +257,28 @@ const state = {
   _pipBridgePlayer: null,
   _ownPipWindow: null,
   _ownPipMode: null,
-  pipArtworkMode: ['compact', 'full', 'focus'].includes(localStorage.getItem('tss_pip_artwork_mode'))
-    ? localStorage.getItem('tss_pip_artwork_mode')
+  pipArtworkMode: ['compact', 'full', 'focus'].includes(safeStorage.getItem('tss_pip_artwork_mode'))
+    ? safeStorage.getItem('tss_pip_artwork_mode')
     : 'compact',
   _ownPipHost: null,
   _videoPip: null,
+  _pipOpenTransaction: null,
+  _ownPipCleanup: null,
+  _pipTrackMenuClose: null,
+  _ctxMenuClose: null,
+  _browserMediaOwner: null,
   _playTimeLastAt: null,
   _playTimeWasAudible: false,
   _playTimeRemainderMs: 0,
-  _liveSyncKnownIds: new Set(),
+  _liveSyncSources: new Map(),
   _liveSyncInFlight: false,
   _liveSyncLastCheck: 0,
-  _liveSyncSource: '',
   _liveSyncTimer: null,
   _playbackDiagnostics: (() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('tss_playback_diagnostics') || '[]');
-      return Array.isArray(saved) ? saved.slice(-80) : [];
-    } catch (_) { return []; }
+    safeStorage.removeItem('tss_playback_diagnostics');
+    return [];
   })(),
-  _playbackDiagnosticFault: (() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('tss_playback_diagnostics') || '[]');
-      return Array.isArray(saved) && saved.some(entry => ['crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed', 'recovery-exhausted', 'recovery-failed'].includes(entry?.event));
-    } catch (_) { return false; }
-  })(),
+  _playbackDiagnosticFault: false,
   _tabTitleBeforePlayback: null,
   _tabTitleValue: '',
   _browserMetadataKey: '',
@@ -198,7 +289,6 @@ const state = {
   },
 };
 
-// ── utils ─────────────────────────────────────────────────────────────────────
 
 function fisherYates(arr) {
   const a = [...arr];
@@ -209,8 +299,7 @@ function fisherYates(arr) {
   return a;
 }
 
-// weighted shuffle (Efraimidis-Spirakis): every track appears exactly once,
-// but higher-priority tracks tend to land earlier in the round, lower later
+// Efraimidis-Spirakis weighted sampling without replacement.
 function weightedShuffle(indices) {
   return indices
     .map(ti => ({ ti, k: Math.random() ** (1 / (state.priority[ti] ?? 1.0)) }))
@@ -366,9 +455,7 @@ function buildReshuffledQueue(indices, currentTi = null, meta = state.meta) {
   return [currentTi, ...spaceDuplicateTitles(shuffled, meta, currentTi)];
 }
 
-// Keep the first position balanced across rounds. Small playlists make normal
-// randomness look biased very quickly, so choose the least-used eligible
-// starter first and shuffle the rest normally (including explicit priorities).
+// Least-used eligible starters keep small playlists balanced across rounds.
 function buildBalancedRound(indices, previousTi = null) {
   if (!indices.length) return [];
 
@@ -506,17 +593,22 @@ function pauseSoundCloudTransport() {
   }
 }
 
+function nativePlaybackAllowed() {
+  return Boolean(state.active && !state.suspended && !state._userPaused
+    && Number.isInteger(state._nativeTrack) && state.queue[state.pos] === state._nativeTrack);
+}
+
 function installNativePlaybackGuard() {
   if (state._nativePlaybackGuardInstalled) return;
   state._nativePlaybackGuardInstalled = true;
 
   document.addEventListener('click', event => {
     const button = event.target?.closest?.('.playControls__play');
-    if (!button || (!state.active && !state.loading) || state._nativeGuardButtonAction
-        || Number.isInteger(state._nativeTrack)) return;
+    if (!button || state._nativeGuardButtonAction || nativePlaybackAllowed()) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     queueMicrotask(() => {
+      if (nativePlaybackAllowed()) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     });
@@ -524,13 +616,12 @@ function installNativePlaybackGuard() {
 
   document.addEventListener('play', event => {
     const audio = event.target;
-    if (audio?.tagName !== 'AUDIO' || (!state.active && !state.loading) || isTrueShuffleAudio(audio)
-        || Number.isInteger(state._nativeTrack)) return;
-    // Private decks own ordinary queue playback. A preview-restricted track is
-    // the only exception: SoundCloud's player must enforce the signed-in
-    // listener's entitlement instead of our public stream resolver.
+    if (audio?.tagName !== 'AUDIO' || isTrueShuffleAudio(audio) || nativePlaybackAllowed()) return;
+    // Native autoplay is blocked even before True Shuffle starts. Only an
+    // explicitly selected native fallback may use SoundCloud's player.
     try { audio.pause(); } catch (_) {}
     queueMicrotask(() => {
+      if (nativePlaybackAllowed()) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     });
@@ -540,7 +631,7 @@ function installNativePlaybackGuard() {
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
-      if ((state.active || state.loading) && !Number.isInteger(state._nativeTrack)) {
+      if (!nativePlaybackAllowed()) {
         pauseSoundCloudTransport();
         pauseSoundCloud();
       }
@@ -549,80 +640,119 @@ function installNativePlaybackGuard() {
 }
 
 function pause() {
+  state._userPaused = true;
+  if (state._crossfading) state._crossfadePausedByUser = true;
   const deck = currentDeckAudio();
   if (deck) {
-    state._decks.forEach(audio => { if (audio && !audio.paused) audio.pause(); });
-    if (state._crossfading) suspendAudioGraph();
+    state._decks.forEach(audio => {
+      try { if (audio && !audio.paused) audio.pause(); } catch (_) {}
+    });
+    if (state._crossfading) void suspendAudioGraph(state._playbackAbort.signal);
     return;
   }
   pauseSoundCloud();
 }
 
 async function toggle() {
+  const epoch = state._playbackEpoch;
+  if (!state.active) return;
+  const signal = state._playbackAbort.signal;
   const deck = currentDeckAudio();
-  if (deck) {
-    if (state._crossfading) {
-      const mixingDecks = state._decks.filter((audio, index) =>
-        audio && state._deckTracks[index] !== null
-      );
-      const shouldResume = mixingDecks.length > 0 && mixingDecks.every(audio => audio.paused);
-      if (shouldResume) {
-        state._crossfadePausedByUser = false;
-        await resumeAudioGraph();
-        await Promise.all(mixingDecks.map(audio => audio.play().catch(() => {})));
-      } else {
-        state._crossfadePausedByUser = true;
-        mixingDecks.forEach(audio => { if (!audio.paused) audio.pause(); });
-        await suspendAudioGraph();
+  const pending = state._pendingPlaybackTrack;
+  const pendingCurrent = pending?.epoch === epoch;
+  const retryGraph = Number.isInteger(state._deckTrack)
+    && (state._userPaused || !deck || deck.paused)
+    && (state._audioGraphFailed || state._audioContext?.state === 'closed');
+  if ((pendingCurrent || retryGraph) && !state.busy) {
+    const ti = pendingCurrent ? pending.ti : state._deckTrack;
+    const countPlay = pendingCurrent ? pending.countPlay : false;
+    const position = pendingCurrent ? pending.position : (Number(deck?.currentTime) || 0);
+    const initialSeek = state._deckSeekRequest;
+    state._pendingPlaybackTrack = null;
+    state._userPaused = false;
+    state._crossfadePausedByUser = false;
+    await runPlaybackOperation('resume prepared', async isCurrent => {
+      const played = await playAt(ti, countPlay);
+      if (!isCurrent()) return played;
+      if (played === true && Number.isFinite(position)) {
+        const resumedDeck = currentDeckAudio();
+        const latestSeek = state._deckSeekRequest;
+        if (resumedDeck) {
+          const desiredTime = latestSeek !== initialSeek && latestSeek?.epoch === epoch
+            && latestSeek.audio === resumedDeck ? latestSeek.time : position;
+          const duration = Number(resumedDeck.duration);
+          resumedDeck.currentTime = Math.min(Math.max(0, desiredTime),
+            Number.isFinite(duration) ? Math.max(0, duration - 0.1) : desiredTime);
+        }
+      } else if (state._pendingPlaybackTrack?.epoch === epoch
+          && state._pendingPlaybackTrack.ti === ti) {
+        state._pendingPlaybackTrack.position = position;
       }
-      setTimeout(refreshPlayBtn, 80);
+      return played;
+    });
+    return;
+  }
+  if (deck) {
+    const resume = state._userPaused || deck.paused;
+    if (!resume) {
+      pause();
+      refreshPlayBtn();
       return;
     }
-    if (deck.paused) {
-      await resumeAudioGraph();
-      await deck.play().catch(() => {});
+    state._userPaused = false;
+    state._crossfadePausedByUser = false;
+    const decks = state._crossfading
+      ? state._decks.filter((audio, index) => audio && state._deckTracks[index] !== null)
+      : [deck];
+    const identities = decks.map(audio => {
+      const index = state._decks.indexOf(audio);
+      return { audio, index, token: state._deckPrepareTokens[index], track: state._deckTracks[index] };
+    });
+    const isCurrent = () => state.active && state._playbackEpoch === epoch
+      && !signal.aborted && !state._userPaused
+      && identities.every(({ audio, index, token, track }) => state._decks[index] === audio
+        && state._deckPrepareTokens[index] === token && state._deckTracks[index] === track);
+    try {
+      if (!await resumeAudioGraph(signal) || !isCurrent()) return;
+      await Promise.all(identities.map(({ audio, index }) =>
+        playDeckWithDeadline(audio, index, signal, isCurrent)));
+      if (!isCurrent()) return;
+    } catch (_) {
+      if (!isCurrent()) return;
+    } finally {
+      if (state._playbackEpoch === epoch) refreshPlayBtn();
+    }
+    return;
+  }
+  if (!state.suspended && Number.isInteger(state._nativeTrack)
+      && state.queue[state.pos] === state._nativeTrack) {
+    if (!paused()) {
+      pause();
     } else {
-      deck.pause();
+      state._userPaused = false;
+      state._nativeGuardButtonAction = true;
+      try {
+        document.querySelector('.playControls__play')?.click();
+      } finally {
+        state._nativeGuardButtonAction = false;
+      }
     }
-    setTimeout(refreshPlayBtn, 80);
+    setTimeout(() => { if (state._playbackEpoch === epoch) refreshPlayBtn(); }, 150);
     return;
   }
-  if (Number.isInteger(state._nativeTrack)) {
-    state._nativeGuardButtonAction = true;
-    try {
-      document.querySelector('.playControls__play')?.click();
-    } finally {
-      state._nativeGuardButtonAction = false;
-    }
-    setTimeout(refreshPlayBtn, 150);
-    return;
-  }
-  if (state.active || state.loading) {
-    const ti = state.queue[state.pos];
-    if (ti === undefined || state.busy) return;
-    state.busy = true;
-    try {
-      await playAt(ti, false);
-    } finally {
-      state.busy = false;
-      setTimeout(refreshPlayBtn, 80);
-    }
-    return;
-  }
-  state._nativeGuardButtonAction = true;
-  try {
-    document.querySelector('.playControls__play')?.click();
-  } finally {
-    state._nativeGuardButtonAction = false;
-  }
-  setTimeout(refreshPlayBtn, 150);
+  const ti = state.queue[state.pos];
+  if (ti === undefined || state.busy) return;
+  state._userPaused = false;
+  await runPlaybackOperation('resume', () => playAt(ti, false));
 }
 
 function seekTo(ratio) {
   ratio = Math.max(0, Math.min(1, ratio));
   const deck = currentDeckAudio();
-  if (deck && Number.isFinite(deck.duration) && deck.duration > 0) {
-    deck.currentTime = deck.duration * ratio;
+  if (deck && ((Number.isFinite(deck.duration) && deck.duration > 0) || ratio === 0)) {
+    const time = ratio === 0 ? 0 : deck.duration * ratio;
+    state._deckSeekRequest = { epoch: state._playbackEpoch, audio: deck, time };
+    deck.currentTime = time;
     updateProgressBar();
     return;
   }
@@ -688,7 +818,8 @@ function waveformUrl(el) {
 }
 
 function getArtistLink(el) {
-  const a = el.querySelector('.trackItem__username, .soundTitle__username, a.sc-link-secondary');
+  const a = el.querySelector('.trackItem__username, .soundTitle__username')
+    || el.querySelector('a.sc-link-secondary');
   if (!a) return null;
   const href = a.getAttribute('href');
   if (!href) return null;
@@ -705,9 +836,13 @@ function trackId(m) {
 
 function getMeta(el) {
   const likeButton = el.querySelector('.sc-button-like');
+  const artistNames = [...new Set([...el.querySelectorAll('.trackItem__username, .soundTitle__username')]
+    .map(node => node.textContent.trim())
+    .filter(name => name && name !== '—'))];
+  const fallbackArtist = artistNames.length ? '' : el.querySelector('.sc-link-secondary')?.textContent.trim();
   return {
     title:   el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.textContent.trim() || '—',
-    artist:  el.querySelector('.trackItem__username, .soundTitle__username, .sc-link-secondary')?.textContent.trim() || '—',
+    artist:  artistNames.join(', ') || fallbackArtist || '—',
     artwork: artwork(el),
     link:    getLink(el),
     artistLink: getArtistLink(el),
@@ -725,14 +860,16 @@ function playlistSnapshotFromHtml(html) {
   try {
     const hydration = JSON.parse(match[1]);
     const entry = hydration.find(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
-    const tracks = Array.isArray(entry?.data?.tracks) ? entry.data.tracks : [];
-    if (!tracks.length) return null;
-    const trackCount = Number(entry.data.track_count) || tracks.length;
+    if (!Array.isArray(entry?.data?.tracks)) return null;
+    const tracks = entry.data.tracks.filter(track => Number.isFinite(Number(track?.id)));
+    const reportedCount = Number(entry.data.track_count);
+    if (!tracks.length && entry.data.track_count !== 0) return null;
+    const trackCount = Number.isFinite(reportedCount) && reportedCount >= 0 ? reportedCount : tracks.length;
     return {
       id: entry.data.id || null,
       trackCount,
       complete: tracks.length >= trackCount,
-      tracks: tracks.filter(track => Number.isFinite(Number(track?.id))),
+      tracks,
     };
   } catch (_) {
     return null;
@@ -766,7 +903,7 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
   const meta = {
     soundcloudId: Number(track.id) || null,
     title: track.title || '—',
-    artist: track.user?.username || track.publisher_metadata?.artist || '—',
+    artist: String(track.publisher_metadata?.artist || '').trim() || String(track.user?.username || '').trim() || '—',
     artwork: artworkUrl ? artworkUrl.replace(/-([a-z]+|t\d+x\d+)\.(jpg|png)$/i, '-t200x200.$2') : null,
     link: track.permalink_url,
     artistLink: track.user?.permalink_url || null,
@@ -814,7 +951,6 @@ function esc(str) {
     .replace(/"/g, '&quot;');
 }
 
-// ── icons ─────────────────────────────────────────────────────────────────────
 
 const SVG = {
   play:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M3 2.5v11l10-5.5z"/></svg>`,
@@ -847,10 +983,9 @@ function recordPlaybackDiagnostic(event, details = {}) {
   };
   state._playbackDiagnostics.push(entry);
   if (state._playbackDiagnostics.length > 80) state._playbackDiagnostics.splice(0, state._playbackDiagnostics.length - 80);
-  if (['crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed', 'recovery-exhausted', 'recovery-failed'].includes(event)) {
+  if (PLAYBACK_DIAGNOSTIC_FAULTS.has(event)) {
     state._playbackDiagnosticFault = true;
   }
-  try { localStorage.setItem('tss_playback_diagnostics', JSON.stringify(state._playbackDiagnostics)); } catch (_) {}
   updatePlaybackDiagnosticButton();
   try { console.info('[True Shuffle][playback]', entry); } catch (_) {}
 }
@@ -916,7 +1051,7 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
       mixGain: state._deckAudioGraphs[index]?.mixGain?.gain?.value,
       autoGain: state._deckAudioGraphs[index]?.autoGain?.gain?.value,
     } : null),
-    diagnostics: state._playbackDiagnostics.slice(-40).map(entry => {
+    diagnostics: sanitizePlaybackDiagnostics(state._playbackDiagnostics).slice(-40).map(entry => {
       const { diagnostics, ...summary } = entry;
       return summary;
     }),
@@ -925,41 +1060,102 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
 
 function updatePlaybackDiagnosticButton() {
   const button = document.getElementById('tss-playback-debug');
-  if (button) button.hidden = !state._playbackDiagnosticFault;
+  if (!button) return;
+  button.hidden = !state._playbackDiagnosticFault;
+  button.dataset.status = state._playbackDiagnosticFault ? 'current' : 'none';
+}
+
+function showPlaybackReportHelp() {
+  document.getElementById('tss-debug-help-close')?.click();
+  const opener = document.activeElement;
+  const reportDialog = document.querySelector('#tss-debug-overlay .tss-debug-dialog');
+  const overlay = document.createElement('div');
+  overlay.id = 'tss-debug-help-overlay';
+  overlay.innerHTML = `
+    <div class="tss-debug-dialog tss-debug-help-dialog" role="dialog" aria-modal="true" aria-labelledby="tss-debug-help-title">
+      <div class="tss-debug-head"><strong id="tss-debug-help-title">How to report a playback issue</strong><button id="tss-debug-help-close" type="button" aria-label="Close reporting instructions">${SVG.close}</button></div>
+      <ol class="tss-debug-help-steps">
+        <li><strong>Keep this page open.</strong> Reports exist only until you reload or close the page. Copy the report first.</li>
+        <li><strong>Choose “Copy report”.</strong> Return to the report and copy it. If copying is blocked, select the report text and copy it manually.</li>
+        <li><strong>Add what happened.</strong> Include your browser and version, Tampermonkey or Violentmonkey and its version, what you clicked, and what you expected versus what happened. Mention the track and whether the tab was in the background.</li>
+        <li><strong>Post on <a href="https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback" target="_blank" rel="noopener noreferrer">Greasy Fork feedback</a>.</strong> Open the feedback page in a new tab, sign in if needed, and start a new discussion. Paste the copied report as a code block together with the details above.</li>
+      </ol>
+      <p>Greasy Fork feedback is public. Stream tokens and URL parameters are removed, but track names and page addresses may remain. Remove personal information before posting. Nothing is sent automatically.</p>
+      <div class="tss-debug-actions"><button id="tss-debug-help-back" type="button">Back to report</button></div>
+    </div>`;
+  const close = () => {
+    overlay.remove();
+    reportDialog?.removeAttribute('inert');
+    reportDialog?.removeAttribute('aria-hidden');
+    if (opener?.isConnected) opener.focus();
+  };
+  overlay.querySelector('#tss-debug-help-close').onclick = close;
+  overlay.querySelector('#tss-debug-help-back').onclick = close;
+  overlay.onclick = event => { if (event.target === overlay) close(); };
+  overlay.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); close(); }
+    if (event.key === 'Tab') {
+      const first = overlay.querySelector('#tss-debug-help-close');
+      const last = overlay.querySelector('#tss-debug-help-back');
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  };
+  reportDialog?.setAttribute('inert', '');
+  reportDialog?.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(overlay);
+  overlay.querySelector('#tss-debug-help-close').focus();
 }
 
 function showPlaybackDiagnostics() {
   document.getElementById('tss-debug-overlay')?.remove();
+  const opener = document.activeElement;
   const overlay = document.createElement('div');
   overlay.id = 'tss-debug-overlay';
   const report = JSON.stringify(playbackDiagnosticSnapshot('user-opened-report'), null, 2);
   overlay.innerHTML = `
     <div class="tss-debug-dialog" role="dialog" aria-modal="true" aria-labelledby="tss-debug-title">
-      <div class="tss-debug-head"><div><strong id="tss-debug-title">Playback report</strong><span>Firefox diagnostics</span></div><button id="tss-debug-close" type="button" aria-label="Close">${SVG.close}</button></div>
-      <p>Copy this report if playback stops again. Stream tokens and URL parameters are removed.</p>
+      <div class="tss-debug-head"><div><strong id="tss-debug-title">Playback report</strong><span>Browser diagnostics</span></div><button id="tss-debug-close" type="button" aria-label="Close">${SVG.close}</button></div>
+      <p>Copy this report before reloading or closing the page. Reports are not saved. Stream tokens and URL parameters are removed.</p>
       <pre id="tss-debug-report"></pre>
-      <div class="tss-debug-actions"><button id="tss-debug-clear" type="button">Clear</button><button id="tss-debug-copy" type="button">Copy report</button></div>
+      <div class="tss-debug-actions"><button id="tss-debug-help" type="button">How to report</button><button id="tss-debug-clear" type="button">Clear</button><button id="tss-debug-copy" type="button">Copy report</button></div>
     </div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('#tss-debug-report').textContent = report;
-  const close = () => overlay.remove();
+  const close = () => {
+    document.getElementById('tss-debug-help-close')?.click();
+    overlay.remove();
+    const target = opener?.isConnected && !opener.hidden ? opener : document.getElementById('tss-hub-start');
+    target?.focus();
+  };
   overlay.querySelector('#tss-debug-close').onclick = close;
   overlay.onclick = event => { if (event.target === overlay) close(); };
+  overlay.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); close(); }
+    if (event.key === 'Tab') {
+      const first = overlay.querySelector('#tss-debug-close');
+      const last = overlay.querySelector('#tss-debug-copy');
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  };
+  overlay.querySelector('#tss-debug-help').onclick = showPlaybackReportHelp;
   overlay.querySelector('#tss-debug-clear').onclick = () => {
     state._playbackDiagnostics = [];
     state._playbackDiagnosticFault = false;
-    try { localStorage.removeItem('tss_playback_diagnostics'); } catch (_) {}
     updatePlaybackDiagnosticButton();
     close();
   };
   overlay.querySelector('#tss-debug-copy').onclick = async event => {
+    const button = event.currentTarget;
     try {
       await navigator.clipboard.writeText(report);
-      event.currentTarget.textContent = 'Copied';
+      button.textContent = 'Copied';
     } catch (_) {
-      event.currentTarget.textContent = 'Copy failed';
+      button.textContent = 'Copy failed';
     }
   };
+  overlay.querySelector('#tss-debug-copy').focus();
 }
 
 const EQ_BANDS = [
@@ -1019,26 +1215,24 @@ function hydrationWaveformUrl(meta) {
   return null;
 }
 
-async function resolveWaveformUrl(meta) {
+async function resolveWaveformUrl(meta, options = {}) {
   const direct = meta?.waveform || hydrationWaveformUrl(meta);
   if (direct) return direct;
-
-  // Firefox often exposes less playlist hydration than Chromium. Resolve the
-  // exact track through SoundCloud's API instead of reusing a title match or a
-  // recently observed waveform resource from another track.
   const wantedUrl = normalizeTrackUrl(meta?.link);
   if (!wantedUrl) return null;
-  const clientId = await discoverSoundCloudClientIdFromBundle();
-  if (!clientId) return null;
+  const isCurrent = options.isCurrent || (() => !options.signal?.aborted);
   try {
-    const response = await fetch(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`);
-    if (!response.ok) return null;
-    const track = await response.json();
+    const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), options);
+    if (!clientId || !isCurrent()) return null;
+    const response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`, 'json', options);
+    if (!response.ok || !isCurrent()) return null;
+    const track = response.data;
     const candidateUrl = normalizeTrackUrl(track?.permalink_url || track?.permalinkUrl || '');
     const resolved = candidateUrl === wantedUrl ? (track?.waveform_url || track?.waveformUrl) : null;
     if (resolved) meta.waveform = resolved;
     return resolved || null;
-  } catch (_) {
+  } catch (error) {
+    if (error?.name !== 'AbortError') recordPlaybackDiagnostic('waveform-resolution-failed', { error: String(error?.name || error) });
     return null;
   }
 }
@@ -1068,80 +1262,101 @@ function renderWaveform(heights = DEFAULT_WAVE_HEIGHTS) {
 async function loadTrackWaveform(meta) {
   const key = trackId(meta) || meta?.title || '';
   const request = ++waveformRequest;
+  const epoch = state._playbackEpoch;
+  const signal = state._playbackAbort?.signal;
+  const isCurrent = () => request === waveformRequest && epoch === state._playbackEpoch && !signal?.aborted;
   if (!key) { renderWaveform(); return; }
   if (waveformCache.has(key)) { renderWaveform(waveformCache.get(key)); return; }
-
-  const url = await resolveWaveformUrl(meta);
-  if (!url) { renderWaveform(); return; }
   try {
-    const response = await fetch(url, { credentials: 'omit' });
+    const url = await resolveWaveformUrl(meta, { signal, isCurrent });
+    if (!isCurrent()) return;
+    if (!url) { renderWaveform(); return; }
+    const response = await fetchSoundCloudResource(url, 'json', { signal, credentials: 'omit' });
+    if (!isCurrent()) return;
     if (!response.ok) throw new Error(`waveform ${response.status}`);
-    const payload = await response.json();
-    const heights = downsampleWaveform(payload.samples || payload.data || payload);
+    const payload = response.data;
+    const heights = downsampleWaveform(payload?.samples || payload?.data || payload);
     if (!heights) throw new Error('waveform samples missing');
     waveformCache.set(key, heights);
-    if (request === waveformRequest) renderWaveform(heights);
-  } catch (_) {
-    if (request === waveformRequest) renderWaveform();
+    renderWaveform(heights);
+  } catch (error) {
+    if (isCurrent()) {
+      recordPlaybackDiagnostic('waveform-load-failed', { error: String(error?.name || error) });
+      renderWaveform();
+    }
   }
 }
 
-// ── worker ────────────────────────────────────────────────────────────────────
 
 function mkWorker() {
+  let url;
   try {
     const src = `
       let t = null;
       self.onmessage = e => {
-        if (e.data === 'start') { clearInterval(t); t = setInterval(() => self.postMessage(0), 50); }
-        else                    { clearInterval(t); t = null; }
+        clearInterval(t);
+        t = null;
+        if (e.data === 'start') {
+          self.postMessage('ready');
+          t = setInterval(() => self.postMessage(0), 50);
+        }
       };
     `;
-    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-    const w   = new Worker(url);
-    URL.revokeObjectURL(url);
-    return w;
+    url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    return new Worker(url);
   } catch (_) {
     return null;
+  } finally {
+    if (url) URL.revokeObjectURL(url);
   }
 }
 
-// ── persistent stats ──────────────────────────────────────────────────────────
 
 const LIFETIME_KEY = 'tss_lifetime';
 
+function sanitizeLifetimeStats(value) {
+  const record = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const count = number => typeof number === 'number' && Number.isFinite(number) && number >= 0
+    ? Math.floor(number) : 0;
+  const counts = record.playCounts && typeof record.playCounts === 'object' && !Array.isArray(record.playCounts)
+    ? record.playCounts : {};
+  return {
+    played: count(record.played),
+    elapsed: count(record.elapsed),
+    playCounts: Object.fromEntries(Object.entries(counts).filter(([key, value]) =>
+      /^(0|[1-9]\d*)$/.test(key) && count(value) > 0
+    ).map(([key, value]) => [key, count(value)])),
+  };
+}
+
 function loadLifetimeStats() {
   try {
-    const raw = localStorage.getItem(LIFETIME_KEY);
-    if (!raw) return { played: 0, playCounts: {}, elapsed: 0 };
-    return JSON.parse(raw);
-  } catch (_) { return { played: 0, playCounts: {}, elapsed: 0 }; }
+    const raw = safeStorage.getItem(LIFETIME_KEY);
+    return sanitizeLifetimeStats(raw ? JSON.parse(raw) : null);
+  } catch (_) { return sanitizeLifetimeStats(null); }
 }
 
 function saveLifetimeStats() {
   try {
     const lt   = loadLifetimeStats();
-    const base = state._lifetimeBase || { played: 0, elapsed: 0, playCounts: {} };
+    const base = sanitizeLifetimeStats(state._lifetimeBase);
+    const current = sanitizeLifetimeStats(state.stats);
     const merged = {
-      played:     (lt.played  || 0) + Math.max(0, (state.stats.played  || 0) - (base.played  || 0)),
-      elapsed:    (lt.elapsed || 0) + Math.max(0, (state.stats.elapsed || 0) - (base.elapsed || 0)),
+      played:     lt.played + Math.max(0, current.played - base.played),
+      elapsed:    lt.elapsed + Math.max(0, current.elapsed - base.elapsed),
       playCounts: { ...lt.playCounts },
       _ts:        Date.now(),
     };
-    for (const [k, v] of Object.entries(state.stats.playCounts || {})) {
+    for (const [k, v] of Object.entries(current.playCounts)) {
       const delta = v - (base.playCounts?.[k] || 0);
       if (delta > 0) merged.playCounts[k] = (merged.playCounts[k] || 0) + delta;
     }
-    localStorage.setItem(LIFETIME_KEY, JSON.stringify(merged));
-    state._lifetimeBase = {
-      played: state.stats.played || 0,
-      elapsed: state.stats.elapsed || 0,
-      playCounts: { ...(state.stats.playCounts || {}) },
-    };
-  } catch (_) {}
+    if (!safeStorage.setItem(LIFETIME_KEY, JSON.stringify(merged))) return false;
+    state._lifetimeBase = current;
+    return true;
+  } catch (_) { return false; }
 }
 
-// ── accent color ──────────────────────────────────────────────────────────────
 
 function extractAccentColor(imgUrl, cb) {
   try {
@@ -1192,7 +1407,6 @@ function applyAccentColor(r, g, b) {
   document.documentElement.style.setProperty('--tss-ab', String(b));
 }
 
-// ── merge toast ───────────────────────────────────────────────────────────────
 
 function showMergeToast(count) {
   let toast = document.getElementById('tss-merge-toast');
@@ -1221,7 +1435,6 @@ function showMergeToast(count) {
   toast._t = setTimeout(() => { toast.style.opacity = '0'; }, 2600);
 }
 
-// ── sleep timer ───────────────────────────────────────────────────────────────
 
 function timedSleepRemaining(timer, now = Date.now()) {
   if (!timer || timer.type !== 'time') return Math.max(0, Number(timer?.remaining) || 0);
@@ -1244,10 +1457,7 @@ function updateSleepDisplay(now = Date.now()) {
   }
 }
 
-// ── playback ──────────────────────────────────────────────────────────────────
 
-// Experimental two-deck playback. True Shuffle keeps SoundCloud's native
-// transport blocked and retries only its private audio decks while active.
 function currentDeckAudio() {
   if (!Number.isInteger(state._deckIndex) || state._deckIndex < 0) return null;
   return state._decks[state._deckIndex] || null;
@@ -1274,10 +1484,8 @@ function setSleepTimer(value, now = Date.now()) {
   updateSleepDisplay(now);
 }
 
-// Better SoundCloud Feed's PiP polls SoundCloud's page-level scPlayer rather
-// than Media Session. While True Shuffle's private deck is audible, expose a
-// small scPlayer-compatible view of that deck. Every wrapper delegates back to
-// SoundCloud unchanged as soon as custom-deck playback is inactive.
+// Better SoundCloud Feed's PiP reads scPlayer, not Media Session. Expose the
+// private deck while active; otherwise delegate to SoundCloud unchanged.
 function betterFeedPipActive() {
   return state.active && Number.isInteger(state._deckTrack) && Boolean(currentDeckAudio());
 }
@@ -1311,11 +1519,8 @@ function betterFeedPipSound() {
   };
 }
 
-// Better SoundCloud Feed owns the PiP UI, but its canvas progress can stop
-// repainting while the SoundCloud tab is in the background. Keep that visual
-// surface aligned with the same background-safe clock used by our hub. The
-// selectors are deliberately scoped to Better Feed's PiP and this is a no-op
-// everywhere else.
+// Better Feed's PiP canvas can stop repainting in background tabs.
+// Sync its scoped visual surface with our background-safe hub clock.
 function syncBetterFeedPipWindow() {
   if (!betterFeedPipActive()) return false;
 
@@ -1434,28 +1639,38 @@ function setOwnPipButtonState() {
   button.title = ownPipIsOpen() ? `${mode} is open` : 'Open True Shuffle PiP';
 }
 
+function pipTransactionIsCurrent(transaction) {
+  return state.active && state._playbackEpoch === transaction.epoch
+    && state._pipOpenTransaction === transaction && !transaction.controller.signal.aborted;
+}
+
+function exitOwnedVideoPip(video) {
+  try {
+    if (pageWindow.document?.pictureInPictureElement === video) {
+      void withDeadline(() => pageWindow.document.exitPictureInPicture(), 5000).catch(() => {});
+    } else if (video?.webkitPresentationMode === 'picture-in-picture') {
+      video.webkitSetPresentationMode('inline');
+    }
+  } catch (_) {}
+}
+
 function closeOwnPip() {
+  const transaction = state._pipOpenTransaction;
+  state._pipOpenTransaction = null;
+  transaction?.controller.abort();
+  try { transaction?.dispose?.(); } catch (_) {}
   const pipWindow = state._ownPipWindow;
   const pipHost = state._ownPipHost;
   const videoPip = state._videoPip;
   const mode = state._ownPipMode;
+  try { state._pipTrackMenuClose?.(); } catch (_) {}
+  try { state._ownPipCleanup?.(); } catch (_) {}
   state._ownPipWindow = null;
   state._ownPipHost = null;
   state._ownPipMode = null;
   state._videoPip = null;
-  if (videoPip) {
-    if (videoPip.timer) clearInterval(videoPip.timer);
-    try {
-      if (pageWindow.document?.pictureInPictureElement === videoPip.video) {
-        void pageWindow.document.exitPictureInPicture();
-      } else if (videoPip.video?.webkitPresentationMode === 'picture-in-picture') {
-        videoPip.video.webkitSetPresentationMode('inline');
-      }
-    } catch (_) {}
-    try { videoPip.stream?.getTracks?.().forEach(track => track.stop()); } catch (_) {}
-    try { videoPip.video?.remove(); } catch (_) {}
-    try { videoPip.canvas?.remove(); } catch (_) {}
-  }
+  state._ownPipCleanup = null;
+  try { videoPip?.dispose(); } catch (_) {}
   try { pipHost?.remove(); } catch (_) {}
   try {
     if (mode === 'document' && pipWindow && !pipWindow.closed) pipWindow.close();
@@ -1608,7 +1823,7 @@ function renderOwnPipQueue(pipDocument, currentTi) {
 }
 
 function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
-  pipDocument.getElementById('tss-pip-track-menu')?.remove();
+  state._pipTrackMenuClose?.();
   const meta = state.meta[ti] || {};
   const menu = pipDocument.createElement('div');
   menu.id = 'tss-pip-track-menu';
@@ -1643,7 +1858,17 @@ function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
     menu.style.right = `${Math.max(10, playerRect.right - anchorRect.right)}px`;
   }
 
-  const close = () => menu.remove();
+  let registration = null;
+  const dismiss = event => {
+    if (!menu.contains(event.target) && !anchor.contains(event.target)) close();
+  };
+  const close = () => {
+    clearTimeout(registration);
+    pipDocument.removeEventListener('pointerdown', dismiss, true);
+    menu.remove();
+    if (state._pipTrackMenuClose === close) state._pipTrackMenuClose = null;
+  };
+  state._pipTrackMenuClose = close;
   menu.querySelector('.tss-pip-menu-title button').onclick = close;
   menu.querySelector('[data-action="play"]').onclick = () => {
     close();
@@ -1668,13 +1893,7 @@ function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
     };
   });
 
-  setTimeout(() => {
-    const dismiss = event => {
-      if (!menu.contains(event.target) && event.target !== anchor) {
-        close();
-        pipDocument.removeEventListener('pointerdown', dismiss, true);
-      }
-    };
+  registration = setTimeout(() => {
     pipDocument.addEventListener('pointerdown', dismiss, true);
   }, 0);
 }
@@ -1687,7 +1906,7 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
     anchor.setAttribute('aria-pressed', 'false');
     return;
   }
-  pipDocument.getElementById('tss-pip-track-menu')?.remove();
+  state._pipTrackMenuClose?.();
   const menu = pipDocument.createElement('section');
   menu.id = 'tss-pip-sound-menu';
   menu.className = 'tss-pip-sound-menu';
@@ -1759,7 +1978,7 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
   menu.querySelectorAll('[data-curve]').forEach(button => {
     button.onclick = () => {
       state.crossfadeCurve = button.dataset.curve;
-      localStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      safeStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
       menu.querySelectorAll('[data-curve]').forEach(option => option.setAttribute('aria-pressed', option === button ? 'true' : 'false'));
       syncCrossfadeControls();
     };
@@ -1906,7 +2125,7 @@ function nextOwnPipArtworkMode(mode = state.pipArtworkMode) {
 function setOwnPipArtworkMode(mode, pipDocument = state._ownPipWindow?.document) {
   const nextMode = ['compact', 'full', 'focus'].includes(mode) ? mode : 'compact';
   state.pipArtworkMode = nextMode;
-  try { localStorage.setItem('tss_pip_artwork_mode', nextMode); } catch (_) {}
+  try { safeStorage.setItem('tss_pip_artwork_mode', nextMode); } catch (_) {}
 
   const player = pipDocument?.getElementById('tss-pip-player');
   if (player) player.dataset.artworkMode = nextMode;
@@ -2159,9 +2378,10 @@ function drawVideoPipFrame(canvas) {
   ctx.fillText(String(nextMeta.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle')).slice(0, 46), 119, 316);
 }
 
-async function openVideoPipFallback() {
-  if (!standardVideoPipSupported() || typeof document.createElement('canvas').captureStream !== 'function') return false;
+async function openVideoPipFallback(transaction) {
+  if (!pipTransactionIsCurrent(transaction) || !standardVideoPipSupported()) return false;
   const canvas = document.createElement('canvas');
+  if (typeof canvas.captureStream !== 'function') return false;
   canvas.width = 640;
   canvas.height = 360;
   canvas.style.cssText = 'position:fixed;width:1px;height:1px;left:-9999px;top:-9999px;pointer-events:none';
@@ -2169,68 +2389,92 @@ async function openVideoPipFallback() {
   video.muted = true;
   video.playsInline = true;
   video.style.cssText = canvas.style.cssText;
-  document.body.append(canvas, video);
-  const stream = canvas.captureStream(8);
-  video.srcObject = stream;
-  drawVideoPipFrame(canvas);
-  try {
-    await video.play();
-  } catch (error) {
-    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
-    video.remove();
-    canvas.remove();
-    throw error;
-  }
-
+  let stream = null;
+  let timer = null;
+  let disposed = false;
   let syncing = true;
-  const syncVideoState = () => {
-    syncing = true;
-    const shouldPause = paused();
-    if (shouldPause && !video.paused) video.pause();
-    else if (!shouldPause && video.paused) void video.play().catch(() => {});
-    queueMicrotask(() => { syncing = false; });
+  let playPending = false;
+  const playbackController = new AbortController();
+  const onPause = () => {
+    if (!disposed && !syncing && !paused()) pause();
   };
-  video.addEventListener('pause', () => {
-    if (!syncing && !paused()) pause();
-  });
-  video.addEventListener('play', () => {
-    if (!syncing && paused()) void toggle();
-  });
-
-  try {
-    if (typeof video.requestPictureInPicture === 'function') await video.requestPictureInPicture();
-    else if (typeof video.webkitSetPresentationMode === 'function') video.webkitSetPresentationMode('picture-in-picture');
-    else throw new Error('Video PiP unavailable');
-  } catch (error) {
-    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+  const onPlay = () => {
+    if (!disposed && !syncing && paused()) void toggle();
+  };
+  const onPresentationChange = () => {
+    if (video.webkitPresentationMode !== 'picture-in-picture') dispose();
+  };
+  const dispose = () => {
+    if (disposed) { exitOwnedVideoPip(video); return; }
+    disposed = true;
+    playbackController.abort();
+    clearInterval(timer);
+    video.removeEventListener('pause', onPause);
+    video.removeEventListener('play', onPlay);
+    video.removeEventListener('leavepictureinpicture', dispose);
+    video.removeEventListener('webkitpresentationmodechanged', onPresentationChange);
+    exitOwnedVideoPip(video);
+    try { video.pause(); } catch (_) {}
+    try { stream?.getTracks().forEach(track => track.stop()); } catch (_) {}
+    video.srcObject = null;
     video.remove();
     canvas.remove();
+    if (state._videoPip?.video === video) {
+      state._videoPip = null;
+      state._ownPipMode = null;
+      setOwnPipButtonState();
+    }
+  };
+  transaction.dispose = dispose;
+  try {
+    document.body.append(canvas, video);
+    stream = canvas.captureStream(8);
+    video.srcObject = stream;
+    drawVideoPipFrame(canvas);
+    await withDeadline(signal => Promise.resolve(video.play()).then(() => {
+      if (signal.aborted || disposed || !pipTransactionIsCurrent(transaction)) {
+        video.pause();
+        throw new DOMException('PiP cancelled', 'AbortError');
+      }
+    }), 5000, transaction.controller.signal);
+    if (!pipTransactionIsCurrent(transaction)) { dispose(); return false; }
+    video.addEventListener('pause', onPause);
+    video.addEventListener('play', onPlay);
+    video.addEventListener('leavepictureinpicture', dispose);
+    video.addEventListener('webkitpresentationmodechanged', onPresentationChange);
+    if (typeof video.requestPictureInPicture === 'function') {
+      await withDeadline(signal => Promise.resolve(video.requestPictureInPicture()).then(() => {
+        if (signal.aborted || disposed || !pipTransactionIsCurrent(transaction)) {
+          dispose();
+          throw new DOMException('PiP cancelled', 'AbortError');
+        }
+      }), 5000, transaction.controller.signal);
+    } else if (typeof video.webkitSetPresentationMode === 'function') {
+      video.webkitSetPresentationMode('picture-in-picture');
+    } else throw new Error('Video PiP unavailable');
+    if (disposed || !pipTransactionIsCurrent(transaction)) { dispose(); return false; }
+    timer = setInterval(() => {
+      if (disposed) return;
+      drawVideoPipFrame(canvas);
+      syncing = true;
+      if (paused() && !video.paused) video.pause();
+      else if (!paused() && video.paused && !playPending) {
+        playPending = true;
+        void withDeadline(signal => Promise.resolve(video.play()).then(() => {
+          if (signal.aborted || disposed || paused()) video.pause();
+        }), 5000, playbackController.signal).catch(() => {}).finally(() => { playPending = false; });
+      }
+      queueMicrotask(() => { syncing = false; });
+    }, 250);
+    state._ownPipMode = 'video';
+    state._videoPip = { video, canvas, stream, timer, dispose };
+    showMergeToast('using native video PiP fallback');
+    setOwnPipButtonState();
+    return true;
+  } catch (error) {
+    dispose();
     throw error;
   }
-
-  const timer = setInterval(() => {
-    drawVideoPipFrame(canvas);
-    syncVideoState();
-  }, 250);
-  state._ownPipMode = 'video';
-  state._videoPip = { video, canvas, stream, timer };
-  const cleanup = () => {
-    if (state._videoPip?.video !== video) return;
-    clearInterval(timer);
-    try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
-    video.remove();
-    canvas.remove();
-    state._videoPip = null;
-    state._ownPipMode = null;
-    setOwnPipButtonState();
-  };
-  video.addEventListener('leavepictureinpicture', cleanup, { once: true });
-  video.addEventListener('webkitpresentationmodechanged', () => {
-    if (video.webkitPresentationMode !== 'picture-in-picture') cleanup();
-  });
-  showMergeToast('using native video PiP fallback');
-  setOwnPipButtonState();
-  return true;
 }
 
 function openInPagePipFallback() {
@@ -2250,6 +2494,7 @@ function openInPagePipFallback() {
   try {
     mountOwnPipWindow(iframe.contentWindow, 'inline');
   } catch (error) {
+    state._ownPipCleanup?.();
     host.remove();
     state._ownPipHost = null;
     state._ownPipWindow = null;
@@ -2259,6 +2504,12 @@ function openInPagePipFallback() {
 
   const header = iframe.contentDocument?.querySelector('.tss-pip-header');
   if (header) {
+    let finishDrag = null;
+    const disposeMount = state._ownPipCleanup;
+    state._ownPipCleanup = () => {
+      finishDrag?.();
+      disposeMount?.();
+    };
     header.style.cursor = 'grab';
     header.addEventListener('pointerdown', event => {
       if (event.target.closest('button')) return;
@@ -2277,12 +2528,15 @@ function openInPagePipFallback() {
         host.style.right = 'auto';
         host.style.bottom = 'auto';
       };
+      finishDrag?.();
       const up = () => {
+        finishDrag = null;
         header.style.cursor = 'grab';
         iframe.contentDocument.removeEventListener('pointermove', move);
         iframe.contentDocument.removeEventListener('pointerup', up);
         iframe.contentDocument.removeEventListener('pointercancel', up);
       };
+      finishDrag = up;
       iframe.contentDocument.addEventListener('pointermove', move);
       iframe.contentDocument.addEventListener('pointerup', up);
       iframe.contentDocument.addEventListener('pointercancel', up);
@@ -2297,36 +2551,74 @@ async function openOwnPip() {
     showMergeToast('start True Shuffle before opening PiP');
     return false;
   }
+  if (state._pipOpenTransaction) return state._pipOpenTransaction.promise;
   if (ownPipIsOpen()) {
     try { state._ownPipWindow?.focus?.(); } catch (_) {}
     return true;
   }
-
-  const documentPip = documentPipApi();
-  if (documentPip) {
-    let pipWindow = null;
-    try {
-      pipWindow = await documentPip.requestWindow(ownPipDimensions());
-      return mountOwnPipWindow(pipWindow, 'document');
-    } catch (error) {
-      console.warn('[True Shuffle] Document PiP failed; trying fallback.', error);
-      try { pipWindow?.close?.(); } catch (_) {}
-      state._ownPipWindow = null;
-      state._ownPipMode = null;
+  const transaction = { epoch: state._playbackEpoch, controller: new AbortController(), dispose: null, promise: null };
+  state._pipOpenTransaction = transaction;
+  transaction.promise = (async () => {
+    const documentPip = documentPipApi();
+    if (documentPip) {
+      let pipWindow = null;
+      try {
+        pipWindow = await withDeadline(signal => Promise.resolve(documentPip.requestWindow(ownPipDimensions())).then(acquired => {
+          if (signal.aborted || !pipTransactionIsCurrent(transaction)) {
+            try { acquired?.close?.(); } catch (_) {}
+            throw new DOMException('PiP cancelled', 'AbortError');
+          }
+          return acquired;
+        }), 5000, transaction.controller.signal);
+        transaction.dispose = () => {
+          if (state._ownPipWindow === pipWindow) state._ownPipCleanup?.();
+          try { pipWindow?.close?.(); } catch (_) {}
+        };
+        if (!pipTransactionIsCurrent(transaction)) { transaction.dispose(); return false; }
+        return mountOwnPipWindow(pipWindow, 'document');
+      } catch (error) {
+        transaction.dispose?.();
+        transaction.dispose = null;
+        if (!pipTransactionIsCurrent(transaction)) return false;
+        console.warn('[True Shuffle] Document PiP failed; trying fallback.', error);
+      }
     }
-  }
-  if (standardVideoPipSupported()) {
-    try {
-      if (await openVideoPipFallback()) return true;
-    } catch (_) {}
-  }
-  return openInPagePipFallback();
+    if (standardVideoPipSupported()) {
+      try {
+        if (await openVideoPipFallback(transaction)) return true;
+      } catch (_) {}
+    }
+    if (!pipTransactionIsCurrent(transaction)) return false;
+    return openInPagePipFallback();
+  })().catch(error => {
+    try { transaction.dispose?.(); } catch (_) {}
+    console.warn('[True Shuffle] PiP unavailable.', error);
+    return false;
+  }).finally(() => {
+    if (state._pipOpenTransaction === transaction) state._pipOpenTransaction = null;
+  });
+  return transaction.promise;
 }
 
 function mountOwnPipWindow(pipWindow, mode = 'document') {
+  const pipDocument = pipWindow.document;
   state._ownPipWindow = pipWindow;
   state._ownPipMode = mode;
-  const pipDocument = pipWindow.document;
+  const dispose = () => {
+    pipWindow.removeEventListener('resize', syncOwnPipWindow);
+    pipWindow.removeEventListener('pagehide', onPageHide);
+    if (state._ownPipWindow === pipWindow) {
+      state._pipTrackMenuClose?.();
+      state._ownPipWindow = null;
+      state._ownPipMode = null;
+      state._ownPipCleanup = null;
+    }
+  };
+  const onPageHide = () => {
+    dispose();
+    setOwnPipButtonState();
+  };
+  state._ownPipCleanup = dispose;
   pipDocument.title = 'True Shuffle';
   const style = pipDocument.createElement('style');
   style.textContent = `
@@ -2525,7 +2817,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   };
   const viewToggle = pipDocument.getElementById('tss-pip-view-toggle');
   viewToggle.onclick = () => {
-    pipDocument.getElementById('tss-pip-track-menu')?.remove();
+    state._pipTrackMenuClose?.();
     pipDocument.getElementById('tss-pip-sound-menu')?.remove();
     soundButton.dataset.active = 'false';
     soundButton.setAttribute('aria-pressed', 'false');
@@ -2601,15 +2893,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     if (event.key === 'ArrowRight') seekTo(Math.min(1, progress() + 0.03));
   };
   pipWindow.addEventListener('resize', syncOwnPipWindow);
-  if (mode === 'document') {
-    pipWindow.addEventListener('pagehide', () => {
-      if (state._ownPipWindow === pipWindow) {
-        state._ownPipWindow = null;
-        state._ownPipMode = null;
-        setOwnPipButtonState();
-      }
-    }, { once: true });
-  }
+  if (mode === 'document') pipWindow.addEventListener('pagehide', onPageHide, { once: true });
 
   setOwnPipArtworkMode(state.pipArtworkMode, pipDocument);
   setOwnPipButtonState();
@@ -2626,7 +2910,16 @@ function installBetterFeedPipBridge() {
     'getCurrentSound', 'getCurrentQueueItem', 'isPlaying', 'toggleCurrent',
     'playNext', 'playPrev', 'seekCurrentTo', 'seekCurrentBy',
   ];
-  const originals = Object.fromEntries(methodNames.map(name => [name, player[name]]));
+  const originals = {};
+  const descriptors = {};
+  try {
+    for (const name of methodNames) {
+      const descriptor = Object.getOwnPropertyDescriptor(player, name);
+      if (descriptor ? !('value' in descriptor) || !descriptor.writable : !Object.isExtensible(player)) return false;
+      descriptors[name] = descriptor;
+      originals[name] = player[name];
+    }
+  } catch (_) { return false; }
   const callOriginal = (name, args) => {
     const fn = originals[name];
     return typeof fn === 'function' ? fn.apply(player, args) : undefined;
@@ -2644,39 +2937,53 @@ function installBetterFeedPipBridge() {
     updateHub();
   };
 
+  const patched = {};
+  const installed = [];
   try {
-    player.getCurrentSound = (...args) => betterFeedPipActive()
+    patched.getCurrentSound = (...args) => betterFeedPipActive()
       ? betterFeedPipSound()
       : callOriginal('getCurrentSound', args);
-    player.getCurrentQueueItem = (...args) => betterFeedPipActive()
+    patched.getCurrentQueueItem = (...args) => betterFeedPipActive()
       ? null
       : callOriginal('getCurrentQueueItem', args);
-    player.isPlaying = (...args) => betterFeedPipActive()
+    patched.isPlaying = (...args) => betterFeedPipActive()
       ? !currentDeckAudio().paused
       : callOriginal('isPlaying', args);
-    player.toggleCurrent = (...args) => {
+    patched.toggleCurrent = (...args) => {
       if (!betterFeedPipActive()) return callOriginal('toggleCurrent', args);
       void toggle();
     };
-    player.playNext = (...args) => {
+    patched.playNext = (...args) => {
       if (!betterFeedPipActive()) return callOriginal('playNext', args);
       state.manualAction = true;
       state._manualActionAt = Date.now();
       void next();
     };
-    player.playPrev = (...args) => {
+    patched.playPrev = (...args) => {
       if (!betterFeedPipActive()) return callOriginal('playPrev', args);
       void prevTrack();
     };
-    player.seekCurrentTo = (callback, ...args) => {
+    patched.seekCurrentTo = (callback, ...args) => {
       if (!betterFeedPipActive()) return callOriginal('seekCurrentTo', [callback, ...args]);
       seekDeck(callback, false);
     };
-    player.seekCurrentBy = (callback, ...args) => {
+    patched.seekCurrentBy = (callback, ...args) => {
       if (!betterFeedPipActive()) return callOriginal('seekCurrentBy', [callback, ...args]);
       seekDeck(callback, true);
     };
+    for (const name of methodNames) {
+      Object.defineProperty(player, name, descriptors[name]
+        ? { ...descriptors[name], value: patched[name] }
+        : { value: patched[name], writable: true, enumerable: true, configurable: true });
+      installed.push(name);
+    }
   } catch (_) {
+    for (const name of installed.reverse()) {
+      try {
+        if (descriptors[name]) Object.defineProperty(player, name, descriptors[name]);
+        else delete player[name];
+      } catch (_) {}
+    }
     return false;
   }
 
@@ -2704,7 +3011,9 @@ function ensureCrossfadeDecks() {
 
 function autoLevelTrackKey(ti) {
   const meta = state.meta[ti];
-  return trackId(meta) || normalizeTrackUrl(meta?.link) || '';
+  const identity = trackId(meta) || normalizeTrackUrl(meta?.link) || '';
+  const equalizer = state.eqEnabled ? state.eqBands.join(',') : '0,0,0,0,0';
+  return identity ? JSON.stringify([identity, equalizer]) : '';
 }
 
 function calculateAutoLevelGain(rms, peak, masterVolume) {
@@ -2718,9 +3027,7 @@ function calculateAutoLevelGain(rms, peak, masterVolume) {
 
   const targetRms = 0.225;
   const desired = targetRms / level;
-  // Chromium can report unusually low analyser RMS values for some streams.
-  // Keep quiet-track correction subtle so Auto Level cannot overpower the
-  // user's master-volume setting while still attenuating genuinely loud tracks.
+  // Chromium can underreport analyser RMS; cap boosts to respect master volume.
   const maxBoost = 1.25;
   const masterHeadroom = 1 / master;
   const peakHeadroom = Number.isFinite(measuredPeak) && measuredPeak > 0
@@ -2736,7 +3043,7 @@ function saveAutoLevelCacheSoon() {
       .sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
       .slice(0, 300);
     state._autoLevelCache = Object.fromEntries(entries);
-    try { localStorage.setItem('tss_auto_level_cache_v4', JSON.stringify(state._autoLevelCache)); } catch (_) {}
+    try { safeStorage.setItem('tss_auto_level_cache_v4', JSON.stringify(state._autoLevelCache)); } catch (_) {}
   }, 800);
 }
 
@@ -2748,26 +3055,46 @@ function flushEqualizerPersistence() {
   equalizerPersistTimer = null;
   const customPresets = sanitizeCustomEqPresets(state.customEqPresets);
   state.customEqPresets = customPresets;
+  const mirrorSaved = safeStorage.setItem('tss_eq_custom_presets', JSON.stringify(customPresets));
   if (customPresetsPending) {
+    let saved = false;
     try {
-      if (typeof GM_setValue === 'function') GM_setValue(CUSTOM_EQ_PRESETS_KEY, customPresets);
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(CUSTOM_EQ_PRESETS_KEY, customPresets);
+        saved = true;
+      } else if (typeof GM_getValue !== 'function') {
+        saved = mirrorSaved;
+      }
     } catch (_) {}
-    customPresetsPending = false;
+    customPresetsPending = !saved;
+    state._equalizerSaveFailed = !saved;
   }
-  try {
-    localStorage.setItem('tss_eq_enabled', String(state.eqEnabled));
-    localStorage.setItem('tss_eq_bands', JSON.stringify(state.eqBands));
-    localStorage.setItem('tss_eq_preset', state.eqPreset);
-    // Keep a local mirror for migration and non-Tampermonkey development runs.
-    localStorage.setItem('tss_eq_custom_presets', JSON.stringify(customPresets));
-  } catch (_) {}
+  safeStorage.setItem('tss_eq_enabled', String(state.eqEnabled));
+  safeStorage.setItem('tss_eq_bands', JSON.stringify(state.eqBands));
+  safeStorage.setItem('tss_eq_preset', state.eqPreset);
+  updateEqualizerPersistenceStatus();
+  return !customPresetsPending;
+}
+
+function updateEqualizerPersistenceStatus() {
+  const overlay = document.getElementById('tss-eq-overlay');
+  const error = overlay?.querySelector('#tss-eq-save-error');
+  if (!error) return;
+  if (state._equalizerSaveFailed) {
+    overlay.querySelector('#tss-eq-save-row').dataset.open = 'true';
+    error.textContent = 'Preset changes are unsaved. Try again before leaving this page.';
+    error.dataset.persistence = 'true';
+  } else if (error.dataset.persistence === 'true') {
+    error.textContent = '';
+    delete error.dataset.persistence;
+  }
 }
 
 function persistEqualizer({ customPresets = false, immediate = false } = {}) {
   customPresetsPending = customPresetsPending || customPresets;
   clearTimeout(equalizerPersistTimer);
   if (immediate) {
-    flushEqualizerPersistence();
+    return flushEqualizerPersistence();
   } else {
     equalizerPersistTimer = setTimeout(flushEqualizerPersistence, 220);
   }
@@ -2775,12 +3102,16 @@ function persistEqualizer({ customPresets = false, immediate = false } = {}) {
 
 function syncEqualizer() {
   const now = state._audioContext?.currentTime || 0;
-  state._deckAudioGraphs.forEach(graph => {
+  state._deckAudioGraphs.forEach((graph, deckIndex) => {
     if (!graph?.eqFilters) return;
     graph.eqFilters.forEach((filter, index) => {
       const value = state.eqEnabled ? state.eqBands[index] : 0;
       filter.gain.setTargetAtTime(value, now, 0.025);
     });
+    const ti = state._deckTracks[deckIndex];
+    if (Number.isInteger(ti) && graph.trackKey !== autoLevelTrackKey(ti)) {
+      applyCachedAutoLevel(deckIndex, ti);
+    }
   });
   syncDeckProcessingRouting();
 
@@ -2792,70 +3123,109 @@ function syncEqualizer() {
   }
 }
 
+function retireAudioGraph() {
+  const context = state._audioContext;
+  state._crossfadeToken++;
+  state._crossfadePrefetchToken++;
+  state._deckPrepareTokens = state._deckPrepareTokens.map(token => token + 1);
+  for (const controller of state._deckPrepareAborts || []) {
+    try { controller?.abort(); } catch (_) {}
+  }
+  try { state._crossfadeSchedule?.resolve?.(false); } catch (_) {}
+  state._crossfadeSchedule = null;
+  state._crossfading = false;
+  state._crossfadePending = false;
+  for (const graph of state._deckAudioGraphs) {
+    if (!graph) continue;
+    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain, graph.mixGain]) {
+      try { node?.disconnect(); } catch (_) {}
+    }
+  }
+  for (const audio of state._decks) {
+    try { audio.pause(); } catch (_) {}
+    try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+    try { audio.remove(); } catch (_) {}
+  }
+  state._decks = [];
+  state._deckAudioGraphs = [null, null];
+  state._deckTracks = [null, null];
+  state._deckGains = [0, 0];
+  state._deckIndex = -1;
+  state._deckTrack = null;
+  state._audioContext = null;
+  state._audioMaster = null;
+  state._audioClipper = null;
+  state._appliedMasterGain = null;
+  state._audioGraphFailed = false;
+  try { void Promise.resolve(context?.close()).catch(() => {}); } catch (_) {}
+}
+
 function ensureAutoLevelAudioGraph() {
   const AudioContextCtor = window.AudioContext || window.webkitAudioContext
     || pageWindow.AudioContext || pageWindow.webkitAudioContext;
+  if (state._audioContext?.state === 'closed' || state._audioGraphFailed) retireAudioGraph();
   if (!AudioContextCtor) return false;
   const decks = ensureCrossfadeDecks();
+  let context = state._audioContext;
+  let published = Boolean(context);
   try {
-    if (!state._audioContext) {
-      const context = new AudioContextCtor();
+    if (!context) {
+      context = new AudioContextCtor();
       const master = context.createGain();
       const clipper = context.createWaveShaper();
       master.gain.value = state.playbackVolume;
-      // A two-point identity curve is linear inside full scale and WaveShaper
-      // clamps only samples that exceed it. Unlike a compressor, this has no
-      // envelope or release tail, so EQ/crossfade overs are contained without
-      // turning musical peaks into program-dependent volume pumping.
+      // Identity inside full scale, clipping only overs: no compressor envelope.
       clipper.curve = new Float32Array([-1, 1]);
       clipper.oversample = '4x';
       master.connect(state.safetyClipper ? clipper : context.destination);
       clipper.connect(context.destination);
+      // Allocate/configure BOTH decks before irreversibly binding either element.
+      const graphs = decks.map((audio, index) => {
+        const eqFilters = EQ_BANDS.map((band, bandIndex) => {
+          const filter = context.createBiquadFilter();
+          filter.type = band.type;
+          filter.frequency.value = band.frequency;
+          filter.Q.value = band.q;
+          filter.gain.value = state.eqEnabled ? state.eqBands[bandIndex] : 0;
+          return filter;
+        });
+        const analyser = context.createAnalyser();
+        const autoGain = context.createGain();
+        const mixGain = context.createGain();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.72;
+        autoGain.gain.value = 1;
+        mixGain.gain.value = state._deckGains[index] || 0;
+        mixGain.connect(master);
+        return {
+          source: null, eqFilters, analyser, autoGain, mixGain,
+          buffer: new Float32Array(analyser.fftSize),
+          smoothedRms: 0, peakRms: 0, measuredPeak: 0, currentGain: 1,
+          samples: 0, settled: false, trackKey: '',
+          appliedAutoGain: 1, appliedMixGain: state._deckGains[index] || 0,
+          autoGainMaster: null,
+        };
+      });
       state._audioContext = context;
       state._audioMaster = master;
       state._audioClipper = clipper;
-    }
-
-    decks.forEach((audio, index) => {
-      if (state._deckAudioGraphs[index]) return;
-      const source = state._audioContext.createMediaElementSource(audio);
-      const eqFilters = EQ_BANDS.map((band, bandIndex) => {
-        const filter = state._audioContext.createBiquadFilter();
-        filter.type = band.type;
-        filter.frequency.value = band.frequency;
-        filter.Q.value = band.q;
-        filter.gain.value = state.eqEnabled ? state.eqBands[bandIndex] : 0;
-        return filter;
+      state._deckAudioGraphs = graphs;
+      published = true;
+      decks.forEach((audio, index) => {
+        // Retain the source immediately; failure after this point retires elements.
+        graphs[index].source = context.createMediaElementSource(audio);
+        audio.volume = 1;
       });
-      const analyser = state._audioContext.createAnalyser();
-      const autoGain = state._audioContext.createGain();
-      const mixGain = state._audioContext.createGain();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.72;
-      autoGain.gain.value = 1;
-      mixGain.gain.value = state._deckGains[index] || 0;
-      mixGain.connect(state._audioMaster);
-      audio.volume = 1;
-      state._deckAudioGraphs[index] = {
-        source, eqFilters, analyser, autoGain, mixGain,
-        buffer: new Float32Array(analyser.fftSize),
-        smoothedRms: 0,
-        peakRms: 0,
-        measuredPeak: 0,
-        currentGain: 1,
-        samples: 0,
-        settled: false,
-        trackKey: '',
-        appliedAutoGain: 1,
-        appliedMixGain: state._deckGains[index] || 0,
-        autoGainMaster: null,
-      };
-    });
-    syncDeckProcessingRouting();
+    }
     syncEqualizer();
-    if (state._audioContext.state === 'suspended') void state._audioContext.resume();
+    if (context.state === 'suspended' && !state._userPaused) void resumeAudioGraph();
     return true;
   } catch (_) {
+    if (published) retireAudioGraph();
+    else {
+      // Native output is still intact because neither media element was bound.
+      try { void Promise.resolve(context?.close()).catch(() => {}); } catch (_) {}
+    }
     return false;
   }
 }
@@ -2903,25 +3273,34 @@ function syncSafetyClipper() {
   } catch (_) {}
 }
 
-async function resumeAudioGraph() {
+async function resumeAudioGraph(signal = state._playbackAbort?.signal) {
   const context = state._audioContext;
+  if (signal?.aborted || state._userPaused || state._audioGraphFailed) return false;
   if (!context || context.state === 'running') return true;
   if (context.state === 'closed') return false;
   try {
-    await context.resume();
-    return context.state === 'running';
+    await withDeadline(() => context.resume(), 5000, signal);
+    const current = !signal?.aborted && state._audioContext === context;
+    if (current && context.state !== 'running') state._audioGraphFailed = true;
+    return current && !state._userPaused && context.state === 'running';
   } catch (_) {
+    if (!signal?.aborted && state._audioContext === context) state._audioGraphFailed = true;
     return false;
   }
 }
 
-async function suspendAudioGraph() {
+async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
   const context = state._audioContext;
-  if (!context || context.state !== 'running') return true;
+  if (signal?.aborted) return false;
+  if (!context || context.state === 'suspended') return true;
+  if (context.state === 'closed') return false;
   try {
-    await context.suspend();
-    return context.state === 'suspended';
+    await withDeadline(() => context.suspend(), 5000, signal);
+    const current = !signal?.aborted && state._audioContext === context;
+    if (current && context.state !== 'suspended') state._audioGraphFailed = true;
+    return current && context.state === 'suspended';
   } catch (_) {
+    if (!signal?.aborted && state._audioContext === context) state._audioGraphFailed = true;
     return false;
   }
 }
@@ -3118,7 +3497,7 @@ function initializePlaybackVolume() {
   state._lastSoundCloudVolume = nativeVolume;
   state._playbackVolumeStored = true;
   state._playbackVolumeInitialized = true;
-  try { localStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
+  try { safeStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
   syncCrossfadeVolume();
   syncPlaybackVolumeControls();
   return true;
@@ -3134,7 +3513,7 @@ function syncPlaybackVolumeFromSoundCloud() {
   state._lastSoundCloudVolume = nativeVolume;
   if (!changedOutsideHub || Math.abs(nativeVolume - state.playbackVolume) <= 0.004) return;
   state.playbackVolume = nativeVolume;
-  try { localStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
+  try { safeStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
   syncCrossfadeVolume();
   syncPlaybackVolumeControls();
 }
@@ -3216,7 +3595,7 @@ function setPlaybackVolume(value) {
   state.playbackVolume = Math.max(0, Math.min(1, Number(value) || 0));
   state._playbackVolumeStored = true;
   state._playbackVolumeInitialized = true;
-  localStorage.setItem('tss_playback_volume', String(state.playbackVolume));
+  safeStorage.setItem('tss_playback_volume', String(state.playbackVolume));
   syncCrossfadeVolume();
   setSoundCloudVolume(state.playbackVolume);
   syncPlaybackVolumeControls();
@@ -3226,13 +3605,13 @@ function setAutoLevelEnabled(enabled) {
   const nextValue = Boolean(enabled);
   if (nextValue && !ensureAutoLevelAudioGraph()) {
     state.autoLevel = false;
-    localStorage.setItem('tss_auto_level', 'false');
+    safeStorage.setItem('tss_auto_level', 'false');
     syncPlaybackVolumeControls();
     return false;
   }
   state.autoLevel = nextValue;
-  localStorage.setItem('tss_auto_level', String(state.autoLevel));
-  if (state.autoLevel && state._audioContext?.state === 'suspended') void state._audioContext.resume();
+  safeStorage.setItem('tss_auto_level', String(state.autoLevel));
+  if (state.autoLevel && state._audioContext?.state === 'suspended') void resumeAudioGraph();
   syncDeckProcessingRouting();
   state._deckTracks.forEach((ti, index) => {
     if (Number.isInteger(ti)) applyCachedAutoLevel(index, ti);
@@ -3245,7 +3624,7 @@ function setAutoLevelEnabled(enabled) {
 function setCrossfadeSeconds(value) {
   const previousSeconds = state.crossfadeSeconds;
   state.crossfadeSeconds = Math.max(0, Math.min(12, Number(value) || 0));
-  localStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
+  safeStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
   if (state.crossfadeSeconds <= 0) {
     setCrossfadeStatus('off');
   } else {
@@ -3300,13 +3679,15 @@ function syncCrossfadeControls() {
 
 }
 
-function discoverSoundCloudClientId(excluded = '') {
-  if (state._clientId && state._clientId !== excluded) return state._clientId;
+function discoverSoundCloudClientId(excluded = new Set()) {
+  const rejected = excluded;
+  const usable = id => id && !rejected.has(id);
+  if (usable(state._clientId)) return state._clientId;
   try {
     const entries = performance.getEntriesByType('resource');
     for (let i = entries.length - 1; i >= 0; i--) {
       const match = String(entries[i].name || '').match(/[?&]client_id=([A-Za-z0-9_-]+)/);
-      if (match && match[1] !== excluded) {
+      if (match && usable(match[1])) {
         state._clientId = match[1];
         return state._clientId;
       }
@@ -3320,6 +3701,21 @@ function syncBrowserNowPlaying() {
   const meta = state.active && Number.isInteger(ti) ? state.meta[ti] : null;
 
   if (!meta?.title) {
+    state._ctxMenuClose?.();
+    const owner = state._browserMediaOwner;
+    state._browserMediaOwner = null;
+    if (owner) {
+      try {
+        const session = owner.session;
+        // Native SoundCloud may already have replaced our metadata on Stop.
+        if (session.metadata === owner.metadataValue) {
+          if (session.playbackState === owner.playbackValue) {
+            session.playbackState = owner.playbackBefore === 'playing' ? 'paused' : owner.playbackBefore;
+          }
+          session.metadata = owner.metadataBefore;
+        }
+      } catch (_) {}
+    }
     if (state._tabTitleBeforePlayback !== null && document.title === state._tabTitleValue) {
       document.title = state._tabTitleBeforePlayback;
     }
@@ -3341,27 +3737,43 @@ function syncBrowserNowPlaying() {
     const mediaSession = pageWindow.navigator?.mediaSession;
     const MediaMetadataCtor = pageWindow.MediaMetadata;
     const metadataKey = [meta.title, artist, meta.artwork || ''].join('\n');
+    if (mediaSession && state._browserMediaOwner?.session !== mediaSession) {
+      state._browserMediaOwner = {
+        session: mediaSession,
+        metadataBefore: mediaSession.metadata,
+        metadataValue: mediaSession.metadata,
+        playbackBefore: mediaSession.playbackState || 'none',
+        playbackValue: null,
+      };
+    }
+    const owner = state._browserMediaOwner;
     if (mediaSession && typeof MediaMetadataCtor === 'function'
-        && state._browserMetadataKey !== metadataKey) {
+        && (state._browserMetadataKey !== metadataKey || mediaSession.metadata !== owner.metadataValue)) {
       const init = {
         title: String(meta.title),
         artist,
         album: 'SoundCloud True Shuffle',
       };
       if (meta.artwork) init.artwork = [{ src: meta.artwork }];
-      mediaSession.metadata = new MediaMetadataCtor(init);
+      const metadata = new MediaMetadataCtor(init);
+      mediaSession.metadata = metadata;
+      owner.metadataValue = metadata;
       state._browserMetadataKey = metadataKey;
     }
     if (mediaSession && 'playbackState' in mediaSession) {
-      mediaSession.playbackState = paused() ? 'paused' : 'playing';
+      const playbackState = paused() ? 'paused' : 'playing';
+      mediaSession.playbackState = playbackState;
+      owner.playbackValue = playbackState;
     }
   } catch (_) {}
 
   return true;
 }
 
-async function discoverSoundCloudClientIdFromBundle(excluded = '') {
-  const existing = discoverSoundCloudClientId(excluded);
+async function discoverSoundCloudClientIdFromBundle(excluded = new Set(), options = {}) {
+  const rejected = excluded;
+  if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
+  const existing = options.bundleOnly ? '' : discoverSoundCloudClientId(rejected);
   if (existing) return existing;
   const scripts = [...document.scripts]
     .map(script => script.src)
@@ -3369,19 +3781,23 @@ async function discoverSoundCloudClientIdFromBundle(excluded = '') {
     .slice(-8);
   for (const src of scripts) {
     try {
-      const text = await fetch(src).then(response => response.ok ? response.text() : '');
-      const matches = text.matchAll(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9_-]{20,})["']/g);
-      const match = [...matches].find(candidate => candidate[1] !== excluded);
+      const response = await fetchSoundCloudResource(src, 'text', options);
+      if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
+      const matches = String(response.data || '').matchAll(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9_-]{20,})["']/g);
+      const match = [...matches].find(candidate => !rejected.has(candidate[1]));
       if (match) {
         state._clientId = match[1];
         return state._clientId;
       }
-    } catch (_) {}
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      recordPlaybackDiagnostic('client-discovery-failed', { error: String(error?.name || error) });
+    }
   }
   return '';
 }
 
-async function resolveProgressiveStreams(track, clientId) {
+async function resolveProgressiveStreams(track, clientId, options = {}) {
   const transcodings = Array.isArray(track?.media?.transcodings)
     ? track.media.transcodings
     : (Array.isArray(track?.transcodings)
@@ -3405,12 +3821,16 @@ async function resolveProgressiveStreams(track, clientId) {
       endpoint.searchParams.set('client_id', clientId);
       const authorization = track.track_authorization || track.trackAuthorization;
       if (authorization) endpoint.searchParams.set('track_authorization', authorization);
-      const response = await fetch(endpoint);
+      const response = await fetchSoundCloudResource(endpoint, 'json', options);
+      if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
       if (response.status === 401 || response.status === 403) authFailed = true;
       if (!response.ok) continue;
-      const stream = await response.json();
+      const stream = response.data;
       if (stream?.url && !urls.includes(stream.url)) urls.push(stream.url);
-    } catch (_) {}
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      recordPlaybackDiagnostic('stream-endpoint-failed', { error: String(error?.name || error) });
+    }
   }
   return { urls, authFailed };
 }
@@ -3438,75 +3858,102 @@ function hydrationTrackForPlayback(meta) {
   return null;
 }
 
-async function fetchPlaybackTrack(url) {
+async function fetchPlaybackTrack(url, options = {}) {
   try {
-    const response = await fetch(url);
+    const response = await fetchSoundCloudResource(url, 'json', options);
+    if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
     return {
-      track: response.ok ? await response.json() : null,
+      track: response.data,
       authFailed: response.status === 401 || response.status === 403,
     };
-  } catch (_) {
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    recordPlaybackDiagnostic('track-request-failed', { error: String(error?.name || error) });
     return { track: null, authFailed: false };
   }
 }
 
-async function resolveCrossfadeStreams(meta, options) {
-  options = options || {};
+async function resolveCrossfadeStreams(meta, options = {}) {
+  const epoch = state._playbackEpoch;
+  const signal = options.signal || state._playbackAbort?.signal;
+  const checkCurrent = () => {
+    if (epoch !== state._playbackEpoch || signal?.aborted || (options.isCurrent && !options.isCurrent())) {
+      throw new DOMException('Playback canceled', 'AbortError');
+    }
+  };
+  const requestOptions = { ...options, signal };
+  checkCurrent();
   const key = normalizeTrackUrl(meta?.link);
   if (!key) return [];
+  const now = Date.now();
+  for (const [cachedKey, value] of state._streamCache) {
+    if (now - value.ts >= 30 * 60 * 1000) state._streamCache.delete(cachedKey);
+  }
   if (options.forceRefresh) state._streamCache.delete(key);
   const cached = state._streamCache.get(key);
-  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) {
-    const urls = Array.isArray(cached.urls) ? cached.urls : [cached.url].filter(Boolean);
-    if (urls.length) return urls;
+  if (cached?.urls?.length) {
+    state._streamCache.delete(key);
+    state._streamCache.set(key, cached);
+    return cached.urls;
   }
 
-  let rejectedClientId = '';
-  for (let credentialAttempt = 0; credentialAttempt < 2; credentialAttempt++) {
-    const clientId = await discoverSoundCloudClientIdFromBundle(rejectedClientId);
+  const rejected = new Set();
+  // After two resource-history candidates, inspect current bundles rather than
+  // repeatedly cycling expired IDs from our own failed resource requests.
+  for (let credentialAttempt = 0; credentialAttempt < 8; credentialAttempt++) {
+    const clientId = await discoverSoundCloudClientIdFromBundle(rejected, {
+      ...requestOptions, bundleOnly: credentialAttempt >= 2,
+    });
+    checkCurrent();
     if (!clientId) return [];
     let authFailed = false;
     const resolveTrack = async track => {
+      checkCurrent();
       if (!track) return [];
+      if (!meta.artist || meta.artist === '—') {
+        Object.assign(meta, mergeTrackMeta(meta, metaFromSoundCloudTrack(track, meta.sourcePage, meta.playlistPosition)));
+      }
       if (syncTrackPlaybackAccess(meta, track)) return [];
-      const result = await resolveProgressiveStreams(track, clientId);
+      const result = await resolveProgressiveStreams(track, clientId, requestOptions);
+      checkCurrent();
       authFailed = authFailed || result.authFailed;
       if (result.urls.length) {
+        state._streamCache.delete(key);
         state._streamCache.set(key, { urls: result.urls, ts: Date.now() });
+        while (state._streamCache.size > 128) state._streamCache.delete(state._streamCache.keys().next().value);
       }
       return result.urls;
     };
-
     const embedded = hydrationTrackForPlayback(meta)
       || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null);
     let urls = await resolveTrack(embedded);
+    checkCurrent();
     if (urls.length) return urls;
     if (meta.requiresNativePlayback) return [];
-
     if (Number.isFinite(Number(meta.soundcloudId)) && Number(meta.soundcloudId) > 0) {
       const endpoint = new URL(`https://api-v2.soundcloud.com/tracks/${Number(meta.soundcloudId)}`);
       endpoint.searchParams.set('client_id', clientId);
       if (meta.trackAuthorization) endpoint.searchParams.set('track_authorization', meta.trackAuthorization);
-      const result = await fetchPlaybackTrack(endpoint);
+      const result = await fetchPlaybackTrack(endpoint, requestOptions);
+      checkCurrent();
       authFailed = authFailed || result.authFailed;
       urls = await resolveTrack(result.track);
+      checkCurrent();
       if (urls.length) return urls;
       if (meta.requiresNativePlayback) return [];
     }
-
     const resolveEndpoint = new URL('https://api-v2.soundcloud.com/resolve');
     resolveEndpoint.searchParams.set('url', meta.link);
     resolveEndpoint.searchParams.set('client_id', clientId);
-    const resolved = await fetchPlaybackTrack(resolveEndpoint);
+    const resolved = await fetchPlaybackTrack(resolveEndpoint, requestOptions);
+    checkCurrent();
     authFailed = authFailed || resolved.authFailed;
     urls = await resolveTrack(resolved.track);
+    checkCurrent();
     if (urls.length) return urls;
-    if (meta.requiresNativePlayback) return [];
-
-    if (!authFailed) break;
-    rejectedClientId = clientId;
-    state._clientId = '';
-    await wait(100);
+    if (meta.requiresNativePlayback || !authFailed) return [];
+    rejected.add(clientId);
+    if (state._clientId === clientId) state._clientId = '';
   }
   return [];
 }
@@ -3518,14 +3965,19 @@ async function resolveCrossfadeStream(meta, options) {
 
 function resetDeck(audio, index) {
   if (!audio) return;
-  audio.pause();
-  audio.removeAttribute('src');
-  try { audio.load(); } catch (_) {}
+  const safely = operation => {
+    try { operation(); } catch (error) {
+      recordPlaybackDiagnostic('deck-reset-failed', { error: String(error?.name || error) });
+    }
+  };
+  safely(() => audio.pause());
+  safely(() => audio.removeAttribute('src'));
+  safely(() => audio.load());
   if (Number.isInteger(index)) {
     state._deckTracks[index] = null;
     state._deckGains[index] = 0;
     const graph = state._deckAudioGraphs[index];
-    if (graph) {
+    if (graph && state._audioContext) {
       const now = state._audioContext.currentTime;
       graph.trackKey = '';
       graph.samples = 0;
@@ -3533,13 +3985,13 @@ function resetDeck(audio, index) {
       graph.peakRms = 0;
       graph.currentGain = 1;
       graph.autoGainMaster = null;
-      setAudioParamImmediately(graph.autoGain.gain, 1, now);
-      setAudioParamImmediately(graph.mixGain.gain, 0, now);
+      safely(() => setAudioParamImmediately(graph.autoGain.gain, 1, now));
+      safely(() => setAudioParamImmediately(graph.mixGain.gain, 0, now));
       graph.appliedAutoGain = 1;
       graph.appliedMixGain = 0;
     }
   }
-  audio.volume = state._deckAudioGraphs[index] ? 1 : 0;
+  safely(() => { audio.volume = state._deckAudioGraphs[index] ? 1 : 0; });
 }
 
 
@@ -3555,6 +4007,7 @@ function stopCrossfadeDecks() {
   state._crossfadeToken++;
   state._crossfadePrefetchToken++;
   state._deckPrepareTokens = state._deckPrepareTokens.map(token => token + 1);
+  state._deckPrepareAborts?.forEach(controller => controller?.abort());
   state._crossfading = false;
   state._crossfadePausedByUser = false;
   state._crossfadePending = false;
@@ -3567,44 +4020,70 @@ function stopCrossfadeDecks() {
   setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'armed' : 'off');
 }
 
-async function prepareCrossfadeDeck(index, ti, options) {
-  options = options || {};
-  const decks = ensureCrossfadeDecks();
-  if (state.autoLevel || state.eqEnabled || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
-  const audio = decks[index];
-  if (!audio || !state.meta[ti]) return null;
+async function prepareCrossfadeDeck(index, ti, options = {}) {
+  const epoch = state._playbackEpoch;
+  const sessionSignal = options.signal || state._playbackAbort?.signal;
+  if (!state.active || sessionSignal?.aborted || (options.isCurrent && !options.isCurrent())) return null;
+  if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+      || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
+    if (!ensureAutoLevelAudioGraph()) return null;
+  }
+  const audio = ensureCrossfadeDecks()[index];
+  const meta = state.meta[ti];
+  if (!audio || !meta) return null;
+  state._deckPrepareAborts ||= [];
+  state._deckPrepareAborts[index]?.abort();
+  const controller = new AbortController();
+  state._deckPrepareAborts[index] = controller;
+  const abort = () => controller.abort();
+  sessionSignal?.addEventListener('abort', abort, { once: true });
   const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
   state._deckPrepareTokens[index] = requestToken;
-  const requestIsCurrent = () => state._deckPrepareTokens[index] === requestToken
-    && state._decks[index] === audio;
-  if (!options.forceRefresh
-      && state._deckTracks[index] === ti
-      && audio.currentSrc
-      && audio.readyState >= 2) return audio;
-
-  const streamUrls = await resolveCrossfadeStreams(state.meta[ti], options);
-  if (!requestIsCurrent() || !streamUrls.length) return null;
-  for (const streamUrl of streamUrls) {
-    if (!requestIsCurrent()) return null;
-    resetDeck(audio, index);
-    audio.src = streamUrl;
-    audio.preload = 'auto';
-    state._deckTracks[index] = ti;
-    state._deckGains[index] = 0;
-    applyCachedAutoLevel(index, ti);
-    syncCrossfadeVolume();
-    audio.load();
-    if (await waitForDeck(audio, options.timeout || 5000)) {
-      if (!deckIsPreviewLimited(state.meta[ti], audio)) return audio;
-      state.meta[ti].requiresNativePlayback = true;
-      state._streamCache.delete(normalizeTrackUrl(state.meta[ti]?.link));
+  const requestIsCurrent = () => state.active && epoch === state._playbackEpoch
+    && !controller.signal.aborted && !sessionSignal?.aborted
+    && state._deckPrepareTokens[index] === requestToken
+    && state._decks[index] === audio && state.meta[ti] === meta
+    && (!options.isCurrent || options.isCurrent());
+  try {
+    if (!options.forceRefresh && state._deckTracks[index] === ti
+        && audio.currentSrc && audio.readyState >= 2) return audio;
+    const streamUrls = await resolveCrossfadeStreams(meta, {
+      ...options, signal: controller.signal, isCurrent: requestIsCurrent,
+    });
+    if (!requestIsCurrent() || !streamUrls.length) return null;
+    for (const streamUrl of streamUrls) {
+      if (!requestIsCurrent()) return null;
       resetDeck(audio, index);
-      return null;
+      audio.src = streamUrl;
+      const assignedSource = audio.src;
+      audio.preload = 'auto';
+      state._deckTracks[index] = ti;
+      state._deckGains[index] = 0;
+      applyCachedAutoLevel(index, ti);
+      syncCrossfadeVolume();
+      audio.load();
+      const ready = await waitForDeck(audio, options.timeout || 5000, controller.signal, requestIsCurrent);
+      if (!requestIsCurrent() || audio.src !== assignedSource || state._deckTracks[index] !== ti) return null;
+      if (ready) {
+        if (!deckIsPreviewLimited(meta, audio)) return audio;
+        meta.requiresNativePlayback = true;
+        state._streamCache.delete(normalizeTrackUrl(meta.link));
+        resetDeck(audio, index);
+        return null;
+      }
     }
+    if (!requestIsCurrent()) return null;
+    state._streamCache.delete(normalizeTrackUrl(meta.link));
+    resetDeck(audio, index);
+    return null;
+  } catch (error) {
+    if (!requestIsCurrent() || error?.name === 'AbortError') return null;
+    recordPlaybackDiagnostic('deck-preparation-failed', { error: String(error?.name || error) });
+    resetDeck(audio, index);
+    return null;
+  } finally {
+    sessionSignal?.removeEventListener('abort', abort);
   }
-  state._streamCache.delete(normalizeTrackUrl(state.meta[ti]?.link));
-  resetDeck(audio, index);
-  return null;
 }
 
 function cancelCrossfadeForRecovery(activeIndex) {
@@ -3613,10 +4092,11 @@ function cancelCrossfadeForRecovery(activeIndex) {
   state._crossfadeSchedule?.resolve?.(false);
   state._crossfadeSchedule = null;
   state._crossfading = false;
-  state._crossfadePausedByUser = false;
+  state._crossfadePausedByUser = Boolean(state._userPaused);
   state._crossfadePending = false;
   state._decks.forEach((audio, index) => {
     if (!audio || index === activeIndex) return;
+    state._deckPrepareTokens[index] = (state._deckPrepareTokens[index] || 0) + 1;
     resetDeck(audio, index);
   });
   state._deckGains[activeIndex] = 1;
@@ -3627,55 +4107,74 @@ function cancelCrossfadeForRecovery(activeIndex) {
 async function recoverCurrentDeckStream(audio, position, reason = 'unknown', attempt = 1) {
   const index = state._decks.indexOf(audio);
   const ti = index >= 0 ? state._deckTracks[index] : null;
-  if (index < 0 || !Number.isInteger(ti) || ti !== state._deckTrack || !state.meta[ti]) return false;
+  const meta = state.meta[ti];
+  const epoch = state._playbackEpoch;
+  const foreground = state._playbackRequest;
+  const sessionSignal = state._playbackAbort.signal;
+  if (!state.active || state._userPaused || index < 0
+      || !Number.isInteger(ti) || ti !== state._deckTrack || !meta) return null;
   const savedTime = Math.max(0, Number(position) || 0);
-  recordPlaybackDiagnostic('recovery-start', {
-    reason,
-    attempt,
-    position: Math.round(savedTime * 10) / 10,
-    readyState: Number(audio.readyState) || 0,
-    networkState: Number(audio.networkState) || 0,
-  });
-  cancelCrossfadeForRecovery(index);
+  const initialSeek = state._deckSeekRequest;
   const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
   state._deckPrepareTokens[index] = requestToken;
-  const streamUrl = await resolveCrossfadeStream(state.meta[ti], { forceRefresh: true });
-  if (!streamUrl || state._deckPrepareTokens[index] !== requestToken
-      || state._deckTracks[index] !== ti || state._deckTrack !== ti) {
-    recordPlaybackDiagnostic('recovery-aborted', { reason, attempt, freshStream: Boolean(streamUrl) });
-    return false;
-  }
+  const ownsDeck = () => state.active && state._playbackEpoch === epoch
+    && state._playbackRequest === foreground && !sessionSignal.aborted
+    && state._decks[index] === audio && state.meta[ti] === meta
+    && state._deckPrepareTokens[index] === requestToken
+    && state._deckTracks[index] === ti && state._deckTrack === ti;
   try {
-    audio.pause();
-    audio.src = streamUrl;
-    audio.preload = 'auto';
-    audio.load();
-    if (!await waitForDeck(audio, 8000)) return false;
-    const duration = Number(audio.duration);
-    audio.currentTime = Math.min(Number.isFinite(duration) ? Math.max(0, duration - 0.1) : savedTime, savedTime);
-    await resumeAudioGraph();
-    await audio.play();
-    state._deckGains[index] = 1;
-    syncCrossfadeVolume();
-    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
-    setTimeout(() => { void prefetchUpcomingCrossfadeTrack(); }, 0);
-    recordPlaybackDiagnostic('recovery-success', {
-      reason,
-      attempt,
-      resumedAt: Math.round((Number(audio.currentTime) || 0) * 10) / 10,
+    recordPlaybackDiagnostic('recovery-start', {
+      reason, attempt, position: Math.round(savedTime * 10) / 10,
+      readyState: Number(audio.readyState) || 0,
+      networkState: Number(audio.networkState) || 0,
     });
-    return true;
+    cancelCrossfadeForRecovery(index);
+    return await withDeadline(async signal => {
+      const isCurrent = () => ownsDeck() && !signal.aborted && !state._userPaused;
+      const streamUrl = await resolveCrossfadeStream(meta, { forceRefresh: true, signal });
+      if (!isCurrent()) return null;
+      if (!streamUrl) return false;
+      audio.pause();
+      audio.src = streamUrl;
+      audio.preload = 'auto';
+      audio.load();
+      const ready = await waitForDeck(audio, 8000, signal, isCurrent);
+      if (!isCurrent()) return null;
+      if (!ready) return false;
+      const duration = Number(audio.duration);
+      const latestSeek = state._deckSeekRequest;
+      const resumeTime = latestSeek !== initialSeek && latestSeek?.epoch === epoch
+        && latestSeek.audio === audio ? latestSeek.time : savedTime;
+      audio.currentTime = Math.min(Number.isFinite(duration) ? Math.max(0, duration - 0.1) : resumeTime, resumeTime);
+      const graphReady = await resumeAudioGraph(signal);
+      if (!isCurrent()) return null;
+      if (!graphReady) return false;
+      const played = await playDeckWithDeadline(audio, index, signal, isCurrent);
+      if (!isCurrent()) return null;
+      if (!played) return false;
+      state._deckGains[index] = 1;
+      syncCrossfadeVolume();
+      if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+      setTimeout(() => {
+        if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error =>
+          recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+      }, 0);
+      recordPlaybackDiagnostic('recovery-success', {
+        reason, attempt, resumedAt: Math.round((Number(audio.currentTime) || 0) * 10) / 10,
+      });
+      return true;
+    }, 15000, sessionSignal);
   } catch (error) {
+    if (!ownsDeck() || state._userPaused) return null;
     recordPlaybackDiagnostic('recovery-failed', {
-      reason,
-      attempt,
-      error: String(error?.name || error || 'unknown').slice(0, 80),
+      reason, attempt, error: String(error?.name || error || 'unknown').slice(0, 80),
     });
     return false;
   }
 }
 
-async function waitForDeck(audio, timeout = 5000) {
+async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () => true) {
+  if (signal?.aborted || !isCurrent()) return false;
   if (audio.readyState >= 2) return true;
   return new Promise(resolve => {
     let settled = false;
@@ -3685,13 +4184,16 @@ async function waitForDeck(audio, timeout = 5000) {
       clearTimeout(timer);
       audio.removeEventListener('canplay', onReady);
       audio.removeEventListener('error', onError);
-      resolve(ok);
+      signal?.removeEventListener('abort', onError);
+      resolve(ok && !signal?.aborted && isCurrent());
     };
     const onReady = () => finish(true);
     const onError = () => finish(false);
     const timer = setTimeout(() => finish(audio.readyState >= 2), timeout);
     audio.addEventListener('canplay', onReady, { once: true });
     audio.addEventListener('error', onError, { once: true });
+    signal?.addEventListener('abort', onError, { once: true });
+    if (signal?.aborted || !isCurrent()) onError();
   });
 }
 
@@ -3754,31 +4256,40 @@ function scheduleAudioParamCurve(param, values, startTime, duration) {
 }
 
 function waitForCrossfadeSchedule(schedule, token) {
+  const epoch = state._playbackEpoch;
+  const signal = state._playbackAbort.signal;
+  const context = state._audioContext;
   return new Promise(resolve => {
     let settled = false;
-    let lastClockValue = Number(state._audioContext?.currentTime) || 0;
+    let timer;
+    let lastClockValue = Number(context?.currentTime) || 0;
     let lastClockAdvanceAt = Date.now();
     const finish = completed => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
       delete schedule.resolve;
       resolve(completed);
     };
+    const onAbort = () => finish(false);
     schedule.resolve = finish;
+    signal.addEventListener('abort', onAbort, { once: true });
     const poll = () => {
       if (settled) return;
-      if (token !== state._crossfadeToken || state._crossfadeSchedule !== schedule) {
+      if (!state.active || state._playbackEpoch !== epoch || signal.aborted
+          || state._audioContext !== context || token !== state._crossfadeToken
+          || state._crossfadeSchedule !== schedule || (schedule.isCurrent && !schedule.isCurrent())) {
         finish(false);
         return;
       }
-      if (state._audioContext?.currentTime >= schedule.endTime - 0.005) {
-        finish(true);
-        return;
-      }
-      const clockValue = Number(state._audioContext?.currentTime) || 0;
-      if (state._crossfadePausedByUser) {
+      const clockValue = Number(context?.currentTime) || 0;
+      if (state._userPaused || state._crossfadePausedByUser) {
         lastClockValue = clockValue;
         lastClockAdvanceAt = Date.now();
+      } else if (clockValue >= schedule.endTime - 0.005) {
+        finish(true);
+        return;
       } else if (clockValue > lastClockValue + 0.005) {
         lastClockValue = clockValue;
         lastClockAdvanceAt = Date.now();
@@ -3786,12 +4297,12 @@ function waitForCrossfadeSchedule(schedule, token) {
         recordPlaybackDiagnostic('crossfade-clock-stall', {
           elapsed: Math.round(Math.max(0, clockValue - schedule.startTime) * 10) / 10,
           duration: schedule.duration,
-          contextState: state._audioContext?.state || 'missing',
+          contextState: context?.state || 'missing',
         });
         finish(false);
         return;
       }
-      setTimeout(poll, 80);
+      timer = setTimeout(poll, 80);
     };
     poll();
   });
@@ -3800,12 +4311,16 @@ function waitForCrossfadeSchedule(schedule, token) {
 function settleScheduledCrossfade() {
   const schedule = state._crossfadeSchedule;
   if (!schedule || typeof schedule.resolve !== 'function') return;
+  if (!state.active || (schedule.isCurrent && !schedule.isCurrent())) {
+    schedule.resolve(false);
+    return;
+  }
   const now = Date.now();
   const clockValue = Number(state._audioContext?.currentTime) || 0;
   const incoming = state._decks[schedule.incomingIndex];
   const incomingTime = Number(incoming?.currentTime) || 0;
 
-  if (state._crossfadePausedByUser) {
+  if (state._userPaused || state._crossfadePausedByUser) {
     schedule.lastClockValue = clockValue;
     schedule.lastClockAdvanceAt = now;
     schedule.lastIncomingTime = incomingTime;
@@ -3813,7 +4328,7 @@ function settleScheduledCrossfade() {
     return;
   }
 
-  if (incoming?.paused && !incoming.ended && now - (schedule.createdAt || now) >= 350) {
+  if (incoming?.paused && !incoming.ended && now - (schedule.createdAt ?? now) >= 350) {
     if (!schedule.faultRecorded) {
       schedule.faultRecorded = true;
       recordPlaybackDiagnostic('crossfade-deck-paused', playbackDiagnosticSnapshot('incoming-deck-paused'));
@@ -3836,8 +4351,8 @@ function settleScheduledCrossfade() {
     schedule.lastIncomingAdvanceAt = now;
   }
 
-  const clockStalledFor = now - (schedule.lastClockAdvanceAt || schedule.createdAt || now);
-  const mediaStalledFor = now - (schedule.lastIncomingAdvanceAt || schedule.createdAt || now);
+  const clockStalledFor = now - (schedule.lastClockAdvanceAt ?? schedule.createdAt ?? now);
+  const mediaStalledFor = now - (schedule.lastIncomingAdvanceAt ?? schedule.createdAt ?? now);
   if (clockStalledFor >= 2500 && mediaStalledFor >= 2500) {
     if (!schedule.faultRecorded) {
       schedule.faultRecorded = true;
@@ -3850,119 +4365,156 @@ function settleScheduledCrossfade() {
 function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
   const duration = Math.max(0.25, seconds);
   const startedAt = Number(incoming.currentTime) || 0;
-  const startedWallAt = Date.now();
+  const epoch = state._playbackEpoch;
+  const signal = state._playbackAbort.signal;
   const outgoingIndex = state._decks.indexOf(outgoing);
   const incomingIndex = state._decks.indexOf(incoming);
+  const outgoingToken = state._deckPrepareTokens[outgoingIndex];
+  const incomingToken = state._deckPrepareTokens[incomingIndex];
   const curve = state.crossfadeCurve;
-  return new Promise(resolve => {
+  let lastWallAt = Date.now();
+  let activeWallMs = 0;
+  let wasPaused = Boolean(state._userPaused || state._crossfadePausedByUser);
+  return new Promise((resolve, reject) => {
+    let timer;
+    let settled = false;
+    const finish = (completed, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    signal.addEventListener('abort', onAbort, { once: true });
     const poll = () => {
-      if (token !== state._crossfadeToken) { resolve(false); return; }
-      if (Date.now() - startedWallAt > (duration + 5) * 1000) { resolve(false); return; }
-      const elapsed = Math.max(0, (Number(incoming.currentTime) || startedAt) - startedAt);
-      const t = Math.max(0, Math.min(1, elapsed / duration));
-      const [outgoingGain, incomingGain] = crossfadeGains(t, curve);
-      state._deckGains[outgoingIndex] = outgoingGain;
-      state._deckGains[incomingIndex] = incomingGain;
-      syncCrossfadeVolume();
-      if (t >= 1) { resolve(true); return; }
-      setTimeout(poll, 50);
+      if (settled) return;
+      if (!state.active || state._playbackEpoch !== epoch || signal.aborted
+          || token !== state._crossfadeToken || state._decks[outgoingIndex] !== outgoing
+          || state._decks[incomingIndex] !== incoming
+          || state._deckPrepareTokens[outgoingIndex] !== outgoingToken
+          || state._deckPrepareTokens[incomingIndex] !== incomingToken) {
+        finish(false);
+        return;
+      }
+      const now = Date.now();
+      const userPaused = Boolean(state._userPaused || state._crossfadePausedByUser);
+      if (!wasPaused && !userPaused) activeWallMs += Math.max(0, now - lastWallAt);
+      lastWallAt = now;
+      wasPaused = userPaused;
+      if (!userPaused) {
+        const elapsed = Math.max(0, (Number(incoming.currentTime) || 0) - startedAt);
+        const t = Math.max(0, Math.min(1, elapsed / duration));
+        try {
+          const [outgoingGain, incomingGain] = crossfadeGains(t, curve);
+          state._deckGains[outgoingIndex] = outgoingGain;
+          state._deckGains[incomingIndex] = incomingGain;
+          syncCrossfadeVolume();
+        } catch (error) { finish(false, error); return; }
+        if (t >= 1) { finish(true); return; }
+        if (activeWallMs > (duration + 5) * 1000) { finish(false); return; }
+      }
+      timer = setTimeout(poll, 50);
     };
     poll();
   });
 }
 
 async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
+  const epoch = state._playbackEpoch;
+  const signal = state._playbackAbort.signal;
+  const foreground = state._playbackRequest;
   const duration = Math.max(0.25, seconds);
+  const graphAvailable = ensureAutoLevelAudioGraph();
   const outgoingIndex = state._decks.indexOf(outgoing);
   const incomingIndex = state._decks.indexOf(incoming);
+  if (outgoingIndex < 0 || incomingIndex < 0) return null;
+  const outgoingToken = state._deckPrepareTokens[outgoingIndex];
+  const incomingToken = state._deckPrepareTokens[incomingIndex];
+  const context = state._audioContext;
   const curve = state.crossfadeCurve;
+  const ownsTransition = () => state.active && state._playbackEpoch === epoch
+    && !signal.aborted && state._playbackRequest === foreground && token === state._crossfadeToken
+    && state._decks[outgoingIndex] === outgoing && state._decks[incomingIndex] === incoming
+    && state._deckPrepareTokens[outgoingIndex] === outgoingToken
+    && state._deckPrepareTokens[incomingIndex] === incomingToken && state._audioContext === context;
+  if (!ownsTransition() || state._userPaused) return null;
+  let schedule = null;
+  let succeeded = false;
   state._crossfading = true;
   state._crossfadePausedByUser = false;
-  setCrossfadeStatus('mixing');
-
-  const graphReady = ensureAutoLevelAudioGraph()
-    && state._deckAudioGraphs[outgoingIndex]
-    && state._deckAudioGraphs[incomingIndex]
-    && await resumeAudioGraph();
-
-  let completed = false;
-  if (graphReady) {
-    const context = state._audioContext;
-    const startTime = context.currentTime + 0.015;
-    const steps = 129;
-    const outgoingValues = new Float32Array(steps);
-    const incomingValues = new Float32Array(steps);
-    for (let i = 0; i < steps; i++) {
-      const [outGain, inGain] = crossfadeGains(i / (steps - 1), curve);
-      outgoingValues[i] = outGain;
-      incomingValues[i] = inGain;
+  try {
+    setCrossfadeStatus('mixing');
+    let completed;
+    if (graphAvailable && state._deckAudioGraphs[outgoingIndex] && state._deckAudioGraphs[incomingIndex]) {
+      const resumed = await resumeAudioGraph(signal);
+      if (!ownsTransition() || state._userPaused) return null;
+      if (!resumed) return false;
+      const startTime = context.currentTime + 0.015;
+      const steps = 129;
+      const outgoingValues = new Float32Array(steps);
+      const incomingValues = new Float32Array(steps);
+      for (let i = 0; i < steps; i++) {
+        const [outGain, inGain] = crossfadeGains(i / (steps - 1), curve);
+        outgoingValues[i] = outGain;
+        incomingValues[i] = inGain;
+      }
+      schedule = {
+        token, outgoingIndex, incomingIndex, curve, isCurrent: ownsTransition,
+        startTime, duration, endTime: startTime + duration, createdAt: Date.now(),
+        lastClockValue: context.currentTime, lastClockAdvanceAt: Date.now(),
+        lastIncomingTime: Number(incoming.currentTime) || 0, lastIncomingAdvanceAt: Date.now(),
+        faultRecorded: false,
+      };
+      state._crossfadeSchedule = schedule;
+      scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
+      scheduleAudioParamCurve(state._deckAudioGraphs[incomingIndex].mixGain.gain, incomingValues, startTime, duration);
+      completed = await waitForCrossfadeSchedule(schedule, token);
+    } else {
+      completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
     }
-    const schedule = {
-      token, outgoingIndex, incomingIndex, curve,
-      startTime, duration, endTime: startTime + duration,
-      createdAt: Date.now(),
-      lastClockValue: context.currentTime,
-      lastClockAdvanceAt: Date.now(),
-      lastIncomingTime: Number(incoming.currentTime) || 0,
-      lastIncomingAdvanceAt: Date.now(),
-      faultRecorded: false,
-    };
-    state._crossfadeSchedule = schedule;
-    scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
-    scheduleAudioParamCurve(state._deckAudioGraphs[incomingIndex].mixGain.gain, incomingValues, startTime, duration);
-    completed = await waitForCrossfadeSchedule(schedule, token);
-  } else {
-    completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
-  }
-
-  if (!completed || token !== state._crossfadeToken) {
-    if (token !== state._crossfadeToken) return false;
-
-    // Firefox can leave a running media element attached to a suspended Web
-    // Audio clock. Never leave next() waiting forever: promote the incoming
-    // deck to full gain and resume it instead of dropping into native playback.
-    state._crossfadeSchedule = null;
-    const context = state._audioContext;
-    const now = context?.currentTime || 0;
-    const outgoingGraph = state._deckAudioGraphs[outgoingIndex];
-    const incomingGraph = state._deckAudioGraphs[incomingIndex];
-    setAudioParamImmediately(outgoingGraph?.mixGain.gain, 0, now);
-    setAudioParamImmediately(incomingGraph?.mixGain.gain, 1, now);
-    state._deckGains[outgoingIndex] = 0;
-    state._deckGains[incomingIndex] = 1;
-    outgoing.pause();
-    if (!state._crossfadePausedByUser && incoming.paused) {
-      await resumeAudioGraph();
-      try { await incoming.play(); } catch (_) {
-        recordPlaybackDiagnostic('crossfade-handoff-failed', playbackDiagnosticSnapshot('incoming-resume-rejected'));
-        const recovered = await recoverCurrentDeckStream(
-          incoming,
-          Number(incoming.currentTime) || 0,
-          'crossfade-handoff',
-          1,
-        );
-        if (!recovered) {
-          state._crossfading = false;
-          setCrossfadeStatus('fallback');
-          return false;
-        }
+    if (!ownsTransition() || state._userPaused) return null;
+    if (!completed) {
+      // Media can report playing while its output graph is suspended. Resume
+      // output even when no additional media play() call is necessary.
+      const resumed = await resumeAudioGraph(signal);
+      if (!ownsTransition() || state._userPaused) return null;
+      if (!resumed) return false;
+      if (incoming.paused) {
+        const played = await playDeckWithDeadline(incoming, incomingIndex, signal,
+          () => ownsTransition() && !state._userPaused);
+        if (!ownsTransition() || state._userPaused) return null;
+        if (!played) return false;
       }
     }
+    if (state._crossfadeSchedule === schedule) state._crossfadeSchedule = null;
+    const now = context?.currentTime || 0;
+    setAudioParamImmediately(state._deckAudioGraphs[outgoingIndex]?.mixGain.gain, 0, now);
+    setAudioParamImmediately(state._deckAudioGraphs[incomingIndex]?.mixGain.gain, 1, now);
+    outgoing.pause();
+    state._deckGains[outgoingIndex] = 0;
+    state._deckGains[incomingIndex] = 1;
     syncCrossfadeVolume();
-    state._crossfading = false;
-    state._crossfadePausedByUser = false;
-    setCrossfadeStatus('ready');
+    succeeded = true;
     return true;
+  } catch (error) {
+    if (!ownsTransition() || state._userPaused) return null;
+    recordPlaybackDiagnostic('crossfade-handoff-failed', {
+      error: String(error?.name || error || 'unknown').slice(0, 80),
+    });
+    return false;
+  } finally {
+    if (ownsTransition()) {
+      if (state._crossfadeSchedule === schedule) {
+        schedule?.resolve?.(false);
+        state._crossfadeSchedule = null;
+      }
+      state._crossfading = false;
+      state._crossfadePausedByUser = Boolean(state._userPaused);
+      try { setCrossfadeStatus(succeeded ? 'ready' : 'fallback'); } catch (_) {}
+    }
   }
-  state._crossfadeSchedule = null;
-  outgoing.pause();
-  state._deckGains[outgoingIndex] = 0;
-  state._deckGains[incomingIndex] = 1;
-  syncCrossfadeVolume();
-  state._crossfading = false;
-  state._crossfadePausedByUser = false;
-  setCrossfadeStatus('ready');
-  return true;
 }
 
 async function prefetchUpcomingCrossfadeTrack() {
@@ -3995,56 +4547,157 @@ function upcomingTrackIndex() {
 
 function refreshUpcomingCrossfadePreparation() {
   state._crossfadePrefetchToken++;
+  if (state.busy) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
   if (standby < 0 || standby >= state._decks.length) return;
 
   state._deckPrepareTokens[standby] = (state._deckPrepareTokens[standby] || 0) + 1;
+  state._deckPrepareAborts?.[standby]?.abort();
   if (state._crossfading || standby === state._deckIndex) return;
 
   const nextTi = upcomingTrackIndex();
   if (state._deckTracks[standby] !== null && state._deckTracks[standby] !== nextTi) {
     resetDeck(state._decks[standby], standby);
   }
-  if (state.active && currentDeckAudio()) void prefetchUpcomingCrossfadeTrack();
+  if (state.active && !state.busy && currentDeckAudio()) {
+    void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+  }
+}
+
+async function runPlaybackOperation(label, operation) {
+  const epoch = state._playbackEpoch;
+  const request = {};
+  state._playbackRequest = request;
+  state.busy = true;
+  const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request;
+  try {
+    return await operation(isCurrent);
+  } catch (error) {
+    if (isCurrent() && error?.name !== 'AbortError') {
+      recordPlaybackDiagnostic('playback-operation-failed', { operation: label, error: String(error?.name || error) });
+    }
+    return false;
+  } finally {
+    if (isCurrent()) {
+      state.busy = false;
+      try { updateHub(); } catch (error) {
+        recordPlaybackDiagnostic('playback-ui-failed', { operation: label, error: String(error?.name || error) });
+      }
+    }
+  }
+}
+
+async function playDeckWithDeadline(audio, index, signal, isCurrent) {
+  const source = audio.src;
+  const preparation = state._deckPrepareTokens[index];
+  if (!isCurrent() || signal?.aborted || state._userPaused) return null;
+  const playTokens = state._deckPlayTokens || (state._deckPlayTokens = []);
+  const playToken = (playTokens[index] || 0) + 1;
+  playTokens[index] = playToken;
+  let abandoned = false;
+  try {
+    await withDeadline(() => {
+      const playing = audio.play();
+      // A late completion may share a source with a newer explicit resume.
+      // Only the play attempt that still owns this deck may pause it.
+      Promise.resolve(playing).then(() => {
+        const eligibleSource = !audio.src || (state._deckPrepareTokens[index] === preparation && audio.src === source);
+        if ((abandoned || !isCurrent() || state._userPaused)
+            && state._deckPlayTokens[index] === playToken
+            && state._decks[index] === audio && eligibleSource) {
+          try { audio.pause(); } catch (error) {
+            recordPlaybackDiagnostic('late-play-cleanup-failed', { error: String(error?.name || error) });
+          }
+        }
+      }, () => {});
+      return playing;
+    }, 5000, signal);
+    if (!isCurrent() || state._userPaused) return null;
+    return true;
+  } catch (error) {
+    const owned = isCurrent();
+    if (owned && state._deckPlayTokens[index] === playToken
+        && state._decks[index] === audio && audio.src === source) {
+      abandoned = true;
+      // Abort pending media startup without discarding the recovery owner.
+      try { audio.pause(); audio.load(); } catch (_) {}
+    }
+    if (!owned || signal?.aborted || state._userPaused) return null;
+    throw error;
+  }
 }
 
 async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
+  const epoch = state._playbackEpoch;
+  const request = state._playbackRequest;
+  const signal = state._playbackAbort?.signal;
+  const meta = state.meta[ti];
+  const isCurrent = () => state.active && epoch === state._playbackEpoch
+    && state._playbackRequest === request && state.meta[ti] === meta && !signal?.aborted;
+  if (!isCurrent()) return null;
+  if (meta?.requiresNativePlayback) return false;
+  if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+      || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
+    if (!ensureAutoLevelAudioGraph()) return false;
+  }
   const outgoing = currentDeckAudio();
-  if (state.meta[ti]?.requiresNativePlayback) return false;
   const outgoingIndex = state._deckIndex;
   const incomingIndex = outgoingIndex === 0 ? 1 : 0;
-  const canMix = Boolean(outgoing && !outgoing.paused && !outgoing.ended && requestedFade > 0);
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
-
   let incoming = null;
+  let canMix = false;
+  let ownsIncoming = isCurrent;
+  const deferPaused = () => {
+    if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
+    return null;
+  };
   for (let attempt = 0; attempt < 2; attempt++) {
-    incoming = await prepareCrossfadeDeck(incomingIndex, ti, { forceRefresh: attempt > 0 });
+    if (!isCurrent()) return null;
+    incoming = await prepareCrossfadeDeck(incomingIndex, ti, { forceRefresh: attempt > 0, signal, isCurrent });
+    if (!isCurrent()) return null;
+    if (state._userPaused) return deferPaused();
     if (!incoming) continue;
+    const preparedToken = state._deckPrepareTokens[incomingIndex];
+    const source = incoming.src;
+    ownsIncoming = () => isCurrent() && state._decks[incomingIndex] === incoming
+      && state._deckPrepareTokens[incomingIndex] === preparedToken
+      && state._deckTracks[incomingIndex] === ti && incoming.src === source;
+    if (!ownsIncoming()) return null;
+    canMix = Boolean(outgoing && state._decks[outgoingIndex] === outgoing
+      && !outgoing.paused && !outgoing.ended && requestedFade > 0);
     incoming.currentTime = 0;
     state._deckGains[incomingIndex] = canMix ? 0 : 1;
     syncCrossfadeVolume();
     pauseSoundCloudTransport();
     pauseSoundCloud();
-    await resumeAudioGraph();
     try {
-      await incoming.play();
+      const resumed = await resumeAudioGraph(signal);
+      if (!ownsIncoming()) return null;
+      if (state._userPaused) return deferPaused();
+      if (!resumed) throw new Error('Audio graph did not resume');
+      const played = await playDeckWithDeadline(incoming, incomingIndex, signal, ownsIncoming);
+      if (!ownsIncoming()) return null;
+      if (state._userPaused) return deferPaused();
+      if (!played) return null;
       break;
     } catch (error) {
+      if (!isCurrent() || state._decks[incomingIndex] !== incoming
+          || state._deckPrepareTokens[incomingIndex] !== preparedToken) return null;
       recordPlaybackDiagnostic('custom-start-retry', {
-        attempt: attempt + 1,
-        error: String(error?.name || error || 'unknown').slice(0, 80),
+        attempt: attempt + 1, error: String(error?.name || error || 'unknown').slice(0, 80),
       });
       resetDeck(incoming, incomingIndex);
       incoming = null;
     }
   }
+  if (!isCurrent()) return null;
   if (!incoming) {
     if (state.crossfadeSeconds > 0) setCrossfadeStatus('fallback');
     return false;
   }
-
+  if (state._userPaused) return deferPaused();
   const token = ++state._crossfadeToken;
-  if (Number.isInteger(outgoingIndex) && outgoingIndex >= 0 && !canMix) {
+  if (outgoingIndex >= 0 && !canMix) {
     state._deckGains[outgoingIndex] = 0;
     state._deckGains[incomingIndex] = 1;
     syncCrossfadeVolume();
@@ -4053,31 +4706,45 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   state._deckTrack = ti;
   state._nativeTrack = null;
   installBetterFeedPipBridge();
-  state.lastTitle = state.meta[ti]?.title || '';
+  if (canMix) {
+    const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token);
+    if (!ownsIncoming() || state._crossfadeToken !== token) return null;
+    if (state._userPaused) return deferPaused();
+    if (mixed !== true) return mixed === false ? false : null;
+  }
+  if (!ownsIncoming()) return null;
+  if (outgoing && outgoing !== incoming && state._decks[outgoingIndex] === outgoing) resetDeck(outgoing, outgoingIndex);
+  if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+  state._pendingPlaybackTrack = null;
+  state.lastTitle = meta?.title || '';
   state.lastProgress = 0;
   if (countPlay) trackPlayed(ti);
-
-  if (canMix) {
-    await animateDeckCrossfade(outgoing, incoming, requestedFade, token);
-    resetDeck(outgoing, outgoingIndex);
-  } else if (outgoing && outgoing !== incoming) {
-    resetDeck(outgoing, outgoingIndex);
-    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
-  } else {
-    if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
-  }
-
   clearTimeout(state._customPlaybackRetryTimer);
   state._customPlaybackRetryTimer = null;
   state.suspended = false;
-  setTimeout(() => { void prefetchUpcomingCrossfadeTrack(); }, 0);
-  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 80);
+  setTimeout(() => {
+    if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+  }, 0);
+  setTimeout(() => {
+    if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
+  }, 80);
   return true;
 }
 
 function trackPlayed(ti) {
   state.stats.played++;
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
+}
+
+function finalizeLeavingCurrentTrack(ti) {
+  if (state.meta[ti]?.removedFromPlaylist) state.meta[ti].unavailable = true;
+}
+
+function recountRoundTotal() {
+  const remaining = state.queue.slice(state.pos);
+  const queued = new Set(remaining);
+  const pending = new Set(state.playNext.filter(ti => !queued.has(ti)));
+  state.roundTotal = state.roundPlayed + remaining.length + pending.size;
 }
 
 function consumeCurrentQueueTrack() {
@@ -4087,14 +4754,9 @@ function consumeCurrentQueueTrack() {
   state.history.push(justPlayed);
   if (state.history.length > 100) state.history.shift();
 
-  // Spotify-style shuffle: each track plays exactly once per round.
-  // The played track is removed and NOT re-inserted; only when the
-  // whole round is exhausted do we reshuffle everything for a new round.
   state.queue.splice(state.pos, 1);
   state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
-  if (state.meta[justPlayed]?.removedFromPlaylist) {
-    state.meta[justPlayed].unavailable = true;
-  }
+  finalizeLeavingCurrentTrack(justPlayed);
 
   const remaining = state.queue.length - state.pos;
   if (!state.stopAfterRound && remaining <= 0) {
@@ -4114,6 +4776,7 @@ function consumeCurrentQueueTrack() {
     }
     state.queue.splice(state.pos, 0, ti);
   }
+  recountRoundTotal();
 
   return justPlayed;
 }
@@ -4128,9 +4791,7 @@ function currentPageTrackElements() {
     ...document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item, .badgeList__item'),
   ];
 
-  // The current Likes grid exposes track cards through their action controls
-  // rather than a stable list-item class. Keep those cards in the same DOM
-  // collection pipeline as conventional track lists.
+  // Likes cards lack a stable list-item class; locate them by action controls.
   if (isLikedTracksPage()) {
     for (const control of document.querySelectorAll('.soundActions .sc-button-more, button[title="More"]')) {
       const card = control.closest('.sound');
@@ -4138,14 +4799,69 @@ function currentPageTrackElements() {
     }
   }
 
-  return [...new Set(elements)];
+  const seen = new Set();
+  return elements.filter(el => {
+    const link = getLink(el);
+    const id = link ? normalizeTrackUrl(link) : el;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
 }
 
-async function loadTracks() {
-  const preserveScrolledLikes = isLikedTracksPage();
+function beginCollectionRequest(sourcePage, ownsLoading = true, ownsBusy = false) {
+  cancelCollectionRequest();
+  const controller = new AbortController();
+  const playbackSignal = state._playbackAbort.signal;
+  let request;
+  const abort = () => {
+    controller.abort();
+    if (request) finishCollectionRequest(request);
+  };
+  playbackSignal.addEventListener('abort', abort, { once: true });
+  request = {
+    sourcePage, epoch: ++state._collectionEpoch,
+    playbackEpoch: state._playbackEpoch, routeEpoch: state._routeEpoch || 0,
+    signal: controller.signal, controller, playbackSignal, abort, ownsLoading, ownsBusy,
+  };
+  state._collectionRequest = request;
+  if (ownsLoading) state.loading = true;
+  if (ownsBusy) state.busy = true;
+  return request;
+}
+
+function collectionRequestCurrent(request) {
+  return !request.signal.aborted && state._collectionRequest === request
+    && request.epoch === state._collectionEpoch && request.playbackEpoch === state._playbackEpoch
+    && request.routeEpoch === (state._routeEpoch || 0)
+    && playlistBase(location.href) === playlistBase(request.sourcePage);
+}
+
+function finishCollectionRequest(request) {
+  request.playbackSignal.removeEventListener('abort', request.abort);
+  if (state._collectionRequest !== request) return;
+  state._collectionRequest = null;
+  if (request.ownsLoading) state.loading = false;
+  if (request.ownsBusy) state.busy = false;
+  try { updateHub(); } catch (_) {}
+}
+
+function cancelCollectionRequest() {
+  const request = state._collectionRequest;
+  if (!request) return;
+  request.controller.abort();
+  finishCollectionRequest(request);
+}
+
+async function loadTracks(request = null) {
+  const sourcePage = request?.sourcePage || location.href;
+  const currentRequest = () => !request || collectionRequestCurrent(request);
+  const pause = ms => request ? withDeadline(() => wait(ms), ms + 1000, request.signal) : wait(ms);
+  const preserveScrolledLikes = isLikedTracksPage(sourcePage);
   const seen = new Map();
   let current = [];
   const collect = () => {
+    if (!currentRequest()) return;
     current = currentPageTrackElements();
     if (!preserveScrolledLikes) return;
     for (const el of current) {
@@ -4157,12 +4873,14 @@ async function loadTracks() {
   for (let i = 0; i < 20; i++) {
     collect();
     if ((preserveScrolledLikes ? seen.size : current.length) > 0) break;
-    await wait(500);
+    await pause(500);
+    if (!currentRequest()) return [];
   }
   let last = 0, stable = 0, iters = 0;
   while (stable < 2 && iters < 60) {
     window.scrollTo(0, document.body.scrollHeight);
-    await wait(900);
+    await pause(900);
+    if (!currentRequest()) return [];
     collect();
     const n = preserveScrolledLikes ? seen.size : current.length;
     n === last ? stable++ : (stable = 0, last = n);
@@ -4180,7 +4898,7 @@ function bindCurrentPageElements(pageEls) {
   });
   state.els = state.meta.map(meta => {
     const el = byId.get(trackId(meta)) || null;
-    if (el) delete meta.unavailable;
+    if (el && !meta.removedFromPlaylist) delete meta.unavailable;
     return el;
   });
 }
@@ -4191,192 +4909,209 @@ function trackAvailable(ti) {
 }
 
 async function playWithSoundCloudSession(ti, countPlay = true) {
+  const epoch = state._playbackEpoch;
+  const request = state._playbackRequest;
+  const signal = state._playbackAbort?.signal;
   const meta = state.meta[ti];
   const el = state.els[ti];
+  const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request
+    && state.meta[ti] === meta && state.els[ti] === el && !signal?.aborted;
+  if (!isCurrent()) return null;
   if (!meta?.requiresNativePlayback || !el || !document.body.contains(el)) return false;
-
+  if (state._userPaused) return null;
   stopCrossfadeDecks();
-  state._nativeTrack = ti;
-  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-  await wait(80);
-
-  const button = el.querySelector(
-    'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
-  ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
-  if (!button) {
-    state._nativeTrack = null;
-    return false;
-  }
-
-  button.click();
+  pauseSoundCloudTransport();
+  pauseSoundCloud();
+  state.suspended = false;
   let started = false;
-  for (let attempt = 0; attempt < 20; attempt++) {
-    await wait(150);
-    const nativeAudio = [...document.querySelectorAll('audio')]
-      .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
-    if (nativeAudio || !soundCloudPaused()) {
-      started = true;
-      break;
+  state._nativeTrack = ti;
+  try {
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    await withDeadline(() => wait(80), 1000, signal);
+    if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
+    const button = el.querySelector(
+      'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
+    ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
+    if (!button) { state._nativeTrack = null; return false; }
+    button.click();
+    const wanted = normalizeTrackUrl(meta.link);
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await withDeadline(() => wait(150), 1000, signal);
+      if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
+      const nativeAudio = [...document.querySelectorAll('audio')]
+        .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
+      const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
+      if (wanted && normalizeTrackUrl(playerLink?.href) === wanted && (nativeAudio || !soundCloudPaused())) {
+        started = true;
+        break;
+      }
+    }
+    if (!started) {
+      state._nativeTrack = null;
+      recordPlaybackDiagnostic('native-track-not-acknowledged', { trackIndex: ti });
+      return false;
+    }
+    state._pendingPlaybackTrack = null;
+    state.lastTitle = meta.title || playerTitle();
+    state.lastProgress = 0;
+    state.suspended = false;
+    if (countPlay) trackPlayed(ti);
+    if (!state._nativeSessionNoticeShown) {
+      state._nativeSessionNoticeShown = true;
+      showMergeToast('Premium track: using your SoundCloud session (crossfade and EQ paused)');
+    }
+    setTimeout(() => {
+      if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
+    }, 80);
+    return true;
+  } catch (error) {
+    if (!isCurrent() || signal?.aborted) return null;
+    state._nativeTrack = null;
+    recordPlaybackDiagnostic('native-start-failed', { error: String(error?.name || error) });
+    return false;
+  } finally {
+    if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
+    if (isCurrent() && !started) {
+      state._nativeTrack = null;
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
     }
   }
-  if (!started) {
-    state._nativeTrack = null;
-    return false;
-  }
-
-  state.lastTitle = meta.title || playerTitle();
-  state.lastProgress = 0;
-  state.suspended = false;
-  if (countPlay) trackPlayed(ti);
-  if (!state._nativeSessionNoticeShown) {
-    state._nativeSessionNoticeShown = true;
-    showMergeToast('Premium track: using your SoundCloud session (crossfade and EQ paused)');
-  }
-  setTimeout(() => { refreshPlayBtn(); updateProgressBar(); updateHub(); }, 80);
-  return true;
 }
 
 
 async function playAt(idx, countPlay = true, attemptedCustomTracks = null) {
-  if (!state.active || !state.meta[idx]) return;
+  const epoch = state._playbackEpoch;
+  const request = state._playbackRequest;
+  const meta = state.meta[idx];
+  const isCurrent = () => state.active && epoch === state._playbackEpoch
+    && state._playbackRequest === request && state.meta[idx] === meta;
+  if (!isCurrent() || !meta || !trackAvailable(idx)) return null;
+  if (state._userPaused) {
+    state._pendingPlaybackTrack = { ti: idx, countPlay, epoch };
+    return null;
+  }
   const requestedFade = currentDeckAudio()
     ? (state._crossfadePending
       ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
       : (state.crossfadeManual ? state.crossfadeSeconds : 0))
     : 0;
-  if (await playWithCrossfadeDeck(idx, countPlay, requestedFade)) return;
-
+  const custom = await playWithCrossfadeDeck(idx, countPlay, requestedFade);
+  if (!isCurrent() || state._userPaused || custom === null) return null;
+  if (custom) return true;
   stopCrossfadeDecks();
   setCrossfadeStatus('fallback');
-  if (state.meta[idx]?.requiresNativePlayback
-      && await playWithSoundCloudSession(idx, countPlay)) return;
+  if (meta.requiresNativePlayback) {
+    const native = await playWithSoundCloudSession(idx, countPlay);
+    if (!isCurrent() || state._userPaused || native === null) return null;
+    if (native) return true;
+  }
   const attempted = attemptedCustomTracks || new Set();
   attempted.add(idx);
-  recordPlaybackDiagnostic('custom-start-exhausted', {
-    trackIndex: idx,
-    attempted: attempted.size,
-  });
-
+  recordPlaybackDiagnostic('custom-start-exhausted', { trackIndex: idx, attempted: attempted.size });
   const currentQueueIndex = state.queue.indexOf(idx, state.pos);
   if (currentQueueIndex === state.pos && state.queue.length - state.pos > 1) {
     state.queue.splice(currentQueueIndex, 1);
     state.queue.push(idx);
   }
-  const replacement = state.queue
-    .slice(state.pos)
-    .find(ti => trackAvailable(ti) && !attempted.has(ti));
-  if (replacement !== undefined) {
-    await playAt(replacement, countPlay, attempted);
-    return;
-  }
-
+  const replacement = state.queue.slice(state.pos).find(ti => trackAvailable(ti) && !attempted.has(ti));
+  if (replacement !== undefined) return playAt(replacement, countPlay, attempted);
   state.suspended = true;
-  state.busy = false;
   showMergeToast('Custom playback unavailable — retrying shortly');
   updateHub();
   clearTimeout(state._customPlaybackRetryTimer);
-  state._customPlaybackRetryTimer = setTimeout(() => {
+  const timer = setTimeout(() => {
+    if (!isCurrent() || state._customPlaybackRetryTimer !== timer) return;
     state._customPlaybackRetryTimer = null;
-    if (!state.active || state.busy) return;
+    if (state.busy || state._userPaused) return;
     const retryTrack = state.queue[state.pos];
     if (retryTrack === undefined) return;
     state.suspended = false;
-    state.busy = true;
-    void playAt(retryTrack, countPlay).finally(() => {
-      state.busy = false;
-      updateHub();
-    });
+    void runPlaybackOperation('automatic retry', () => playAt(retryTrack, countPlay));
   }, 5000);
+  state._customPlaybackRetryTimer = timer;
+  return false;
 }
 
 async function next(fromWatcher = false) {
-  if (!state.active) return;
-  if (state.busy) return;
+  if (!state.active || state.busy || (fromWatcher && state._userPaused)) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
-
-  // detect quick skip before anything changes
-  const isQuickSkip = !fromWatcher && state.manualAction && state.lastProgress < 0.15;
-
-  if (!state.queue.some(trackAvailable)) {
-    state.suspended = true;
-    updateHub();
-    return;
-  }
-
-  state.suspended = false;
-  state.busy      = true;
-
-  const justPlayed = state.queue[state.pos];
-
-  // skip counter → auto-deprioritize after 2 quick skips
-  if (isQuickSkip && justPlayed !== undefined) {
-    state.skipCounts[justPlayed] = (state.skipCounts[justPlayed] || 0) + 1;
-    if (state.skipCounts[justPlayed] >= 2) {
-      state.priority[justPlayed] = 0.25;
-      delete state.skipCounts[justPlayed];
-    }
-  }
-
-  // sleep timer: track countdown
-  if (state.sleepTimer?.type === 'tracks') {
-    state.sleepTimer.remaining--;
-    updateSleepDisplay();
-    if (state.sleepTimer.remaining <= 0) {
-      state.sleepTimer = null;
-      const sel = document.getElementById('tss-hub-sleep');
-      if (sel) sel.value = 'off';
-      pause();
-      stop();
-      updateHub();
-      renderList();
-      state.busy = false;
+  if (!fromWatcher) state._userPaused = false;
+  return runPlaybackOperation('next', async isCurrent => {
+    const isQuickSkip = !fromWatcher && state.manualAction && state.lastProgress < 0.15;
+    if (!state.queue.some(trackAvailable)) {
+      state.suspended = true;
       return;
     }
-  }
-
-  consumeCurrentQueueTrack();
-
-  if (state.pos >= state.queue.length) {
-    stop();
+    state.suspended = false;
+    const justPlayed = state.queue[state.pos];
+    if (isQuickSkip && justPlayed !== undefined) {
+      state.skipCounts[justPlayed] = (state.skipCounts[justPlayed] || 0) + 1;
+      if (state.skipCounts[justPlayed] >= 2) {
+        state.priority[justPlayed] = 0.25;
+        delete state.skipCounts[justPlayed];
+      }
+    }
+    if (state.sleepTimer?.type === 'tracks') {
+      state.sleepTimer.remaining--;
+      updateSleepDisplay();
+      if (state.sleepTimer.remaining <= 0) {
+        state.sleepTimer = null;
+        const sel = document.getElementById('tss-hub-sleep');
+        if (sel) sel.value = 'off';
+        pause();
+        stop();
+        renderList();
+        return;
+      }
+    }
+    consumeCurrentQueueTrack();
+    if (state.pos >= state.queue.length) { stop(); renderList(); return; }
+    await playAt(state.queue[state.pos]);
+    if (!isCurrent()) return;
+    badges();
     renderList();
-    state.busy = false;
-    return;
-  }
-
-  await playAt(state.queue[state.pos]);
-  badges();
-  renderList();
-  state.busy = false;
+  });
 }
 
 async function prevTrack() {
-  if (!state.active) return;
-  if (state.busy) return;
-
-  if (currentSec() > 3 || !state.history.length) {
-    seekTo(0);
-    return;
+  if (!state.active || state.busy) return;
+  let historyIndex;
+  try {
+    if (currentSec() > 3 || !state.history.length) { seekTo(0); return; }
+    historyIndex = state.history.length - 1;
+    while (historyIndex >= 0 && !trackAvailable(state.history[historyIndex])) historyIndex--;
+    if (historyIndex < 0) { seekTo(0); return; }
+  } catch (error) {
+    recordPlaybackDiagnostic('playback-operation-failed', {
+      operation: 'previous', error: String(error?.name || error),
+    });
+    return false;
   }
-
-  state.busy         = true;
-  state.manualAction = true;
-  state._manualActionAt = Date.now();
-
-  const prevTi = state.history.pop();
-  const existingIdx = state.queue.indexOf(prevTi);
-  if (existingIdx !== -1) {
-    state.queue.splice(existingIdx, 1);
-    if (existingIdx < state.pos) state.pos--;
-  }
-  state.queue.splice(state.pos, 0, prevTi);
-  state.roundPlayed = Math.max(0, state.roundPlayed - 1);
-  refreshUpcomingCrossfadePreparation();
-
-  await playAt(state.queue[state.pos], false);
-  badges();
-  renderList();
-  state.busy = false;
+  return runPlaybackOperation('previous', async isCurrent => {
+    state._userPaused = false;
+    state.manualAction = true;
+    state._manualActionAt = Date.now();
+    const prevTi = state.history.splice(historyIndex, 1)[0];
+    const current = state.queue[state.pos];
+    finalizeLeavingCurrentTrack(current);
+    if (current !== undefined && !trackAvailable(current)) state.queue.splice(state.pos, 1);
+    removePlayNextOccurrences(prevTi);
+    const existingIdx = state.queue.indexOf(prevTi);
+    if (existingIdx !== -1) {
+      state.queue.splice(existingIdx, 1);
+      if (existingIdx < state.pos) state.pos--;
+    }
+    state.queue.splice(state.pos, 0, prevTi);
+    state.roundPlayed = Math.max(0, state.roundPlayed - 1);
+    recountRoundTotal();
+    refreshUpcomingCrossfadePreparation();
+    await playAt(prevTi, false);
+    if (!isCurrent()) return;
+    badges();
+    renderList();
+  });
 }
 
 function moveSelectedTrackToCurrent(ti) {
@@ -4388,11 +5123,13 @@ function moveSelectedTrackToCurrent(ti) {
     if (state.history.length > 100) state.history.shift();
     state.queue.splice(state.pos, 1);
     state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
+    finalizeLeavingCurrentTrack(current);
   }
 
   const targetIndex = state.queue.indexOf(ti);
   if (targetIndex !== -1) state.queue.splice(targetIndex, 1);
   state.queue.splice(state.pos, 0, ti);
+  recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   return true;
 }
@@ -4406,33 +5143,27 @@ function removePlayNextOccurrences(ti) {
 }
 
 async function jumpTo(qi, ti) {
-  if (!state.active) return;
-  if (state.busy) return;
-  state.busy         = true;
-  state.manualAction = true;
-  state._manualActionAt = Date.now();
-  state.suspended    = false;
-  const removedPlayNext = removePlayNextOccurrences(ti);
-
-  if (!moveSelectedTrackToCurrent(ti)) {
-    await playAt(ti, false);
-    if (removedPlayNext) renderList();
-    state.busy = false;
-    return;
-  }
-  await playAt(ti);
-  badges();
-  renderList();
-  state.busy = false;
+  if (!state.active || state.busy || !trackAvailable(ti)) return;
+  state._userPaused = false;
+  return runPlaybackOperation('jump', async isCurrent => {
+    state.manualAction = true;
+    state._manualActionAt = Date.now();
+    state.suspended = false;
+    removePlayNextOccurrences(ti);
+    const moved = moveSelectedTrackToCurrent(ti);
+    recountRoundTotal();
+    await playAt(ti, moved);
+    if (!isCurrent()) return;
+    badges();
+    renderList();
+  });
 }
 
 function queueNext(ti) {
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
-  if (ti === currentTi || state.playNext.includes(ti)) return false;
-  const reintroducesPlayedTrack = state.history.includes(ti)
-    && !state.queue.slice(state.pos + 1).includes(ti);
+  if (!trackAvailable(ti) || ti === currentTi || state.playNext.includes(ti)) return false;
   state.playNext.push(ti);
-  if (reintroducesPlayedTrack) state.roundTotal++;
+  recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   renderList();
   return true;
@@ -4470,68 +5201,101 @@ function removeFromQueue(qi) {
   renderList();
 }
 
-async function fetchLivePlaylistSnapshot(sourcePage) {
+async function fetchLivePlaylistSnapshot(sourcePage, signal = null) {
   if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) return null;
   try {
     const requestUrl = new URL(sourcePage);
     requestUrl.searchParams.set('_tss_live_sync', String(Date.now()));
-    const response = await fetch(requestUrl, {
+    const response = await fetchSoundCloudResource(requestUrl, 'text', {
+      signal,
       cache: 'no-store',
       credentials: 'include',
       headers: { Accept: 'text/html' },
     });
     if (!response.ok) return null;
-    return playlistSnapshotFromHtml(await response.text());
+    return playlistSnapshotFromHtml(response.data);
   } catch (_) {
     return null;
   }
 }
 
-async function resolveLiveTrackMeta(track, sourcePage, playlistPosition = null) {
+function mergeTrackMeta(primary, fallback) {
+  if (!primary) return fallback ? { ...fallback } : null;
+  const merged = { ...primary };
+  for (const [key, value] of Object.entries(fallback || {})) {
+    const current = merged[key];
+    if (current == null || (typeof current === 'string' && (!current.trim() || current.trim() === '—'))
+        || (Array.isArray(current) && !current.length)) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+async function resolveLiveTrackMeta(track, sourcePage, playlistPosition = null, signal = null) {
   const hydrated = metaFromSoundCloudTrack(track, sourcePage, playlistPosition);
-  if (hydrated) return hydrated;
+  if (hydrated?.artist && hydrated.artist !== '—') return hydrated;
 
   const id = Number(track?.id);
-  if (!Number.isFinite(id)) return null;
-  const clientId = await discoverSoundCloudClientIdFromBundle();
-  if (!clientId) return null;
+  if (!Number.isFinite(id)) return hydrated;
+  const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
+  if (!clientId || signal?.aborted) return hydrated;
   try {
-    const response = await fetch(`https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`);
-    if (!response.ok) return null;
-    return metaFromSoundCloudTrack(await response.json(), sourcePage, playlistPosition);
+    const response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`, 'json', { signal });
+    if (!response.ok || signal?.aborted) return hydrated;
+    return mergeTrackMeta(hydrated, metaFromSoundCloudTrack(response.data, sourcePage, playlistPosition));
   } catch (_) {
-    return null;
+    return hydrated;
   }
 }
 
-async function resolvePlaylistSnapshotMetas(snapshot, sourcePage) {
+async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas = [], signal = null) {
   if (!snapshot?.tracks?.length) return [];
   const resolvedById = new Map();
+  const positionsById = new Map();
+  const existingByLink = new Map();
+  existingMetas.forEach(meta => {
+    if (meta.link) existingByLink.set(normalizeTrackUrl(meta.link), meta);
+  });
   const unresolvedIds = [];
 
   snapshot.tracks.forEach((track, index) => {
-    const meta = metaFromSoundCloudTrack(track, sourcePage, index + 1);
-    if (meta) resolvedById.set(Number(track.id), meta);
-    else unresolvedIds.push(Number(track.id));
+    const id = Number(track.id);
+    positionsById.set(id, index + 1);
+    const existing = track.permalink_url ? existingByLink.get(normalizeTrackUrl(track.permalink_url)) : null;
+    const meta = mergeTrackMeta(existing, metaFromSoundCloudTrack(track, sourcePage, index + 1));
+    if (meta) {
+      meta.soundcloudId = id;
+      meta.sourcePage = sourcePage;
+      meta.playlistPosition = index + 1;
+      resolvedById.set(id, meta);
+    }
+    if (!meta?.artist || meta.artist === '—') unresolvedIds.push(id);
   });
 
   if (unresolvedIds.length) {
-    const clientId = await discoverSoundCloudClientIdFromBundle();
+    const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
     if (clientId) {
       for (let start = 0; start < unresolvedIds.length; start += 50) {
+        if (signal?.aborted) break;
         const ids = unresolvedIds.slice(start, start + 50);
         try {
           const endpoint = new URL('https://api-v2.soundcloud.com/tracks');
           endpoint.searchParams.set('ids', ids.join(','));
           endpoint.searchParams.set('client_id', clientId);
-          const response = await fetch(endpoint);
-          if (!response.ok) continue;
-          const tracks = await response.json();
+          const response = await fetchSoundCloudResource(endpoint, 'json', { signal });
+          if (!response.ok || signal?.aborted) continue;
+          const tracks = response.data;
           if (!Array.isArray(tracks)) continue;
           tracks.forEach(track => {
-            const position = snapshot.tracks.findIndex(item => Number(item.id) === Number(track?.id)) + 1;
+            const id = Number(track?.id);
+            const position = positionsById.get(id);
+            if (!position) return;
             const meta = metaFromSoundCloudTrack(track, sourcePage, position);
-            if (meta) resolvedById.set(Number(track.id), meta);
+            if (meta) {
+              const existing = meta.link ? existingByLink.get(normalizeTrackUrl(meta.link)) : null;
+              resolvedById.set(id, mergeTrackMeta(existing, mergeTrackMeta(resolvedById.get(id), meta)));
+            }
           });
         } catch (_) {}
       }
@@ -4543,32 +5307,44 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage) {
     .filter(Boolean);
 }
 
-async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise = null) {
-  const domMeta = pageEls.map(getMeta);
+async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise = null, signal = null) {
+  const domByLink = new Map();
+  for (const el of pageEls) {
+    const meta = getMeta(el);
+    const key = normalizeTrackUrl(meta.link || '');
+    if (!key) continue;
+    const previous = domByLink.get(key);
+    domByLink.set(key, { el: previous?.el || el, meta: mergeTrackMeta(previous?.meta, meta) });
+  }
+  const dom = [...domByLink.values()];
+  const fallback = () => ({ els: dom.map(item => item.el), meta: dom.map(item => item.meta), complete: false });
   if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) {
-    return { els: pageEls, meta: domMeta, complete: true };
+    return { ...fallback(), complete: true };
   }
-
-  const snapshot = await (snapshotPromise || fetchLivePlaylistSnapshot(sourcePage));
-  if (!snapshot?.complete || snapshot.tracks.length <= domMeta.length) {
-    return { els: pageEls, meta: domMeta, complete: Boolean(snapshot?.complete) };
+  const snapshot = await (snapshotPromise || fetchLivePlaylistSnapshot(sourcePage, signal));
+  if (signal?.aborted || !snapshot?.complete) return fallback();
+  const snapshotMeta = await resolvePlaylistSnapshotMetas(snapshot, sourcePage, dom.map(item => item.meta), signal);
+  if (signal?.aborted) return fallback();
+  const resolved = new Map();
+  for (const meta of snapshotMeta) {
+    const key = normalizeTrackUrl(meta.link || '');
+    if (!key || resolved.has(key)) continue;
+    const matching = domByLink.get(key);
+    const merged = mergeTrackMeta(matching?.meta, meta);
+    merged.sourcePage = sourcePage;
+    merged.playlistPosition = meta.playlistPosition;
+    if (meta.soundcloudId != null) merged.soundcloudId = meta.soundcloudId;
+    resolved.set(key, { el: matching?.el || null, meta: merged });
   }
-
-  const snapshotMeta = await resolvePlaylistSnapshotMetas(snapshot, sourcePage);
-  if (snapshotMeta.length !== snapshot.tracks.length) {
-    return { els: pageEls, meta: domMeta, complete: false };
+  const complete = resolved.size === new Set(snapshot.tracks.map(track => Number(track.id))).size;
+  // A complete identity snapshot is authoritative; counts of rendered rows are not.
+  if (!complete) {
+    for (const [key, item] of domByLink) {
+      if (!resolved.has(key)) resolved.set(key, item);
+    }
   }
-
-  const elementsByLink = new Map();
-  pageEls.forEach(el => {
-    const id = trackId(getMeta(el));
-    if (id && !elementsByLink.has(id)) elementsByLink.set(id, el);
-  });
-  return {
-    els: snapshotMeta.map(meta => elementsByLink.get(trackId(meta)) || null),
-    meta: snapshotMeta,
-    complete: true,
-  };
+  const result = [...resolved.values()];
+  return { els: result.map(item => item.el), meta: result.map(item => item.meta), complete };
 }
 
 function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
@@ -4607,7 +5383,33 @@ function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
   return added.length;
 }
 
+function registerLiveQueueSource(sourcePage, indices) {
+  const source = playlistBase(sourcePage);
+  if (!source) return;
+  let members = state._liveSyncSources.get(source);
+  if (!members) {
+    members = new Set();
+    state._liveSyncSources.set(source, members);
+  }
+  for (const ti of indices) members.add(ti);
+}
+
+function reviveRemovedQueueTrack(ti) {
+  const meta = state.meta[ti];
+  const restoreUpcoming = meta.removedFromPlaylist && meta._restoreUpcoming;
+  delete meta.removedFromPlaylist;
+  delete meta.unavailable;
+  delete meta._restoreUpcoming;
+  if (!restoreUpcoming || state.queue.slice(state.pos).includes(ti) || state.playNext.includes(ti)) return false;
+  insertTracksRandomlyAfterCurrent(state.queue, state.pos, [ti]);
+  recountRoundTotal();
+  refreshUpcomingCrossfadePreparation();
+  return true;
+}
+
 function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
+  const members = state._liveSyncSources.get(playlistBase(sourcePage));
+  if (!members) return 0;
   const snapshotIds = new Set(snapshot.tracks.map(track => Number(track.id)));
   const positions = new Map(snapshot.tracks.map((track, index) => [Number(track.id), index + 1]));
   const elementsByLink = new Map();
@@ -4618,14 +5420,16 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
 
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
   let removed = 0;
-  let removedFromRound = 0;
 
-  for (const knownId of snapshot.complete === false ? [] : [...state._liveSyncKnownIds]) {
-    if (snapshotIds.has(knownId)) continue;
-    state._liveSyncKnownIds.delete(knownId);
-    const ti = state.meta.findIndex(meta => Number(meta?.soundcloudId) === knownId
-      && playlistBase(meta?.sourcePage || '') === playlistBase(sourcePage));
-    if (ti === -1) continue;
+  for (const ti of snapshot.complete === true ? members : []) {
+    const knownId = Number(state.meta[ti]?.soundcloudId);
+    if (!Number.isFinite(knownId) || snapshotIds.has(knownId)) continue;
+    members.delete(ti);
+    let retained = false;
+    for (const otherMembers of state._liveSyncSources.values()) {
+      if (otherMembers.has(ti)) { retained = true; break; }
+    }
+    if (retained) continue;
 
     const meta = state.meta[ti];
     meta.removedFromPlaylist = true;
@@ -4633,34 +5437,29 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
     state.els[ti] = null;
 
     let removedQueued = 0;
-    for (let qi = state.queue.length - 1; qi >= 0; qi--) {
-      if (state.queue[qi] !== ti || qi === state.pos) continue;
-      if (qi >= state.pos) removedQueued++;
+    for (let qi = state.queue.length - 1; qi > state.pos; qi--) {
+      if (state.queue[qi] !== ti) continue;
+      removedQueued++;
       state.queue.splice(qi, 1);
-      if (qi < state.pos) state.pos = Math.max(0, state.pos - 1);
     }
     const hadPlayNext = state.playNext.includes(ti);
     state.playNext = state.playNext.filter(pendingTi => pendingTi !== ti);
-    removedFromRound += removedQueued;
-    if (!removedQueued && hadPlayNext && state.history.includes(ti)) removedFromRound++;
+    if (removedQueued || hadPlayNext) meta._restoreUpcoming = true;
     removed++;
   }
 
   state.meta.forEach((meta, ti) => {
     const id = Number(meta?.soundcloudId);
-    if (!snapshotIds.has(id)) return;
-    meta.playlistPosition = positions.get(id);
-    if (playlistBase(meta.sourcePage || '') !== playlistBase(sourcePage)) return;
-    delete meta.removedFromPlaylist;
-    delete meta.unavailable;
+    if (!members.has(ti) || !snapshotIds.has(id)) return;
+    if (playlistBase(meta.sourcePage || '') === playlistBase(sourcePage)) {
+      meta.playlistPosition = positions.get(id);
+    }
+    reviveRemovedQueueTrack(ti);
     const el = elementsByLink.get(trackId(meta));
     if (el) state.els[ti] = el;
   });
 
-  if (removedFromRound) {
-    const minimum = state.roundPlayed + (state.queue[state.pos] === undefined ? 0 : 1);
-    state.roundTotal = Math.max(minimum, state.roundTotal - removedFromRound);
-  }
+  recountRoundTotal();
   return removed;
 }
 
@@ -4673,168 +5472,174 @@ function showLiveSyncResult(added, removed) {
 
 async function syncLiveQueue(options) {
   options = options || {};
-  const sourcePage = String(state.playlistUrl || '').split(/[?#]/)[0].replace(/\/+$/, '');
-  if (!state.active || state.loading || state.busy || state.suspended
-      || !/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage)) return 0;
+  const sources = state._liveSyncSources;
+  const epoch = state._playbackEpoch;
+  const signal = state._playbackAbort.signal;
+  const routeEpoch = state._routeEpoch || 0;
+  if (!state.active || state.loading || state.busy || state.suspended || !sources.size) return 0;
   if (state._liveSyncInFlight) return 0;
 
   const now = Date.now();
   if (!options.force && now - state._liveSyncLastCheck < LIVE_SYNC_INTERVAL_MS) return 0;
   state._liveSyncInFlight = true;
   state._liveSyncLastCheck = now;
+  const currentQueue = () => state.active && !state.suspended && !state.loading && !state.busy
+    && state._liveSyncSources === sources && state._playbackEpoch === epoch && !signal.aborted
+    && (state._routeEpoch || 0) === routeEpoch;
   try {
-    const snapshot = await fetchLivePlaylistSnapshot(sourcePage);
-    if (!snapshot?.tracks?.length || !state.active || state.playlistUrl.split(/[?#]/)[0].replace(/\/+$/, '') !== sourcePage) return 0;
+    const snapshots = await Promise.all([...sources.keys()]
+      .filter(sourcePage => /soundcloud\.com\/[^/]+\/sets\//.test(sourcePage))
+      .map(async sourcePage => {
+        try {
+          return { sourcePage, snapshot: await fetchLivePlaylistSnapshot(sourcePage, signal) };
+        } catch (_) {
+          return { sourcePage, snapshot: null };
+        }
+      }));
+    if (!currentQueue()) return 0;
 
-    const pageEls = playlistBase(location.href) === playlistBase(sourcePage)
-      ? [...document.querySelectorAll('.trackList__item, .soundList__item, li.sc-list-item')]
+    const knownIds = new Set(state.meta.map(meta => Number(meta?.soundcloudId)));
+    const resolved = new Map();
+    const updates = snapshots.filter(({ snapshot }) => Array.isArray(snapshot?.tracks));
+    for (const { sourcePage, snapshot } of updates) {
+      for (let index = 0; index < snapshot.tracks.length; index++) {
+        const track = snapshot.tracks[index];
+        const id = Number(track.id);
+        if (!Number.isFinite(id) || knownIds.has(id) || resolved.has(id)) continue;
+        let meta = null;
+        try {
+          meta = await resolveLiveTrackMeta(track, sourcePage, index + 1, signal);
+        } catch (_) {}
+        if (!currentQueue()) return 0;
+        if (meta) resolved.set(id, meta);
+      }
+    }
+
+    const pageSource = playlistBase(location.href);
+    const pageEls = sources.has(pageSource)
+      ? currentPageTrackElements()
       : [];
-    const sourceChanged = state._liveSyncSource !== sourcePage;
-    const initializing = sourceChanged || !state._liveSyncKnownIds.size;
-    if (initializing) {
-      state._liveSyncSource = sourcePage;
-      state._liveSyncKnownIds = new Set();
-      const sourceIndices = state.meta
-        .map((meta, ti) => ({ meta, ti }))
-        .filter(item => playlistBase(item.meta?.sourcePage || sourcePage) === playlistBase(sourcePage));
-      sourceIndices.forEach(({ meta }) => {
-        const id = Number(meta?.soundcloudId);
-        if (Number.isFinite(id)) state._liveSyncKnownIds.add(id);
-      });
-      if (snapshot.tracks.length === sourceIndices.length) {
-        snapshot.tracks.forEach((track, index) => {
-          const meta = state.meta[sourceIndices[index].ti];
-          if (!Number.isFinite(Number(meta.soundcloudId))) meta.soundcloudId = Number(track.id);
-          meta.playlistPosition = index + 1;
-          if (Number(meta.soundcloudId) === Number(track.id)) {
-            state._liveSyncKnownIds.add(Number(track.id));
-          }
-        });
-      }
-    }
-
-    const removed = reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls);
-    const candidates = snapshot.tracks.filter(track => !state._liveSyncKnownIds.has(Number(track.id)));
-    if (!candidates.length) {
-      if (removed) {
-        refreshUpcomingCrossfadePreparation();
-        badges();
-        renderList();
-        updateHub();
-        showLiveSyncResult(0, removed);
-      } else {
-        badges();
-        if (initializing) renderList();
-      }
-      return 0;
-    }
-
-    const metas = [];
-    for (const track of candidates) {
-      const playlistPosition = snapshot.tracks.findIndex(item => Number(item.id) === Number(track.id)) + 1;
-      const meta = await resolveLiveTrackMeta(track, sourcePage, playlistPosition);
-      if (meta) metas.push(meta);
-    }
-    if (!state.active || state.suspended) return 0;
-
-    const added = applyLiveQueueTracks(metas, pageEls, false);
-    for (const meta of metas) {
+    const existingById = new Map();
+    const existingByLink = new Map();
+    state.meta.forEach((meta, ti) => {
       const id = Number(meta?.soundcloudId);
-      const represented = Number.isFinite(id) && state.meta.some(existing =>
-        Number(existing?.soundcloudId) === id
-        && playlistBase(existing?.sourcePage || sourcePage) === playlistBase(sourcePage));
-      if (represented) state._liveSyncKnownIds.add(id);
+      if (Number.isFinite(id)) existingById.set(id, ti);
+      const link = trackId(meta);
+      if (link) existingByLink.set(link, ti);
+    });
+    const metas = [];
+    for (const [id, meta] of resolved) {
+      if (!meta || existingById.has(id)) continue;
+      const ti = existingByLink.get(trackId(meta));
+      if (ti === undefined) metas.push(meta);
+      else {
+        state.meta[ti].soundcloudId = id;
+        existingById.set(id, ti);
+      }
     }
-    if (removed && !added) {
+    const firstNewIndex = state.meta.length;
+    const added = applyLiveQueueTracks(metas, pageEls, false);
+    for (let ti = firstNewIndex; ti < state.meta.length; ti++) {
+      existingById.set(Number(state.meta[ti].soundcloudId), ti);
+    }
+
+    // Record membership in every source before removing anything. A track can
+    // move between playlists, or belong to several, without leaving the queue.
+    for (const { sourcePage, snapshot } of updates) {
+      const members = sources.get(sourcePage);
+      for (const track of snapshot.tracks) {
+        const ti = existingById.get(Number(track.id));
+        if (ti !== undefined) members.add(ti);
+      }
+    }
+    let removed = 0;
+    for (const { sourcePage, snapshot } of updates) {
+      removed += reconcileLivePlaylistSnapshot(snapshot, sourcePage, sourcePage === pageSource ? pageEls : []);
+    }
+    if (removed) {
       refreshUpcomingCrossfadePreparation();
-      badges();
-      renderList();
       updateHub();
-    } else if (initializing && !added) {
+    }
+    if (updates.length) {
       badges();
       renderList();
     }
     showLiveSyncResult(added, removed);
     return added;
   } finally {
-    state._liveSyncInFlight = false;
+    if (state._liveSyncSources === sources) state._liveSyncInFlight = false;
   }
 }
 
 function resetLiveQueueSync() {
   if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
-  state._liveSyncKnownIds = new Set();
+  state._liveSyncSources = new Map();
   state._liveSyncInFlight = false;
   state._liveSyncLastCheck = 0;
-  state._liveSyncSource = '';
   state._liveSyncTimer = null;
 }
 
 async function mergeCurrentPage() {
   if (!state.active) { showMergeToast(-1); return; }
-
+  if (state.loading || state.busy) return;
   const btn = document.getElementById('tss-merge-btn');
+  const pageUrl = playlistBase(location.href);
+  const request = beginCollectionRequest(pageUrl, false, false);
   if (btn) { btn.style.opacity = '0.35'; btn.style.pointerEvents = 'none'; }
-
-  const pageUrl = location.href.split(/[?#]/)[0].replace(/\/+$/, '');
-  const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
-    ? fetchLivePlaylistSnapshot(pageUrl)
-    : null;
-  const pageEls = await loadTracks();
-  const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
-
-  if (btn) { btn.style.opacity = ''; btn.style.pointerEvents = ''; }
-
-  if (!state.active) return;
-  if (!collection.meta.length) { showMergeToast(0); return; }
-
-  const existingById = new Map();
-  state.meta.forEach((m, ti) => {
-    const id = trackId(m);
-    if (id) existingById.set(id, ti);
-  });
-  const added = [];
-
-  collection.meta.forEach((m, index) => {
-    const el = collection.els[index] || null;
-    const id = trackId(m);
-    if (id && existingById.has(id)) {
-      const ti = existingById.get(id);
-      if (el) state.els[ti] = el;
-      state.meta[ti] = { ...state.meta[ti], ...m };
-      delete state.meta[ti].unavailable;
-      return;
+  try {
+    const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
+    const pageEls = await loadTracks(request);
+    if (!collectionRequestCurrent(request) || !state.active) return;
+    const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
+    if (!collectionRequestCurrent(request) || !state.active) return;
+    if (!collection.meta.length && !collection.complete) { showMergeToast(0); return; }
+    const existingById = new Map(state.meta.map((meta, ti) => [trackId(meta), ti]));
+    const added = [];
+    const members = [];
+    collection.meta.forEach((meta, index) => {
+      const id = trackId(meta);
+      let ti = existingById.get(id);
+      if (ti !== undefined) {
+        if (collection.els[index]) state.els[ti] = collection.els[index];
+        const previous = state.meta[ti];
+        Object.assign(previous, mergeTrackMeta(previous, meta));
+        if (playlistBase(previous.sourcePage || '') === pageUrl) {
+          state.meta[ti].playlistPosition = meta.playlistPosition;
+        }
+        reviveRemovedQueueTrack(ti);
+      } else {
+        ti = state.meta.length;
+        state.meta.push(meta);
+        state.els.push(collection.els[index] || null);
+        existingById.set(id, ti);
+        added.push(ti);
+      }
+      members.push(ti);
+    });
+    registerLiveQueueSource(pageUrl, members);
+    if (added.length) {
+      state.queue.splice(state.pos + 1, 0, ...fisherYates(added));
+      spaceUpcomingDuplicateTitles(state.queue, state.pos);
+      recountRoundTotal();
+      refreshUpcomingCrossfadePreparation();
     }
-    const ti = state.els.length;
-    state.els.push(el);
-    state.meta.push(m);
-    if (id) existingById.set(id, ti);
-    added.push(ti);
-  });
-
-  if (added.length > 0) {
-    const shuffled = fisherYates(added);
-    state.queue.splice(state.pos + 1, 0, ...shuffled);
-    spaceUpcomingDuplicateTitles(state.queue, state.pos);
-    state.roundTotal += added.length;
-    refreshUpcomingCrossfadePreparation();
-
-    // adopt this page as the active playlist context and resume
-    state.playlistUrl = location.href.split(/[?#]/)[0];
-    state.suspended   = false;
-    state.lastTitle   = playerTitle();
-    resetLiveQueueSync();
-    void syncLiveQueue({ force: true });
-
-    // restart watcher if it died during suspension navigation
+    state.playlistUrl = pageUrl;
+    state.suspended = false;
+    state.lastTitle = playerTitle();
     if (!state.worker && !state._workerInterval) startWatcher();
-
     badges();
     renderList();
-    updateHub();
+    showMergeToast(added.length);
+    finishCollectionRequest(request);
+    void syncLiveQueue({ force: true });
+  } catch (_) {
+    if (collectionRequestCurrent(request)) showMergeToast('could not merge this page');
+  } finally {
+    if (btn && (!state._collectionRequest || state._collectionRequest === request)) {
+      btn.style.opacity = ''; btn.style.pointerEvents = '';
+    }
+    finishCollectionRequest(request);
   }
-
-  showMergeToast(added.length);
 }
 
 async function reshuffleCurrentPage() {
@@ -4854,7 +5659,10 @@ async function reshuffleCurrentPage() {
 
   setLoading(true);
   const pageUrl = location.href.split(/[?#]/)[0];
-  const samePlaylist = playlistBase(pageUrl) === playlistBase(state.playlistUrl);
+  const samePlaylist = playlistBase(pageUrl) === playlistBase(state.playlistUrl)
+    || state._liveSyncSources.has(playlistBase(pageUrl));
+  let request = null;
+  let acceptedEpoch = null;
 
   try {
     if (samePlaylist && !state.suspended) {
@@ -4882,14 +5690,14 @@ async function reshuffleCurrentPage() {
       return;
     }
 
-    state.loading = true;
-    state.busy = true;
+    request = beginCollectionRequest(pageUrl, true, true);
+    state._userPaused = false;
     updateHub();
-    const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
-      ? fetchLivePlaylistSnapshot(pageUrl)
-      : null;
-    const pageEls = await loadTracks();
-    const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
+    const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
+    const pageEls = await loadTracks(request);
+    if (!collectionRequestCurrent(request) || !state.active) return;
+    const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
+    if (!collectionRequestCurrent(request) || !state.active) return;
     if (!collection.meta.length) {
       showMergeToast('no tracks found on this page');
       return;
@@ -4901,6 +5709,11 @@ async function reshuffleCurrentPage() {
       return;
     }
 
+    finishCollectionRequest(request);
+    acceptedEpoch = invalidatePlaybackSession();
+    stopCrossfadeDecks();
+    state.busy = true;
+    resetLiveQueueSync();
     state.els = collection.els;
     state.meta = collection.meta;
     state.queue = newQueue;
@@ -4916,6 +5729,7 @@ async function reshuffleCurrentPage() {
     refreshUpcomingCrossfadePreparation();
     state.manualAction = false;
     state.playlistUrl = pageUrl;
+    registerLiveQueueSource(pageUrl, [...Array(state.meta.length).keys()]);
     saveLifetimeStats();
     state.stats.playCounts = {};
     state._lifetimeBase = {
@@ -4924,214 +5738,265 @@ async function reshuffleCurrentPage() {
       playCounts: {},
     };
 
-    await playAt(state.queue[0]);
-    if (!state.active) return;
-
-    state.busy = false;
+    startWatcher();
+    await runPlaybackOperation('replace queue', () => playAt(state.queue[0]));
+    if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
     badges();
     renderList();
-    startWatcher();
     updateHub();
     showMergeToast(`${state.queue.length} tracks loaded & reshuffled`);
   } catch (_) {
-    showMergeToast('could not re-shuffle this page');
+    if (request && collectionRequestCurrent(request)) showMergeToast('could not re-shuffle this page');
+    if (acceptedEpoch !== null && state._playbackEpoch === acceptedEpoch) state.busy = false;
   } finally {
-    state.loading = false;
-    state.busy = false;
-    setLoading(false);
-    updateHub();
+    if (request) finishCollectionRequest(request);
+    if (!state._collectionRequest) setLoading(false);
   }
 }
 
 function remapCachedQueue(cache, meta) {
-  const idToNew = {};
-  meta.forEach((m, ti) => { const id = trackId(m); if (id) idToNew[id] = ti; });
-
-  const metaKeys = cache.metaKeys;
-  const remapOld = oldTi => {
-    const id = metaKeys[oldTi];
-    return (id && idToNew[id] !== undefined) ? idToNew[id] : null;
-  };
-  const remappedQueue = cache.queue.map(remapOld).filter(ti => ti !== null);
-  if (!remappedQueue.length) return null;
-
-  // A snapshot contains only the unplayed part of the current round. Add
-  // genuinely new playlist entries, never old entries already consumed.
-  const cachedIds = new Set(metaKeys.filter(Boolean));
-  const extras = fisherYates([...Array(meta.length).keys()].filter(ti => {
-    const id = trackId(meta[ti]);
-    return !id || !cachedIds.has(id);
-  }));
-  const cachedPos = typeof cache.pos === 'number' ? cache.pos : 0;
-  const currentTi = remapOld(cache.queue[cachedPos]);
-  const currentIndex = currentTi === null ? -1 : remappedQueue.indexOf(currentTi);
-  let finalQueue;
-  let newPos;
-  if (currentIndex !== -1) {
-    const prefix = remappedQueue.slice(0, currentIndex + 1);
-    const upcoming = remappedQueue.slice(currentIndex + 1).concat(extras);
-    finalQueue = prefix.concat(spaceDuplicateTitles(upcoming, meta, currentTi));
-    newPos = currentIndex;
-  } else {
-    finalQueue = spaceDuplicateTitles(remappedQueue.concat(extras), meta);
-    newPos = 0;
-  }
-
-  const history = (Array.isArray(cache.history) ? cache.history : [])
-    .map(remapOld).filter(ti => ti !== null);
+  const idToNew = new Map(meta.map((item, ti) => [trackId(item), ti]));
+  const remapOld = oldTi => idToNew.get(cache.metaKeys[oldTi]);
+  const available = ti => ti !== undefined && !meta[ti].unavailable;
+  const cachedPos = Math.max(0, Number(cache.pos) || 0);
+  const prefix = cache.queue.slice(0, cachedPos).map(remapOld).filter(ti => ti !== undefined);
+  const remainingSet = new Set(cache.queue.slice(cachedPos).map(remapOld).filter(available));
+  const remaining = [...remainingSet];
+  const cachedIds = new Set(cache.metaKeys.filter(Boolean));
+  const extras = fisherYates(meta.map((_, ti) => ti).filter(ti => available(ti)
+    && (!cachedIds.has(trackId(meta[ti]))
+      || (meta[ti]._restoreUpcoming && !meta[ti].removedFromPlaylist && !remainingSet.has(ti)))));
+  const currentTi = remaining[0];
+  const upcoming = remaining.slice(1).concat(extras);
+  const finalQueue = prefix.concat(currentTi === undefined
+    ? spaceDuplicateTitles(upcoming, meta)
+    : [currentTi, ...spaceDuplicateTitles(upcoming, meta, currentTi)]);
+  const playNext = [...new Set((cache.playNext || []).map(remapOld).filter(available))]
+    .filter(ti => ti !== finalQueue[prefix.length]);
+  if (finalQueue.length <= prefix.length && !playNext.length) return null;
+  if (finalQueue.length <= prefix.length) finalQueue.push(playNext.shift());
+  const history = (cache.history || []).map(remapOld).filter(ti => ti !== undefined);
   const priority = {};
   for (const [key, weight] of Object.entries(cache.priority || {})) {
-    const newTi = remapOld(+key);
-    if (newTi !== null) priority[newTi] = weight;
+    const ti = remapOld(+key);
+    if (ti !== undefined) priority[ti] = weight;
   }
-
+  const roundPlayed = Math.max(0, Number(cache.roundPlayed) || 0);
+  const scheduled = new Set(finalQueue.slice(prefix.length));
   return {
-    queue: finalQueue,
-    pos: newPos,
-    history,
-    priority,
-    roundPlayed: Math.max(0, Number(cache.roundPlayed) || 0),
-    roundTotal: Math.max(finalQueue.length, Number(cache.roundTotal) || finalQueue.length),
+    queue: finalQueue, pos: prefix.length, history, priority, playNext, roundPlayed,
+    roundTotal: roundPlayed + finalQueue.length - prefix.length + playNext.filter(ti => !scheduled.has(ti)).length,
   };
+}
+
+function saveQueueSessionCache() {
+  try {
+    if (state.queue[state.pos] === undefined && !state.playNext.length) {
+      sessionStorage.removeItem('tss_queue_cache');
+      return false;
+    }
+    sessionStorage.setItem('tss_queue_cache', JSON.stringify({
+      queue: state.queue, pos: state.pos, history: state.history, priority: state.priority,
+      playNext: state.playNext, playlistUrl: state.playlistUrl, ts: Date.now(),
+      meta: state.meta, metaKeys: state.meta.map(trackId),
+      sources: [...state._liveSyncSources].map(([sourcePage, members]) => [sourcePage, [...members]]),
+      roundPlayed: state.roundPlayed, roundTotal: state.roundTotal,
+    }));
+    return true;
+  } catch (_) { return false; }
+}
+
+function restoreQueueSessionCache(cache, collection, pageUrl) {
+  if (!Array.isArray(cache.meta) || !Array.isArray(cache.sources)) return remapCachedQueue(cache, state.meta);
+  const meta = cache.meta.map(item => ({ ...item }));
+  const byId = new Map(meta.map((item, ti) => [trackId(item), ti]));
+  const els = meta.map(() => null);
+  const pageMembers = new Set();
+  collection.meta.forEach((item, index) => {
+    let ti = byId.get(trackId(item));
+    if (ti === undefined) {
+      ti = meta.length;
+      meta.push(item);
+      els.push(null);
+      byId.set(trackId(item), ti);
+    } else {
+      meta[ti] = mergeTrackMeta(meta[ti], item);
+      if (playlistBase(meta[ti].sourcePage || '') === pageUrl) meta[ti].playlistPosition = item.playlistPosition;
+      delete meta[ti].removedFromPlaylist;
+      delete meta[ti].unavailable;
+    }
+    els[ti] = collection.els[index] || null;
+    pageMembers.add(ti);
+  });
+  const sources = new Map(cache.sources.map(([sourcePage, members]) => [sourcePage, new Set(members.filter(ti => meta[ti]))]));
+  if (collection.complete) sources.set(pageUrl, pageMembers);
+  else {
+    const retained = sources.get(pageUrl) || new Set();
+    for (const ti of pageMembers) retained.add(ti);
+    sources.set(pageUrl, retained);
+  }
+  const allMembers = new Set();
+  for (const members of sources.values()) for (const ti of members) allMembers.add(ti);
+  const cachedUpcoming = new Set(cache.queue.slice(Math.max(0, Number(cache.pos) || 0)).concat(cache.playNext || []));
+  meta.forEach((item, ti) => {
+    if (allMembers.has(ti)) return;
+    item.removedFromPlaylist = true;
+    item.unavailable = true;
+    if (cachedUpcoming.has(ti)) item._restoreUpcoming = true;
+  });
+  const restored = remapCachedQueue(cache, meta);
+  if (!restored) return null;
+  for (let qi = restored.pos; qi < restored.queue.length; qi++) {
+    delete meta[restored.queue[qi]]._restoreUpcoming;
+  }
+  for (const ti of restored.playNext) delete meta[ti]._restoreUpcoming;
+  state.meta = meta;
+  state.els = els;
+  state._liveSyncSources = sources;
+  return restored;
 }
 
 async function start() {
   if (!validPage()) return;
-
-  if (state.active) {
+  if (state.active || state.loading) {
     stop();
     renderList();
     return;
   }
-
-  state.loading = true;
-  pauseSoundCloudTransport();
-  pauseSoundCloud();
-  updateHub();
-
-  const pageUrl = location.href.split(/[?#]/)[0].replace(/\/+$/, '');
-  const snapshotPromise = /soundcloud\.com\/[^/]+\/sets\//.test(pageUrl)
-    ? fetchLivePlaylistSnapshot(pageUrl)
-    : null;
-  const pageEls = await loadTracks();
-  const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise);
-  if (!collection.meta.length || playlistBase(location.href) !== playlistBase(pageUrl)) {
-    state.loading = false;
-    updateHub();
-    return;
-  }
-
-  state.els  = collection.els;
-  state.meta = collection.meta;
-
-  let _cached = null;
+  state._userPaused = false;
+  invalidatePlaybackSession();
+  resetLiveQueueSync();
+  const pageUrl = playlistBase(location.href);
+  const request = beginCollectionRequest(pageUrl);
+  let acceptedEpoch = null;
   try {
-    const _raw = sessionStorage.getItem('tss_queue_cache');
-    if (_raw) {
-      const _c = JSON.parse(_raw);
-      if (Date.now() - (_c.ts || 0) < 30 * 60 * 1000
-          && playlistBase(location.href) === playlistBase(_c.playlistUrl || '')
-          && Array.isArray(_c.queue) && _c.queue.length > 0
-          && Array.isArray(_c.metaKeys)) {
-
-        const restored = remapCachedQueue(_c, state.meta);
-        if (restored) {
-          sessionStorage.removeItem('tss_queue_cache');
-          _cached = restored;
-        }
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
+    updateHub();
+    const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
+    const pageEls = await loadTracks(request);
+    if (!collectionRequestCurrent(request)) return;
+    const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
+    if (!collectionRequestCurrent(request)) return;
+    finishCollectionRequest(request);
+    acceptedEpoch = invalidatePlaybackSession();
+    stopCrossfadeDecks();
+    state.els = collection.els;
+    state.meta = collection.meta;
+    registerLiveQueueSource(pageUrl, state.meta.map((_, ti) => ti));
+    let cached = null;
+    try {
+      const raw = sessionStorage.getItem('tss_queue_cache');
+      const cache = raw ? JSON.parse(raw) : null;
+      if (cache && Date.now() - (cache.ts || 0) < 30 * 60 * 1000
+          && playlistBase(cache.playlistUrl || '') === pageUrl
+          && Array.isArray(cache.queue) && cache.queue.length && Array.isArray(cache.metaKeys)) {
+        cached = restoreQueueSessionCache(cache, collection, pageUrl);
+        if (cached) sessionStorage.removeItem('tss_queue_cache');
       }
+    } catch (_) {}
+    if (cached) {
+      Object.assign(state, cached);
+    } else {
+      state.priority = {};
+      state.queue = buildReshuffledQueue(state.meta.map((_, ti) => ti).filter(trackAvailable));
+      state.pos = 0;
+      state.history = [];
+      state.playNext = [];
+      state.roundPlayed = 0;
+      state.roundTotal = state.queue.length;
     }
-  } catch (_) {}
-
-  if (_cached) {
-    state.queue    = _cached.queue;
-    state.pos      = _cached.pos;
-    state.history  = _cached.history;
-    state.priority = _cached.priority;
-    state.roundPlayed = _cached.roundPlayed;
-    state.roundTotal = _cached.roundTotal;
-  } else {
-    state.priority = {};
-    state.queue    = buildReshuffledQueue([...Array(state.meta.length).keys()]);
-    state.pos      = 0;
-    state.history  = [];
-    state.roundPlayed = 0;
-    state.roundTotal = state.queue.length;
+    if (state.queue[state.pos] === undefined) return;
+    state.skipCounts = {};
+    state.roundStarts = {};
+    state.active = true;
+    state.busy = true;
+    state.suspended = false;
+    state.manualAction = false;
+    state.playlistUrl = pageUrl;
+    const previous = state._savedStats;
+    state.stats = previous && Date.now() - (previous._ts || 0) < 600_000
+      ? { ...previous } : { played: 0, playCounts: {}, elapsed: 0 };
+    state._savedStats = null;
+    state._lifetimeBase = { played: state.stats.played, elapsed: state.stats.elapsed, playCounts: { ...state.stats.playCounts } };
+    await runPlaybackOperation('start', () => {
+      initializePlaybackVolume();
+      startWatcher();
+      return playAt(state.queue[state.pos]);
+    });
+    if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
+    badges();
+    renderList();
+    updateHub();
+    void syncLiveQueue({ force: true });
+  } catch (_) {
+    if (collectionRequestCurrent(request)) showMergeToast('could not load this page');
+    if (acceptedEpoch !== null && state._playbackEpoch === acceptedEpoch) state.busy = false;
+  } finally {
+    finishCollectionRequest(request);
   }
-
-  state.playNext     = [];
-  state.skipCounts   = {};
-  state.roundStarts  = {};
-  state.active       = true;
-  state.loading      = false;
-  state.suspended    = false;
-  state.busy         = false;
-  state.manualAction = false;
-  state.playlistUrl  = location.href.split(/[?#]/)[0];
-
-  // resume session stats if stopped recently, else start fresh
-  const prev = state._savedStats;
-  if (prev && (Date.now() - (prev._ts || 0)) < 600_000) {
-    state.stats = { ...prev };
-  } else {
-    state.stats = { played: 0, playCounts: {}, elapsed: 0 };
-  }
-  state._savedStats  = null;
-  state._lifetimeBase = { played: state.stats.played, elapsed: state.stats.elapsed, playCounts: { ...state.stats.playCounts } };
-
-  initializePlaybackVolume();
-  await playAt(state.queue[state.pos]);
-  if (!state.active) return;
-  badges();
-  renderList();
-  startWatcher();
-  updateHub();
-  void syncLiveQueue({ force: true });
 }
 
 function stop() {
-  closeOwnPip();
+  invalidatePlaybackSession();
+  state.active = false;
+  state.busy = false;
+  state.loading = false;
+  state._userPaused = true;
+  state._pendingPlaybackTrack = null;
+  state._playbackRequest = null;
+  state.sleepTimer = null;
   clearTimeout(state._customPlaybackRetryTimer);
   state._customPlaybackRetryTimer = null;
-  if (Number.isInteger(state._nativeTrack)) {
-    pauseSoundCloudTransport();
-    pauseSoundCloud();
-  }
-  stopCrossfadeDecks();
-  state.active     = false;
-  state.busy       = false;
-  state.loading    = false;
-  state.sleepTimer = null;
-  syncBrowserNowPlaying();
-  resetLiveQueueSync();
-  const sleepSel = document.getElementById('tss-hub-sleep');
-  if (sleepSel) sleepSel.value = 'off';
-  state.worker?.postMessage('stop');
-  state.worker?.terminate();
+  const safely = operation => {
+    try { operation(); } catch (error) {
+      recordPlaybackDiagnostic('stop-cleanup-failed', { error: String(error?.name || error) });
+    }
+  };
+  safely(() => state._watcherCleanup?.());
+  state._watcherCleanup = null;
+  safely(closeOwnPip);
+  safely(pauseSoundCloudTransport);
+  safely(pauseSoundCloud);
+  safely(stopCrossfadeDecks);
+  safely(syncBrowserNowPlaying);
+  safely(resetLiveQueueSync);
+  safely(() => {
+    const sleepSel = document.getElementById('tss-hub-sleep');
+    if (sleepSel) sleepSel.value = 'off';
+  });
+  const worker = state.worker;
   state.worker = null;
+  safely(() => worker?.postMessage('stop'));
+  safely(() => worker?.terminate());
   if (state._endedHandler) {
-    document.removeEventListener('ended', state._endedHandler, true);
+    safely(() => document.removeEventListener('ended', state._endedHandler, true));
     state._endedHandler = null;
   }
   if (state._workerInterval) {
     clearInterval(state._workerInterval);
     state._workerInterval = null;
   }
-  document.querySelectorAll('.tss-badge').forEach(b => b.remove());
+  safely(() => document.querySelectorAll('.tss-badge').forEach(b => b.remove()));
   state._savedStats = { ...state.stats, _ts: Date.now() };
-  saveLifetimeStats();
-  updateHub();
+  safely(saveLifetimeStats);
+  safely(updateHub);
 }
 
-// ── watcher ───────────────────────────────────────────────────────────────────
 
 function startWatcher() {
+  state._watcherCleanup?.();
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
   if (state._endedHandler) {
     document.removeEventListener('ended', state._endedHandler, true);
     state._endedHandler = null;
   }
+  const epoch = state._playbackEpoch;
+  const watcherToken = (state._watcherToken || 0) + 1;
+  state._watcherToken = watcherToken;
+  const watcherIsCurrent = () => state.active && state._playbackEpoch === epoch
+    && state._watcherToken === watcherToken;
 
   state.lastTitle = playerTitle();
   let lastTitle  = state.lastTitle;
@@ -5140,15 +6005,17 @@ function startWatcher() {
   let lastRemaining = Infinity;
   let endpointTicks = 0;
   let uiTicks = 0;
-  const deckStall = { deck: null, current: 0, observedAt: 0, stalledSince: 0, recoveryAttempts: 0, recovering: false };
+  let deckStall;
   const resetDeckStall = (deck = null, current = 0, now = Date.now()) => {
-    deckStall.deck = deck;
-    deckStall.current = current;
-    deckStall.observedAt = now;
-    deckStall.stalledSince = 0;
-    deckStall.recoveryAttempts = 0;
-    deckStall.recovering = false;
+    const index = deck ? state._decks.indexOf(deck) : -1;
+    deckStall = {
+      deck, index, track: state._deckTrack, meta: state.meta[state._deckTrack],
+      preparation: state._deckPrepareTokens[index], foreground: state._playbackRequest,
+      current, position: current, observedAt: now, stalledSince: null,
+      recoveryAttempts: 0, recovering: false, retryPending: false,
+    };
   };
+  resetDeckStall();
 
   const deckHasBufferedAhead = (deck, current, seconds = 1) => {
     try {
@@ -5161,45 +6028,24 @@ function startWatcher() {
   };
 
   const resetEndGuard = async () => {
+    if (!watcherIsCurrent()) return;
     lastTitle = playerTitle();
     endpointTicks = 0;
     if (!state.active) { nearEnd = false; return; }
     for (let i = 0; i < 10; i++) {
       if (progress() < 0.1) break;
       await wait(100);
+      if (!watcherIsCurrent()) return;
     }
     nearEnd = false;
   };
 
   const returnToQueuePage = (consumeCurrent = false) => {
+    if (!watcherIsCurrent()) return;
     if (consumeCurrent) consumeCurrentQueueTrack();
 
-    const worker = state.worker;
-    state.worker = null;
-    if (worker) worker.terminate();
-    if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
-    if (state._endedHandler) {
-      document.removeEventListener('ended', state._endedHandler, true);
-      state._endedHandler = null;
-    }
-
-    try {
-      if (state.queue.length) {
-        sessionStorage.setItem('tss_queue_cache', JSON.stringify({
-          queue:       state.queue.slice(),
-          pos:         state.pos,
-          history:     state.history.slice(),
-          priority:    { ...state.priority },
-          playlistUrl: state.playlistUrl,
-          ts:          Date.now(),
-          metaKeys:    state.meta.map(m => trackId(m) || ''),
-          roundPlayed: state.roundPlayed,
-          roundTotal:  state.roundTotal,
-        }));
-      } else {
-        sessionStorage.removeItem('tss_queue_cache');
-      }
-    } catch (_) {}
+    cleanup();
+    saveQueueSessionCache();
 
     state.active    = false;
     state.busy      = false;
@@ -5213,7 +6059,7 @@ function startWatcher() {
   };
 
   const advanceAtNaturalEnd = async () => {
-    if (!state.active || state.busy || nearEnd) return;
+    if (!watcherIsCurrent() || state._userPaused || state.busy || nearEnd) return;
     nearEnd = true;
 
     try {
@@ -5229,7 +6075,7 @@ function startWatcher() {
         await next(true);
       }
     } finally {
-      await resetEndGuard();
+      if (watcherIsCurrent()) await resetEndGuard();
     }
   };
 
@@ -5242,7 +6088,7 @@ function startWatcher() {
   document.addEventListener('ended', onMediaEnded, true);
 
   const tick = async () => {
-    if (!state.active) return;
+    if (!watcherIsCurrent()) return;
     if (checkSleepTimerDeadline()) return;
     if (!state.busy && Number.isFinite(state._liveSyncLastCheck)
         && Date.now() - state._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS) {
@@ -5257,14 +6103,11 @@ function startWatcher() {
     // Web Audio's independent clock reaches the end of the scheduled fade.
     settleScheduledCrossfade();
 
-    // A manual transition normally clears when the title changes. Tracks can
-    // legitimately share the same displayed title, so never keep the guard
-    // alive long enough to swallow the next natural end.
+    // Equal track titles can hide a transition; expire the guard before the next end.
     if (state.manualAction && Date.now() - state._manualActionAt > 3000) {
       state.manualAction = false;
     }
 
-    // End detection runs at 50 ms; visual refreshes keep their old cadence.
     if (++uiTicks >= 6) {
       uiTicks = 0;
       syncPlaybackVolumeFromSoundCloud();
@@ -5297,6 +6140,7 @@ function startWatcher() {
       && Number.isInteger(state._deckTrack)
       && !state._crossfading
       && !nearEnd
+      && !state._userPaused
       && !paused()
       && upcomingCrossfadeDeckReady()
       && !(state.stopAfterRound && state.pos >= state.queue.length - 1)
@@ -5310,77 +6154,80 @@ function startWatcher() {
       try {
         await next(true);
       } finally {
-        state._crossfadePending = false;
-        await resetEndGuard();
+        if (watcherIsCurrent()) {
+          state._crossfadePending = false;
+          await resetEndGuard();
+        }
       }
       return;
     }
 
-    // A custom media element can remain "playing" with either decoded audio
-    // buffered ahead or a depleted/failed progressive response. Both cases
-    // need a fresh authorized URL; replaying the expired URL is insufficient.
+    // Observation timing is not recovery ownership: a reload can itself pause,
+    // seek, or reset media time. Keep its single flight and retry budget intact.
     const deck = currentDeckAudio();
     const stallNow = Date.now();
-    const bufferedAhead = deck ? deckHasBufferedAhead(deck, timing.current) : false;
-    const stallKind = bufferedAhead ? 'decoder' : 'network';
-    const stallEligible = Boolean(deck
-      && timing.source === 'audio'
-      && !state.loading
-      && !state.suspended
-      && !state.manualAction
-      && !nearEnd
-      && !deck.paused
-      && !deck.ended
-      && !deck.seeking
-      && (Number(deck.playbackRate) || 1) > 0
-      && timing.current >= 1
-      && timing.duration - timing.current > Math.max(2, state.crossfadeSeconds + 1));
-    const observationGap = deckStall.observedAt ? stallNow - deckStall.observedAt : 0;
-    const progressed = deck !== deckStall.deck || Math.abs(timing.current - deckStall.current) >= 0.05;
-    if (!stallEligible || progressed || observationGap > 4000) {
+    const index = deck ? state._decks.indexOf(deck) : -1;
+    if (deckStall.deck !== deck || deckStall.track !== state._deckTrack
+        || deckStall.meta !== state.meta[state._deckTrack]
+        || deckStall.preparation !== state._deckPrepareTokens[index]
+        || deckStall.foreground !== state._playbackRequest) {
       resetDeckStall(deck, timing.current, stallNow);
-    } else if (!deckStall.recovering) {
-      deckStall.observedAt = stallNow;
-      if (!deckStall.stalledSince) deckStall.stalledSince = stallNow;
-      const stalledFor = stallNow - deckStall.stalledSince;
+    }
+    deckStall.observedAt = stallNow;
+    if (deckStall.recovering) return;
+    const progressed = timing.current > deckStall.current + 0.05
+      || (!deckStall.retryPending && Math.abs(timing.current - deckStall.current) >= 0.05);
+    if (progressed) resetDeckStall(deck, timing.current, stallNow);
+    const stallEligible = Boolean(deck && timing.source === 'audio'
+      && !state._userPaused && !state.loading && !state.suspended
+      && !state.manualAction && !nearEnd && !deck.ended
+      && (Number(deck.playbackRate) || 1) > 0
+      && (deckStall.retryPending || (!deck.paused && !deck.seeking)));
+    if (!stallEligible) {
+      deckStall.current = timing.current;
+      deckStall.stalledSince = null;
+    } else {
+      const stallKind = deckHasBufferedAhead(deck, timing.current) ? 'decoder' : 'network';
       const stallThreshold = stallKind === 'decoder' ? 15000 : 12000;
-      if (stalledFor >= stallThreshold && deckStall.recoveryAttempts >= 2) {
-        recordPlaybackDiagnostic('recovery-exhausted', {
-          reason: stallKind,
-          attempts: deckStall.recoveryAttempts,
-          position: Math.round(timing.current * 10) / 10,
-        });
-        resetDeckStall();
-        await advanceAtNaturalEnd();
-        return;
-      }
-      if (stalledFor >= stallThreshold) {
-        deckStall.recoveryAttempts++;
-        deckStall.recovering = true;
-        const attempts = deckStall.recoveryAttempts;
-        void recoverCurrentDeckStream(deck, timing.current, stallKind, attempts).then(recovered => {
-          if (deckStall.deck !== deck) return;
-          deckStall.recovering = false;
-          deckStall.recoveryAttempts = attempts;
-          deckStall.current = Number(deck.currentTime) || timing.current;
-          deckStall.observedAt = Date.now();
-          deckStall.stalledSince = recovered ? 0 : deckStall.observedAt - stallThreshold;
-        }).catch(() => {
-          if (deckStall.deck !== deck) return;
-          deckStall.recovering = false;
-          deckStall.recoveryAttempts = attempts;
-          deckStall.observedAt = Date.now();
-          deckStall.stalledSince = deckStall.observedAt - stallThreshold;
-        });
+      if (deckStall.stalledSince === null) deckStall.stalledSince = stallNow;
+      const stalledFor = stallNow - deckStall.stalledSince;
+      if (deckStall.retryPending || stalledFor >= stallThreshold) {
+        if (deckStall.recoveryAttempts >= 2) {
+          recordPlaybackDiagnostic('recovery-exhausted', {
+            reason: stallKind, attempts: deckStall.recoveryAttempts,
+            position: Math.round(deckStall.position * 10) / 10,
+          });
+          resetDeckStall();
+          await advanceAtNaturalEnd();
+          return;
+        }
+        const owner = deckStall;
+        owner.recoveryAttempts++;
+        owner.recovering = true;
+        if (!owner.retryPending) owner.position = timing.current;
+        const recovery = recoverCurrentDeckStream(deck, owner.position, stallKind, owner.recoveryAttempts);
+        owner.preparation = state._deckPrepareTokens[index];
+        const finishRecovery = recovered => {
+          if (!watcherIsCurrent() || deckStall !== owner || currentDeckAudio() !== deck
+              || state._deckPrepareTokens[index] !== owner.preparation
+              || state._deckTrack !== owner.track || state.meta[owner.track] !== owner.meta
+              || state._playbackRequest !== owner.foreground) return;
+          owner.recovering = false;
+          owner.retryPending = recovered !== true;
+          owner.current = Number(deck.currentTime) || 0;
+          owner.observedAt = Date.now();
+          owner.stalledSince = owner.observedAt;
+          if (recovered === true) owner.position = owner.current;
+        };
+        void recovery.then(finishRecovery, () => finishRecovery(false));
         return;
       }
     }
 
-    // SoundCloud can leave a completed stream parked at its exact endpoint
-    // without surfacing audio.ended or changing the title. Require both the
-    // paused player state and two endpoint polls so seeking near the end does
-    // not revive the old percentage-based early skip.
+    // SoundCloud can park at the endpoint without firing ended. Two paused
+    // endpoint polls distinguish this from a seek near the end.
     const parkedAtEnd = timing.duration > 0
+      && !state._userPaused && !deck?.seeking
       && timing.current >= timing.duration - 0.05
       && paused();
     if (parkedAtEnd) {
@@ -5390,8 +6237,7 @@ function startWatcher() {
     endpointTicks = 0;
     const queuedDeckActive = Number.isInteger(state._deckTrack)
       && state.queue[state.pos] === state._deckTrack;
-    const queuedNativeActive = Number.isInteger(state._nativeTrack)
-      && state.queue[state.pos] === state._nativeTrack;
+    const queuedNativeActive = nativePlaybackAllowed();
     const queuedPlaybackActive = queuedDeckActive || queuedNativeActive;
     if (state.suspended && queuedPlaybackActive) state.suspended = false;
 
@@ -5418,7 +6264,7 @@ function startWatcher() {
       if (!state.manualAction && naturalEndTitleChange) {
         titleTicks = 0;
         lastTitle = title;
-        pause();
+        pauseSoundCloud();
         await advanceAtNaturalEnd();
         return;
       }
@@ -5443,16 +6289,69 @@ function startWatcher() {
     if (title) lastTitle = title;
   };
 
-  state.worker = mkWorker();
-  if (state.worker) {
-    state.worker.onmessage = tick;
-    state.worker.postMessage('start');
+  let worker = null;
+  let fallbackInterval = null;
+  let heartbeatTimer = null;
+  let lastHeartbeat = Date.now();
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(heartbeatTimer);
+    if (worker) {
+      worker.onmessage = worker.onerror = worker.onmessageerror = null;
+      try { worker.terminate(); } catch (_) {}
+      if (state.worker === worker) state.worker = null;
+    }
+    if (fallbackInterval !== null) {
+      clearInterval(fallbackInterval);
+      if (state._workerInterval === fallbackInterval) state._workerInterval = null;
+    }
+    document.removeEventListener('ended', onMediaEnded, true);
+    if (state._endedHandler === onMediaEnded) state._endedHandler = null;
+    if (state._watcherToken === watcherToken) state._watcherToken++;
+    if (state._watcherCleanup === cleanup) state._watcherCleanup = null;
+  };
+  state._watcherCleanup = cleanup;
+  const startFallback = () => {
+    if (closed || !watcherIsCurrent() || fallbackInterval !== null) return;
+    clearTimeout(heartbeatTimer);
+    if (worker) {
+      worker.onmessage = worker.onerror = worker.onmessageerror = null;
+      try { worker.terminate(); } catch (_) {}
+      if (state.worker === worker) state.worker = null;
+    }
+    fallbackInterval = setInterval(tick, 50);
+    state._workerInterval = fallbackInterval;
+  };
+  const superviseWorker = () => {
+    if (!watcherIsCurrent()) { cleanup(); return; }
+    if (Date.now() - lastHeartbeat >= 3000) { startFallback(); return; }
+    heartbeatTimer = setTimeout(superviseWorker, 2000);
+  };
+  worker = mkWorker();
+  state.worker = worker;
+  if (worker) {
+    worker.onmessage = event => {
+      if (closed || !watcherIsCurrent() || state.worker !== worker) return;
+      lastHeartbeat = Date.now();
+      if (event?.data !== 'ready') return tick();
+    };
+    worker.onerror = worker.onmessageerror = event => {
+      event?.preventDefault?.();
+      startFallback();
+    };
+    try {
+      worker.postMessage('start');
+      heartbeatTimer = setTimeout(superviseWorker, 2000);
+    } catch (_) {
+      startFallback();
+    }
   } else {
-    state._workerInterval = setInterval(tick, 50);
+    startFallback();
   }
 }
 
-// ── badges ────────────────────────────────────────────────────────────────────
 
 function badges() {
   document.querySelectorAll('.tss-badge').forEach(b => b.remove());
@@ -5472,7 +6371,6 @@ function badges() {
   });
 }
 
-// ── stats ─────────────────────────────────────────────────────────────────────
 
 function tickPlayTime(now = Date.now()) {
   const currentAt = Number(now);
@@ -5529,7 +6427,6 @@ function renderStats() {
   if (tp) tp.textContent = state.stats.played;
   if (tt) tt.textContent = fmtTime(state.stats.elapsed || 0);
 
-  // all-time row
   const ltEl = overlay.querySelector('#tss-stats-lifetime');
   if (ltEl) {
     const lt = loadLifetimeStats();
@@ -5638,7 +6535,7 @@ function showStats() {
     state._playTimeRemainderMs = 0;
     state._savedStats  = null;
     state._lifetimeBase = { played: 0, elapsed: 0, playCounts: {} };
-    try { localStorage.removeItem(LIFETIME_KEY); } catch (_) {}
+    try { safeStorage.removeItem(LIFETIME_KEY); } catch (_) {}
     renderStats();
   };
 
@@ -5662,7 +6559,6 @@ function showStats() {
   };
 }
 
-// ── hub ───────────────────────────────────────────────────────────────────────
 
 function equalizerPresetName() {
   for (const [name, values] of Object.entries({ ...EQ_PRESETS, ...state.customEqPresets })) {
@@ -5748,6 +6644,7 @@ function updateEqualizerPopup() {
   const overlay = document.getElementById('tss-eq-overlay');
   if (!overlay) return;
   renderEqualizerPresetButtons();
+  updateEqualizerPersistenceStatus();
   const power = overlay.querySelector('#tss-eq-power');
   if (power) {
     power.dataset.active = String(state.eqEnabled);
@@ -5841,7 +6738,7 @@ function showEqualizer() {
   };
   overlay.querySelector('#tss-safety-clipper').onchange = event => {
     state.safetyClipper = event.currentTarget.checked;
-    localStorage.setItem('tss_safety_clipper', String(state.safetyClipper));
+    safeStorage.setItem('tss_safety_clipper', String(state.safetyClipper));
     if (ensureAutoLevelAudioGraph()) syncSafetyClipper();
     updateEqualizerPopup();
   };
@@ -5898,8 +6795,8 @@ function showEqualizer() {
     const name = existingName || requested;
     state.customEqPresets[name] = state.eqBands.slice();
     state.eqPreset = name;
-    persistEqualizer({ customPresets: true, immediate: true });
-    saveRow.dataset.open = 'false';
+    const saved = persistEqualizer({ customPresets: true, immediate: true });
+    saveRow.dataset.open = saved ? 'false' : 'true';
     presets.dataset.signature = '';
     updateEqualizerPopup();
   };
@@ -6039,18 +6936,17 @@ function mkHub() {
         background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.26);
       }
       #tss-hub-start[data-active="true"] {
-        background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.32);
-        border:1px solid rgba(255,255,255,0.07);
+        background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.78);
+        border:1px solid rgba(255,255,255,0.16);
       }
       #tss-hub-start[data-active="true"]:hover {
         background:rgba(255,255,255,0.1); color:rgba(255,255,255,0.55);
       }
       #tss-hub-start[data-loading="true"] {
-        background:transparent; color:rgba(255,255,255,0.18);
-        border:1px solid rgba(255,255,255,0.05);
-        cursor:not-allowed; animation:tss-pulse 1.2s ease-in-out infinite;
+        background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.78);
+        border:1px solid rgba(255,255,255,0.16);
+        cursor:pointer;
       }
-      @keyframes tss-pulse { 0%,100%{opacity:1} 50%{opacity:0.38} }
 
       #tss-hub-seekbar { transform-origin:center; transition:transform 0.15s; }
       #tss-hub-seekbar:hover { transform:scaleY(2.5); }
@@ -6160,29 +7056,32 @@ function mkHub() {
       .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:1px; }
       .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.42);font-size:8px;cursor:pointer; }
       .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#ff5500);cursor:pointer; }
-      #tss-playback-debug {
-        width:100%;margin-top:6px;padding:7px 10px;border:1px solid rgba(255,118,82,.24);border-radius:8px;
-        background:rgba(255,92,54,.07);color:#ff9a7d;font:750 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;
-        letter-spacing:.08em;text-transform:uppercase;cursor:pointer;
-      }
-      #tss-playback-debug:hover { background:rgba(255,92,54,.12);border-color:rgba(255,118,82,.38); }
+      #tss-playback-debug { color:#ff5353; }
+      #tss-playback-debug:hover { color:#ff8585;background:rgba(255,70,70,.12); }
+      #tss-playback-debug:focus-visible { outline:2px solid #ff5353;outline-offset:2px; }
       #tss-playback-debug[hidden] { display:none!important; }
-      #tss-debug-overlay { position:fixed;inset:0;z-index:1000002;display:flex;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.72);backdrop-filter:blur(10px); }
-      .tss-debug-dialog { width:min(620px,calc(100vw - 28px));max-height:min(680px,calc(100vh - 28px));display:flex;flex-direction:column;gap:10px;padding:15px;border:1px solid rgba(255,255,255,.11);border-radius:13px;background:#0b0b0b;box-shadow:0 22px 70px rgba(0,0,0,.75);color:#eee;font-family:-apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-debug-overlay,#tss-debug-help-overlay { position:fixed;inset:0;z-index:1000002;display:flex;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.72);backdrop-filter:blur(10px); }
+      #tss-debug-help-overlay { z-index:1000003; }
+      .tss-debug-dialog { box-sizing:border-box;width:min(620px,calc(100vw - 28px));max-height:min(680px,calc(100vh - 44px));overflow:auto;display:flex;flex-direction:column;gap:10px;padding:15px;border:1px solid rgba(255,255,255,.11);border-radius:13px;background:#0b0b0b;box-shadow:0 22px 70px rgba(0,0,0,.75);color:#eee;font-family:-apple-system,'Segoe UI',system-ui,sans-serif; }
       .tss-debug-head { display:flex;align-items:center;justify-content:space-between;gap:15px; }
       .tss-debug-head strong { display:block;font-size:13px;letter-spacing:.02em; }
       .tss-debug-head span { display:block;margin-top:2px;color:rgba(255,255,255,.38);font-size:9px; }
       .tss-debug-head button { width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.65);cursor:pointer; }
       .tss-debug-dialog p { margin:0;color:rgba(255,255,255,.45);font-size:10px;line-height:1.45; }
       #tss-debug-report { min-height:180px;max-height:460px;margin:0;padding:11px;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#050505;color:#b7c3cc;font:9px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word; }
-      .tss-debug-actions { display:flex;justify-content:flex-end;gap:7px; }
+      .tss-debug-actions { display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px; }
       .tss-debug-actions button { min-width:92px;padding:8px 11px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#151515;color:#ddd;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
       #tss-debug-copy { border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.35);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.13);color:#fff; }
+      .tss-debug-help-dialog { width:min(480px,calc(100vw - 28px));gap:16px; }
+      .tss-debug-help-steps { margin:0;padding-left:22px;color:#bbb;font-size:14px;line-height:1.55; }
+      .tss-debug-help-steps li + li { margin-top:12px; }
+      .tss-debug-help-steps a { color:#ffb08c;text-decoration:underline;text-underline-offset:3px; }
+      .tss-debug-help-steps strong { color:#eee; }
+      .tss-debug-help-dialog p { color:#aaa;font-size:12px;line-height:1.5; }
       @media (prefers-reduced-motion:reduce) {
         .tss-crossfade-reveal,#tss-crossfade-chevron { transition:none; }
       }
 
-      /* v5 deck concept — visual layer only */
       #tss-hub {
         --tss-panel:rgba(10,10,10,0.96);
         --tss-line:rgba(255,255,255,0.09);
@@ -6304,9 +7203,6 @@ function mkHub() {
       #tss-hub-sleep-display:empty { display:none; }
       #tss-hub-sleep { border-radius:7px;padding:5px 7px;font-size:9px; }
       #tss-hub-start { min-height:44px;border-radius:10px;text-transform:uppercase;letter-spacing:0.08em;font-size:10px; }
-      #tss-hub-start[data-active="true"] {
-        display:none;
-      }
       #tss-hub-start[data-active="true"]:hover { color:rgba(255,255,255,0.78);border-color:rgba(255,255,255,0.16); }
       .tss-deck-utilities label { color:rgba(255,255,255,0.4) !important;font-size:9px !important; }
 
@@ -6521,6 +7417,7 @@ function mkHub() {
           <span class="tss-deck-label">True Shuffle</span>
         </div>
         <div style="display:flex; gap:3px; align-items:center;">
+          <button id="tss-playback-debug" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Playback issue: open report" title="Playback issue: open report" hidden><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6.75"/><circle cx="8" cy="12.5" r="1" fill="currentColor" stroke="none"/></svg></button>
           <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP" style="display:none;">${SVG.pip}</button>
           <button id="tss-hub-eq" class="tss-hub-btn tss-hub-btn-icon" data-active="false" aria-label="Equalizer" aria-pressed="false" title="Equalizer off">${SVG.equalizer}</button>
           <button id="tss-hub-stats" class="tss-hub-btn tss-hub-btn-icon" aria-label="Session stats" title="session stats">${SVG.chart}</button>
@@ -6607,7 +7504,6 @@ function mkHub() {
               </div>
             </div>
           </div>
-          <button id="tss-playback-debug" type="button" hidden>Playback issue detected · open report</button>
 
         </div>
 
@@ -6668,8 +7564,9 @@ function mkHub() {
   stopAfterRound.onchange = () => { state.stopAfterRound = stopAfterRound.checked; };
 
   document.getElementById('tss-hub-start').onclick = () => {
-    if (state.autoLevel || state.eqEnabled || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
-    if (!state.loading) start();
+    if (state.active || state.loading) { stop(); return; }
+    if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
+    void start();
   };
 
   document.getElementById('tss-hub-sleep').onchange = e => {
@@ -6694,7 +7591,7 @@ function mkHub() {
   document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
     button.onclick = () => {
       state.crossfadeCurve = button.dataset.curve;
-      localStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      safeStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
       syncCrossfadeControls();
     };
   });
@@ -6702,7 +7599,7 @@ function mkHub() {
   const crossfadeManual = document.getElementById('tss-crossfade-manual');
   crossfadeManual.onchange = () => {
     state.crossfadeManual = crossfadeManual.checked;
-    localStorage.setItem('tss_crossfade_manual', String(state.crossfadeManual));
+    safeStorage.setItem('tss_crossfade_manual', String(state.crossfadeManual));
     syncCrossfadeControls();
   };
 
@@ -6779,13 +7676,14 @@ function updateHub() {
   const startBtn = document.getElementById('tss-hub-start');
   const actions  = document.getElementById('tss-hub-actions');
   if (startBtn) {
-    startBtn.style.display = active ? 'none' : '';
+    startBtn.style.display = '';
+    startBtn.disabled = false;
     if (loading) {
-      startBtn.textContent     = '⏳ loading…';
+      startBtn.textContent     = 'Cancel loading';
       startBtn.dataset.active  = 'false';
       startBtn.dataset.loading = 'true';
     } else if (active) {
-      startBtn.textContent     = '⏹ Stop Shuffle';
+      startBtn.textContent     = 'Stop Shuffle';
       startBtn.dataset.active  = 'true';
       startBtn.dataset.loading = 'false';
     } else {
@@ -6793,9 +7691,10 @@ function updateHub() {
       startBtn.dataset.active  = 'false';
       startBtn.dataset.loading = 'false';
     }
+    startBtn.setAttribute('aria-label', loading ? 'Cancel loading' : active ? 'Stop Shuffle' : 'Start True Shuffle');
   }
 
-  if (actions) actions.style.padding = active ? '0' : '0 14px 14px';
+  if (actions) actions.style.padding = '0 14px 14px';
 
   const cb = document.getElementById('tss-hub-stop-after');
   if (cb && cb.checked !== state.stopAfterRound) cb.checked = state.stopAfterRound;
@@ -6831,7 +7730,6 @@ function updateHub() {
     if (remainingTime) remainingTime.textContent = '-0:00';
     const bgimg = document.getElementById('tss-hub-bgimg');
     if (bgimg) { bgimg.style.backgroundImage = ''; bgimg.style.opacity = '0'; }
-    // reset accent
     if (state._lastAccentArtwork) {
       state._lastAccentArtwork = '';
       document.documentElement.style.setProperty('--tss-a',  '#ff5500');
@@ -6886,7 +7784,6 @@ function updateHub() {
       const bgimg = document.getElementById('tss-hub-bgimg');
       if (bgimg) { bgimg.style.backgroundImage = `url("${m.artwork}")`; bgimg.style.opacity = '1'; }
 
-      // extract and apply accent color from new artwork
       if (state._lastAccentArtwork !== m.artwork) {
         state._lastAccentArtwork = m.artwork;
         extractAccentColor(m.artwork, ([r, g, b]) => applyAccentColor(r, g, b));
@@ -6919,7 +7816,6 @@ function updateHub() {
   if (nextup) nextup.textContent = nextM ? nextM.title : '—';
 }
 
-// ── sidebar ───────────────────────────────────────────────────────────────────
 
 function syncSidebarToHub() {
   if (!state.sidebarOpen) return;
@@ -6959,9 +7855,9 @@ function setupSidebarResize() {
   if (!sidebar || !handle || !heightHandle) return;
 
   try {
-    const saved = Number(localStorage.getItem('tss_sidebar_width'));
+    const saved = Number(safeStorage.getItem('tss_sidebar_width'));
     if (Number.isFinite(saved) && saved >= 120 && saved <= 620) state.sidebarWidth = saved;
-    const savedHeight = Number(localStorage.getItem('tss_sidebar_height'));
+    const savedHeight = Number(safeStorage.getItem('tss_sidebar_height'));
     if (Number.isFinite(savedHeight) && savedHeight >= 300) state.sidebarHeight = savedHeight;
   } catch (_) {}
 
@@ -6995,7 +7891,7 @@ function setupSidebarResize() {
       delete handle.dataset.dragging;
       sidebar.style.transition = previousTransition;
       document.body.style.cursor = '';
-      try { localStorage.setItem('tss_sidebar_width', String(Math.round(state.sidebarWidth))); } catch (_) {}
+      try { safeStorage.setItem('tss_sidebar_width', String(Math.round(state.sidebarWidth))); } catch (_) {}
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
     };
@@ -7007,7 +7903,7 @@ function setupSidebarResize() {
     e.preventDefault();
     e.stopPropagation();
     state.sidebarWidth = 320;
-    try { localStorage.setItem('tss_sidebar_width', '320'); } catch (_) {}
+    try { safeStorage.setItem('tss_sidebar_width', '320'); } catch (_) {}
     syncSidebarToHub();
   };
 
@@ -7035,7 +7931,7 @@ function setupSidebarResize() {
       delete heightHandle.dataset.dragging;
       sidebar.style.transition = previousTransition;
       document.body.style.cursor = '';
-      try { localStorage.setItem('tss_sidebar_height', String(Math.round(state.sidebarHeight))); } catch (_) {}
+      try { safeStorage.setItem('tss_sidebar_height', String(Math.round(state.sidebarHeight))); } catch (_) {}
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
     };
@@ -7047,7 +7943,7 @@ function setupSidebarResize() {
     e.preventDefault();
     e.stopPropagation();
     state.sidebarHeight = 0;
-    try { localStorage.removeItem('tss_sidebar_height'); } catch (_) {}
+    try { safeStorage.removeItem('tss_sidebar_height'); } catch (_) {}
     syncSidebarToHub();
   };
 }
@@ -7150,7 +8046,6 @@ function toggleSidebar() {
   updateHub();
 }
 
-// ── list ──────────────────────────────────────────────────────────────────────
 
 function renderList(filter) {
   if (!state.sidebarOpen) {
@@ -7158,7 +8053,6 @@ function renderList(filter) {
     return;
   }
   state._sidebarDirty = false;
-  // no explicit filter → keep whatever is currently typed in the search box
   if (filter === undefined) filter = document.getElementById('tss-search')?.value || '';
 
   if (state.sidebarTab === 'history') {
@@ -7385,12 +8279,11 @@ function mkRow(m, qi, ti, cur, past) {
   return row;
 }
 
-// ── context menu ──────────────────────────────────────────────────────────────
 
 function showCtxMenu(e, qi, ti) {
   e.preventDefault();
   e.stopPropagation();
-  document.getElementById('tss-ctx')?.remove();
+  state._ctxMenuClose?.();
 
   const m    = state.meta[ti] || {};
   const menu = document.createElement('div');
@@ -7400,34 +8293,46 @@ function showCtxMenu(e, qi, ti) {
     top:${Math.min(e.clientY, window.innerHeight - 180)}px;
   `;
 
+  const epoch = state._playbackEpoch;
+  const targetIndex = () => state._playbackEpoch === epoch ? state.queue.indexOf(ti) : -1;
+  let registration = null;
+  const close = () => {
+    clearTimeout(registration);
+    document.removeEventListener('click', close);
+    menu.remove();
+    if (state._ctxMenuClose === close) state._ctxMenuClose = null;
+  };
+  state._ctxMenuClose = close;
+
   const items = [
-    { label: '⏭ play next',  action: () => queueNext(ti) },
+    { label: '⏭ play next',  action: () => { if (state._playbackEpoch === epoch) queueNext(ti); } },
     {
       label:    '↑ move up',
       disabled: qi <= state.pos + 1,
       action:   () => {
-        if (qi <= state.pos + 1) return;
-        [state.queue[qi], state.queue[qi - 1]] = [state.queue[qi - 1], state.queue[qi]];
-        if      (state.pos === qi)     state.pos--;
-        else if (state.pos === qi - 1) state.pos++;
+        const index = targetIndex();
+        if (index <= state.pos + 1) return;
+        [state.queue[index], state.queue[index - 1]] = [state.queue[index - 1], state.queue[index]];
         refreshUpcomingCrossfadePreparation();
         badges(); renderList();
       },
     },
     {
       label:    '↓ move down',
-      disabled: qi >= state.queue.length - 1,
+      disabled: qi <= state.pos || qi >= state.queue.length - 1,
       action:   () => {
-        if (qi >= state.queue.length - 1) return;
-        [state.queue[qi], state.queue[qi + 1]] = [state.queue[qi + 1], state.queue[qi]];
-        if      (state.pos === qi)     state.pos++;
-        else if (state.pos === qi + 1) state.pos--;
+        const index = targetIndex();
+        if (index <= state.pos || index >= state.queue.length - 1) return;
+        [state.queue[index], state.queue[index + 1]] = [state.queue[index + 1], state.queue[index]];
         refreshUpcomingCrossfadePreparation();
         badges(); renderList();
       },
     },
     { label: '🔗 copy link', action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); } },
-    { label: '✕ remove',    disabled: qi === state.pos, action: () => removeFromQueue(qi) },
+    { label: '✕ remove', disabled: qi === state.pos, action: () => {
+      const index = targetIndex();
+      if (index !== -1 && index !== state.pos) removeFromQueue(index);
+    } },
   ];
 
   items.forEach(({ label, action, disabled }) => {
@@ -7435,16 +8340,15 @@ function showCtxMenu(e, qi, ti) {
     item.className = `tss-ctx-item${disabled ? ' tss-ctx-disabled' : ''}`;
     item.textContent = label;
     if (!disabled) {
-      item.onclick = () => { action(); menu.remove(); };
+      item.onclick = () => { close(); action(); };
     }
     menu.appendChild(item);
   });
 
   document.body.appendChild(menu);
-  setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 0);
+  registration = setTimeout(() => document.addEventListener('click', close), 0);
 }
 
-// ── inject ────────────────────────────────────────────────────────────────────
 
 async function inject() {
   if (document.getElementById('tss-hub')) return;
@@ -7467,7 +8371,6 @@ async function inject() {
   mkHub();
 }
 
-// ── nav ───────────────────────────────────────────────────────────────────────
 
 const validPage    = () => isSoundCloudPage(location.href);
 const playlistBase = url => url.split(/[?#]/)[0].replace(/\/+$/, '');
@@ -7490,8 +8393,6 @@ function isCollectionPage(url) {
   const parts = soundCloudPathParts(url);
   if (!parts) return false;
 
-  // A concrete playlist/album or one of SoundCloud's user track collections
-  // can replace the queue and therefore keeps the existing merge workflow.
   if (parts.length >= 3 && parts[1] === 'sets' && Boolean(parts[2])) return true;
   return parts.length === 2 && ['likes', 'tracks', 'reposts'].includes(parts[1]);
 }
@@ -7501,70 +8402,57 @@ function isPassiveBrowsePage(url) {
 }
 
 let navLock = false;
-let navPending = false;
 async function onNav() {
-  if (navLock) { navPending = true; return; }
+  state._routeEpoch = (state._routeEpoch || 0) + 1;
+  const routeEpoch = state._routeEpoch;
+  const epoch = state._playbackEpoch;
+  const pageUrl = playlistBase(location.href);
+  cancelCollectionRequest();
   navLock = true;
+  const current = () => state._routeEpoch === routeEpoch && state._playbackEpoch === epoch
+    && playlistBase(location.href) === pageUrl;
+  const wasActive = state.active;
+  const registered = state._liveSyncSources.has(pageUrl) || pageUrl === playlistBase(state.playlistUrl || '');
+  if (wasActive) {
+    state.suspended = !validPage() || (!registered && !isPassiveBrowsePage(location.href));
+    if (state.suspended && Number.isInteger(state._nativeTrack)) {
+      state._nativeTrack = null;
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    }
+    updateHub();
+  }
   try {
-    if (state.active) {
-      if (!validPage()) {
-        state.suspended = true;
-        updateHub();
-        return;
+    await wait(1500);
+    if (!current()) return;
+    if (!validPage()) return;
+    inject();
+    if (wasActive) {
+      if (!state.active) return;
+      if (registered) {
+        if (state._collectionRequest) return;
+        const request = beginCollectionRequest(pageUrl, false, false);
+        try {
+          const freshEls = await loadTracks(request);
+          if (!current() || !state.active || !collectionRequestCurrent(request)) return;
+          if (freshEls.length) bindCurrentPageElements(freshEls);
+        } finally {
+          finishCollectionRequest(request);
+        }
       }
-
-      if (playlistBase(location.href) === playlistBase(state.playlistUrl)) {
-        state.suspended = false;
-        await wait(1500);
-        inject();
-        state.worker?.postMessage('stop');
-        if (state._workerInterval) { clearInterval(state._workerInterval); state._workerInterval = null; }
-        const freshEls = await loadTracks();
-        if (freshEls.length > 0) bindCurrentPageElements(freshEls);
-        if (state.worker) { state.worker.postMessage('start'); } else { startWatcher(); }
-        return;
-      }
-
-      // Passive browse navigation does not replace the shuffled collection. The
-      // custom deck remains authoritative there, and live sync can continue to
-      // poll the persisted source playlist without its DOM being visible.
-      if (isPassiveBrowsePage(location.href)) {
-        state.suspended = false;
-        await wait(1500);
-        inject();
-        updateHub();
-        void syncLiveQueue({ force: true });
-        return;
-      }
-
-      // different valid playlist: suspend queue so user can merge tracks, don't stop
-      state.suspended = true;
-      await wait(1500);
-      inject();
-      updateHub();
+      if (current() && state.active && !state.suspended) void syncLiveQueue({ force: true });
       return;
     }
-
-    await wait(1500);
-    if (validPage()) {
-      inject();
-      try {
-        const raw = sessionStorage.getItem('tss_queue_cache');
-        if (raw) {
-          const c = JSON.parse(raw);
-          if (Date.now() - (c.ts || 0) < 30 * 60 * 1000
-              && playlistBase(location.href) === playlistBase(c.playlistUrl || '')) {
-            await start();
-          }
-        }
-      } catch (_) {}
-    }
+    try {
+      const raw = sessionStorage.getItem('tss_queue_cache');
+      const cache = raw ? JSON.parse(raw) : null;
+      if (cache && Date.now() - (cache.ts || 0) < 30 * 60 * 1000
+          && playlistBase(cache.playlistUrl || '') === pageUrl && !state.active && !state.loading) await start();
+    } catch (_) {}
+  } catch (_) {
+    // A route or playback-session change cancels the obsolete DOM crawl.
   } finally {
-    navLock = false;
-    if (navPending) {
-      navPending = false;
-      queueMicrotask(() => onNav());
-    }
+    if (state._routeEpoch === routeEpoch) navLock = false;
   }
 }
 
@@ -7579,6 +8467,18 @@ function checkForNavigation() {
   }
   void onNav();
   return true;
+}
+
+function installNavigationTracking() {
+  const history = pageWindow.history;
+  for (const method of ['pushState', 'replaceState']) {
+    const original = history[method];
+    history[method] = function (...args) {
+      const result = Reflect.apply(original, this, args);
+      checkForNavigation();
+      return result;
+    };
+  }
 }
 
 function scheduleLiveQueueSync(delay = 250) {
@@ -7606,31 +8506,40 @@ function mutationsAreTrueShuffleOnly(records) {
 }
 
 function scheduleLiveQueueSyncFromMutation(records) {
-  if (playlistBase(location.href) !== playlistBase(state.playlistUrl)
+  if (!state._liveSyncSources.has(playlistBase(location.href))
       || !mutationChangesPlaylistTracks(records)) return false;
   scheduleLiveQueueSync();
   return true;
 }
 
-new MutationObserver(records => {
-  if (mutationsAreTrueShuffleOnly(records)) return;
-  if (checkForNavigation()) return;
-  else if (!navLock && validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
-    injectRetryTimer = setTimeout(() => {
-      injectRetryTimer = null;
-      inject();
-    }, 250);
-  }
-  scheduleLiveQueueSyncFromMutation(records);
-}).observe(document, { subtree: true, childList: true });
+function initializePage() {
+  document.documentElement.style.setProperty('--tss-a', '#ff5500');
+  document.documentElement.style.setProperty('--tss-ar', '255');
+  document.documentElement.style.setProperty('--tss-ag', '85');
+  document.documentElement.style.setProperty('--tss-ab', '0');
 
-// SoundCloud can update history before it renders the next route. Polling the
-// URL keeps navigation responsive even when that transition produces no DOM
-// mutation, including while the custom player is active in the background.
-setInterval(checkForNavigation, 250);
-window.addEventListener('popstate', checkForNavigation);
+  new MutationObserver(records => {
+    if (mutationsAreTrueShuffleOnly(records)) return;
+    if (checkForNavigation()) return;
+    if (!navLock && validPage() && !document.getElementById('tss-hub') && !injectRetryTimer) {
+      injectRetryTimer = setTimeout(() => {
+        injectRetryTimer = null;
+        inject();
+      }, 250);
+    }
+    scheduleLiveQueueSyncFromMutation(records);
+  }).observe(document, { subtree: true, childList: true });
+
+  // SoundCloud can change routes without a DOM mutation.
+  installNavigationTracking();
+  setInterval(checkForNavigation, 250);
+  window.addEventListener('popstate', checkForNavigation);
+  onNav();
+}
 
 window.addEventListener('pagehide', () => {
+  tickPlayTime();
+  saveLifetimeStats();
   if (equalizerPersistTimer || customPresetsPending) flushEqualizerPersistence();
 });
 
@@ -7650,6 +8559,10 @@ window.addEventListener('pageshow', () => {
 });
 
 installNativePlaybackGuard();
-onNav();
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializePage, { once: true });
+} else {
+  initializePage();
+}
 
 })();

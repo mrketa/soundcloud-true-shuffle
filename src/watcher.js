@@ -28,7 +28,6 @@ function startWatcher() {
             nearEnd   = false;
           }
         } else {
-          // Playlist DOM gone — cache queue and navigate back.
           nearEnd = false;
           const worker = state.worker;
           state.worker = null;
@@ -67,7 +66,6 @@ function startWatcher() {
       return;
     }
 
-    // Unrecognised title change — debounce 2 ticks before entering suspended mode.
     if (title && lastTitle && title !== lastTitle) {
       if (++titleTicks >= 2) {
         titleTicks = 0;
