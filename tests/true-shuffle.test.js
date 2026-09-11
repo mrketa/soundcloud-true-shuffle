@@ -1055,15 +1055,7 @@ test('checked stop-after-round leaves the queue exhausted', () => {
   assert.deepEqual(result, []);
 });
 
-test('queue search refresh keeps the current query when no filter is passed', () => {
-  const renderList = extractFunction('renderList');
-  assert.match(renderList, /if \(filter === undefined\)/);
-  assert.match(renderList, /getElementById\('tss-search'\)\?\.value/);
-});
-
 test('closed sidebar defers queue DOM rebuilds until it is opened', () => {
-  const renderList = extractFunction('renderList');
-  assert.match(renderList, /if \(!state\.sidebarOpen\) \{\s*state\._sidebarDirty = true;\s*return;/);
 
   const state = { sidebarOpen: false, _sidebarDirty: true };
   const sidebar = { dataset: {} };

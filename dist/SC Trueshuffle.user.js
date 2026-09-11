@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.1
+// @version      6.2.2
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -8063,6 +8063,11 @@ function renderList(filter) {
   const list  = document.getElementById('tss-sidebar-list');
   const count = document.getElementById('tss-sidebar-count');
   if (!list) return;
+  const q = filter.toLowerCase();
+  const preserveScroll = list.dataset.view === 'queue' && list.dataset.filter === q;
+  const scrollTop = list.scrollTop;
+  list.dataset.view = 'queue';
+  list.dataset.filter = q;
 
   list.innerHTML = '';
 
@@ -8072,7 +8077,6 @@ function renderList(filter) {
     return;
   }
 
-  const q = filter.toLowerCase();
   if (count) {
     const total = Math.max(1, state.roundTotal || state.queue.length);
     const current = Math.min(total, Math.max(1, state.roundPlayed + 1));
@@ -8148,7 +8152,9 @@ function renderList(filter) {
     list.appendChild(row);
   });
 
-  if (!q) {
+  // Background refreshes must not pull the reader back to the playing track.
+  list.scrollTop = preserveScroll ? scrollTop : 0;
+  if (!preserveScroll && !q) {
     let offset = state.playNext.length ? state.playNext.length + 2 : 0;
     if (state.suspended) offset++;
     list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -8161,6 +8167,7 @@ function renderHistory(filter = '') {
   const list  = document.getElementById('tss-sidebar-list');
   const count = document.getElementById('tss-sidebar-count');
   if (!list) return;
+  list.dataset.view = 'history';
 
   list.innerHTML = '';
   if (count) count.textContent = state.history.length ? `${state.history.length}` : '';

@@ -447,6 +447,159 @@ test('published video close handles rejected exit while releasing timer, listene
   assert.equal(h.document.querySelectorAll('video').length, 0);
 });
 
+function queueScrollHarness() {
+  const h = harness({ refreshPlayBtn() {} });
+  const rowHeight = 56;
+  const scrollCalls = [];
+  // Clearing the list collapses its layout; assigning scrollTop before rebuilding
+  // therefore cannot preserve a user's position. Rows have fixed fixture heights.
+  class QueueList extends Element {
+    constructor() {
+      super('div', h.document);
+      this.clientHeight = rowHeight * 5;
+      this._scrollTop = 0;
+    }
+    get scrollHeight() { return this.children.length * rowHeight; }
+    get scrollTop() { return this._scrollTop; }
+    set scrollTop(value) { this._scrollTop = Math.max(0, Math.min(value, this.scrollHeight - this.clientHeight)); }
+    get textContent() { return super.textContent; }
+    set textContent(value) { super.textContent = value; this.scrollTop = 0; }
+  }
+  const list = new QueueList();
+  list.id = 'tss-sidebar-list';
+  const search = h.document.createElement('input');
+  search.id = 'tss-search';
+  search.value = '';
+  h.document.body.append(list, search);
+  const createElement = h.document.createElement.bind(h.document);
+  h.document.createElement = tag => {
+    const element = createElement(tag);
+    element.scrollIntoView = () => {
+      if (element.parentNode !== list) return;
+      scrollCalls.push(element);
+      const top = list.children.indexOf(element) * rowHeight;
+      if (top < list.scrollTop) list.scrollTop = top;
+      else if (top + rowHeight > list.scrollTop + list.clientHeight) list.scrollTop = top + rowHeight - list.clientHeight;
+    };
+    return element;
+  };
+  Object.assign(h.state, {
+    sidebarOpen: true, sidebarTab: 'queue', pos: 12, roundPlayed: 12,
+    queue: Array.from({ length: 120 }, (_, index) => index),
+    meta: Array.from({ length: 120 }, (_, index) => ({
+      title: `${index % 2 ? 'Beta' : 'Alpha'} ${String(index).padStart(3, '0')}`,
+      artist: 'Artist',
+    })),
+    stats: { played: 12 },
+    history: [0, 1, 2],
+  });
+  h.load('mkRow', 'renderHistory', 'renderList');
+  return { ...h, list, search, scrollCalls, rowHeight };
+}
+
+test('repeated queue refreshes preserve a distant browsing position instead of revealing the playing track', () => {
+  const h = queueScrollHarness();
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 8 * h.rowHeight, 'first render reveals the offscreen current track');
+  assert.equal(h.scrollCalls.length, 1);
+  assert.ok(h.scrollCalls[0].textContent.includes(h.state.meta[12].title));
+
+  h.list.scrollTop = 2400;
+  h.scrollCalls.length = 0;
+  for (let refresh = 0; refresh < 3; refresh++) {
+    h.context.renderList();
+    assert.equal(h.list.scrollTop, 2400);
+    assert.equal(h.scrollCalls.length, 0);
+  }
+  h.state.meta[80].title = 'Updated queue metadata';
+  h.context.renderList();
+  assert.ok(h.list.textContent.includes('Updated queue metadata'));
+  assert.equal(h.list.scrollTop, 2400);
+  assert.equal(h.scrollCalls.length, 0);
+});
+
+test('queue removal and playback advance update rows without interrupting queue browsing', () => {
+  const h = queueScrollHarness();
+  h.context.renderList();
+  h.list.scrollTop = 2400;
+  h.scrollCalls.length = 0;
+
+  h.state.queue.splice(20, 1);
+  h.context.renderList();
+  assert.equal(h.list.textContent.includes(h.state.meta[20].title), false);
+  assert.equal(h.list.scrollTop, 2400);
+  assert.equal(h.scrollCalls.length, 0);
+
+  h.state.pos++;
+  h.state.roundPlayed++;
+  h.state.stats.played++;
+  h.context.renderList();
+  const playing = h.list.querySelectorAll('.tss-queue-status').find(status => status.textContent === 'playing');
+  assert.ok(playing.parentNode.textContent.includes(h.state.meta[h.state.queue[h.state.pos]].title));
+  assert.equal(h.list.scrollTop, 2400);
+  assert.equal(h.scrollCalls.length, 0);
+});
+
+test('equivalent searches preserve browsing while new searches start at the top and clearing reveals current', () => {
+  const h = queueScrollHarness();
+  h.context.renderList();
+  h.list.scrollTop = 2400;
+  h.scrollCalls.length = 0;
+
+  h.search.value = 'Alpha';
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 0);
+  assert.equal(h.scrollCalls.length, 0);
+  assert.ok(h.list.textContent.includes('Alpha 118'));
+  assert.equal(h.list.textContent.includes('Beta 119'), false);
+
+  h.list.scrollTop = 1400;
+  h.search.value = 'ALPHA';
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 1400);
+  assert.equal(h.scrollCalls.length, 0);
+
+  h.search.value = 'Beta';
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 0);
+  assert.equal(h.scrollCalls.length, 0);
+  assert.ok(h.list.textContent.includes('Beta 119'));
+  assert.equal(h.list.textContent.includes('Alpha 118'), false);
+
+  h.list.scrollTop = 1400;
+  h.search.value = '';
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 8 * h.rowHeight);
+  assert.equal(h.scrollCalls.length, 1);
+  assert.ok(h.scrollCalls[0].textContent.includes(h.state.meta[12].title));
+});
+
+test('returning from history reveals current in the full queue and starts filtered results at the top', () => {
+  const h = queueScrollHarness();
+  h.context.renderList();
+  h.list.scrollTop = 2400;
+  h.state.sidebarTab = 'history';
+  h.context.renderList();
+  h.state.sidebarTab = 'queue';
+  h.scrollCalls.length = 0;
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 8 * h.rowHeight);
+  assert.equal(h.scrollCalls.length, 1);
+  assert.ok(h.scrollCalls[0].textContent.includes(h.state.meta[12].title));
+
+  h.search.value = 'Alpha';
+  h.context.renderList();
+  h.list.scrollTop = 1400;
+  h.state.sidebarTab = 'history';
+  h.context.renderList();
+  h.state.sidebarTab = 'queue';
+  h.scrollCalls.length = 0;
+  h.context.renderList();
+  assert.equal(h.list.scrollTop, 0);
+  assert.equal(h.scrollCalls.length, 0);
+  assert.ok(h.list.textContent.includes('Alpha 118'));
+});
+
 function contextMenuHarness() {
   const h = harness();
   h.context.removeFromQueue = index => h.state.queue.splice(index, 1);

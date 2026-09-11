@@ -1,5 +1,14 @@
 # Changelog
 
+## v6.2.2 - 2026-09-11
+
+### Long queue scrolling
+
+- Preserve the queue's scroll position during background playlist refreshes, queue edits and playback advances instead of repeatedly scrolling back to the playing track.
+- Keep current-track navigation when returning from History or clearing search; changed searches start at the top of their results.
+- Added scrolling regressions that fail with the old renderer. Passed all nine regression files and JavaScript syntax validation.
+- Verified the production sidebar renderer in a Chromium fixture with 2,000 tracks: repeated refreshes preserve distant scroll positions, and slow scrolling across a 10-second refresh reaches the last track without jumping backward. This was not an authenticated SoundCloud session.
+
 ## v6.2.1 - 2026-09-04
 
 ### Collaborator names and merged playlist updates
