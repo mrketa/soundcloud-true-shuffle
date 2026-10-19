@@ -246,9 +246,20 @@ function diagnosticHarness() {
   const h = harness();
   h.state._playbackDiagnostics = [];
   h.state._playbackDiagnosticFault = false;
+  const diagnosticConfig = [
+    /const DIAGNOSTIC_NUMBER_FIELDS = new Set\([\s\S]*?\n\]\);/,
+    /const DIAGNOSTIC_BOOLEAN_FIELDS = new Set\([\s\S]*?\n\]\);/,
+    /const DIAGNOSTIC_STRING_FIELDS = new Set\([\s\S]*?\n\]\);/,
+    /const DIAGNOSTIC_NESTED_FIELDS = new Set\([\s\S]*?\n\]\);/,
+    /const DIAGNOSTIC_SAFE_LABELS = \{[\s\S]*?\n\};/,
+  ].map(pattern => source.match(pattern)?.[0] || '').join('\n');
+  vm.runInContext(diagnosticConfig, h.context);
   vm.runInContext(source.match(/const PLAYBACK_DIAGNOSTIC_FAULTS = new Set\(\[[\s\S]*?\]\);/)[0], h.context);
-  h.load('updatePlaybackDiagnosticButton', 'sanitizePlaybackDiagnostics', 'recordPlaybackDiagnostic',
-    'safeMediaUrl', 'playbackDiagnosticSnapshot', 'showPlaybackDiagnostics', 'showPlaybackReportHelp');
+  h.load('safeDiagnosticVersion', 'playbackErrorName', 'safeDiagnosticString', 'sanitizeDiagnosticRecord',
+    'sanitizePlaybackDiagnostics', 'playbackDiagnosticHostWindow', 'playbackDiagnosticPageKind',
+    'playbackDiagnosticEnvironment', 'playbackDiagnosticCapabilities', 'diagnosticDeckStreamKind',
+    'updatePlaybackDiagnosticButton', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot',
+    'showPlaybackDiagnostics', 'showPlaybackReportHelp');
   return h;
 }
 
@@ -269,6 +280,11 @@ test('a recorded playback fault and its report remain reachable beside PiP after
   h.context.recordPlaybackDiagnostic('custom-start-retry', { attempt: 1 });
   assert.equal(diagnostic.hidden, true);
   assert.equal(diagnostic.querySelector('svg'), icon);
+  h.context.recordPlaybackDiagnostic('custom-start-candidate-failed', {
+    attempted: 1, failureStage: 'stream-resolution', failureReason: 'http-rate-limited',
+  });
+  assert.equal(diagnostic.hidden, false, 'the diagnostic build makes an in-progress candidate failure reportable');
+  assert.equal(diagnostic.dataset.status, 'current');
   h.context.recordPlaybackDiagnostic('custom-start-exhausted', { attempted: 3 });
   assert.equal(diagnostic.hidden, false);
   assert.equal(diagnostic.dataset.status, 'current');
@@ -290,7 +306,9 @@ test('a recorded playback fault and its report remain reachable beside PiP after
   const stoppedReport = JSON.parse(h.document.getElementById('tss-debug-report').textContent);
   assert.equal(stoppedReport.state.active, false);
   assert.deepEqual(stoppedReport.diagnostics, beforeStop.diagnostics);
-  assert.equal(stoppedReport.diagnostics.at(-1).event, 'custom-start-exhausted');
+  assert.deepEqual(stoppedReport.diagnostics.map(entry => entry.event), [
+    'custom-start-retry', 'custom-start-candidate-failed', 'custom-start-exhausted',
+  ]);
   assert.equal(stoppedReport.diagnostics.at(-1).attempted, 3);
 });
 

@@ -26,6 +26,14 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+const loadReadyDeck = async (audio, _index, streamUrl) => {
+  audio.preload = 'auto';
+  audio.src = streamUrl;
+  const source = audio.src;
+  audio.load();
+  return { supported: true, ready: true, player: null, source };
+};
+
 test('custom EQ presets use Tampermonkey storage with local migration fallback', () => {
   const sanitizeSource = extractFunction('sanitizeCustomEqPresets');
   const localSource = extractFunction('localCustomEqPresets');
@@ -214,7 +222,8 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
   const prepareCrossfadeDeck = Function(
     'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
     'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
-    'waitForDeck', 'normalizeTrackUrl', 'deckIsPreviewLimited',
+    'waitForDeck', 'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl',
+    'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
     `return (${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')})`,
   )(
     state,
@@ -232,6 +241,10 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
     async () => true,
     value => String(value || ''),
     () => false,
+    () => false,
+    loadReadyDeck,
+    error => String(error?.name || 'UnknownError'),
+    () => {},
   );
 
   const oldRequest = prepareCrossfadeDeck(1, 0);
@@ -292,6 +305,7 @@ test('play-next and reorder invalidation prepare the authoritative standby track
     'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph',
     'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
     'waitForDeck', 'normalizeTrackUrl', 'deckIsPreviewLimited', 'currentDeckAudio', 'setCrossfadeStatus',
+    'isHlsStreamUrl', 'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
     `${extractFunction('upcomingTrackIndex')};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
@@ -309,6 +323,10 @@ test('play-next and reorder invalidation prepare the authoritative standby track
     value => String(value || ''),
     () => false,
     () => active,
+    () => {},
+    () => false,
+    loadReadyDeck,
+    error => String(error?.name || 'UnknownError'),
     () => {},
   );
   const settlePrefetch = async () => {
@@ -373,8 +391,9 @@ test('crossfade schedule fails a stalled clock but excludes intentional paused t
     _audioContext: { currentTime: 1, state: 'suspended' },
     _crossfadeToken: 9,
     _crossfadePausedByUser: false,
+    _decks: [{}, {}],
   };
-  const stalledSchedule = { startTime: 1, endTime: 13, duration: 12 };
+  const stalledSchedule = { startTime: 1, endTime: 13, duration: 12, outgoingIndex: 0, incomingIndex: 1 };
   stalledState._crossfadeSchedule = stalledSchedule;
   const waitForStall = Function(
     'state', 'Date', 'setTimeout', 'recordPlaybackDiagnostic', 'clearTimeout',
@@ -399,8 +418,9 @@ test('crossfade schedule fails a stalled clock but excludes intentional paused t
     _audioContext: { currentTime: 1, state: 'suspended' },
     _crossfadeToken: 4,
     _crossfadePausedByUser: true,
+    _decks: [{}, {}],
   };
-  const pausedSchedule = { startTime: 1, endTime: 13, duration: 12 };
+  const pausedSchedule = { startTime: 1, endTime: 13, duration: 12, outgoingIndex: 0, incomingIndex: 1 };
   pausedState._crossfadeSchedule = pausedSchedule;
   const waitWhilePaused = Function(
     'state', 'Date', 'setTimeout', 'recordPlaybackDiagnostic', 'clearTimeout',
@@ -444,13 +464,14 @@ test('background worker resolves paused or frozen Firefox crossfades', () => {
     },
   };
   const settle = Function(
-    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot',
+    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot', 'diagnosticDeckStreamKind',
     `return (${settleSource})`,
   )(
     state,
     { now: () => 500 },
     event => events.push(event),
     reason => ({ reason }),
+    () => 'progressive',
   );
   settle();
   assert.equal(resolution, false);
@@ -464,13 +485,14 @@ test('background worker resolves paused or frozen Firefox crossfades', () => {
   state._crossfadeSchedule.lastClockAdvanceAt = 100;
   state._crossfadeSchedule.lastIncomingAdvanceAt = 100;
   const settleFrozen = Function(
-    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot',
+    'state', 'Date', 'recordPlaybackDiagnostic', 'playbackDiagnosticSnapshot', 'diagnosticDeckStreamKind',
     `return (${settleSource})`,
   )(
     state,
     { now: () => 3000 },
     event => events.push(event),
     reason => ({ reason }),
+    () => 'progressive',
   );
   settleFrozen();
   assert.equal(resolution, false);

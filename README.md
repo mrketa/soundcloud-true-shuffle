@@ -9,7 +9,7 @@
 
 <br/>
 
-![Version](https://img.shields.io/badge/version-6.2.2-ff5500?style=flat-square)
+![Version](https://img.shields.io/badge/version-6.2.3-ff5500?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
 ![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-install-brightgreen?style=flat-square&logo=tampermonkey)
 ![Works in background](https://img.shields.io/badge/background%20tab-✓-ff5500?style=flat-square)
@@ -29,7 +29,7 @@ SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happ
 - **Background playback supervision** — worker heartbeat, timer fallback and audio-clock stall recovery
 - **Round-based shuffle** — every track plays once before a fresh round is generated
 - **Modern floating player** — artwork, real waveform, queue, history, stats and sleep timer
-- **Two-deck audio engine** — direct playback, with exact-track SoundCloud fallback for preview/access-limited tracks
+- **Two-deck audio engine** — progressive and AAC HLS playback in True Shuffle's own decks; previews and HLS/MSE startup failures use exact-track SoundCloud fallback
 - **DJ-style crossfade** — adjustable duration and Smooth, Clean or DJ transition curves
 - **5-band equalizer** — built-in presets, a visual editor and persistent custom presets
 - **Auto Level** — evens out large volume differences between tracks and remembers learned levels
@@ -65,8 +65,13 @@ Network requests, response bodies and audio startup have deadlines. Playback ope
 
 If playback stalls, use **Stop Shuffle** or **Cancel loading**, then start True Shuffle again. A new playback failure reveals a **red exclamation mark next to PiP** in the player header, including after Stop. Click it to open the current report, then choose **Copy report**. Reports exist only in memory: reloading or closing the page discards them, and previously saved diagnostic data is removed on initialization. **Clear** dismisses the current report and error indicator.
 
-Choose **How to report** in the report dialog for a separate short tutorial. Copy the report before reloading, then use its direct link to [Greasy Fork feedback](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback). Sign in if needed and start a new discussion with the report, your browser/version, Tampermonkey or Violentmonkey version, the steps you took, and what happened instead of the expected result. Feedback is public: stream tokens and URL parameters are removed, but review track names and page addresses and remove personal information before posting. Nothing is sent automatically.
+Choose **How to report** in the report dialog for a separate short tutorial. Copy the report before reloading, then use its direct link to [Greasy Fork feedback](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback). Sign in if needed and start a new discussion with the report, the steps you took, and what happened instead of the expected result. Feedback is public. Reports contain the browser family/major version, OS family, userscript manager/version, page category, playback state, numeric indices, and sanitized request/media/audio diagnostics. They exclude track titles, account names, page paths, media or stream URLs, query strings, credentials, and exception text. Nothing is sent automatically; review the report yourself before posting.
 
+The production script records these privacy-filtered diagnostics by default. To use a separately named support install, run `python build.py --diagnostic`; it writes `dist/SC Trueshuffle Diagnostic.user.js`. Disable the regular True Shuffle script before enabling the support copy so only one instance runs on SoundCloud. Both builds collect the same in-memory report.
+
+Reports capture candidate outcomes, request status/timing, stream protocol/quality, HLS/MSE milestones, media readiness/play results, audio-context/graph state, prefetch, crossfade, recovery, and native fallback. URLs, titles, account/page paths, credentials, and full exception messages are not recorded. The report stays local until you choose **Copy report**.
+
+SoundCloud deprecated progressive HTTP streams in favor of AAC HLS after 2025. True Shuffle resolves the signed HLS manifest and plays it through the existing two-deck player with its crossfade and audio processing; pinned hls.js 1.7.3 supplies MSE playback. Native SoundCloud fallback is limited to previews or HLS/MSE startup failures, where crossfade and audio processing are unavailable. See [SoundCloud's streaming migration](https://developers.soundcloud.com/blog/api-streaming-urls/).
 Unavailable browser storage does not prevent playback or volume changes. Custom EQ presets that could not be saved show an unsaved state rather than falsely acknowledging persistence.
 
 ## How it works
@@ -78,7 +83,7 @@ Unavailable browser storage does not prevent playback or volume changes. Custom 
 4. Resolve the selected track and play it through True Shuffle's two-deck audio engine
 5. Apply output level, Auto Level, equalizer and optional crossfade
 6. Coordinate track changes with a supervised worker and the audio clock
-7. Recover stalled custom playback; acknowledge native preview fallback only for the requested track
+7. Recover stalled custom playback; acknowledge the exact requested track in SoundCloud-session fallback
 8. When the round is exhausted → generate a new balanced round
 ```
 

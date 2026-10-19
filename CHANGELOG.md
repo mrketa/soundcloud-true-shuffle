@@ -1,5 +1,31 @@
 # Changelog
 
+## v6.2.3 - 2026-10-19
+
+### Privacy-first playback diagnostics
+
+- Enable technical playback diagnostics in the production userscript; keep the separately named diagnostic build available for isolated support installs.
+- Correlate playback operations and stream attempts. Capture candidate/request outcomes, HTTP status and latency, stream protocol/quality, HLS/MSE attach/manifest/buffer milestones, media readiness and play results, audio graph/context state, recovery, prefetch, crossfade and native fallback acknowledgement.
+- Include coarse browser family/major version, OS family, userscript manager/version, page category, capability flags, numeric queue/deck indices and allowlisted technical state only.
+- Sanitize all report and console entries with a strict field allowlist. Exclude titles, account names, page paths, media/stream URLs, query strings, client IDs, authorization values and exception text. Reports are session-memory only; no telemetry or automatic transmission.
+- Add regression coverage that verifies sensitive/arbitrary text and URLs are dropped while technical status, timing, error classes and playback state remain available.
+
+### AAC HLS custom-deck playback
+
+- Prefer progressive streams when available; otherwise resolve AAC HLS manifests and load them into True Shuffle's two-deck player with pinned hls.js 1.7.3.
+- Keep Web Audio processing, Auto Level, EQ, safety clipper and crossfade active for HLS playback. Use SoundCloud native session playback only for previews or when custom HLS/MSE startup cannot run.
+- Invalidate standby decks after post-readiness fatal HLS errors; suppress crossfade readiness, show the fallback state, and refresh the deck before a later foreground handoff.
+- The supplied reports showed successful API lookups but zero progressive candidates; the reports alone do not establish whether HLS metadata was absent, unavailable, or failed later. The expanded trace now records the candidate and startup stages needed to distinguish those cases.
+
+### Verification
+
+- Rebuilt both release artifacts; `node --check` passed for the source and generated userscripts, and the canonical artifact byte-matches the source.
+- Passed all 62 `node --test` tests, including HLS request tracing, privacy redaction, recovery, crossfade, native fallback and post-readiness standby failure refresh.
+- Synthetic Chromium smoke loaded the production artifact, mounted the styled hub, triggered the fault report, and exercised Copy/Clear; injected title, page-path, stream-URL and credential sentinels were absent from the displayed and copied report.
+- Authenticated SoundCloud playback was not live-tested; the supplied reports still do not establish a single confirmed root cause.
+
+
+
 ## v6.2.2 - 2026-09-11
 
 ### Long queue scrolling

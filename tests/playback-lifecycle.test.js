@@ -4,6 +4,20 @@ const vm = require('vm');
 const assert = require('assert');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+
+const diagnosticConstants = [
+  source.match(/const DIAGNOSTIC_NUMBER_FIELDS = new Set\([\s\S]*?\n\]\);/)?.[0],
+  source.match(/const DIAGNOSTIC_BOOLEAN_FIELDS = new Set\([\s\S]*?\n\]\);/)?.[0],
+  source.match(/const DIAGNOSTIC_STRING_FIELDS = new Set\([\s\S]*?\n\]\);/)?.[0],
+  source.match(/const DIAGNOSTIC_NESTED_FIELDS = new Set\([\s\S]*?\n\]\);/)?.[0],
+  source.match(/const DIAGNOSTIC_SAFE_LABELS = \{[\s\S]*?\n\};/)?.[0],
+].filter(Boolean).join('\n');
+const diagnosticHelpers = [
+  'safeDiagnosticVersion', 'playbackErrorName', 'safeDiagnosticString', 'sanitizeDiagnosticRecord',
+  'sanitizePlaybackDiagnostics', 'playbackDiagnosticHostWindow',
+  'playbackDiagnosticPageKind', 'playbackDiagnosticEnvironment',
+  'playbackDiagnosticCapabilities', 'diagnosticDeckStreamKind', 'diagnosticStreamQuality',
+];
 function extractFunction(name) {
   const marker = `function ${name}(`;
   const start = source.indexOf(marker);
@@ -90,6 +104,7 @@ function fixture(names, overrides = {}) {
     installBetterFeedPipBridge() {}, animateDeckCrossfade: async () => true,
     prefetchUpcomingCrossfadeTrack: async () => {}, refreshPlayBtn() {}, updateProgressBar() {}, updateHub() {},
     recordPlaybackDiagnostic: (type, info) => diagnostics.push({ type, ...info }),
+    performance: { now: () => timers.Date.now() },
     trackPlayed: ti => { state.stats.played++; state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1; },
     trackAvailable: ti => Boolean(state.meta[ti] && !state.meta[ti].unavailable),
     consumeCurrentQueueTrack: () => { state.history.push(state.queue.shift()); },
@@ -98,13 +113,28 @@ function fixture(names, overrides = {}) {
     wait: ms => new Promise(resolve => timers.setTimeout(resolve, ms)),
     ...overrides,
   };
+  context.isHlsStreamUrl ||= value => {
+    const url = String(value || '').toLowerCase();
+    return url.includes('/hls') || url.includes('.m3u8');
+  };
+  context.loadStreamOnDeck ||= async (audio, _index, streamUrl, timeout, signal, isCurrent, diagnosticTrace) => {
+    audio.preload = 'auto';
+    audio.src = streamUrl;
+    const source = audio.src;
+    audio.load();
+    const ready = typeof context.waitForDeck === 'function'
+      ? await context.waitForDeck(audio, timeout, signal, isCurrent, diagnosticTrace)
+      : true;
+    return { supported: true, ready, player: null, source, failed: !ready };
+  };
   vm.createContext(context);
-  vm.runInContext(names.map(extractFunction).join('\n'), context);
+  vm.runInContext(diagnosticConstants, context);
+  vm.runInContext([...new Set([...diagnosticHelpers, ...names])].map(extractFunction).join('\n'), context);
   return { context, state: context.state, timers, decks: context.state._decks, diagnostics };
 }
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
-const deckFunctions = ['resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck'];
+const deckFunctions = ['playbackErrorName', 'resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck'];
 const foregroundFunctions = ['resetDeck', 'playDeckWithDeadline', 'playWithCrossfadeDeck', 'withDeadline'];
 
 test('a rejected Next releases only its operation and the second Next still plays', async () => {
@@ -123,7 +153,12 @@ test('seek-only Back preserves a pending recovery handoff and resumes from the r
   let h;
   h = fixture(['runPlaybackOperation', 'prevTrack', 'recoverCurrentDeckStream',
     'cancelCrossfadeForRecovery', 'resetDeck', 'withDeadline', 'playDeckWithDeadline'], {
-    resolveCrossfadeStream: async () => 'https://media.example/refreshed',
+    resolveCrossfadeStreams: async () => ['https://media.example/refreshed'],
+    loadStreamOnDeck: async (audio, _index, url) => {
+      audio.src = url;
+      audio.load();
+      return { supported: true, ready: true, player: null, source: audio.src };
+    },
     waitForDeck: async () => true,
     resumeAudioGraph: () => resume.promise,
     currentSec: () => h.decks[0].currentTime,
@@ -180,6 +215,487 @@ test('foreground pending media play exhausts its bounded attempts, unlocks, and 
   assert.equal(h.state.busy, false);
   assert.equal(h.state.suspended, false);
   assert.equal(h.state.stats.played, 1);
+});
+test('diagnostic resource tracing records status and timing without request credentials', async () => {
+  let requestUrl = '';
+  const h = fixture([
+    'playbackErrorName', 'recordCustomStartRequest', 'withDeadline', 'fetchSoundCloudResource',
+  ], {
+    performance: { now: () => 50 },
+    fetch: async (url, options) => {
+      requestUrl = String(url);
+      assert.equal(options.diagnosticTrace, undefined);
+      assert.equal(options.diagnosticStage, undefined);
+      return { ok: false, status: 429 };
+    },
+  });
+  const trace = { requestCount: 0, requests: [] };
+  const result = await h.context.fetchSoundCloudResource(
+    'https://api.soundcloud.com/stream?client_id=private-client&track_authorization=private-track',
+    'json',
+    { diagnosticTrace: trace, diagnosticStage: 'progressive-stream' },
+  );
+
+  assert.equal(result.status, 429);
+  assert.match(requestUrl, /private-client/);
+  assert.deepEqual(trace.requests, [{
+    stage: 'progressive-stream', status: 429, elapsedMs: 0,
+  }]);
+  assert.equal(JSON.stringify(trace).includes('private-client'), false);
+  assert.equal(JSON.stringify(trace).includes('private-track'), false);
+});
+
+test('stream lookup trace identifies HTTP rate limiting without preserving request credentials', async () => {
+  const requestUrls = [];
+  const h = fixture([
+    'playbackErrorName', 'recordCustomStartRequest', 'withDeadline', 'fetchSoundCloudResource',
+    'createCustomStartTrace', 'discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle',
+    'isHlsManifestUrl', 'isHlsStreamUrl', 'directHlsStreamUrls',
+    'resolveProgressiveStreams', 'fetchPlaybackTrack', 'resolveCrossfadeStreams',
+  ], {
+    performance: {
+      now: () => 50,
+      getEntriesByType: () => [{ name: 'https://api.soundcloud.com/tracks?client_id=private-client' }],
+    },
+    hydrationTrackForPlayback: () => null,
+    syncTrackPlaybackAccess: () => false,
+    fetch: async url => {
+      requestUrls.push(String(url));
+      return { ok: false, status: 429 };
+    },
+  });
+  h.state._diagnosticBuild = true;
+  h.state.meta[0].artist = 'Known artist';
+  h.state.meta[0].trackAuthorization = 'private-track';
+  h.state.meta[0].transcodings = [{
+    url: 'https://api.soundcloud.com/stream?signature=private-signature',
+    protocol: 'progressive',
+    mimeType: 'audio/mpeg',
+  }];
+  const trace = h.context.createCustomStartTrace(0);
+
+  assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0], { diagnosticTrace: trace }), []);
+  assert.equal(trace.reason, 'http-rate-limited');
+  assert.equal(h.state.meta[0].requiresNativePlayback, undefined, 'HTTP 429 with a known progressive candidate stays on the transient failure path');
+  assert.equal(trace.clientIdFound, true);
+  assert.equal(trace.clientIdSource, 'resource-history');
+  assert.equal(trace.authorizationPresent, true);
+  assert.deepEqual(trace.requests.map(request => [request.stage, request.status]), [
+    ['progressive-stream', 429],
+    ['url-resolve', 429],
+  ]);
+  assert(requestUrls.some(url => url.includes('private-client')));
+  assert.equal(JSON.stringify(trace).includes('private-client'), false);
+  assert.equal(JSON.stringify(trace).includes('private-track'), false);
+  assert.equal(JSON.stringify(trace).includes('private-signature'), false);
+});
+
+test('HLS AAC endpoints resolve to signed manifests for the custom decks', async () => {
+  const requests = [];
+  const h = fixture([
+    'playbackErrorName', 'recordCustomStartRequest', 'withDeadline', 'fetchSoundCloudResource',
+    'createCustomStartTrace', 'customStartDiagnosticDetails',
+    'discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle',
+    'resolveProgressiveStreams', 'isHlsStreamUrl', 'isHlsManifestUrl', 'directHlsStreamUrls',
+    'resolveHlsStreamUrls', 'resolveCrossfadeStreams',
+  ], {
+    performance: {
+      now: () => 50,
+      getEntriesByType: () => [{ name: 'https://api.soundcloud.com/tracks?client_id=private-client' }],
+    },
+    hydrationTrackForPlayback: () => null,
+    syncTrackPlaybackAccess: () => false,
+    fetch: async url => {
+      const endpoint = new URL(String(url));
+      requests.push(endpoint);
+      const quality = endpoint.pathname.includes('aac_160k') ? '160k' : '96k';
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          url: `https://media.example/aac_${quality}/playlist.m3u8?signature=private-stream-token`,
+        }),
+      };
+    },
+  });
+  h.state._diagnosticBuild = true;
+  const meta = h.state.meta[0];
+  meta.artist = 'Known artist';
+  meta.trackAuthorization = 'private-track';
+  meta.transcodings = [
+    {
+      url: 'https://api.soundcloud.com/tracks/42/streams/aac_96k/hls',
+      protocol: 'hls',
+      preset: 'aac_96k',
+      mimeType: 'application/vnd.apple.mpegurl',
+    },
+    {
+      url: 'https://api.soundcloud.com/tracks/42/streams/aac_160k/hls',
+      protocol: 'hls',
+      preset: 'aac_160k',
+      mimeType: 'application/vnd.apple.mpegurl',
+    },
+  ];
+  const trace = h.context.createCustomStartTrace(0);
+
+  const urls = await h.context.resolveCrossfadeStreams(meta, { diagnosticTrace: trace });
+
+  assert.deepEqual(urls.map(url => new URL(url).pathname), [
+    '/aac_160k/playlist.m3u8', '/aac_96k/playlist.m3u8',
+  ]);
+  assert.equal(requests[0].pathname, '/tracks/42/streams/aac_160k/hls');
+  assert.equal(requests[0].searchParams.get('client_id'), 'private-client');
+  assert.equal(requests[0].searchParams.get('track_authorization'), 'private-track');
+  assert.equal(meta.requiresNativePlayback, undefined);
+  assert.equal(trace.progressiveCandidates, 0);
+  assert.equal(trace.hlsCandidates, 2);
+  assert.equal(trace.hlsStreamUrls, 2);
+  assert.equal(trace.hlsMode, 'mse');
+  assert.equal(trace.reason, 'hls-mse-candidate');
+  const details = h.context.customStartDiagnosticDetails(trace);
+  assert.equal(details.hlsCandidates, 2);
+  assert.equal(details.hlsStreamUrls, 2);
+  assert.equal(details.hlsMode, 'mse');
+  assert.deepEqual(trace.requests.map(request => [request.stage, request.status]), [
+    ['hls-stream', 200], ['hls-stream', 200],
+  ]);
+  assert.equal(JSON.stringify(trace).includes('private-client'), false);
+  assert.equal(JSON.stringify(trace).includes('private-track'), false);
+  assert.equal(JSON.stringify(trace).includes('private-stream-token'), false);
+});
+
+test('valid track metadata without supported stream transcodings does not request native playback', async () => {
+  let h;
+  h = fixture([
+    'playbackErrorName', 'recordCustomStartRequest', 'createCustomStartTrace',
+    'discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle',
+    'isHlsManifestUrl', 'isHlsStreamUrl', 'directHlsStreamUrls',
+    'resolveProgressiveStreams', 'fetchPlaybackTrack', 'resolveCrossfadeStreams',
+  ], {
+    performance: {
+      now: () => 50,
+      getEntriesByType: () => [{ name: 'https://api.soundcloud.com/tracks?client_id=private-client' }],
+    },
+    hydrationTrackForPlayback: () => null,
+    syncTrackPlaybackAccess: () => false,
+    fetchSoundCloudResource: async () => ({
+      ok: true,
+      status: 200,
+      data: {
+        id: 42,
+        permalink_url: h.state.meta[0].link,
+        track_authorization: 'private-track',
+        media: { transcodings: [] },
+      },
+    }),
+  });
+  h.state._diagnosticBuild = true;
+  h.state.meta[0].artist = 'Known artist';
+  h.state.meta[0].soundcloudId = 42;
+  const trace = h.context.createCustomStartTrace(0);
+
+  assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0], { diagnosticTrace: trace }), []);
+  assert.equal(trace.trackMetadataFound, true);
+  assert.equal(trace.progressiveCandidates, 0);
+  assert.equal(trace.hlsCandidates, 0);
+  assert.equal(trace.reason, 'unsupported-stream-protocol');
+  assert.equal(h.state.meta[0].requiresNativePlayback, undefined);
+});
+
+test('HLS manifests play on the existing True Shuffle deck and reset destroys the MSE player', async () => {
+  const instances = [];
+  class FakeHls {
+    constructor(config) { this.config = config; this.handlers = new Map(); this.destroyed = false; instances.push(this); }
+    on(event, handler) { this.handlers.set(event, handler); }
+    loadSource(url) { this.source = url; }
+    attachMedia(audio) {
+      this.audio = audio;
+      audio.src = 'blob:https://soundcloud.com/true-shuffle';
+      audio.currentSrc = audio.src;
+      audio.readyState = 2;
+      audio.emit('canplay');
+    }
+    destroy() { this.destroyed = true; }
+  }
+  FakeHls.Events = { ERROR: 'hlsError' };
+  FakeHls.isSupported = () => true;
+  const streamUrl = 'https://media.example/aac_160k/playlist.m3u8?signature=private-stream-token';
+  const h = fixture([
+    'playbackErrorName', 'resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck',
+    'loadStreamOnDeck', 'prepareHlsDeck', 'hlsJsConstructor', 'hlsDiagnosticCode',
+    'isHlsStreamUrl', 'waitForDeck',
+  ], {
+    pageWindow: { Hls: FakeHls },
+    resolveCrossfadeStreams: async () => [streamUrl],
+  });
+  h.state._deckHlsPlayers = [null, null];
+  const trace = {};
+
+  const deck = await h.context.prepareCrossfadeDeck(0, 0, { diagnosticTrace: trace });
+
+  assert.equal(deck, h.decks[0]);
+  assert.equal(instances.length, 1);
+  assert.equal(instances[0].source, streamUrl);
+  assert.equal(instances[0].audio, h.decks[0]);
+  assert.match(deck.src, /^blob:/);
+  assert.equal(h.state._deckHlsPlayers[0], instances[0]);
+  assert.equal(h.state._deckTracks[0], 0);
+  assert.equal(h.state.meta[0].requiresNativePlayback, undefined);
+  assert.equal(trace.hlsMode, 'mse');
+  assert.equal(trace.reason, 'media-ready');
+  assert.equal(JSON.stringify(trace).includes('private-stream-token'), false);
+
+  h.context.resetDeck(deck, 0);
+  assert.equal(instances[0].destroyed, true);
+  assert.equal(h.state._deckHlsPlayers[0], null);
+  assert.equal(h.state._deckTracks[0], null);
+  assert.equal(deck.src, '');
+});
+
+test('HLS startup falls back only when MSE is unsupported', async () => {
+  class UnsupportedHls {}
+  UnsupportedHls.Events = { ERROR: 'hlsError' };
+  UnsupportedHls.isSupported = () => false;
+  const h = fixture([
+    'playbackErrorName', 'resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck',
+    'loadStreamOnDeck', 'prepareHlsDeck', 'hlsJsConstructor', 'hlsDiagnosticCode',
+    'isHlsStreamUrl', 'waitForDeck',
+  ], {
+    pageWindow: { Hls: UnsupportedHls },
+    resolveCrossfadeStreams: async () => ['https://media.example/aac_160k/playlist.m3u8'],
+  });
+  h.state._deckHlsPlayers = [null, null];
+  const trace = {};
+
+  assert.equal(await h.context.prepareCrossfadeDeck(0, 0, { diagnosticTrace: trace }), null);
+  assert.equal(h.state.meta[0].requiresNativePlayback, true);
+  assert.equal(h.state.meta[0].nativePlaybackReason, 'hls-mse-unavailable');
+  assert.equal(trace.hlsMode, 'unsupported');
+  assert.equal(trace.nativeFallbackReason, 'hls-mse-unavailable');
+});
+
+test('fatal HLS manifest errors retain only sanitized type, detail and HTTP status', async () => {
+  class FatalHls {
+    constructor() { this.handlers = new Map(); }
+    on(event, handler) { this.handlers.set(event, handler); }
+    loadSource(url) {
+      this.source = url;
+      this.handlers.get('hlsError')?.('hlsError', {
+        fatal: true, type: 'networkError', details: 'manifestLoadError',
+        response: { code: 403 }, url: 'https://media.example/playlist.m3u8?private=secret',
+      });
+    }
+    attachMedia(audio) { audio.src = 'blob:https://soundcloud.com/true-shuffle'; }
+    destroy() {}
+  }
+  FatalHls.Events = { ERROR: 'hlsError' };
+  FatalHls.isSupported = () => true;
+  const h = fixture([
+    'prepareHlsDeck', 'resetDeck', 'hlsJsConstructor', 'hlsDiagnosticCode', 'waitForDeck',
+  ], { pageWindow: { Hls: FatalHls } });
+  h.state._deckHlsPlayers = [null, null];
+  h.state._deckIndex = 0;
+  h.state._deckTrack = 7;
+  h.state._deckTracks[0] = 7;
+  const trace = {};
+
+  const result = await h.context.prepareHlsDeck(
+    h.decks[0], 0, 'https://media.example/playlist.m3u8?private=secret', 500, null, () => true, trace,
+  );
+
+  assert.equal(result.ready, false);
+  assert.equal(trace.hlsMode, 'mse');
+  assert.equal(trace.hlsErrorType, 'networkError');
+  assert.equal(trace.hlsErrorDetail, 'manifestLoadError');
+  assert.equal(trace.hlsStatus, 403);
+  assert.equal(JSON.stringify(trace).includes('private=secret'), false);
+  assert.deepEqual(h.diagnostics.filter(item => item.type === 'hls-playback-failed').map(item => [
+    item.trackIndex, item.errorType, item.errorDetail, item.status,
+  ]), [[7, 'networkError', 'manifestLoadError', 403]]);
+  h.context.resetDeck(h.decks[0], 0);
+});
+
+test('fatal HLS after readiness invalidates standby and foreground preparation reloads it', async () => {
+  const instances = [];
+  class FakeHls {
+    constructor() { this.handlers = new Map(); this.destroyed = false; instances.push(this); }
+    on(event, handler) { this.handlers.set(event, handler); }
+    loadSource(url) { this.source = url; }
+    attachMedia(deck) {
+      this.audio = deck;
+      deck.src = deck.currentSrc = 'blob:https://soundcloud.com/true-shuffle';
+      deck.readyState = 2;
+      deck.emit('canplay');
+    }
+    destroy() { this.destroyed = true; }
+  }
+  FakeHls.Events = { ERROR: 'hlsError' };
+  FakeHls.isSupported = () => true;
+  let h;
+  h = fixture([
+    'resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck', 'loadStreamOnDeck',
+    'prepareHlsDeck', 'hlsJsConstructor', 'hlsDiagnosticCode', 'isHlsStreamUrl', 'waitForDeck',
+    'upcomingTrackIndex', 'upcomingCrossfadeDeckReady',
+  ], {
+    pageWindow: { Hls: FakeHls },
+    resolveCrossfadeStreams: async () => ['https://media.example/aac_160k/playlist.m3u8'],
+    setCrossfadeStatus: status => { if (h) h.state.crossfadeStatus = status; },
+  });
+  h.state._deckHlsPlayers = [null, null];
+  h.state._deckIndex = 0;
+  h.state._deckTrack = 0;
+  h.state._deckTracks[0] = 0;
+  h.state.crossfadeSeconds = 6;
+  h.state.crossfadeStatus = 'ready';
+
+  assert.equal(await h.context.prepareCrossfadeDeck(1, 1), h.decks[1]);
+  assert.equal(h.context.upcomingCrossfadeDeckReady(), true);
+  instances[0].handlers.get('hlsError')('hlsError', {
+    fatal: true, type: 'networkError', details: 'fragLoadError',
+    response: { code: 503 }, url: 'https://media.example/segment.m4s?signature=private',
+  });
+
+  assert.equal(h.state._deckHlsFailed[1], true);
+  const failure = h.diagnostics.find(item => item.type === 'hls-playback-failed');
+  assert.deepEqual([failure.trackIndex, failure.errorType, failure.errorDetail, failure.status],
+    [1, 'networkError', 'fragLoadError', 503]);
+  assert.equal(JSON.stringify(failure).includes('private'), false);
+  assert.equal(h.state.crossfadeStatus, 'fallback');
+  assert.equal(h.context.upcomingCrossfadeDeckReady(), false);
+  assert.equal(await h.context.prepareCrossfadeDeck(1, 1), h.decks[1]);
+  assert.equal(instances.length, 2);
+  assert.equal(instances[0].destroyed, true);
+  assert.equal(h.state._deckHlsPlayers[1], instances[1]);
+  assert.equal(h.state._deckHlsFailed[1], false);
+  assert.equal(h.context.upcomingCrossfadeDeckReady(), true);
+});
+
+test('deck readiness diagnostics distinguish media errors from a successful readiness event', async () => {
+  const h = fixture(['waitForDeck']);
+  const deck = h.decks[0];
+  deck.readyState = 1;
+  deck.networkState = 3;
+  deck.error = { code: 4 };
+  const trace = {};
+  const pending = h.context.waitForDeck(deck, 5000, null, () => true, trace);
+  deck.emit('error');
+
+  assert.equal(await pending, false);
+  assert.equal(trace.mediaWaitOutcome, 'error');
+  assert.equal(trace.readyState, 1);
+  assert.equal(trace.networkState, 3);
+  assert.equal(trace.mediaErrorCode, 4);
+  assert.equal(deck.listeners.get('error').size, 0);
+});
+
+test('media play diagnostics retain rejection class but not media URL or error text', async () => {
+  const h = fixture(['withDeadline', 'playDeckWithDeadline']);
+  const deck = h.decks[0];
+  deck.src = 'https://media.example/track?signature=private-token';
+  deck.play = () => Promise.reject(Object.assign(new Error('private-token'), { name: 'NotAllowedError' }));
+  const trace = {};
+
+  await assert.rejects(
+    h.context.playDeckWithDeadline(deck, 0, null, () => true, trace),
+    { name: 'NotAllowedError' },
+  );
+  assert.equal(trace.failureStage || trace.stage, 'audio-play');
+  assert.equal(trace.reason, 'play-rejected');
+  assert.equal(trace.errorName, 'NotAllowedError');
+  assert.equal(JSON.stringify(trace).includes('private-token'), false);
+});
+
+test('diagnostic mode records a failed candidate separately when a later track starts', async () => {
+  const h = fixture(['createCustomStartTrace', 'customStartDiagnosticDetails', 'playAt'], {
+    stopCrossfadeDecks() {},
+    playWithCrossfadeDeck: async (ti, _countPlay, _fade, trace) => {
+      if (ti === 0) {
+        trace.stage = 'stream-resolution';
+        trace.reason = 'http-rate-limited';
+        trace.requests.push({ stage: 'progressive-stream', status: 429, elapsedMs: 8 });
+        return false;
+      }
+      return true;
+    },
+  });
+  h.state._diagnosticBuild = true;
+  h.state.queue = [0, 1];
+  h.state.pos = 0;
+  h.context.performance = { now: () => 100 };
+
+  assert.equal(await h.context.playAt(0), true);
+  const failed = h.diagnostics.find(entry => entry.type === 'custom-start-candidate-failed');
+  const recovered = h.diagnostics.find(entry => entry.type === 'custom-start-recovered');
+  assert.equal(failed.trackIndex, 0);
+  assert.equal(failed.failureStage, 'stream-resolution');
+  assert.equal(failed.failureReason, 'http-rate-limited');
+  assert.equal(failed.requests[0].status, 429);
+  assert.equal(failed.passExhausted, false);
+  assert.equal(recovered.trackIndex, 1);
+  assert.equal(recovered.precedingFailedCandidates, 1);
+  assert.equal(h.diagnostics.some(entry => entry.type === 'custom-start-exhausted'), false);
+});
+
+test('diagnostic mode records terminal queue exhaustion and the scheduled retry', async () => {
+  const h = fixture(['createCustomStartTrace', 'customStartDiagnosticDetails', 'playAt', 'runPlaybackOperation'], {
+    stopCrossfadeDecks() {},
+    playWithCrossfadeDeck: async (_ti, _countPlay, _fade, trace) => {
+      trace.stage = 'stream-resolution';
+      trace.reason = 'unsupported-stream-protocol';
+      trace.requests.push({ stage: 'url-resolve', status: 503, elapsedMs: 17 });
+      return false;
+    },
+  });
+  h.state._diagnosticBuild = true;
+  h.state.queue = [0];
+  h.state.pos = 0;
+  h.context.performance = { now: () => 100 };
+
+  assert.equal(await h.context.playAt(0), false);
+  const exhausted = h.diagnostics.find(entry => entry.type === 'custom-start-exhausted');
+  const retry = h.diagnostics.find(entry => entry.type === 'custom-retry-scheduled');
+  assert.equal(exhausted.trackIndex, 0);
+  assert.equal(exhausted.attempted, 1);
+  assert.equal(exhausted.passExhausted, true);
+  assert.equal(exhausted.requests[0].status, 503);
+  assert.equal(h.state.suspended, true);
+  assert.notEqual(h.state._customPlaybackRetryTimer, null);
+  h.context.playWithCrossfadeDeck = async () => true;
+  await h.timers.tick(5000);
+  const recovered = h.diagnostics.find(entry => entry.type === 'custom-start-recovered');
+  assert.equal(recovered.precedingFailedCandidates, 1);
+  assert.equal(h.state._customPlaybackRetryTimer, null);
+  assert.equal(retry.delayMs, 5000);
+  assert.equal(h.state.suspended, false);
+});
+
+test('diagnostic snapshot exposes privacy-safe playback state, features, fallback, and retry', () => {
+  const h = fixture(['playbackDiagnosticSnapshot'], {
+    location: { href: 'https://soundcloud.com/private-user/likes?secret=hidden', pathname: '/you/likes' },
+  });
+  h.state._diagnosticBuild = true;
+  h.state.autoLevel = true;
+  h.state.eqEnabled = true;
+  h.state.safetyClipper = false;
+  h.state.crossfadeSeconds = 4;
+  h.state._customPlaybackRetryTimer = 17;
+  h.state._nativeTrack = 0;
+  h.state.meta[0].nativePlaybackReason = 'hls-mse-unavailable';
+  h.state._playbackDiagnostics = [];
+
+  const report = h.context.playbackDiagnosticSnapshot();
+  assert.deepEqual(report.state.audioFeatures, {
+    autoLevel: true, eqEnabled: true, safetyClipper: false, crossfadeSeconds: 4,
+  });
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.pageKind, 'likes');
+  assert.equal(report.state.retryPending, true);
+  assert.equal(report.state.nativeTrackIndex, 0);
+  assert.equal(report.state.nativeFallbackReason, 'hls-mse-unavailable');
+  assert.equal('page' in report, false);
+  assert.equal('currentTrack' in report.state, false);
+  assert.equal(JSON.stringify(report).includes('private-user'), false);
+  assert.equal(JSON.stringify(report).includes('secret'), false);
 });
 
 test('stale operation completion cannot release the busy owner of a restarted session', async () => {
@@ -419,7 +935,11 @@ test('failed graph resume does not accept paused=false as successful audible pla
     },
     resumeAudioGraph: async () => false,
   });
-  assert.equal(await h.context.playWithCrossfadeDeck(0, true, 0), false);
+  const trace = {};
+  assert.equal(await h.context.playWithCrossfadeDeck(0, true, 0, trace), false);
+  assert.equal(trace.stage, 'audio-context-resume');
+  assert.equal(trace.reason, 'audio-context-resume-failed');
+  assert.equal(trace.errorName, 'Error');
   assert.equal(h.decks[0].plays, 0);
   assert.equal(h.state.stats.played, 0);
   assert.equal(h.decks[0].paused, true);
@@ -542,7 +1062,12 @@ test('a stopped native pre-click delay never clicks an old queue row', async () 
   assert.equal(clicks, 0);
 });
 
-const resolverFunctions = ['discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle', 'resolveProgressiveStreams', 'fetchPlaybackTrack', 'resolveCrossfadeStreams'];
+const resolverFunctions = [
+  'playbackErrorName', 'recordCustomStartRequest',
+  'discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle',
+  'isHlsManifestUrl', 'isHlsStreamUrl', 'directHlsStreamUrls',
+  'resolveProgressiveStreams', 'fetchPlaybackTrack', 'resolveCrossfadeStreams',
+];
 test('credential rejection skips obsolete A and B then reaches valid bundle C across later retries', async () => {
   const A = 'old-client-a', B = 'old-client-b', C = 'valid-client-cccccccccccccccc';
   const tried = [];
@@ -597,7 +1122,7 @@ for (const pendingBody of [false, true]) {
   test(`a pending progressive ${pendingBody ? 'response body' : 'fetch'} cannot hide an earlier working stream`, async () => {
     const stalled = deferred();
     let count = 0;
-    const h = fixture(['withDeadline', 'fetchSoundCloudResource', 'resolveProgressiveStreams'], {
+    const h = fixture(['playbackErrorName', 'withDeadline', 'fetchSoundCloudResource', 'resolveProgressiveStreams'], {
       fetch: () => {
         if (++count === 1) return Promise.resolve({ ok: true, status: 200, json: async () => ({ url: 'https://media.example/working' }) });
         return pendingBody ? Promise.resolve({ ok: true, status: 200, json: () => stalled.promise }) : stalled.promise;
@@ -614,7 +1139,7 @@ for (const pendingBody of [false, true]) {
 }
 
 test('expired stream URLs are pruned and large libraries retain only the newest 128 reusable entries', async () => {
-  const h = fixture(['resolveCrossfadeStreams'], {
+  const h = fixture(['resolveCrossfadeStreams', 'isHlsManifestUrl', 'directHlsStreamUrls'], {
     discoverSoundCloudClientIdFromBundle: async () => 'client',
     hydrationTrackForPlayback: meta => meta,
     syncTrackPlaybackAccess: () => false,

@@ -661,9 +661,11 @@ function createWatcherHarness() {
     'checkSleepTimerDeadline', 'resumeAudioGraph', 'Date', 'syncPlaybackVolumeFromSoundCloud', 'recoverCurrentDeckStream',
     'syncCrossfadeVolume', 'processAutoLevel', 'recordPlaybackDiagnostic',
     'saveQueueSessionCache', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout',
-    'pauseSoundCloud', 'nativePlaybackAllowed',
+    'pauseSoundCloud', 'nativePlaybackAllowed', 'playbackErrorName', 'diagnosticDeckStreamKind',
     `return (${extractFunction('startWatcher')})`,
   );
+  const playbackErrorName = Function(`return (${extractFunction('playbackErrorName')})`)();
+  const diagnosticDeckStreamKind = Function('state', `return (${extractFunction('diagnosticDeckStreamKind')})`)(state);
   const startWatcher = factory(
     state,
     () => title,
@@ -699,7 +701,7 @@ function createWatcherHarness() {
     () => {},
     () => {},
     saveQueueSessionCache, () => 1, () => {}, () => 1, () => {},
-    pause, nativePlaybackAllowed,
+    pause, nativePlaybackAllowed, playbackErrorName, diagnosticDeckStreamKind,
   );
   startWatcher();
 
@@ -2173,6 +2175,33 @@ test('build copies the canonical userscript byte-for-byte without using legacy m
     );
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.deepEqual(fs.readFileSync(output), fs.readFileSync(scriptPath));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic build has distinct metadata and preserves production instrumentation', () => {
+  const root = path.resolve(__dirname, '..');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tss-diagnostic-build-'));
+  const output = path.join(tempDir, 'SC Trueshuffle Diagnostic.user.js');
+  try {
+    const result = childProcess.spawnSync(
+      process.env.PYTHON || 'python',
+      [path.join(root, 'build.py'), '--diagnostic', '--output', output],
+      { cwd: root, encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const canonical = fs.readFileSync(path.join(root, 'SC Trueshuffle.js'), 'utf8');
+    const expected = canonical
+      .replace('// @name         SoundCloud True Shuffle',
+        '// @name         SoundCloud True Shuffle (Temporary Diagnostic)')
+      .replace('// @version      6.2.3', '// @version      6.2.6')
+      .replace('// @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.',
+        '// @description  Temporary diagnostic copy; disable the stable script while diagnosing playback.');
+    assert.equal(fs.readFileSync(output, 'utf8'), expected);
+    assert.match(expected, /@match\s+https:\/\/soundcloud\.com\/\*/);
+    assert.match(expected, /@version\s+6\.2\.6/);
+    assert.match(expected, /const DIAGNOSTIC_BUILD = true;/);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

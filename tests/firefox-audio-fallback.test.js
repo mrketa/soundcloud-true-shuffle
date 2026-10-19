@@ -77,6 +77,35 @@ test('generic failures rotate custom decks while preview tracks may use SoundClo
   assert.equal(state.suspended, false);
 });
 
+test('HLS MSE unsupported uses exact SoundCloud fallback instead of queue rotation', async () => {
+  const harness = createNativeFallbackHarness();
+  const { state, nativeAudio } = harness;
+  state.meta[0].nativePlaybackReason = 'hls-mse-unavailable';
+  state.queue = [0];
+  const playWithCrossfadeDeck = Function(
+    'state', 'currentDeckAudio',
+    `return (${extractFunction('playWithCrossfadeDeck').replace(/^function /, 'async function ')})`,
+  )(state, () => null);
+  const playAt = Function(
+    'state', 'currentDeckAudio', 'playWithCrossfadeDeck', 'stopCrossfadeDecks',
+    'setCrossfadeStatus', 'playWithSoundCloudSession', 'recordPlaybackDiagnostic',
+    'trackAvailable', 'showMergeToast', 'updateHub', 'clearTimeout', 'setTimeout',
+    `return (${extractFunction('playAt').replace(/^function /, 'async function ')})`,
+  )(
+    state, () => null, playWithCrossfadeDeck,
+    () => { state._nativeTrack = null; }, () => {},
+    harness.play, () => {}, () => true, () => {}, () => {}, () => {}, () => 1,
+  );
+  harness.onWait = async () => { harness.currentLink = harness.wanted; };
+
+  assert.equal(await playAt(0), true);
+  assert.equal(state.queue[0], 0, 'the MSE-unsupported track is not deferred as unavailable');
+  assert.equal(state._nativeTrack, 0);
+  assert.equal(harness.button.clickCalls, 1);
+  assert.equal(nativeAudio.paused, false);
+  assert.equal(state.stats.played, 1);
+});
+
 test('SoundCloud access metadata distinguishes previews from entitled streams', () => {
   const syncTrackPlaybackAccess = Function(
     `return (${extractFunction('syncTrackPlaybackAccess')})`,
@@ -159,6 +188,11 @@ function createNativeFallbackHarness() {
     updateProgressBar: () => {}, updateHub: () => {},
     withDeadline: operation => operation(),
     normalizeTrackUrl: value => String(value || ''),
+    playbackErrorName: error => {
+      const name = typeof error?.name === 'string' ? error.name : '';
+      return /^(?:AbortError|TimeoutError|NotAllowedError|NotSupportedError|NotReadableError|InvalidStateError|SecurityError|NetworkError|EncodingError|OperationError|QuotaExceededError|UnknownError|Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|DataError|IndexSizeError|NotFoundError|InvalidAccessError|InvalidModificationError|ConstraintError|NoModificationAllowedError|InvalidCharacterError|OverconstrainedError)$/.test(name)
+        ? name : 'UnknownError';
+    },
     recordPlaybackDiagnostic: () => {},
   };
   for (const name of ['isTrueShuffleAudio', 'soundCloudPaused', 'pauseSoundCloud', 'pauseSoundCloudTransport']) {

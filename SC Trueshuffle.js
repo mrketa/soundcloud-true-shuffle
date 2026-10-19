@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.2
+// @version      6.2.3
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
 // @match        https://soundcloud.com/*
@@ -17,13 +18,16 @@
 'use strict';
 
 const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+const DIAGNOSTIC_BUILD = true;
 const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
 const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
 const PLAYBACK_DIAGNOSTIC_FAULTS = new Set([
   'crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed',
   'recovery-exhausted', 'recovery-failed', 'playback-operation-failed',
-  'custom-start-exhausted', 'native-start-failed', 'native-track-not-acknowledged',
-  'stop-cleanup-failed',
+  'custom-start-exhausted', 'custom-start-candidate-failed', 'hls-playback-failed',
+  'audio-graph-failed', 'audio-context-resume-failed', 'audio-context-suspend-failed',
+  'native-fallback-unavailable', 'native-track-not-acknowledged', 'native-start-failed',
+  'prefetch-failed', 'stop-cleanup-failed',
 ]);
 
 // Accessing localStorage itself can throw in restricted browser contexts.
@@ -39,11 +43,150 @@ const safeStorage = {
   },
 };
 
+const DIAGNOSTIC_NUMBER_FIELDS = new Set([
+  'schemaVersion', 'attemptId', 'operationId', 'playbackEpoch', 'collectionEpoch',
+  'trackIndex', 'deckTrack', 'nativeTrackIndex',
+  'attempt', 'attempted', 'priorFailedCandidates', 'precedingFailedCandidates',
+  'queuePosition', 'queueLength', 'deckIndex', 'outgoingIndex', 'incomingIndex', 'index',
+  'deckCount', 'deckGain', 'mixGain', 'autoGain', 'elapsedMs', 'durationMs', 'duration', 'position', 'resumedAt',
+  'stallThresholdMs',
+  'readyState', 'networkState', 'mediaErrorCode', 'errorCode', 'status', 'hlsStatus', 'stalledFor',
+  'requestCount', 'credentialAttempts', 'progressiveCandidates', 'progressiveUrls',
+  'hlsCandidates', 'hlsAac160Candidates', 'hlsAac96Candidates', 'hlsOtherCandidates',
+  'hlsStreamUrls', 'streamCandidateCount', 'mediaCandidateOrdinal', 'delayMs',
+  'startTime', 'endTime', 'lastClockValue', 'lastClockAdvanceAt', 'lastIncomingTime',
+  'lastIncomingAdvanceAt', 'sampleRate', 'currentTime', 'mediaCurrentTime',
+  'incomingCurrentTime', 'outgoingCurrentTime', 'incomingReadyState', 'incomingNetworkState',
+  'clockElapsed', 'clockStalledFor',
+  'mediaStalledFor', 'crossfadeSeconds', 'crossfadeDuration', 'crossfadeToken', 'token',
+  'levelCount', 'currentLevel', 'bandwidthEstimate', 'hlsErrorCount',
+  'hlsNonFatalErrorCount', 'hlsFatalErrorCount', 'hlsLevelCount', 'hlsCurrentLevel',
+  'hlsBandwidthEstimate', 'hlsBufferedFragmentCount', 'hlsMediaAttachedElapsedMs',
+  'hlsManifestParsedElapsedMs', 'hlsFirstFragmentBufferedElapsedMs', 'mediaWaitElapsedMs',
+  'playElapsedMs', 'pollCount', 'nativePollCount', 'pollLimit', 'maxPolls', 'attempts',
+  'recoveryAttempts', 'elapsed', 'timeoutMs', 'waitMs', 'remainingMs', 'bufferedAhead',
+  'playbackRate', 'browserMajorVersion',
+]);
+const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
+  'passExhausted', 'clientIdFound', 'authFailed', 'trackMetadataFound',
+  'progressiveMetadataAvailable', 'authorizationPresent', 'retryPending', 'active', 'loading',
+  'crossfadePending',
+  'busy', 'suspended', 'crossfading', 'crossfadePausedByUser', 'paused', 'ended',
+  'seeking', 'hlsSupported', 'hlsLibraryAvailable', 'hlsMediaAttached', 'hlsLoading',
+  'hlsManifestParsed', 'hlsFirstFragmentBuffered', 'hlsReady', 'hlsMseSupported', 'mseSupported',
+  'mediaSourceAvailable', 'nativeHlsSupported', 'audioContextAvailable',
+  'sourceNodeConnected', 'graphFailed', 'audioGraphFailed', 'playFulfilled', 'ready',
+  'userPaused', 'visible', 'focused', 'onLine', 'buttonFound', 'clickIssued',
+  'acknowledged', 'hasCurrentSrc', 'sourceBound', 'fallbackAvailable', 'automatic',
+  'crossfadeManual', 'diagnosticsEnabled', 'graphAvailable', 'recoveredSchedule', 'incomingPaused',
+  'outgoingPaused', 'nativeAudioFound', 'playerMatched', 'elementFound', 'elementAttached',
+  'trackElementPresent', 'playButtonFound', 'playClickIssued', 'nativeAcknowledged', 'nativeTransportPaused',
+  'bufferedDataAvailable',
+  'autoLevel', 'eqEnabled', 'safetyClipper',
+]);
+const DIAGNOSTIC_STRING_FIELDS = new Set([
+  'event', 'operation', 'stage', 'failureStage', 'failureReason', 'reason',
+  'streamSource', 'clientIdSource', 'mediaWaitOutcome', 'nativeOutcome',
+  'nativeFallbackReason', 'hlsMode', 'hlsErrorType', 'hlsErrorDetail',
+  'hlsLastErrorType', 'hlsLastErrorDetail', 'errorName', 'error', 'contextState',
+  'contextStateBefore', 'contextStateAfter', 'audioContextState', 'crossfadeStatus',
+  'crossfadeCurve', 'startedVia', 'pageKind', 'streamKind', 'streamQuality',
+  'qualityClass', 'streamProtocol', 'browser', 'platform', 'manager',
+  'managerVersion', 'scriptVersion', 'hlsLibraryVersion', 'graphPhase', 'graphReason',
+  'phase', 'outcome', 'result', 'recoveryOutcome', 'recoveryReason', 'stateName',
+  'sourceKind', 'errorType', 'errorDetail', 'nativeReason', 'nativeAction',
+  'hlsStage', 'audioGraphPhase', 'audioGraphReason', 'requestStage', 'crossfadeOutcome',
+  'crossfadeMode',
+]);
+const DIAGNOSTIC_NESTED_FIELDS = new Set([
+  'requests', 'audioFeatures', 'state', 'audioContext', 'schedule', 'decks',
+  'diagnostics', 'environment', 'capabilities',
+]);
+const DIAGNOSTIC_SAFE_LABELS = {
+  browser: new Set(['chrome', 'chromium', 'edge', 'firefox', 'opera', 'safari', 'other', 'unknown']),
+  platform: new Set(['windows', 'macos', 'linux', 'android', 'ios', 'other', 'unknown']),
+  manager: new Set(['tampermonkey', 'violentmonkey', 'greasemonkey', 'other', 'unknown']),
+  pageKind: new Set(['home', 'likes', 'reposts', 'feed', 'playlist', 'tracks', 'user-tracks', 'profile', 'other']),
+  streamKind: new Set(['progressive', 'hls-mse', 'native', 'blob', 'none', 'unknown']),
+  qualityClass: new Set(['aac-160k', 'aac-96k', 'mp3', 'opus', 'other', 'unknown']),
+  hlsMode: new Set(['not-used', 'mse', 'unsupported']),
+  crossfadeCurve: new Set(['smooth', 'clean', 'dj']),
+  contextState: new Set(['running', 'suspended', 'closed', 'interrupted', 'missing', 'unknown']),
+};
+
+function safeDiagnosticVersion(value) {
+  const version = String(value || '');
+  return /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:[-+][A-Za-z0-9.-]+)?$/.test(version) ? version : 'unknown';
+}
+
+function safeDiagnosticString(key, value) {
+  if (typeof value !== 'string') return '';
+  if (key === 'error' || key === 'errorName') return playbackErrorName({ name: value });
+  if (key === 'scriptVersion' || key === 'managerVersion' || key === 'hlsLibraryVersion') {
+    return safeDiagnosticVersion(value);
+  }
+  const text = value.trim();
+  if (!text || text.length > 64) return '';
+  const normalized = key === 'operation' ? text.toLowerCase().replace(/\s+/g, '-') : text;
+  if (DIAGNOSTIC_SAFE_LABELS[key]) {
+    const label = normalized.toLowerCase();
+    return DIAGNOSTIC_SAFE_LABELS[key].has(label) ? label : '';
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(normalized) ? normalized : '';
+}
+
+function sanitizeDiagnosticRecord(value, depth = 0) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 3) return {};
+  const clean = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === 'at') {
+      if (typeof item === 'string' && Number.isFinite(Date.parse(item))) clean.at = new Date(item).toISOString();
+      continue;
+    }
+    if (DIAGNOSTIC_NUMBER_FIELDS.has(key)) {
+      if (typeof item === 'number' && Number.isFinite(item) && Math.abs(item) <= 1e9) {
+        clean[key] = Math.round(item * 1000) / 1000;
+      }
+      continue;
+    }
+    if (DIAGNOSTIC_BOOLEAN_FIELDS.has(key)) {
+      if (typeof item === 'boolean') clean[key] = item;
+      continue;
+    }
+    if (DIAGNOSTIC_STRING_FIELDS.has(key)) {
+      const safe = safeDiagnosticString(key, item);
+      if (safe) clean[key === 'error' ? 'errorName' : key] = safe;
+      continue;
+    }
+    if (!DIAGNOSTIC_NESTED_FIELDS.has(key)) continue;
+    if (key === 'requests') {
+      if (Array.isArray(item)) {
+        clean.requests = item.slice(-8)
+          .map(entry => sanitizeDiagnosticRecord(entry, depth + 1))
+          .filter(entry => Object.keys(entry).length > 0);
+      }
+    } else if (key === 'decks') {
+      if (Array.isArray(item)) {
+        clean.decks = item.slice(0, 2).map(entry =>
+          entry && typeof entry === 'object' ? sanitizeDiagnosticRecord(entry, depth + 1) : null);
+      }
+    } else if (key === 'diagnostics') {
+      if (Array.isArray(item)) {
+        clean.diagnostics = item.slice(-40)
+          .map(entry => sanitizeDiagnosticRecord(entry, depth + 1))
+          .filter(entry => typeof entry.event === 'string' && typeof entry.at === 'string');
+      }
+    } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+      clean[key] = sanitizeDiagnosticRecord(item, depth + 1);
+    }
+  }
+  return clean;
+}
+
 function sanitizePlaybackDiagnostics(value) {
-  return Array.isArray(value) ? value.filter(entry =>
-    entry && typeof entry === 'object' && !Array.isArray(entry)
-      && typeof entry.event === 'string' && typeof entry.at === 'string'
-  ).slice(-80) : [];
+  if (!Array.isArray(value)) return [];
+  return value.slice(-80).map(entry => sanitizeDiagnosticRecord(entry))
+    .filter(entry => typeof entry.event === 'string' && typeof entry.at === 'string');
 }
 
 function sanitizeAutoLevelCache(value) {
@@ -98,12 +241,33 @@ function withDeadline(operation, timeoutMs = 10000, signal = null) {
 }
 
 async function fetchSoundCloudResource(url, format = 'json', options = {}) {
-  const { signal, timeoutMs = 10000, ...requestOptions } = options;
-  return withDeadline(async requestSignal => {
-    const response = await fetch(url, { ...requestOptions, signal: requestSignal });
-    const data = response.ok ? await response[format]() : null;
-    return { ok: response.ok, status: response.status, data };
-  }, timeoutMs, signal);
+  const {
+    signal, timeoutMs = 10000, diagnosticTrace = null,
+    diagnosticStage = 'soundcloud-resource', ...requestOptions
+  } = options;
+  const startedAt = diagnosticTrace ? performance.now() : 0;
+  let responseStatus = null;
+  try {
+    return await withDeadline(async requestSignal => {
+      const response = await fetch(url, { ...requestOptions, signal: requestSignal });
+      responseStatus = Number(response.status);
+      const data = response.ok ? await response[format]() : null;
+      if (diagnosticTrace) {
+        recordCustomStartRequest(
+          diagnosticTrace, diagnosticStage, responseStatus, performance.now() - startedAt,
+        );
+      }
+      return { ok: response.ok, status: response.status, data };
+    }, timeoutMs, signal);
+  } catch (error) {
+    if (diagnosticTrace) {
+      recordCustomStartRequest(
+        diagnosticTrace, diagnosticStage, responseStatus, performance.now() - startedAt,
+        playbackErrorName(error),
+      );
+    }
+    throw error;
+  }
 }
 
 function invalidatePlaybackSession() {
@@ -149,6 +313,7 @@ function loadCustomEqPresets() {
 
 
 const state = {
+  _diagnosticBuild: DIAGNOSTIC_BUILD,
   active:       false,
   stopAfterRound: false,
   queue:        [],
@@ -231,6 +396,8 @@ const state = {
   _nativeTrack: null,
   _nativeSessionNoticeShown: false,
   _decks: [],
+  _deckHlsPlayers: [null, null],
+  _deckHlsFailed: [false, false],
   _deckTracks: [null, null],
   _deckPrepareTokens: [0, 0],
   _crossfadePrefetchToken: 0,
@@ -893,7 +1060,11 @@ function syncTrackPlaybackAccess(meta, track) {
   if (Number.isFinite(durationMs) && durationMs > 0) meta.durationMs = durationMs;
   if (access) meta.access = access;
   if (policy) meta.policy = policy;
-  if (access || policy || preview) meta.requiresNativePlayback = preview;
+  if (access || policy || preview) {
+    meta.requiresNativePlayback = preview;
+    if (preview) meta.nativePlaybackReason = 'preview-only';
+    else if (meta.nativePlaybackReason === 'preview-only') delete meta.nativePlaybackReason;
+  }
   return preview;
 }
 
@@ -909,11 +1080,17 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
     artistLink: track.user?.permalink_url || null,
     waveform: track.waveform_url || null,
     trackAuthorization: track.track_authorization || null,
+    hls_aac_160_url: track.hls_aac_160_url || track.streams?.hls_aac_160_url
+      || track.media?.hls_aac_160_url || track.media?.streams?.hls_aac_160_url || null,
+    hls_aac_96_url: track.hls_aac_96_url || track.streams?.hls_aac_96_url
+      || track.media?.hls_aac_96_url || track.media?.streams?.hls_aac_96_url || null,
     transcodings: Array.isArray(track.media?.transcodings)
       ? track.media.transcodings.map(item => ({
         url: item?.url || '',
         protocol: item?.format?.protocol || '',
         mimeType: item?.format?.mime_type || '',
+        preset: item?.preset || '',
+        quality: item?.quality || '',
         snipped: item?.snipped === true || item?.is_snipped === true,
       })).filter(item => item.url)
       : [],
@@ -975,50 +1152,333 @@ const SVG = {
 };
 
 function recordPlaybackDiagnostic(event, details = {}) {
-  const entry = {
+  const safeDetails = details && typeof details === 'object' && !Array.isArray(details) ? details : {};
+  const entry = sanitizeDiagnosticRecord({
+    ...safeDetails,
     at: new Date().toISOString(),
     event,
-    track: Number.isInteger(state._deckTrack) ? (state.meta[state._deckTrack]?.title || '') : '',
-    ...details,
-  };
+  });
+  if (!entry.event || !entry.at) return null;
+  state._playbackDiagnostics ||= [];
   state._playbackDiagnostics.push(entry);
-  if (state._playbackDiagnostics.length > 80) state._playbackDiagnostics.splice(0, state._playbackDiagnostics.length - 80);
-  if (PLAYBACK_DIAGNOSTIC_FAULTS.has(event)) {
-    state._playbackDiagnosticFault = true;
+  if (state._playbackDiagnostics.length > 80) {
+    state._playbackDiagnostics.splice(0, state._playbackDiagnostics.length - 80);
   }
-  updatePlaybackDiagnosticButton();
-  try { console.info('[True Shuffle][playback]', entry); } catch (_) {}
+  if (PLAYBACK_DIAGNOSTIC_FAULTS.has(entry.event)) state._playbackDiagnosticFault = true;
+  try { updatePlaybackDiagnosticButton(); } catch (_) {}
+  if (PLAYBACK_DIAGNOSTIC_FAULTS.has(entry.event)) {
+    try { console.info('[True Shuffle][playback]', entry); } catch (_) {}
+  }
+  return entry;
+}
+function playbackErrorName(error) {
+  const name = typeof error?.name === 'string' ? error.name : '';
+  return /^(?:AbortError|TimeoutError|NotAllowedError|NotSupportedError|NotReadableError|InvalidStateError|SecurityError|NetworkError|EncodingError|OperationError|QuotaExceededError|UnknownError|Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|DataError|IndexSizeError|NotFoundError|InvalidAccessError|InvalidModificationError|ConstraintError|NoModificationAllowedError|InvalidCharacterError|OverconstrainedError)$/.test(name)
+    ? name : 'UnknownError';
 }
 
-function safeMediaUrl(value) {
+function playbackDiagnosticHostWindow() {
+  if (typeof pageWindow !== 'undefined' && pageWindow) return pageWindow;
+  if (typeof window !== 'undefined' && window) return window;
+  return globalThis;
+}
+
+function playbackDiagnosticPageKind() {
+  const host = playbackDiagnosticHostWindow();
+  const pathname = String(host.location?.pathname || (typeof location !== 'undefined' ? location.pathname : ''));
+  const segments = pathname.toLowerCase().split('/').filter(Boolean);
+  if (!segments.length) return 'home';
+  if (segments[0] === 'you' && segments[1] === 'likes') return 'likes';
+  if (segments[0] === 'you' && segments[1] === 'reposts') return 'reposts';
+  if (segments[0] === 'feed') return 'feed';
+  if (segments.includes('sets')) return 'playlist';
+  if (segments[segments.length - 1] === 'tracks') return segments[0] === 'you' ? 'tracks' : 'user-tracks';
+  if (segments[0] === 'you') return 'profile';
+  return 'other';
+}
+
+function playbackDiagnosticEnvironment() {
+  const host = playbackDiagnosticHostWindow();
+  const navigatorObject = host.navigator || (typeof navigator !== 'undefined' ? navigator : null);
+  const userAgent = String(navigatorObject?.userAgent || '');
+  const browserPatterns = [
+    [/Edg(?:A|iOS)?\/(\d+)/i, 'edge'],
+    [/OPR\/(\d+)/i, 'opera'],
+    [/Firefox\/(\d+)/i, 'firefox'],
+    [/(?:Chrome|CriOS)\/(\d+)/i, 'chromium'],
+    [/Version\/(\d+).*Safari/i, 'safari'],
+  ];
+  let browser = 'other';
+  let browserMajorVersion = null;
+  for (const [pattern, family] of browserPatterns) {
+    const match = userAgent.match(pattern);
+    if (!match) continue;
+    browser = family;
+    browserMajorVersion = Number(match[1]) || null;
+    break;
+  }
+  const rawPlatform = String(navigatorObject?.userAgentData?.platform || navigatorObject?.platform || '').toLowerCase();
+  const platform = rawPlatform.includes('win') ? 'windows'
+    : (rawPlatform.includes('android') ? 'android'
+      : (rawPlatform.includes('iphone') || rawPlatform.includes('ipad') || rawPlatform.includes('ios') ? 'ios'
+        : (rawPlatform.includes('mac') ? 'macos' : (rawPlatform.includes('linux') ? 'linux' : 'other'))));
+  const managerInfo = typeof GM_info !== 'undefined' && GM_info && typeof GM_info === 'object' ? GM_info : null;
+  const rawManager = String(managerInfo?.scriptHandler || '').toLowerCase();
+  const manager = rawManager.includes('tampermonkey') ? 'tampermonkey'
+    : (rawManager.includes('violentmonkey') ? 'violentmonkey'
+      : (rawManager.includes('greasemonkey') ? 'greasemonkey' : (rawManager ? 'other' : 'unknown')));
+  const managerVersion = safeDiagnosticVersion(managerInfo?.scriptHandlerVersion || '');
+  const scriptVersion = safeDiagnosticVersion(managerInfo?.script?.version || '');
+  const doc = typeof document !== 'undefined' ? document : null;
+  return {
+    browser, browserMajorVersion, platform, manager, managerVersion, scriptVersion,
+    visible: doc?.visibilityState === 'visible',
+    focused: Boolean(doc?.hasFocus?.()),
+    onLine: navigatorObject?.onLine !== false,
+  };
+}
+
+function playbackDiagnosticCapabilities() {
+  const host = playbackDiagnosticHostWindow();
+  const audio = state._decks?.find(Boolean) || null;
+  const HlsCtor = typeof hlsJsConstructor === 'function' ? hlsJsConstructor() : null;
+  let hlsMseSupported = false;
+  let nativeHlsSupported = false;
+  try { hlsMseSupported = Boolean(HlsCtor?.isSupported()); } catch (_) {}
+  try { nativeHlsSupported = Boolean(audio?.canPlayType?.('application/vnd.apple.mpegurl')); } catch (_) {}
+  return {
+    hlsLibraryAvailable: Boolean(HlsCtor),
+    hlsLibraryVersion: safeDiagnosticVersion(HlsCtor?.version || ''),
+    hlsMseSupported,
+    mediaSourceAvailable: Boolean(host.MediaSource || host.ManagedMediaSource),
+    nativeHlsSupported,
+    audioContextAvailable: Boolean(state._audioContext || host.AudioContext || host.webkitAudioContext),
+  };
+}
+
+function diagnosticDeckStreamKind(audio, index) {
+  if (!audio || !(audio.currentSrc || audio.src)) return 'none';
+  if (state._deckHlsPlayers?.[index]) return 'hls-mse';
+  if (String(audio.currentSrc || audio.src).startsWith('blob:')) return 'blob';
+  return 'progressive';
+}
+
+function diagnosticStreamQuality(value) {
   try {
-    const parsed = new URL(value);
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch (_) { return ''; }
+    const pathname = new URL(value).pathname.toLowerCase();
+    if (/aac[_-]?160|160k/.test(pathname)) return 'aac-160k';
+    if (/aac[_-]?96|96k/.test(pathname)) return 'aac-96k';
+    if (/opus/.test(pathname)) return 'opus';
+    if (/mp3/.test(pathname)) return 'mp3';
+  } catch (_) {}
+  return 'unknown';
+}
+
+function createCustomStartTrace(trackIndex) {
+  if (!state._diagnosticBuild) return null;
+  state._diagnosticAttemptSequence = (Number(state._diagnosticAttemptSequence) || 0) + 1;
+  return {
+    attemptId: state._diagnosticAttemptSequence,
+    operationId: Number(state._playbackRequest?.operationId) || 0,
+    trackIndex,
+    startedAt: performance.now(),
+    stage: 'custom-deck',
+    reason: 'not-started',
+    streamSource: 'unknown',
+    streamKind: 'unknown',
+    streamQuality: 'unknown',
+    clientIdFound: false,
+    clientIdSource: 'unknown',
+    credentialAttempts: 0,
+    authFailed: false,
+    progressiveCandidates: 0,
+    hlsCandidates: 0,
+    hlsAac160Candidates: 0,
+    hlsAac96Candidates: 0,
+    hlsOtherCandidates: 0,
+    hlsStreamUrls: 0,
+    hlsMode: 'not-used',
+    hlsLibraryAvailable: false,
+    hlsLibraryVersion: 'unknown',
+    hlsSupported: false,
+    hlsMediaAttached: false,
+    hlsMediaAttachedElapsedMs: null,
+    hlsManifestParsed: false,
+    hlsManifestParsedElapsedMs: null,
+    hlsFirstFragmentBuffered: false,
+    hlsFirstFragmentBufferedElapsedMs: null,
+    hlsBufferedFragmentCount: 0,
+    hlsReady: false,
+    hlsErrorCount: 0,
+    hlsNonFatalErrorCount: 0,
+    hlsFatalErrorCount: 0,
+    hlsStatus: null,
+    hlsErrorType: '',
+    hlsErrorDetail: '',
+    hlsLastErrorType: '',
+    hlsLastErrorDetail: '',
+    hlsLevelCount: 0,
+    hlsCurrentLevel: -1,
+    hlsBandwidthEstimate: null,
+    trackMetadataFound: false,
+    progressiveMetadataAvailable: false,
+    progressiveUrls: 0,
+    streamCandidateCount: 0,
+    mediaCandidateOrdinal: 0,
+    authorizationPresent: false,
+    requestCount: 0,
+    requests: [],
+    mediaWaitOutcome: 'not-started',
+    mediaWaitElapsedMs: 0,
+    readyState: null,
+    networkState: null,
+    mediaErrorCode: 0,
+    playElapsedMs: 0,
+    errorName: '',
+    audioGraphPhase: '',
+    audioGraphReason: '',
+    nativeOutcome: 'not-attempted',
+    nativeFallbackReason: '',
+  };
+}
+
+function recordCustomStartRequest(trace, stage, status, elapsedMs, errorName = '') {
+  if (!trace) return;
+  trace.requestCount++;
+  const request = {
+    stage,
+    status: Number.isFinite(status) ? status : null,
+    elapsedMs: Math.max(0, Math.round(Number(elapsedMs) || 0)),
+  };
+  if (errorName) request.errorName = playbackErrorName({ name: errorName });
+  if (trace.requests.length >= 8) trace.requests.shift();
+  trace.requests.push(request);
+}
+
+function customStartDiagnosticDetails(trace, outcome = 'failed') {
+  if (!trace) return null;
+  const stageDetails = outcome === 'started'
+    ? { stage: trace.stage, reason: trace.reason }
+    : { failureStage: trace.stage, failureReason: trace.reason };
+  return {
+    attemptId: trace.attemptId,
+    operationId: trace.operationId,
+    ...stageDetails,
+    streamSource: trace.streamSource,
+    streamKind: trace.streamKind,
+    streamQuality: trace.streamQuality,
+    clientIdFound: trace.clientIdFound,
+    clientIdSource: trace.clientIdSource,
+    credentialAttempts: trace.credentialAttempts,
+    authFailed: trace.authFailed,
+    progressiveCandidates: trace.progressiveCandidates,
+    progressiveUrls: trace.progressiveUrls,
+    hlsCandidates: trace.hlsCandidates,
+    hlsAac160Candidates: trace.hlsAac160Candidates,
+    hlsAac96Candidates: trace.hlsAac96Candidates,
+    hlsOtherCandidates: trace.hlsOtherCandidates,
+    hlsStreamUrls: trace.hlsStreamUrls,
+    hlsMode: trace.hlsMode,
+    hlsLibraryAvailable: trace.hlsLibraryAvailable,
+    hlsLibraryVersion: trace.hlsLibraryVersion,
+    hlsSupported: trace.hlsSupported,
+    hlsMediaAttached: trace.hlsMediaAttached,
+    hlsMediaAttachedElapsedMs: trace.hlsMediaAttachedElapsedMs,
+    hlsManifestParsed: trace.hlsManifestParsed,
+    hlsManifestParsedElapsedMs: trace.hlsManifestParsedElapsedMs,
+    hlsFirstFragmentBuffered: trace.hlsFirstFragmentBuffered,
+    hlsFirstFragmentBufferedElapsedMs: trace.hlsFirstFragmentBufferedElapsedMs,
+    hlsBufferedFragmentCount: trace.hlsBufferedFragmentCount,
+    hlsReady: trace.hlsReady,
+    hlsErrorCount: trace.hlsErrorCount,
+    hlsNonFatalErrorCount: trace.hlsNonFatalErrorCount,
+    hlsFatalErrorCount: trace.hlsFatalErrorCount,
+    hlsStatus: trace.hlsStatus,
+    hlsErrorType: trace.hlsErrorType,
+    hlsErrorDetail: trace.hlsErrorDetail,
+    hlsLastErrorType: trace.hlsLastErrorType,
+    hlsLastErrorDetail: trace.hlsLastErrorDetail,
+    hlsLevelCount: trace.hlsLevelCount,
+    hlsCurrentLevel: trace.hlsCurrentLevel,
+    hlsBandwidthEstimate: trace.hlsBandwidthEstimate,
+    trackMetadataFound: trace.trackMetadataFound,
+    progressiveMetadataAvailable: trace.progressiveMetadataAvailable,
+    streamCandidateCount: trace.streamCandidateCount,
+    mediaCandidateOrdinal: trace.mediaCandidateOrdinal,
+    authorizationPresent: trace.authorizationPresent,
+    requestCount: trace.requestCount,
+    requests: trace.requests.slice(-8),
+    mediaWaitOutcome: trace.mediaWaitOutcome,
+    mediaWaitElapsedMs: trace.mediaWaitElapsedMs,
+    readyState: trace.readyState,
+    networkState: trace.networkState,
+    mediaErrorCode: trace.mediaErrorCode,
+    playElapsedMs: trace.playElapsedMs,
+    errorName: trace.errorName,
+    audioGraphPhase: trace.audioGraphPhase,
+    audioGraphReason: trace.audioGraphReason,
+    nativeOutcome: trace.nativeOutcome,
+    nativeFallbackReason: trace.nativeFallbackReason,
+    audioFeatures: {
+      autoLevel: Boolean(state.autoLevel),
+      eqEnabled: Boolean(state.eqEnabled),
+      safetyClipper: Boolean(state.safetyClipper),
+      crossfadeSeconds: Number(state.crossfadeSeconds) || 0,
+    },
+    elapsedMs: Math.max(0, Math.round(performance.now() - trace.startedAt)),
+  };
 }
 
 function playbackDiagnosticSnapshot(reason = 'manual') {
   const schedule = state._crossfadeSchedule;
-  return {
+  const environment = playbackDiagnosticEnvironment();
+  const activeDeck = Number.isInteger(state._deckIndex) ? state._decks?.[state._deckIndex] || null : null;
+  const report = {
+    schemaVersion: 2,
+    scriptVersion: environment.scriptVersion,
     at: new Date().toISOString(),
-    reason,
-    page: location.href.split(/[?#]/)[0],
+    reason: safeDiagnosticString('reason', reason) || 'manual',
+    pageKind: playbackDiagnosticPageKind(),
+    environment,
+    capabilities: playbackDiagnosticCapabilities(),
     state: {
       active: state.active,
+      loading: state.loading,
+      userPaused: Boolean(state._userPaused),
+      crossfadePending: Boolean(state._crossfadePending),
+      playbackEpoch: Number(state._playbackEpoch) || 0,
+      collectionEpoch: Number(state._collectionEpoch) || 0,
+      operationId: Number(state._playbackRequest?.operationId) || 0,
       busy: state.busy,
       suspended: state.suspended,
       crossfading: state._crossfading,
       crossfadePausedByUser: state._crossfadePausedByUser,
       crossfadeStatus: state.crossfadeStatus,
+      crossfadeCurve: state.crossfadeCurve,
+      crossfadeManual: Boolean(state.crossfadeManual),
       crossfadeSeconds: state.crossfadeSeconds,
       queuePosition: state.pos,
       queueLength: state.queue.length,
       deckIndex: state._deckIndex,
       deckTrack: state._deckTrack,
-      currentTrack: Number.isInteger(state._deckTrack) ? state.meta[state._deckTrack]?.title || '' : '',
+      nativeTrackIndex: Number.isInteger(state._nativeTrack) ? state._nativeTrack : null,
+      nativeFallbackReason: Number.isInteger(state._nativeTrack)
+        ? state.meta[state._nativeTrack]?.nativePlaybackReason || 'native-player'
+        : null,
+      streamKind: activeDeck ? diagnosticDeckStreamKind(activeDeck, state._deckIndex) : 'none',
+      retryPending: Boolean(state._customPlaybackRetryTimer),
+      diagnosticsEnabled: Boolean(state._diagnosticBuild),
+      audioGraphFailed: Boolean(state._audioGraphFailed),
+      contextState: state._audioContext?.state || 'missing',
+      audioFeatures: {
+        autoLevel: Boolean(state.autoLevel),
+        eqEnabled: Boolean(state.eqEnabled),
+        safetyClipper: Boolean(state.safetyClipper),
+        crossfadeSeconds: Number(state.crossfadeSeconds) || 0,
+      },
     },
     audioContext: state._audioContext ? {
-      state: state._audioContext.state,
+      contextState: state._audioContext.state,
       currentTime: Number(state._audioContext.currentTime) || 0,
       sampleRate: Number(state._audioContext.sampleRate) || 0,
     } : null,
@@ -1034,28 +1494,37 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
       lastIncomingTime: schedule.lastIncomingTime,
       lastIncomingAdvanceAt: schedule.lastIncomingAdvanceAt,
     } : null,
-    decks: state._decks.map((audio, index) => audio ? {
-      index,
-      trackIndex: state._deckTracks[index],
-      title: Number.isInteger(state._deckTracks[index]) ? state.meta[state._deckTracks[index]]?.title || '' : '',
-      paused: audio.paused,
-      ended: audio.ended,
-      seeking: audio.seeking,
-      currentTime: Number(audio.currentTime) || 0,
-      duration: Number(audio.duration) || 0,
-      readyState: Number(audio.readyState) || 0,
-      networkState: Number(audio.networkState) || 0,
-      errorCode: Number(audio.error?.code) || 0,
-      source: safeMediaUrl(audio.currentSrc || audio.src),
-      deckGain: state._deckGains[index],
-      mixGain: state._deckAudioGraphs[index]?.mixGain?.gain?.value,
-      autoGain: state._deckAudioGraphs[index]?.autoGain?.gain?.value,
-    } : null),
-    diagnostics: sanitizePlaybackDiagnostics(state._playbackDiagnostics).slice(-40).map(entry => {
-      const { diagnostics, ...summary } = entry;
-      return summary;
+    decks: state._decks.map((audio, index) => {
+      if (!audio) return null;
+      const hls = state._deckHlsPlayers?.[index];
+      return {
+        index,
+        trackIndex: state._deckTracks[index],
+        streamKind: diagnosticDeckStreamKind(audio, index),
+        paused: audio.paused,
+        ended: audio.ended,
+        seeking: audio.seeking,
+        currentTime: Number(audio.currentTime) || 0,
+        duration: Number(audio.duration) || 0,
+        readyState: Number(audio.readyState) || 0,
+        networkState: Number(audio.networkState) || 0,
+        errorCode: Number(audio.error?.code) || 0,
+        hasCurrentSrc: Boolean(audio.currentSrc || audio.src),
+        playbackRate: Number(audio.playbackRate) || 1,
+        deckGain: state._deckGains[index],
+        mixGain: state._deckAudioGraphs[index]?.mixGain?.gain?.value,
+        autoGain: state._deckAudioGraphs[index]?.autoGain?.gain?.value,
+        hlsMediaAttached: Boolean(hls?.media === audio),
+        hlsLoading: Boolean(hls?.loadingEnabled),
+        hlsLevelCount: Array.isArray(hls?.levels) ? hls.levels.length : 0,
+        hlsCurrentLevel: Number.isFinite(Number(hls?.currentLevel)) ? Number(hls.currentLevel) : null,
+        hlsBandwidthEstimate: Number.isFinite(Number(hls?.bandwidthEstimate))
+          ? Math.round(Number(hls.bandwidthEstimate)) : null,
+      };
     }),
+    diagnostics: sanitizePlaybackDiagnostics(state._playbackDiagnostics).slice(-40),
   };
+  return sanitizeDiagnosticRecord(report);
 }
 
 function updatePlaybackDiagnosticButton() {
@@ -1080,7 +1549,7 @@ function showPlaybackReportHelp() {
         <li><strong>Add what happened.</strong> Include your browser and version, Tampermonkey or Violentmonkey and its version, what you clicked, and what you expected versus what happened. Mention the track and whether the tab was in the background.</li>
         <li><strong>Post on <a href="https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback" target="_blank" rel="noopener noreferrer">Greasy Fork feedback</a>.</strong> Open the feedback page in a new tab, sign in if needed, and start a new discussion. Paste the copied report as a code block together with the details above.</li>
       </ol>
-      <p>Greasy Fork feedback is public. Stream tokens and URL parameters are removed, but track names and page addresses may remain. Remove personal information before posting. Nothing is sent automatically.</p>
+      <p>Greasy Fork feedback is public. Reports exclude track titles, account/page paths, media and stream URLs, query strings, credentials, and exception text. They contain technical browser/OS and playback details. Nothing is transmitted automatically; review the copied report before posting.</p>
       <div class="tss-debug-actions"><button id="tss-debug-help-back" type="button">Back to report</button></div>
     </div>`;
   const close = () => {
@@ -1116,7 +1585,7 @@ function showPlaybackDiagnostics() {
   overlay.innerHTML = `
     <div class="tss-debug-dialog" role="dialog" aria-modal="true" aria-labelledby="tss-debug-title">
       <div class="tss-debug-head"><div><strong id="tss-debug-title">Playback report</strong><span>Browser diagnostics</span></div><button id="tss-debug-close" type="button" aria-label="Close">${SVG.close}</button></div>
-      <p>Copy this report before reloading or closing the page. Reports are not saved. Stream tokens and URL parameters are removed.</p>
+      <p>Copy this report before reloading or closing the page. Reports stay in memory and omit track titles, account/page paths, stream URLs, query strings, credentials, and exception text.</p>
       <pre id="tss-debug-report"></pre>
       <div class="tss-debug-actions"><button id="tss-debug-help" type="button">How to report</button><button id="tss-debug-clear" type="button">Clear</button><button id="tss-debug-copy" type="button">Copy report</button></div>
     </div>`;
@@ -1232,7 +1701,7 @@ async function resolveWaveformUrl(meta, options = {}) {
     if (resolved) meta.waveform = resolved;
     return resolved || null;
   } catch (error) {
-    if (error?.name !== 'AbortError') recordPlaybackDiagnostic('waveform-resolution-failed', { error: String(error?.name || error) });
+    if (error?.name !== 'AbortError') recordPlaybackDiagnostic('waveform-resolution-failed', { errorName: playbackErrorName(error) });
     return null;
   }
 }
@@ -1281,7 +1750,7 @@ async function loadTrackWaveform(meta) {
     renderWaveform(heights);
   } catch (error) {
     if (isCurrent()) {
-      recordPlaybackDiagnostic('waveform-load-failed', { error: String(error?.name || error) });
+      recordPlaybackDiagnostic('waveform-load-failed', { errorName: playbackErrorName(error) });
       renderWaveform();
     }
   }
@@ -2992,7 +3461,11 @@ function installBetterFeedPipBridge() {
 }
 
 function ensureCrossfadeDecks() {
-  if (state._decks.length === 2 && state._decks.every(Boolean)) return state._decks;
+  if (state._decks.length === 2 && state._decks.every(Boolean)) {
+    state._deckHlsPlayers ||= [null, null];
+    state._deckHlsFailed ||= [false, false];
+    return state._decks;
+  }
   state._decks = [0, 1].map(index => {
     const audio = document.createElement('audio');
     audio.id = `tss-crossfade-deck-${index + 1}`;
@@ -3004,6 +3477,8 @@ function ensureCrossfadeDecks() {
     document.body.appendChild(audio);
     return audio;
   });
+  state._deckHlsPlayers = [null, null];
+  state._deckHlsFailed = [false, false];
   state._deckTracks = [null, null];
   state._deckGains = [0, 0];
   return state._decks;
@@ -3141,6 +3616,10 @@ function retireAudioGraph() {
       try { node?.disconnect(); } catch (_) {}
     }
   }
+  for (const hls of state._deckHlsPlayers || []) {
+    try { hls?.destroy?.(); } catch (_) {}
+  }
+  state._deckHlsPlayers = [null, null];
   for (const audio of state._decks) {
     try { audio.pause(); } catch (_) {}
     try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
@@ -3164,23 +3643,38 @@ function ensureAutoLevelAudioGraph() {
   const AudioContextCtor = window.AudioContext || window.webkitAudioContext
     || pageWindow.AudioContext || pageWindow.webkitAudioContext;
   if (state._audioContext?.state === 'closed' || state._audioGraphFailed) retireAudioGraph();
-  if (!AudioContextCtor) return false;
-  const decks = ensureCrossfadeDecks();
   let context = state._audioContext;
+  const created = !context;
   let published = Boolean(context);
+  let phase = 'select-audio-context';
+  let failedDeckIndex = null;
+  if (!AudioContextCtor) {
+    recordPlaybackDiagnostic('audio-graph-failed', {
+      phase: 'constructor-unavailable',
+      reason: 'audio-context-unavailable',
+      contextState: 'missing',
+      deckCount: state._decks.length,
+    });
+    return false;
+  }
+  const decks = ensureCrossfadeDecks();
   try {
     if (!context) {
+      phase = 'create-context';
       context = new AudioContextCtor();
+      phase = 'create-master-nodes';
       const master = context.createGain();
       const clipper = context.createWaveShaper();
       master.gain.value = state.playbackVolume;
       // Identity inside full scale, clipping only overs: no compressor envelope.
       clipper.curve = new Float32Array([-1, 1]);
       clipper.oversample = '4x';
+      phase = 'connect-master-routing';
       master.connect(state.safetyClipper ? clipper : context.destination);
       clipper.connect(context.destination);
-      // Allocate/configure BOTH decks before irreversibly binding either element.
+      phase = 'allocate-deck-processing-nodes';
       const graphs = decks.map((audio, index) => {
+        failedDeckIndex = index;
         const eqFilters = EQ_BANDS.map((band, bandIndex) => {
           const filter = context.createBiquadFilter();
           filter.type = band.type;
@@ -3211,16 +3705,34 @@ function ensureAutoLevelAudioGraph() {
       state._audioClipper = clipper;
       state._deckAudioGraphs = graphs;
       published = true;
+      phase = 'bind-media-element-source';
       decks.forEach((audio, index) => {
-        // Retain the source immediately; failure after this point retires elements.
+        failedDeckIndex = index;
         graphs[index].source = context.createMediaElementSource(audio);
         audio.volume = 1;
       });
     }
+    phase = 'apply-processing-routing';
     syncEqualizer();
     if (context.state === 'suspended' && !state._userPaused) void resumeAudioGraph();
+    if (created) {
+      recordPlaybackDiagnostic('audio-graph-ready', {
+        phase: 'ready',
+        contextState: context.state,
+        sampleRate: Number(context.sampleRate) || 0,
+        deckCount: decks.length,
+        sourceNodeConnected: true,
+      });
+    }
     return true;
-  } catch (_) {
+  } catch (error) {
+    recordPlaybackDiagnostic('audio-graph-failed', {
+      phase,
+      deckIndex: failedDeckIndex,
+      errorName: playbackErrorName(error),
+      contextState: context?.state || 'missing',
+      sourceBound: published,
+    });
     if (published) retireAudioGraph();
     else {
       // Native output is still intact because neither media element was bound.
@@ -3273,35 +3785,107 @@ function syncSafetyClipper() {
   } catch (_) {}
 }
 
-async function resumeAudioGraph(signal = state._playbackAbort?.signal) {
+async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosticTrace = null) {
   const context = state._audioContext;
-  if (signal?.aborted || state._userPaused || state._audioGraphFailed) return false;
+  const fail = (reason, error = null, contextStateBefore = context?.state || 'missing') => {
+    const errorName = error ? playbackErrorName(error) : '';
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'audio-context-resume';
+      diagnosticTrace.reason = reason;
+      diagnosticTrace.audioGraphPhase = 'resume';
+      diagnosticTrace.audioGraphReason = reason;
+      if (errorName) diagnosticTrace.errorName = errorName;
+    }
+    if (!signal?.aborted && !state._userPaused) {
+      recordPlaybackDiagnostic('audio-context-resume-failed', {
+        attemptId: diagnosticTrace?.attemptId,
+        reason,
+        errorName,
+        contextStateBefore,
+        contextStateAfter: context?.state || 'missing',
+        audioGraphFailed: Boolean(state._audioGraphFailed),
+      });
+    }
+    return false;
+  };
+  if (signal?.aborted || state._userPaused) return false;
+  if (state._audioGraphFailed) return fail('graph-marked-failed');
   if (!context || context.state === 'running') return true;
-  if (context.state === 'closed') return false;
+  if (context.state === 'closed') return fail('context-closed');
+  const contextStateBefore = context.state;
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'audio-context-resume';
+    diagnosticTrace.reason = 'resume-pending';
+    diagnosticTrace.audioGraphPhase = 'resume';
+  }
   try {
     await withDeadline(() => context.resume(), 5000, signal);
     const current = !signal?.aborted && state._audioContext === context;
-    if (current && context.state !== 'running') state._audioGraphFailed = true;
-    return current && !state._userPaused && context.state === 'running';
-  } catch (_) {
-    if (!signal?.aborted && state._audioContext === context) state._audioGraphFailed = true;
-    return false;
+    if (!current || state._userPaused) return false;
+    if (context.state !== 'running') {
+      state._audioGraphFailed = true;
+      return fail('context-not-running', null, contextStateBefore);
+    }
+    if (diagnosticTrace) {
+      diagnosticTrace.reason = 'audio-context-resumed';
+      diagnosticTrace.audioGraphReason = 'resumed';
+    }
+    recordPlaybackDiagnostic('audio-context-resumed', {
+      attemptId: diagnosticTrace?.attemptId,
+      contextStateBefore,
+      contextStateAfter: context.state,
+      sampleRate: Number(context.sampleRate) || 0,
+      elapsedMs: typeof performance !== 'undefined'
+        ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+    });
+    return true;
+  } catch (error) {
+    if (signal?.aborted || state._userPaused) return false;
+    if (state._audioContext === context) state._audioGraphFailed = true;
+    const reason = error?.name === 'TimeoutError' ? 'resume-timeout' : 'resume-rejected';
+    return fail(reason, error, contextStateBefore);
   }
 }
 
 async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
   const context = state._audioContext;
+  const fail = (reason, error = null, contextStateBefore = context?.state || 'missing') => {
+    if (!signal?.aborted) {
+      recordPlaybackDiagnostic('audio-context-suspend-failed', {
+        reason,
+        errorName: error ? playbackErrorName(error) : '',
+        contextStateBefore,
+        contextStateAfter: context?.state || 'missing',
+      });
+    }
+    return false;
+  };
   if (signal?.aborted) return false;
   if (!context || context.state === 'suspended') return true;
-  if (context.state === 'closed') return false;
+  if (context.state === 'closed') return fail('context-closed');
+  const contextStateBefore = context.state;
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
   try {
     await withDeadline(() => context.suspend(), 5000, signal);
     const current = !signal?.aborted && state._audioContext === context;
-    if (current && context.state !== 'suspended') state._audioGraphFailed = true;
-    return current && context.state === 'suspended';
-  } catch (_) {
-    if (!signal?.aborted && state._audioContext === context) state._audioGraphFailed = true;
-    return false;
+    if (!current) return false;
+    if (context.state !== 'suspended') {
+      state._audioGraphFailed = true;
+      return fail('context-not-suspended', null, contextStateBefore);
+    }
+    recordPlaybackDiagnostic('audio-context-suspended', {
+      contextStateBefore,
+      contextStateAfter: context.state,
+      elapsedMs: typeof performance !== 'undefined'
+        ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+    });
+    return true;
+  } catch (error) {
+    if (signal?.aborted) return false;
+    if (state._audioContext === context) state._audioGraphFailed = true;
+    return fail(error?.name === 'TimeoutError' ? 'suspend-timeout' : 'suspend-rejected',
+      error, contextStateBefore);
   }
 }
 
@@ -3774,26 +4358,39 @@ async function discoverSoundCloudClientIdFromBundle(excluded = new Set(), option
   const rejected = excluded;
   if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
   const existing = options.bundleOnly ? '' : discoverSoundCloudClientId(rejected);
-  if (existing) return existing;
+  if (existing) {
+    if (options.diagnosticTrace) {
+      options.diagnosticTrace.clientIdFound = true;
+      options.diagnosticTrace.clientIdSource = 'resource-history';
+    }
+    return existing;
+  }
   const scripts = [...document.scripts]
     .map(script => script.src)
     .filter(src => /a-v2\.sndcdn\.com\/assets\/.+\.js/i.test(src))
     .slice(-8);
   for (const src of scripts) {
     try {
-      const response = await fetchSoundCloudResource(src, 'text', options);
+      const response = await fetchSoundCloudResource(src, 'text', {
+        ...options, diagnosticStage: 'client-bundle',
+      });
       if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
       const matches = String(response.data || '').matchAll(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9_-]{20,})["']/g);
       const match = [...matches].find(candidate => !rejected.has(candidate[1]));
       if (match) {
         state._clientId = match[1];
+        if (options.diagnosticTrace) {
+          options.diagnosticTrace.clientIdFound = true;
+          options.diagnosticTrace.clientIdSource = 'bundle';
+        }
         return state._clientId;
       }
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
-      recordPlaybackDiagnostic('client-discovery-failed', { error: String(error?.name || error) });
+      recordPlaybackDiagnostic('client-discovery-failed', { error: playbackErrorName(error) });
     }
   }
+  if (options.diagnosticTrace) options.diagnosticTrace.clientIdFound = false;
   return '';
 }
 
@@ -3815,24 +4412,330 @@ async function resolveProgressiveStreams(track, clientId, options = {}) {
     });
   const urls = [];
   let authFailed = false;
+  const diagnosticTrace = options.diagnosticTrace;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'stream-resolution';
+    diagnosticTrace.progressiveCandidates += progressive.length;
+    diagnosticTrace.authorizationPresent ||= Boolean(track.track_authorization || track.trackAuthorization);
+  }
   for (const transcoding of progressive) {
     try {
       const endpoint = new URL(transcoding.url);
       endpoint.searchParams.set('client_id', clientId);
       const authorization = track.track_authorization || track.trackAuthorization;
       if (authorization) endpoint.searchParams.set('track_authorization', authorization);
-      const response = await fetchSoundCloudResource(endpoint, 'json', options);
+      const response = await fetchSoundCloudResource(endpoint, 'json', {
+        ...options, diagnosticStage: 'progressive-stream',
+      });
       if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
       if (response.status === 401 || response.status === 403) authFailed = true;
       if (!response.ok) continue;
       const stream = response.data;
-      if (stream?.url && !urls.includes(stream.url)) urls.push(stream.url);
+      if (stream?.url && !urls.includes(stream.url)) {
+        urls.push(stream.url);
+        if (diagnosticTrace) diagnosticTrace.progressiveUrls++;
+      }
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
-      recordPlaybackDiagnostic('stream-endpoint-failed', { error: String(error?.name || error) });
+      recordPlaybackDiagnostic('stream-endpoint-failed', { error: playbackErrorName(error) });
     }
   }
   return { urls, authFailed };
+}
+
+function hlsJsConstructor() {
+  const candidate = pageWindow?.Hls || globalThis.Hls;
+  return candidate && typeof candidate.isSupported === 'function'
+    && typeof candidate.Events?.ERROR === 'string' ? candidate : null;
+}
+
+function isHlsStreamUrl(value) {
+  try {
+    const segments = new URL(value).pathname.toLowerCase().split('/');
+    return segments.some(segment => segment === 'hls' || segment.startsWith('hls_'))
+      || segments.at(-1)?.endsWith('.m3u8');
+  } catch (_) {
+    return false;
+  }
+}
+
+function isHlsManifestUrl(value) {
+  try {
+    return new URL(value).pathname.toLowerCase().endsWith('.m3u8');
+  } catch (_) {
+    return false;
+  }
+}
+
+function directHlsStreamUrls(track) {
+  const streams = track?.streams || track?.media?.streams || {};
+  return [
+    track?.hls_aac_160_url, track?.hls_aac_96_url,
+    streams.hls_aac_160_url, streams.hls_aac_96_url,
+    track?.media?.hls_aac_160_url, track?.media?.hls_aac_96_url,
+  ].filter(isHlsManifestUrl);
+}
+
+async function resolveHlsStreamUrls(track, clientId, options = {}) {
+  const urls = directHlsStreamUrls(track);
+  if (urls.length) return { urls, authFailed: false };
+  const transcodings = Array.isArray(track?.media?.transcodings)
+    ? track.media.transcodings
+    : (Array.isArray(track?.transcodings) ? track.transcodings : []);
+  const candidates = [];
+  for (const transcoding of transcodings) {
+    const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '').toLowerCase();
+    if (!transcoding?.url || (!protocol.includes('hls') && !isHlsStreamUrl(transcoding.url))) continue;
+    try {
+      const endpoint = new URL(transcoding.url);
+      endpoint.searchParams.set('client_id', clientId);
+      const authorization = track.track_authorization || track.trackAuthorization;
+      if (authorization) endpoint.searchParams.set('track_authorization', authorization);
+      const quality = `${transcoding.preset || ''} ${transcoding.quality || ''} ${endpoint.pathname}`.toLowerCase();
+      const priority = /aac[_-]?160|160k/.test(quality) ? 0
+        : (/aac[_-]?96|96k/.test(quality) ? 1 : 2);
+      candidates.push({ url: endpoint, priority });
+    } catch (_) {}
+  }
+  candidates.sort((a, b) => a.priority - b.priority);
+  let authFailed = false;
+  for (const candidate of candidates) {
+    try {
+      const response = await fetchSoundCloudResource(candidate.url, 'json', {
+        ...options, diagnosticStage: 'hls-stream',
+      });
+      if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
+      if (response.status === 401 || response.status === 403) authFailed = true;
+      if (!response.ok) continue;
+      const data = response.data;
+      const resolvedUrls = typeof data === 'string' ? [data] : [
+        data?.url, data?.hls_aac_160_url, data?.hls_aac_96_url,
+      ];
+      for (const url of resolvedUrls) {
+        if (isHlsManifestUrl(url) && !urls.includes(url)) urls.push(url);
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      recordPlaybackDiagnostic('hls-endpoint-failed', { error: playbackErrorName(error) });
+    }
+  }
+  return { urls, authFailed };
+}
+
+function hlsDiagnosticCode(value) {
+  const code = String(value || '');
+  return /^[A-Za-z0-9_-]{1,48}$/.test(code) ? code : 'unknown';
+}
+
+async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace) {
+  const HlsCtor = hlsJsConstructor();
+  if (diagnosticTrace) {
+    diagnosticTrace.hlsLibraryAvailable = Boolean(HlsCtor);
+    diagnosticTrace.hlsLibraryVersion = safeDiagnosticVersion(HlsCtor?.version || '');
+  }
+  let supported = false;
+  try { supported = Boolean(HlsCtor?.isSupported()); } catch (_) {}
+  if (diagnosticTrace) diagnosticTrace.hlsSupported = supported;
+  if (!supported) {
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'hls-mse';
+      diagnosticTrace.reason = 'hls-mse-unavailable';
+      diagnosticTrace.hlsMode = 'unsupported';
+    }
+    return { supported: false, ready: false, player: null, source: '' };
+  }
+  let player;
+  try {
+    player = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
+  } catch (error) {
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'hls-mse';
+      diagnosticTrace.reason = 'hls-initialization-error';
+      diagnosticTrace.hlsMode = 'unsupported';
+      diagnosticTrace.errorName = playbackErrorName(error);
+    }
+    return { supported: false, ready: false, player: null, source: '' };
+  }
+  state._deckHlsPlayers ||= [null, null];
+  state._deckHlsFailed ||= [false, false];
+  state._deckHlsFailed[index] = false;
+  state._deckHlsPlayers[index] = player;
+  const waitController = new AbortController();
+  const abortWait = () => { if (!waitController.signal.aborted) waitController.abort(); };
+  signal?.addEventListener('abort', abortWait, { once: true });
+  let fatalError = null;
+  const hlsStartedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
+  const hlsElapsedMs = () => typeof performance !== 'undefined'
+    ? Math.max(0, Math.round(performance.now() - hlsStartedAt)) : 0;
+  let readinessSettled = false;
+  let reportedFatal = false;
+  const onHlsError = (_event, data) => {
+    if (!data || state._deckHlsPlayers[index] !== player) return;
+    const errorType = hlsDiagnosticCode(data.type);
+    const errorDetail = hlsDiagnosticCode(data.details);
+    const status = Number(data.response?.code) || null;
+    if (diagnosticTrace) {
+      diagnosticTrace.hlsErrorCount = (Number(diagnosticTrace.hlsErrorCount) || 0) + 1;
+      diagnosticTrace.hlsLastErrorType = errorType;
+      diagnosticTrace.hlsLastErrorDetail = errorDetail;
+      if (status !== null) diagnosticTrace.hlsStatus = status;
+      if (data.fatal) {
+        diagnosticTrace.hlsFatalErrorCount = (Number(diagnosticTrace.hlsFatalErrorCount) || 0) + 1;
+        diagnosticTrace.hlsErrorType = errorType;
+        diagnosticTrace.hlsErrorDetail = errorDetail;
+      } else {
+        diagnosticTrace.hlsNonFatalErrorCount = (Number(diagnosticTrace.hlsNonFatalErrorCount) || 0) + 1;
+      }
+    }
+    if (!data.fatal || fatalError) return;
+    fatalError = data;
+    const trackIndex = state._deckTracks[index];
+    if (readinessSettled) {
+      state._deckHlsFailed ||= [false, false];
+      state._deckHlsFailed[index] = true;
+      if (state.active && Number.isInteger(trackIndex) && !reportedFatal) {
+        reportedFatal = true;
+        recordPlaybackDiagnostic('hls-playback-failed', {
+          attemptId: diagnosticTrace?.attemptId,
+          trackIndex,
+          streamKind: 'hls-mse',
+          stage: 'hls-stream',
+          reason: 'fatal-hls-error',
+          errorType,
+          errorDetail,
+          status,
+          hlsLibraryVersion: safeDiagnosticVersion(HlsCtor.version || ''),
+          hlsLevelCount: Array.isArray(player.levels) ? player.levels.length : 0,
+          hlsCurrentLevel: Number.isFinite(Number(player.currentLevel)) ? Number(player.currentLevel) : -1,
+          hlsBandwidthEstimate: Number.isFinite(Number(player.bandwidthEstimate))
+            ? Math.round(Number(player.bandwidthEstimate)) : null,
+          hlsErrorCount: diagnosticTrace?.hlsErrorCount || 1,
+          hlsNonFatalErrorCount: diagnosticTrace?.hlsNonFatalErrorCount || 0,
+          hlsFatalErrorCount: diagnosticTrace?.hlsFatalErrorCount || 1,
+          hlsMediaAttached: diagnosticTrace?.hlsMediaAttached || false,
+          hlsMediaAttachedElapsedMs: diagnosticTrace?.hlsMediaAttachedElapsedMs,
+          hlsManifestParsed: diagnosticTrace?.hlsManifestParsed || false,
+          hlsManifestParsedElapsedMs: diagnosticTrace?.hlsManifestParsedElapsedMs,
+          hlsFirstFragmentBuffered: diagnosticTrace?.hlsFirstFragmentBuffered || false,
+          hlsFirstFragmentBufferedElapsedMs: diagnosticTrace?.hlsFirstFragmentBufferedElapsedMs,
+          hlsBufferedFragmentCount: diagnosticTrace?.hlsBufferedFragmentCount || 0,
+          readyState: Number(audio.readyState) || 0,
+          networkState: Number(audio.networkState) || 0,
+        });
+      }
+      if (state.active && state._deckIndex !== index && state.crossfadeSeconds > 0) {
+        setCrossfadeStatus('fallback');
+      }
+    } else {
+      abortWait();
+    }
+  };
+  const onMediaAttached = () => {
+    if (diagnosticTrace && state._deckHlsPlayers[index] === player) {
+      diagnosticTrace.hlsMediaAttached = true;
+      diagnosticTrace.hlsMediaAttachedElapsedMs = hlsElapsedMs();
+    }
+  };
+  const onManifestParsed = () => {
+    if (!diagnosticTrace || state._deckHlsPlayers[index] !== player) return;
+    diagnosticTrace.hlsManifestParsed = true;
+    diagnosticTrace.hlsManifestParsedElapsedMs = hlsElapsedMs();
+    diagnosticTrace.hlsLevelCount = Array.isArray(player.levels) ? player.levels.length : 0;
+    diagnosticTrace.hlsCurrentLevel = Number.isFinite(Number(player.currentLevel)) ? Number(player.currentLevel) : -1;
+    diagnosticTrace.hlsBandwidthEstimate = Number.isFinite(Number(player.bandwidthEstimate))
+      ? Math.round(Number(player.bandwidthEstimate)) : 0;
+  };
+  const onFragmentBuffered = () => {
+    if (!diagnosticTrace || state._deckHlsPlayers[index] !== player) return;
+    diagnosticTrace.hlsBufferedFragmentCount = (Number(diagnosticTrace.hlsBufferedFragmentCount) || 0) + 1;
+    if (!diagnosticTrace.hlsFirstFragmentBuffered) {
+      diagnosticTrace.hlsFirstFragmentBuffered = true;
+      diagnosticTrace.hlsFirstFragmentBufferedElapsedMs = hlsElapsedMs();
+    }
+    if (Number.isFinite(Number(player.bandwidthEstimate))) {
+      diagnosticTrace.hlsBandwidthEstimate = Math.round(Number(player.bandwidthEstimate));
+    }
+  };
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'hls-mse';
+    diagnosticTrace.reason = 'attaching-hls-media';
+    diagnosticTrace.hlsMode = 'mse';
+  }
+  try {
+    player.on(HlsCtor.Events.ERROR, onHlsError);
+    if (HlsCtor.Events.MEDIA_ATTACHED) player.on(HlsCtor.Events.MEDIA_ATTACHED, onMediaAttached);
+    if (HlsCtor.Events.MANIFEST_PARSED) player.on(HlsCtor.Events.MANIFEST_PARSED, onManifestParsed);
+    if (HlsCtor.Events.FRAG_BUFFERED) player.on(HlsCtor.Events.FRAG_BUFFERED, onFragmentBuffered);
+    const readiness = waitForDeck(audio, timeout, waitController.signal, isCurrent, diagnosticTrace);
+    player.loadSource(streamUrl);
+    player.attachMedia(audio);
+    const ready = await readiness;
+    readinessSettled = true;
+    if (diagnosticTrace) diagnosticTrace.hlsReady = ready;
+    if (fatalError) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'hls-stream';
+        diagnosticTrace.reason = 'hls-fatal-error';
+        diagnosticTrace.mediaWaitOutcome = 'hls-fatal';
+      }
+      const trackIndex = state._deckTracks[index];
+      if (!reportedFatal && state.active && state._deckIndex === index
+          && state._deckTrack === trackIndex && Number.isInteger(trackIndex)) {
+        reportedFatal = true;
+        recordPlaybackDiagnostic('hls-playback-failed', {
+          attemptId: diagnosticTrace?.attemptId,
+          trackIndex,
+          streamKind: 'hls-mse',
+          stage: 'hls-stream',
+          reason: 'fatal-hls-error',
+          errorType: hlsDiagnosticCode(fatalError.type),
+          errorDetail: hlsDiagnosticCode(fatalError.details),
+          status: Number(fatalError.response?.code) || null,
+          hlsLibraryVersion: safeDiagnosticVersion(player.version || ''),
+          hlsLevelCount: Array.isArray(player.levels) ? player.levels.length : 0,
+          hlsCurrentLevel: Number.isFinite(Number(player.currentLevel)) ? Number(player.currentLevel) : -1,
+          hlsBandwidthEstimate: Number.isFinite(Number(player.bandwidthEstimate))
+            ? Math.round(Number(player.bandwidthEstimate)) : null,
+          hlsErrorCount: diagnosticTrace?.hlsErrorCount || 1,
+          hlsNonFatalErrorCount: diagnosticTrace?.hlsNonFatalErrorCount || 0,
+          hlsFatalErrorCount: diagnosticTrace?.hlsFatalErrorCount || 1,
+          hlsMediaAttached: diagnosticTrace?.hlsMediaAttached || false,
+          hlsMediaAttachedElapsedMs: diagnosticTrace?.hlsMediaAttachedElapsedMs,
+          hlsManifestParsed: diagnosticTrace?.hlsManifestParsed || false,
+          hlsManifestParsedElapsedMs: diagnosticTrace?.hlsManifestParsedElapsedMs,
+          hlsFirstFragmentBuffered: diagnosticTrace?.hlsFirstFragmentBuffered || false,
+          hlsFirstFragmentBufferedElapsedMs: diagnosticTrace?.hlsFirstFragmentBufferedElapsedMs,
+          hlsBufferedFragmentCount: diagnosticTrace?.hlsBufferedFragmentCount || 0,
+          readyState: Number(audio.readyState) || 0,
+          networkState: Number(audio.networkState) || 0,
+        });
+      }
+      return { supported: true, ready: false, player, source: audio.src, failed: true };
+    }
+    return { supported: true, ready, player, source: audio.src, failed: !ready };
+  } catch (error) {
+    readinessSettled = true;
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'hls-stream';
+      diagnosticTrace.reason = 'hls-initialization-error';
+      diagnosticTrace.errorName = playbackErrorName(error);
+    }
+    return { supported: true, ready: false, player, source: audio.src, failed: true };
+  } finally {
+    signal?.removeEventListener('abort', abortWait);
+  }
+}
+
+async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace) {
+  audio.preload = 'auto';
+  if (isHlsStreamUrl(streamUrl)) {
+    return prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace);
+  }
+  audio.src = streamUrl;
+  const source = audio.src;
+  audio.load();
+  const ready = await waitForDeck(audio, timeout, signal, isCurrent, diagnosticTrace);
+  return { supported: true, ready, player: null, source, failed: !ready };
 }
 
 function hydrationTrackForPlayback(meta) {
@@ -3868,7 +4771,7 @@ async function fetchPlaybackTrack(url, options = {}) {
     };
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
-    recordPlaybackDiagnostic('track-request-failed', { error: String(error?.name || error) });
+    recordPlaybackDiagnostic('track-request-failed', { error: playbackErrorName(error) });
     return { track: null, authFailed: false };
   }
 }
@@ -3876,15 +4779,23 @@ async function fetchPlaybackTrack(url, options = {}) {
 async function resolveCrossfadeStreams(meta, options = {}) {
   const epoch = state._playbackEpoch;
   const signal = options.signal || state._playbackAbort?.signal;
+  const diagnosticTrace = options.diagnosticTrace;
   const checkCurrent = () => {
     if (epoch !== state._playbackEpoch || signal?.aborted || (options.isCurrent && !options.isCurrent())) {
       throw new DOMException('Playback canceled', 'AbortError');
     }
   };
   const requestOptions = { ...options, signal };
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'stream-resolution';
+    diagnosticTrace.reason = 'resolving';
+  }
   checkCurrent();
   const key = normalizeTrackUrl(meta?.link);
-  if (!key) return [];
+  if (!key) {
+    if (diagnosticTrace) diagnosticTrace.reason = 'missing-track-link';
+    return [];
+  }
   const now = Date.now();
   for (const [cachedKey, value] of state._streamCache) {
     if (now - value.ts >= 30 * 60 * 1000) state._streamCache.delete(cachedKey);
@@ -3894,86 +4805,207 @@ async function resolveCrossfadeStreams(meta, options = {}) {
   if (cached?.urls?.length) {
     state._streamCache.delete(key);
     state._streamCache.set(key, cached);
+    if (diagnosticTrace) {
+      diagnosticTrace.streamSource = 'stream-cache';
+      for (const url of cached.urls) {
+        if (isHlsStreamUrl(url)) diagnosticTrace.hlsStreamUrls++;
+        else diagnosticTrace.progressiveUrls++;
+      }
+      if (diagnosticTrace.hlsStreamUrls) diagnosticTrace.hlsMode = 'mse';
+      diagnosticTrace.reason = 'cached-stream';
+    }
     return cached.urls;
   }
 
   const rejected = new Set();
+  let trackMetadataFound = false;
+  let hlsAvailable = false;
+  let progressiveMetadataAvailable = false;
   // After two resource-history candidates, inspect current bundles rather than
   // repeatedly cycling expired IDs from our own failed resource requests.
   for (let credentialAttempt = 0; credentialAttempt < 8; credentialAttempt++) {
+    if (diagnosticTrace) diagnosticTrace.credentialAttempts++;
     const clientId = await discoverSoundCloudClientIdFromBundle(rejected, {
       ...requestOptions, bundleOnly: credentialAttempt >= 2,
     });
     checkCurrent();
-    if (!clientId) return [];
+    if (!clientId) {
+      if (diagnosticTrace) diagnosticTrace.reason = 'client-id-unavailable';
+      return [];
+    }
     let authFailed = false;
-    const resolveTrack = async track => {
+    const resolveTrack = async (track, source) => {
       checkCurrent();
+      if (diagnosticTrace && source) diagnosticTrace.streamSource = source;
       if (!track) return [];
+      const trackId = Number(track.id);
+      const expectedId = Number(meta.soundcloudId);
+      const trackUrl = normalizeTrackUrl(track.permalink_url || track.permalinkUrl || '');
+      const exactTrack = track === meta
+        || (Number.isFinite(expectedId) && expectedId > 0 && trackId === expectedId)
+        || (trackUrl && trackUrl === key);
+      if (exactTrack) {
+        trackMetadataFound = true;
+        if (diagnosticTrace) diagnosticTrace.trackMetadataFound = true;
+      }
       if (!meta.artist || meta.artist === '—') {
         Object.assign(meta, mergeTrackMeta(meta, metaFromSoundCloudTrack(track, meta.sourcePage, meta.playlistPosition)));
       }
-      if (syncTrackPlaybackAccess(meta, track)) return [];
+      if (syncTrackPlaybackAccess(meta, track)) {
+        if (diagnosticTrace) {
+          diagnosticTrace.stage = 'access-classification';
+          diagnosticTrace.reason = 'native-preview-required';
+          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+        }
+        return [];
+      }
+      const transcodings = Array.isArray(track.media?.transcodings)
+        ? track.media.transcodings
+        : (Array.isArray(track.transcodings) ? track.transcodings : []);
+      const directHlsUrls = exactTrack ? directHlsStreamUrls(track) : [];
+      let hlsCandidateCount = directHlsUrls.length;
+      if (exactTrack) {
+        const hasHls160 = Boolean(track.hls_aac_160_url || track.streams?.hls_aac_160_url
+          || track.media?.hls_aac_160_url || track.media?.streams?.hls_aac_160_url);
+        const hasHls96 = Boolean(track.hls_aac_96_url || track.streams?.hls_aac_96_url
+          || track.media?.hls_aac_96_url || track.media?.streams?.hls_aac_96_url);
+        for (const transcoding of transcodings) {
+          const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '');
+          if (!transcoding?.url) continue;
+          if (protocol === 'progressive') progressiveMetadataAvailable = true;
+          if (!protocol.toLowerCase().includes('hls') && !isHlsStreamUrl(transcoding.url)) continue;
+          hlsCandidateCount++;
+          const quality = `${transcoding.preset || ''} ${transcoding.quality || ''}`.toLowerCase();
+          if (diagnosticTrace && /aac[_-]?160|160k/.test(quality)) diagnosticTrace.hlsAac160Candidates++;
+          else if (diagnosticTrace && /aac[_-]?96|96k/.test(quality)) diagnosticTrace.hlsAac96Candidates++;
+          else if (diagnosticTrace) diagnosticTrace.hlsOtherCandidates++;
+        }
+        if (diagnosticTrace) {
+          diagnosticTrace.hlsAac160Candidates += Number(hasHls160);
+          diagnosticTrace.hlsAac96Candidates += Number(hasHls96);
+          diagnosticTrace.hlsOtherCandidates += Math.max(0, directHlsUrls.length - Number(hasHls160) - Number(hasHls96));
+        }
+      }
+      if (diagnosticTrace) diagnosticTrace.progressiveMetadataAvailable = progressiveMetadataAvailable;
+      if (hlsCandidateCount) hlsAvailable = true;
+      if (diagnosticTrace) diagnosticTrace.hlsCandidates += hlsCandidateCount;
       const result = await resolveProgressiveStreams(track, clientId, requestOptions);
       checkCurrent();
       authFailed = authFailed || result.authFailed;
-      if (result.urls.length) {
+      let urls = result.urls;
+      if (!urls.length && hlsCandidateCount) {
+        const hlsResult = await resolveHlsStreamUrls(track, clientId, requestOptions);
+        checkCurrent();
+        authFailed = authFailed || hlsResult.authFailed;
+        urls = hlsResult.urls;
+        if (urls.length && diagnosticTrace) {
+          diagnosticTrace.hlsStreamUrls += urls.length;
+          diagnosticTrace.hlsMode = 'mse';
+          diagnosticTrace.reason = 'hls-mse-candidate';
+        } else if (!urls.length && diagnosticTrace) {
+          diagnosticTrace.stage = 'stream-classification';
+          diagnosticTrace.reason = 'hls-url-unavailable';
+        }
+      }
+      if (urls.length) {
         state._streamCache.delete(key);
-        state._streamCache.set(key, { urls: result.urls, ts: Date.now() });
+        state._streamCache.set(key, { urls, ts: Date.now() });
         while (state._streamCache.size > 128) state._streamCache.delete(state._streamCache.keys().next().value);
       }
-      return result.urls;
+      return urls;
     };
-    const embedded = hydrationTrackForPlayback(meta)
-      || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null);
-    let urls = await resolveTrack(embedded);
+    const hydrated = hydrationTrackForPlayback(meta);
+    const embedded = hydrated || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null);
+    let urls = await resolveTrack(embedded, hydrated ? 'hydration' : (embedded ? 'track-metadata' : 'none'));
     checkCurrent();
     if (urls.length) return urls;
-    if (meta.requiresNativePlayback) return [];
+    if (meta.requiresNativePlayback) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'stream-classification';
+        diagnosticTrace.reason = 'native-fallback-required';
+        diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+      }
+      return [];
+    }
     if (Number.isFinite(Number(meta.soundcloudId)) && Number(meta.soundcloudId) > 0) {
       const endpoint = new URL(`https://api-v2.soundcloud.com/tracks/${Number(meta.soundcloudId)}`);
       endpoint.searchParams.set('client_id', clientId);
       if (meta.trackAuthorization) endpoint.searchParams.set('track_authorization', meta.trackAuthorization);
-      const result = await fetchPlaybackTrack(endpoint, requestOptions);
+      const result = await fetchPlaybackTrack(endpoint, {
+        ...requestOptions, diagnosticStage: 'track-lookup',
+      });
       checkCurrent();
       authFailed = authFailed || result.authFailed;
-      urls = await resolveTrack(result.track);
+      urls = await resolveTrack(result.track, 'track-api');
       checkCurrent();
       if (urls.length) return urls;
-      if (meta.requiresNativePlayback) return [];
+      if (meta.requiresNativePlayback) {
+        if (diagnosticTrace) {
+          diagnosticTrace.stage = 'stream-classification';
+          diagnosticTrace.reason = 'native-fallback-required';
+          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+        }
+        return [];
+      }
     }
     const resolveEndpoint = new URL('https://api-v2.soundcloud.com/resolve');
     resolveEndpoint.searchParams.set('url', meta.link);
     resolveEndpoint.searchParams.set('client_id', clientId);
-    const resolved = await fetchPlaybackTrack(resolveEndpoint, requestOptions);
+    const resolved = await fetchPlaybackTrack(resolveEndpoint, {
+      ...requestOptions, diagnosticStage: 'url-resolve',
+    });
     checkCurrent();
     authFailed = authFailed || resolved.authFailed;
-    urls = await resolveTrack(resolved.track);
+    urls = await resolveTrack(resolved.track, 'url-resolve');
     checkCurrent();
     if (urls.length) return urls;
-    if (meta.requiresNativePlayback || !authFailed) return [];
+    if (meta.requiresNativePlayback) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'stream-classification';
+        diagnosticTrace.reason = 'native-fallback-required';
+        diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+      }
+      return [];
+    }
+    if (!authFailed) {
+      if (diagnosticTrace) {
+        const statuses = diagnosticTrace.requests.map(request => request.status);
+        if (statuses.includes(429)) diagnosticTrace.reason = 'http-rate-limited';
+        else if (statuses.some(status => status >= 500 && status <= 599)) diagnosticTrace.reason = 'http-server-error';
+        else if (diagnosticTrace.requests.some(request => request.errorName)) diagnosticTrace.reason = 'request-error';
+        else if (hlsAvailable) diagnosticTrace.reason = 'hls-url-unavailable';
+        else if (progressiveMetadataAvailable) diagnosticTrace.reason = 'progressive-url-unavailable';
+        else diagnosticTrace.reason = trackMetadataFound ? 'unsupported-stream-protocol' : 'track-not-found';
+      }
+      return [];
+    }
+    if (diagnosticTrace) diagnosticTrace.authFailed = true;
     rejected.add(clientId);
     if (state._clientId === clientId) state._clientId = '';
   }
+  if (diagnosticTrace) diagnosticTrace.reason = 'authorization-rejected';
   return [];
 }
 
-async function resolveCrossfadeStream(meta, options) {
-  const streams = await resolveCrossfadeStreams(meta, options);
-  return streams[0] || null;
-}
 
 function resetDeck(audio, index) {
   if (!audio) return;
   const safely = operation => {
     try { operation(); } catch (error) {
-      recordPlaybackDiagnostic('deck-reset-failed', { error: String(error?.name || error) });
+      recordPlaybackDiagnostic('deck-reset-failed', { errorName: playbackErrorName(error) });
     }
   };
+  if (Number.isInteger(index) && state._deckHlsPlayers?.[index]) {
+    const hls = state._deckHlsPlayers[index];
+    state._deckHlsPlayers[index] = null;
+    safely(() => hls.destroy());
+  }
   safely(() => audio.pause());
   safely(() => audio.removeAttribute('src'));
   safely(() => audio.load());
   if (Number.isInteger(index)) {
+    state._deckHlsFailed ||= [false, false];
+    state._deckHlsFailed[index] = false;
     state._deckTracks[index] = null;
     state._deckGains[index] = 0;
     const graph = state._deckAudioGraphs[index];
@@ -4023,14 +5055,32 @@ function stopCrossfadeDecks() {
 async function prepareCrossfadeDeck(index, ti, options = {}) {
   const epoch = state._playbackEpoch;
   const sessionSignal = options.signal || state._playbackAbort?.signal;
+  const diagnosticTrace = options.diagnosticTrace || null;
   if (!state.active || sessionSignal?.aborted || (options.isCurrent && !options.isCurrent())) return null;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'audio-graph';
+    diagnosticTrace.reason = 'checking-audio-graph';
+  }
   if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
       || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
-    if (!ensureAutoLevelAudioGraph()) return null;
+    if (!ensureAutoLevelAudioGraph()) {
+      if (diagnosticTrace) {
+        diagnosticTrace.audioGraphPhase = 'prepare';
+        diagnosticTrace.audioGraphReason = 'graph-unavailable';
+        diagnosticTrace.reason = 'audio-graph-unavailable';
+      }
+      return null;
+    }
   }
   const audio = ensureCrossfadeDecks()[index];
   const meta = state.meta[ti];
-  if (!audio || !meta) return null;
+  if (!audio || !meta) {
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'deck-preparation';
+      diagnosticTrace.reason = 'missing-deck-or-metadata';
+    }
+    return null;
+  }
   state._deckPrepareAborts ||= [];
   state._deckPrepareAborts[index]?.abort();
   const controller = new AbortController();
@@ -4046,39 +5096,115 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
     && (!options.isCurrent || options.isCurrent());
   try {
     if (!options.forceRefresh && state._deckTracks[index] === ti
-        && audio.currentSrc && audio.readyState >= 2) return audio;
+        && audio.currentSrc && audio.readyState >= 2 && !state._deckHlsFailed?.[index]) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'deck-readiness';
+        diagnosticTrace.reason = 'prepared-deck-reused';
+        diagnosticTrace.mediaWaitOutcome = 'already-ready';
+        diagnosticTrace.readyState = Number(audio.readyState) || 0;
+        diagnosticTrace.networkState = Number(audio.networkState) || 0;
+        diagnosticTrace.mediaErrorCode = Number(audio.error?.code) || 0;
+        diagnosticTrace.streamKind = diagnosticDeckStreamKind(audio, index);
+        diagnosticTrace.hlsMode = state._deckHlsPlayers?.[index] ? 'mse' : 'not-used';
+        diagnosticTrace.hlsReady = Boolean(state._deckHlsPlayers?.[index]);
+      }
+      return audio;
+    }
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'stream-resolution';
+      diagnosticTrace.reason = 'resolving-streams';
+    }
     const streamUrls = await resolveCrossfadeStreams(meta, {
       ...options, signal: controller.signal, isCurrent: requestIsCurrent,
     });
-    if (!requestIsCurrent() || !streamUrls.length) return null;
-    for (const streamUrl of streamUrls) {
+    if (!requestIsCurrent()) return null;
+    if (!streamUrls.length) {
+      if (diagnosticTrace && diagnosticTrace.reason === 'resolving-streams') {
+        diagnosticTrace.reason = 'no-stream-url';
+      }
+      return null;
+    }
+    if (diagnosticTrace) {
+      diagnosticTrace.streamCandidateCount = streamUrls.length;
+      diagnosticTrace.stage = 'deck-readiness';
+      diagnosticTrace.reason = 'loading-media';
+    }
+    let hlsCandidatesFailed = false;
+    for (let candidateIndex = 0; candidateIndex < streamUrls.length; candidateIndex++) {
+      const streamUrl = streamUrls[candidateIndex];
       if (!requestIsCurrent()) return null;
+      if (diagnosticTrace) diagnosticTrace.mediaCandidateOrdinal = candidateIndex + 1;
       resetDeck(audio, index);
-      audio.src = streamUrl;
-      const assignedSource = audio.src;
-      audio.preload = 'auto';
+      const hlsStream = isHlsStreamUrl(streamUrl);
+      if (diagnosticTrace) {
+        diagnosticTrace.streamKind = hlsStream ? 'hls-mse' : 'progressive';
+        diagnosticTrace.streamQuality = diagnosticStreamQuality(streamUrl);
+      }
       state._deckTracks[index] = ti;
       state._deckGains[index] = 0;
       applyCachedAutoLevel(index, ti);
       syncCrossfadeVolume();
-      audio.load();
-      const ready = await waitForDeck(audio, options.timeout || 5000, controller.signal, requestIsCurrent);
-      if (!requestIsCurrent() || audio.src !== assignedSource || state._deckTracks[index] !== ti) return null;
-      if (ready) {
-        if (!deckIsPreviewLimited(meta, audio)) return audio;
+      const loaded = await loadStreamOnDeck(
+        audio, index, streamUrl, options.timeout || 5000,
+        controller.signal, requestIsCurrent, diagnosticTrace,
+      );
+      const sourceIsCurrent = loaded.player
+        ? state._deckHlsPlayers[index] === loaded.player
+        : audio.src === loaded.source;
+      if (!requestIsCurrent() || !sourceIsCurrent || state._deckTracks[index] !== ti) return null;
+      if (!loaded.supported) {
         meta.requiresNativePlayback = true;
+        meta.nativePlaybackReason = 'hls-mse-unavailable';
+        if (diagnosticTrace) diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason;
+        resetDeck(audio, index);
+        return null;
+      }
+      const ready = loaded.ready;
+      if (!ready && hlsStream) hlsCandidatesFailed = true;
+      if (ready) {
+        if (!deckIsPreviewLimited(meta, audio)) {
+          if (diagnosticTrace) diagnosticTrace.reason = 'media-ready';
+          return audio;
+        }
+        meta.requiresNativePlayback = true;
+        meta.nativePlaybackReason = 'preview-limited';
+        if (diagnosticTrace) {
+          diagnosticTrace.stage = 'stream-classification';
+          diagnosticTrace.reason = 'preview-limited';
+        }
         state._streamCache.delete(normalizeTrackUrl(meta.link));
         resetDeck(audio, index);
         return null;
       }
+      if (diagnosticTrace) {
+        if (hlsStream && !['hls-fatal-error', 'hls-initialization-error'].includes(diagnosticTrace.reason)) {
+          diagnosticTrace.stage = 'hls-readiness';
+          diagnosticTrace.reason = diagnosticTrace.mediaWaitOutcome === 'error'
+            ? 'hls-media-error' : 'hls-readiness-timeout';
+        } else if (!hlsStream) {
+          diagnosticTrace.stage = 'deck-readiness';
+          diagnosticTrace.reason = diagnosticTrace.mediaWaitOutcome === 'error'
+            ? 'media-error' : 'readiness-timeout';
+        }
+      }
     }
     if (!requestIsCurrent()) return null;
+    if (hlsCandidatesFailed && options.forceRefresh) {
+      meta.requiresNativePlayback = true;
+      meta.nativePlaybackReason = 'hls-custom-playback-failed';
+      if (diagnosticTrace) diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason;
+    }
     state._streamCache.delete(normalizeTrackUrl(meta.link));
     resetDeck(audio, index);
     return null;
   } catch (error) {
     if (!requestIsCurrent() || error?.name === 'AbortError') return null;
-    recordPlaybackDiagnostic('deck-preparation-failed', { error: String(error?.name || error) });
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'deck-preparation';
+      diagnosticTrace.reason = 'preparation-error';
+      diagnosticTrace.errorName = playbackErrorName(error);
+    }
+    recordPlaybackDiagnostic('deck-preparation-failed', { error: playbackErrorName(error) });
     resetDeck(audio, index);
     return null;
   } finally {
@@ -4115,85 +5241,209 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
       || !Number.isInteger(ti) || ti !== state._deckTrack || !meta) return null;
   const savedTime = Math.max(0, Number(position) || 0);
   const initialSeek = state._deckSeekRequest;
-  const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
-  state._deckPrepareTokens[index] = requestToken;
+  const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(ti) : null;
+  const startedAt = diagnosticTrace?.startedAt
+    ?? (state._diagnosticBuild && typeof performance !== 'undefined' ? performance.now() : 0);
+  let recoveryOutcome = 'pending';
   const ownsDeck = () => state.active && state._playbackEpoch === epoch
     && state._playbackRequest === foreground && !sessionSignal.aborted
     && state._decks[index] === audio && state.meta[ti] === meta
     && state._deckPrepareTokens[index] === requestToken
     && state._deckTracks[index] === ti && state._deckTrack === ti;
-  try {
-    recordPlaybackDiagnostic('recovery-start', {
-      reason, attempt, position: Math.round(savedTime * 10) / 10,
+  const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
+  state._deckPrepareTokens[index] = requestToken;
+  const reportRecoveryResult = result => {
+    if (!state._diagnosticBuild || result === null) return;
+    recordPlaybackDiagnostic('recovery-result', {
+      ...(customStartDiagnosticDetails(diagnosticTrace, result === true ? 'started' : 'failed') || {}),
+      attemptId: diagnosticTrace?.attemptId,
+      operationId: diagnosticTrace?.operationId,
+      trackIndex: ti,
+      attempt,
+      result: recoveryOutcome,
+      recoveryReason: reason,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      position: Math.round((Number(audio.currentTime) || savedTime) * 10) / 10,
       readyState: Number(audio.readyState) || 0,
       networkState: Number(audio.networkState) || 0,
+      mediaErrorCode: Number(audio.error?.code) || 0,
+    });
+  };
+  const finish = (result, outcome) => {
+    recoveryOutcome = outcome;
+    if (diagnosticTrace) diagnosticTrace.recoveryOutcome = outcome;
+    return result;
+  };
+  try {
+    recordPlaybackDiagnostic('recovery-start', {
+      attemptId: diagnosticTrace?.attemptId,
+      operationId: diagnosticTrace?.operationId,
+      trackIndex: ti,
+      reason,
+      attempt,
+      position: Math.round(savedTime * 10) / 10,
+      streamKind: diagnosticDeckStreamKind(audio, index),
+      readyState: Number(audio.readyState) || 0,
+      networkState: Number(audio.networkState) || 0,
+      mediaErrorCode: Number(audio.error?.code) || 0,
+      audioContextState: state._audioContext?.state || 'missing',
     });
     cancelCrossfadeForRecovery(index);
-    return await withDeadline(async signal => {
+    const result = await withDeadline(async signal => {
       const isCurrent = () => ownsDeck() && !signal.aborted && !state._userPaused;
-      const streamUrl = await resolveCrossfadeStream(meta, { forceRefresh: true, signal });
+      const streamUrls = await resolveCrossfadeStreams(meta, {
+        forceRefresh: true, signal, diagnosticTrace,
+      });
       if (!isCurrent()) return null;
-      if (!streamUrl) return false;
-      audio.pause();
-      audio.src = streamUrl;
-      audio.preload = 'auto';
-      audio.load();
-      const ready = await waitForDeck(audio, 8000, signal, isCurrent);
-      if (!isCurrent()) return null;
-      if (!ready) return false;
+      if (!streamUrls.length) return finish(false, 'stream-unavailable');
+      let loaded = null;
+      for (const streamUrl of streamUrls) {
+        if (!isCurrent()) return null;
+        audio.pause();
+        const previousHls = state._deckHlsPlayers?.[index];
+        if (previousHls) {
+          state._deckHlsPlayers[index] = null;
+          previousHls.destroy();
+        }
+        audio.removeAttribute('src');
+        audio.load();
+        if (diagnosticTrace) {
+          diagnosticTrace.streamKind = isHlsStreamUrl(streamUrl) ? 'hls-mse' : 'progressive';
+          diagnosticTrace.streamQuality = diagnosticStreamQuality(streamUrl);
+        }
+        const candidate = await loadStreamOnDeck(
+          audio, index, streamUrl, 8000, signal, isCurrent, diagnosticTrace,
+        );
+        if (!isCurrent()) return null;
+        if (!candidate.supported) {
+          meta.requiresNativePlayback = true;
+          meta.nativePlaybackReason = 'hls-mse-unavailable';
+          recordPlaybackDiagnostic('hls-playback-failed', {
+            attemptId: diagnosticTrace?.attemptId,
+            trackIndex: ti,
+            streamKind: 'hls-mse',
+            reason: 'hls-mse-unavailable',
+            errorType: 'runtime',
+            errorDetail: 'mse-unavailable',
+            status: null,
+            readyState: Number(audio.readyState) || 0,
+            networkState: Number(audio.networkState) || 0,
+          });
+          return finish(false, 'hls-mse-unavailable');
+        }
+        const sourceIsCurrent = candidate.player
+          ? state._deckHlsPlayers[index] === candidate.player
+          : audio.src === candidate.source;
+        if (!sourceIsCurrent) return null;
+        loaded = candidate;
+        if (loaded.ready) break;
+      }
+      if (!loaded?.ready) return finish(false, diagnosticTrace?.reason || 'media-not-ready');
       const duration = Number(audio.duration);
       const latestSeek = state._deckSeekRequest;
       const resumeTime = latestSeek !== initialSeek && latestSeek?.epoch === epoch
         && latestSeek.audio === audio ? latestSeek.time : savedTime;
       audio.currentTime = Math.min(Number.isFinite(duration) ? Math.max(0, duration - 0.1) : resumeTime, resumeTime);
-      const graphReady = await resumeAudioGraph(signal);
+      const graphReady = await resumeAudioGraph(signal, diagnosticTrace);
       if (!isCurrent()) return null;
-      if (!graphReady) return false;
-      const played = await playDeckWithDeadline(audio, index, signal, isCurrent);
+      if (!graphReady) return finish(false, 'audio-context-resume-failed');
+      const played = await playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticTrace);
       if (!isCurrent()) return null;
-      if (!played) return false;
+      if (!played) return finish(false, diagnosticTrace?.reason || 'media-play-failed');
       state._deckGains[index] = 1;
       syncCrossfadeVolume();
       if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
       setTimeout(() => {
         if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error =>
-          recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+          recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
       }, 0);
+      recoveryOutcome = 'recovered';
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'recovery';
+        diagnosticTrace.reason = 'recovered';
+        diagnosticTrace.recoveryOutcome = recoveryOutcome;
+      }
       recordPlaybackDiagnostic('recovery-success', {
-        reason, attempt, resumedAt: Math.round((Number(audio.currentTime) || 0) * 10) / 10,
+        attemptId: diagnosticTrace?.attemptId,
+        trackIndex: ti,
+        reason,
+        attempt,
+        streamKind: diagnosticDeckStreamKind(audio, index),
+        resumedAt: Math.round((Number(audio.currentTime) || 0) * 10) / 10,
+        readyState: Number(audio.readyState) || 0,
+        networkState: Number(audio.networkState) || 0,
       });
       return true;
     }, 15000, sessionSignal);
+    if (result === null) return null;
+    if (recoveryOutcome === 'pending') recoveryOutcome = result ? 'recovered' : 'recovery-failed';
+    reportRecoveryResult(result);
+    return result;
   } catch (error) {
     if (!ownsDeck() || state._userPaused) return null;
+    const errorName = playbackErrorName(error);
+    recoveryOutcome = errorName === 'TimeoutError' ? 'recovery-timeout' : 'recovery-exception';
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'recovery';
+      diagnosticTrace.reason = recoveryOutcome;
+      diagnosticTrace.errorName = errorName;
+      diagnosticTrace.recoveryOutcome = recoveryOutcome;
+    }
     recordPlaybackDiagnostic('recovery-failed', {
-      reason, attempt, error: String(error?.name || error || 'unknown').slice(0, 80),
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: ti,
+      reason,
+      attempt,
+      errorName,
+      streamKind: diagnosticDeckStreamKind(audio, index),
+      readyState: Number(audio.readyState) || 0,
+      networkState: Number(audio.networkState) || 0,
+      mediaErrorCode: Number(audio.error?.code) || 0,
     });
+    reportRecoveryResult(false);
     return false;
   }
 }
-
-async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () => true) {
-  if (signal?.aborted || !isCurrent()) return false;
-  if (audio.readyState >= 2) return true;
+async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () => true, diagnosticTrace = null) {
+  const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
+  const recordState = outcome => {
+    if (!diagnosticTrace) return;
+    diagnosticTrace.mediaWaitOutcome = outcome;
+    diagnosticTrace.mediaWaitElapsedMs = typeof performance !== 'undefined'
+      ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+    diagnosticTrace.readyState = Number(audio.readyState) || 0;
+    diagnosticTrace.networkState = Number(audio.networkState) || 0;
+    diagnosticTrace.mediaErrorCode = Number(audio.error?.code) || 0;
+  };
+  if (signal?.aborted || !isCurrent()) {
+    recordState('aborted');
+    return false;
+  }
+  if (audio.readyState >= 2) {
+    recordState('already-ready');
+    return true;
+  }
   return new Promise(resolve => {
     let settled = false;
-    const finish = ok => {
+    const finish = outcome => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       audio.removeEventListener('canplay', onReady);
       audio.removeEventListener('error', onError);
-      signal?.removeEventListener('abort', onError);
-      resolve(ok && !signal?.aborted && isCurrent());
+      signal?.removeEventListener('abort', onAbort);
+      recordState(outcome);
+      const ready = outcome === 'canplay' || outcome === 'timeout-ready';
+      resolve(ready && !signal?.aborted && isCurrent());
     };
-    const onReady = () => finish(true);
-    const onError = () => finish(false);
-    const timer = setTimeout(() => finish(audio.readyState >= 2), timeout);
+    const onReady = () => finish('canplay');
+    const onError = () => finish('error');
+    const onAbort = () => finish('aborted');
+    const timer = setTimeout(() => finish(audio.readyState >= 2 ? 'timeout-ready' : 'timeout'), timeout);
     audio.addEventListener('canplay', onReady, { once: true });
     audio.addEventListener('error', onError, { once: true });
-    signal?.addEventListener('abort', onError, { once: true });
-    if (signal?.aborted || !isCurrent()) onError();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted || !isCurrent()) onAbort();
   });
 }
 
@@ -4295,9 +5545,17 @@ function waitForCrossfadeSchedule(schedule, token) {
         lastClockAdvanceAt = Date.now();
       } else if (Date.now() - lastClockAdvanceAt >= 2500) {
         recordPlaybackDiagnostic('crossfade-clock-stall', {
+          attemptId: schedule.attemptId,
+          reason: 'audio-context-clock-stalled',
+          outgoingIndex: schedule.outgoingIndex,
+          incomingIndex: schedule.incomingIndex,
           elapsed: Math.round(Math.max(0, clockValue - schedule.startTime) * 10) / 10,
           duration: schedule.duration,
           contextState: context?.state || 'missing',
+          incomingPaused: Boolean(state._decks[schedule.incomingIndex]?.paused),
+          incomingCurrentTime: Number(state._decks[schedule.incomingIndex]?.currentTime) || 0,
+          incomingReadyState: Number(state._decks[schedule.incomingIndex]?.readyState) || 0,
+          incomingNetworkState: Number(state._decks[schedule.incomingIndex]?.networkState) || 0,
         });
         finish(false);
         return;
@@ -4331,7 +5589,20 @@ function settleScheduledCrossfade() {
   if (incoming?.paused && !incoming.ended && now - (schedule.createdAt ?? now) >= 350) {
     if (!schedule.faultRecorded) {
       schedule.faultRecorded = true;
-      recordPlaybackDiagnostic('crossfade-deck-paused', playbackDiagnosticSnapshot('incoming-deck-paused'));
+      recordPlaybackDiagnostic('crossfade-deck-paused', {
+        attemptId: schedule.attemptId,
+        reason: 'incoming-deck-paused',
+        outgoingIndex: schedule.outgoingIndex,
+        incomingIndex: schedule.incomingIndex,
+        duration: schedule.duration,
+        contextState: state._audioContext?.state || 'missing',
+        incomingPaused: Boolean(incoming.paused),
+        incomingCurrentTime: incomingTime,
+        readyState: Number(incoming.readyState) || 0,
+        networkState: Number(incoming.networkState) || 0,
+        mediaErrorCode: Number(incoming.error?.code) || 0,
+        streamKind: diagnosticDeckStreamKind(incoming, schedule.incomingIndex),
+      });
     }
     schedule.resolve(false);
     return;
@@ -4356,7 +5627,23 @@ function settleScheduledCrossfade() {
   if (clockStalledFor >= 2500 && mediaStalledFor >= 2500) {
     if (!schedule.faultRecorded) {
       schedule.faultRecorded = true;
-      recordPlaybackDiagnostic('crossfade-clock-stall', playbackDiagnosticSnapshot('worker-clock-stall'));
+      recordPlaybackDiagnostic('crossfade-clock-stall', {
+        attemptId: schedule.attemptId,
+        reason: 'worker-clock-and-media-stalled',
+        outgoingIndex: schedule.outgoingIndex,
+        incomingIndex: schedule.incomingIndex,
+        duration: schedule.duration,
+        contextState: state._audioContext?.state || 'missing',
+        clockStalledFor: Math.round(clockStalledFor),
+        mediaStalledFor: Math.round(mediaStalledFor),
+        currentTime: Math.round(clockValue * 1000) / 1000,
+        incomingCurrentTime: incomingTime,
+        incomingPaused: Boolean(incoming?.paused),
+        readyState: Number(incoming?.readyState) || 0,
+        networkState: Number(incoming?.networkState) || 0,
+        mediaErrorCode: Number(incoming?.error?.code) || 0,
+        streamKind: diagnosticDeckStreamKind(incoming, schedule.incomingIndex),
+      });
     }
     schedule.resolve(false);
   }
@@ -4421,7 +5708,7 @@ function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
   });
 }
 
-async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
+async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnosticTrace = null) {
   const epoch = state._playbackEpoch;
   const signal = state._playbackAbort.signal;
   const foreground = state._playbackRequest;
@@ -4444,13 +5731,69 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
   let succeeded = false;
   state._crossfading = true;
   state._crossfadePausedByUser = false;
+  let failureStage = 'crossfade-start';
+  let recoveredSchedule = false;
+  const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'crossfade';
+    diagnosticTrace.reason = 'handoff-started';
+  }
+  if (state._diagnosticBuild) {
+    recordPlaybackDiagnostic('crossfade-started', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: state._deckTrack,
+      outgoingIndex,
+      incomingIndex,
+      duration,
+      crossfadeCurve: curve,
+      graphAvailable: Boolean(graphAvailable),
+      crossfadeMode: graphAvailable ? 'audio-clock' : 'media-clock',
+      contextState: context?.state || 'missing',
+      outgoingPaused: Boolean(outgoing.paused),
+      incomingPaused: Boolean(incoming.paused),
+      outgoingCurrentTime: Number(outgoing.currentTime) || 0,
+      incomingCurrentTime: Number(incoming.currentTime) || 0,
+      streamKind: diagnosticDeckStreamKind(incoming, incomingIndex),
+    });
+  }
+  const reportHandoffFailure = (stage, failureReason, error = null) => {
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'crossfade';
+      diagnosticTrace.reason = failureReason;
+      if (error) diagnosticTrace.errorName = playbackErrorName(error);
+    }
+    if (state._diagnosticBuild) {
+      recordPlaybackDiagnostic('crossfade-handoff-failed', {
+        attemptId: diagnosticTrace?.attemptId,
+        trackIndex: state._deckTrack,
+        failureStage: stage,
+        failureReason,
+        errorName: error ? playbackErrorName(error) : '',
+        outgoingIndex,
+        incomingIndex,
+        duration,
+        crossfadeCurve: curve,
+        graphAvailable: Boolean(graphAvailable),
+        crossfadeMode: graphAvailable ? 'audio-clock' : 'media-clock',
+        contextState: context?.state || 'missing',
+        incomingPaused: Boolean(incoming.paused),
+        incomingCurrentTime: Number(incoming.currentTime) || 0,
+        elapsedMs: typeof performance !== 'undefined'
+          ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+      });
+    }
+  };
   try {
     setCrossfadeStatus('mixing');
     let completed;
     if (graphAvailable && state._deckAudioGraphs[outgoingIndex] && state._deckAudioGraphs[incomingIndex]) {
-      const resumed = await resumeAudioGraph(signal);
+      failureStage = 'audio-context-resume';
+      const resumed = await resumeAudioGraph(signal, diagnosticTrace);
       if (!ownsTransition() || state._userPaused) return null;
-      if (!resumed) return false;
+      if (!resumed) {
+        reportHandoffFailure(failureStage, 'audio-context-resume-failed');
+        return false;
+      }
       const startTime = context.currentTime + 0.015;
       const steps = 129;
       const outgoingValues = new Float32Array(steps);
@@ -4461,31 +5804,46 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
         incomingValues[i] = inGain;
       }
       schedule = {
-        token, outgoingIndex, incomingIndex, curve, isCurrent: ownsTransition,
+        token, attemptId: diagnosticTrace?.attemptId, outgoingIndex, incomingIndex,
         startTime, duration, endTime: startTime + duration, createdAt: Date.now(),
         lastClockValue: context.currentTime, lastClockAdvanceAt: Date.now(),
         lastIncomingTime: Number(incoming.currentTime) || 0, lastIncomingAdvanceAt: Date.now(),
         faultRecorded: false,
       };
       state._crossfadeSchedule = schedule;
+      failureStage = 'audio-clock-schedule';
       scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
       scheduleAudioParamCurve(state._deckAudioGraphs[incomingIndex].mixGain.gain, incomingValues, startTime, duration);
       completed = await waitForCrossfadeSchedule(schedule, token);
     } else {
+      failureStage = 'media-clock-fallback';
       completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
     }
     if (!ownsTransition() || state._userPaused) return null;
     if (!completed) {
+      recoveredSchedule = true;
+      failureStage = 'crossfade-recovery-resume';
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'crossfade';
+        diagnosticTrace.reason = 'schedule-recovery';
+      }
       // Media can report playing while its output graph is suspended. Resume
       // output even when no additional media play() call is necessary.
-      const resumed = await resumeAudioGraph(signal);
+      const resumed = await resumeAudioGraph(signal, diagnosticTrace);
       if (!ownsTransition() || state._userPaused) return null;
-      if (!resumed) return false;
+      if (!resumed) {
+        reportHandoffFailure(failureStage, 'audio-context-resume-failed');
+        return false;
+      }
       if (incoming.paused) {
+        failureStage = 'incoming-deck-replay';
         const played = await playDeckWithDeadline(incoming, incomingIndex, signal,
-          () => ownsTransition() && !state._userPaused);
+          () => ownsTransition() && !state._userPaused, diagnosticTrace);
         if (!ownsTransition() || state._userPaused) return null;
-        if (!played) return false;
+        if (!played) {
+          reportHandoffFailure(failureStage, 'incoming-play-failed');
+          return false;
+        }
       }
     }
     if (state._crossfadeSchedule === schedule) state._crossfadeSchedule = null;
@@ -4496,13 +5854,33 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token) {
     state._deckGains[outgoingIndex] = 0;
     state._deckGains[incomingIndex] = 1;
     syncCrossfadeVolume();
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'crossfade';
+      diagnosticTrace.reason = 'handoff-completed';
+    }
+    if (state._diagnosticBuild) {
+      recordPlaybackDiagnostic('crossfade-completed', {
+        attemptId: diagnosticTrace?.attemptId,
+        trackIndex: state._deckTrack,
+        result: 'completed',
+        outgoingIndex,
+        incomingIndex,
+        duration,
+        crossfadeCurve: curve,
+        graphAvailable: Boolean(graphAvailable),
+        recoveredSchedule,
+        crossfadeMode: graphAvailable ? 'audio-clock' : 'media-clock',
+        elapsedMs: typeof performance !== 'undefined'
+          ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+        contextState: context?.state || 'missing',
+        incomingCurrentTime: Number(incoming.currentTime) || 0,
+      });
+    }
     succeeded = true;
     return true;
   } catch (error) {
     if (!ownsTransition() || state._userPaused) return null;
-    recordPlaybackDiagnostic('crossfade-handoff-failed', {
-      error: String(error?.name || error || 'unknown').slice(0, 80),
-    });
+    reportHandoffFailure(failureStage, 'handoff-exception', error);
     return false;
   } finally {
     if (ownsTransition()) {
@@ -4523,14 +5901,37 @@ async function prefetchUpcomingCrossfadeTrack() {
   if (nextTi === undefined) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
   const requestToken = ++state._crossfadePrefetchToken;
+  const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(nextTi) : null;
+  const isCurrent = () => requestToken === state._crossfadePrefetchToken
+    && state.active && !state._crossfading && standby !== state._deckIndex
+    && upcomingTrackIndex() === nextTi;
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
-  const audio = await prepareCrossfadeDeck(standby, nextTi);
-  if (requestToken !== state._crossfadePrefetchToken
-      || !state.active
-      || state._crossfading
-      || standby === state._deckIndex
-      || upcomingTrackIndex() !== nextTi) return;
+  let audio = null;
+  try {
+    audio = await prepareCrossfadeDeck(standby, nextTi, { diagnosticTrace, isCurrent });
+  } catch (error) {
+    recordPlaybackDiagnostic('prefetch-failed', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: nextTi,
+      deckIndex: standby,
+      reason: 'prefetch-exception',
+      errorName: playbackErrorName(error),
+      elapsedMs: diagnosticTrace
+        ? Math.max(0, Math.round(performance.now() - diagnosticTrace.startedAt)) : 0,
+    });
+    return null;
+  }
+  if (!isCurrent()) return null;
+  if (state._diagnosticBuild) {
+    recordPlaybackDiagnostic('prefetch-result', {
+      ...(customStartDiagnosticDetails(diagnosticTrace, audio ? 'started' : 'failed') || {}),
+      trackIndex: nextTi,
+      deckIndex: standby,
+      result: audio ? 'ready' : 'not-ready',
+    });
+  }
   if (state.crossfadeSeconds > 0) setCrossfadeStatus(audio ? 'ready' : 'fallback');
+  return audio;
 }
 
 function upcomingCrossfadeDeckReady() {
@@ -4538,7 +5939,8 @@ function upcomingCrossfadeDeckReady() {
   if (nextTi === undefined) return false;
   const standby = state._deckIndex === 0 ? 1 : 0;
   const audio = state._decks[standby];
-  return Boolean(audio && state._deckTracks[standby] === nextTi && audio.readyState >= 2);
+  return Boolean(audio && state._deckTracks[standby] === nextTi
+    && audio.readyState >= 2 && !state._deckHlsFailed?.[standby]);
 }
 
 function upcomingTrackIndex() {
@@ -4560,62 +5962,110 @@ function refreshUpcomingCrossfadePreparation() {
     resetDeck(state._decks[standby], standby);
   }
   if (state.active && !state.busy && currentDeckAudio()) {
-    void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+    void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
   }
 }
 
 async function runPlaybackOperation(label, operation) {
   const epoch = state._playbackEpoch;
-  const request = {};
+  state._diagnosticOperationSequence = (Number(state._diagnosticOperationSequence) || 0) + 1;
+  const operationId = state._diagnosticOperationSequence;
+  const request = { operationId };
+  const startedAt = state._diagnosticBuild && typeof performance !== 'undefined' ? performance.now() : 0;
   state._playbackRequest = request;
   state.busy = true;
   const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request;
+  let result = 'unknown';
+  if (state._diagnosticBuild) {
+    recordPlaybackDiagnostic('playback-operation-started', {
+      operationId,
+      operation: label,
+      trackIndex: state.queue[state.pos] ?? null,
+      queuePosition: state.pos,
+      queueLength: state.queue.length,
+      deckIndex: state._deckIndex,
+      userPaused: Boolean(state._userPaused),
+      audioContextState: state._audioContext?.state || 'missing',
+    });
+  }
   try {
-    return await operation(isCurrent);
+    const value = await operation(isCurrent);
+    result = value === true ? 'succeeded' : (value === false ? 'failed' : (value === null ? 'cancelled' : 'completed'));
+    return value;
   } catch (error) {
+    result = error?.name === 'AbortError' ? 'cancelled' : 'exception';
     if (isCurrent() && error?.name !== 'AbortError') {
-      recordPlaybackDiagnostic('playback-operation-failed', { operation: label, error: String(error?.name || error) });
+      recordPlaybackDiagnostic('playback-operation-failed', {
+        operationId, operation: label, errorName: playbackErrorName(error),
+      });
     }
     return false;
   } finally {
     if (isCurrent()) {
+      if (state._diagnosticBuild) {
+        recordPlaybackDiagnostic('playback-operation-finished', {
+          operationId,
+          operation: label,
+          result,
+          elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          suspended: Boolean(state.suspended),
+          deckIndex: state._deckIndex,
+          trackIndex: state._deckTrack,
+          audioContextState: state._audioContext?.state || 'missing',
+        });
+      }
       state.busy = false;
       try { updateHub(); } catch (error) {
-        recordPlaybackDiagnostic('playback-ui-failed', { operation: label, error: String(error?.name || error) });
+        recordPlaybackDiagnostic('playback-ui-failed', { operationId, operation: label, errorName: playbackErrorName(error) });
       }
     }
   }
 }
 
-async function playDeckWithDeadline(audio, index, signal, isCurrent) {
+async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticTrace = null) {
   const source = audio.src;
   const preparation = state._deckPrepareTokens[index];
+  const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
   if (!isCurrent() || signal?.aborted || state._userPaused) return null;
   const playTokens = state._deckPlayTokens || (state._deckPlayTokens = []);
   const playToken = (playTokens[index] || 0) + 1;
   playTokens[index] = playToken;
   let abandoned = false;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'audio-play';
+    diagnosticTrace.reason = 'play-pending';
+  }
   try {
     await withDeadline(() => {
       const playing = audio.play();
-      // A late completion may share a source with a newer explicit resume.
-      // Only the play attempt that still owns this deck may pause it.
       Promise.resolve(playing).then(() => {
         const eligibleSource = !audio.src || (state._deckPrepareTokens[index] === preparation && audio.src === source);
         if ((abandoned || !isCurrent() || state._userPaused)
             && state._deckPlayTokens[index] === playToken
             && state._decks[index] === audio && eligibleSource) {
           try { audio.pause(); } catch (error) {
-            recordPlaybackDiagnostic('late-play-cleanup-failed', { error: String(error?.name || error) });
+            recordPlaybackDiagnostic('late-play-cleanup-failed', { error: playbackErrorName(error) });
           }
         }
       }, () => {});
       return playing;
     }, 5000, signal);
     if (!isCurrent() || state._userPaused) return null;
+    if (diagnosticTrace) {
+      diagnosticTrace.reason = 'play-fulfilled';
+      diagnosticTrace.playElapsedMs = typeof performance !== 'undefined'
+        ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+    }
     return true;
   } catch (error) {
     const owned = isCurrent();
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'audio-play';
+      diagnosticTrace.reason = error?.name === 'TimeoutError' ? 'play-timeout' : 'play-rejected';
+      diagnosticTrace.errorName = playbackErrorName(error);
+      diagnosticTrace.playElapsedMs = typeof performance !== 'undefined'
+        ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+    }
     if (owned && state._deckPlayTokens[index] === playToken
         && state._decks[index] === audio && audio.src === source) {
       abandoned = true;
@@ -4627,7 +6077,7 @@ async function playDeckWithDeadline(audio, index, signal, isCurrent) {
   }
 }
 
-async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
+async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTrace = null) {
   const epoch = state._playbackEpoch;
   const request = state._playbackRequest;
   const signal = state._playbackAbort?.signal;
@@ -4635,10 +6085,25 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   const isCurrent = () => state.active && epoch === state._playbackEpoch
     && state._playbackRequest === request && state.meta[ti] === meta && !signal?.aborted;
   if (!isCurrent()) return null;
-  if (meta?.requiresNativePlayback) return false;
+  if (meta?.requiresNativePlayback) {
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'native-fallback';
+      diagnosticTrace.reason = 'native-fallback-required';
+      diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+    }
+    return false;
+  }
   if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
       || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
-    if (!ensureAutoLevelAudioGraph()) return false;
+    if (!ensureAutoLevelAudioGraph()) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'audio-graph';
+        diagnosticTrace.audioGraphPhase = 'playback';
+        diagnosticTrace.audioGraphReason = 'graph-unavailable';
+        diagnosticTrace.reason = 'audio-graph-unavailable';
+      }
+      return false;
+    }
   }
   const outgoing = currentDeckAudio();
   const outgoingIndex = state._deckIndex;
@@ -4653,10 +6118,22 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   };
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!isCurrent()) return null;
-    incoming = await prepareCrossfadeDeck(incomingIndex, ti, { forceRefresh: attempt > 0, signal, isCurrent });
+    const prepareOptions = { forceRefresh: attempt > 0, signal, isCurrent };
+    if (diagnosticTrace) prepareOptions.diagnosticTrace = diagnosticTrace;
+    incoming = await prepareCrossfadeDeck(incomingIndex, ti, prepareOptions);
     if (!isCurrent()) return null;
     if (state._userPaused) return deferPaused();
-    if (!incoming) continue;
+    if (!incoming) {
+      if (meta.requiresNativePlayback) {
+        if (diagnosticTrace) {
+          diagnosticTrace.stage = 'native-fallback';
+          diagnosticTrace.reason = 'native-fallback-required';
+          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+        }
+        return false;
+      }
+      continue;
+    }
     const preparedToken = state._deckPrepareTokens[incomingIndex];
     const source = incoming.src;
     ownsIncoming = () => isCurrent() && state._decks[incomingIndex] === incoming
@@ -4671,11 +6148,18 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
     pauseSoundCloudTransport();
     pauseSoundCloud();
     try {
-      const resumed = await resumeAudioGraph(signal);
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'audio-context-resume';
+        diagnosticTrace.reason = 'resume-pending';
+      }
+      const resumed = await resumeAudioGraph(signal, diagnosticTrace);
       if (!ownsIncoming()) return null;
       if (state._userPaused) return deferPaused();
-      if (!resumed) throw new Error('Audio graph did not resume');
-      const played = await playDeckWithDeadline(incoming, incomingIndex, signal, ownsIncoming);
+      if (!resumed) {
+        if (diagnosticTrace) diagnosticTrace.reason = 'audio-context-resume-failed';
+        throw new Error('Audio graph did not resume');
+      }
+      const played = await playDeckWithDeadline(incoming, incomingIndex, signal, ownsIncoming, diagnosticTrace);
       if (!ownsIncoming()) return null;
       if (state._userPaused) return deferPaused();
       if (!played) return null;
@@ -4683,8 +6167,19 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
     } catch (error) {
       if (!isCurrent() || state._decks[incomingIndex] !== incoming
           || state._deckPrepareTokens[incomingIndex] !== preparedToken) return null;
+      if (diagnosticTrace) {
+        diagnosticTrace.errorName = playbackErrorName(error);
+        if (diagnosticTrace.stage === 'audio-context-resume' && diagnosticTrace.reason === 'resume-pending') {
+          diagnosticTrace.reason = 'audio-context-resume-error';
+        }
+      }
       recordPlaybackDiagnostic('custom-start-retry', {
-        attempt: attempt + 1, error: String(error?.name || error || 'unknown').slice(0, 80),
+        attempt: attempt + 1,
+        errorName: playbackErrorName(error),
+        ...(diagnosticTrace ? {
+          stage: diagnosticTrace.stage,
+          reason: diagnosticTrace.reason,
+        } : {}),
       });
       resetDeck(incoming, incomingIndex);
       incoming = null;
@@ -4707,10 +6202,12 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   state._nativeTrack = null;
   installBetterFeedPipBridge();
   if (canMix) {
-    const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token);
+    const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token, diagnosticTrace);
     if (!ownsIncoming() || state._crossfadeToken !== token) return null;
     if (state._userPaused) return deferPaused();
-    if (mixed !== true) return mixed === false ? false : null;
+    if (mixed !== true) {
+      return mixed === false ? false : null;
+    }
   }
   if (!ownsIncoming()) return null;
   if (outgoing && outgoing !== incoming && state._decks[outgoingIndex] === outgoing) resetDeck(outgoing, outgoingIndex);
@@ -4722,8 +6219,12 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade) {
   clearTimeout(state._customPlaybackRetryTimer);
   state._customPlaybackRetryTimer = null;
   state.suspended = false;
+  if (diagnosticTrace) {
+    diagnosticTrace.stage = 'custom-deck';
+    diagnosticTrace.reason = 'started';
+  }
   setTimeout(() => {
-    if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { error: String(error?.name || error) }));
+    if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
   }, 0);
   setTimeout(() => {
     if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
@@ -4908,7 +6409,7 @@ function trackAvailable(ti) {
   return Boolean(meta && !meta.unavailable && (meta.sourcePage || state.els[ti]));
 }
 
-async function playWithSoundCloudSession(ti, countPlay = true) {
+async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace = null) {
   const epoch = state._playbackEpoch;
   const request = state._playbackRequest;
   const signal = state._playbackAbort?.signal;
@@ -4917,14 +6418,38 @@ async function playWithSoundCloudSession(ti, countPlay = true) {
   const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request
     && state.meta[ti] === meta && state.els[ti] === el && !signal?.aborted;
   if (!isCurrent()) return null;
-  if (!meta?.requiresNativePlayback || !el || !document.body.contains(el)) return false;
+  if (!meta?.requiresNativePlayback) return false;
+  if (!el || !document.body.contains(el)) {
+    recordPlaybackDiagnostic('native-fallback-unavailable', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: ti,
+      reason: el ? 'track-element-detached' : 'track-element-missing',
+      elementFound: Boolean(el),
+      elementAttached: Boolean(el && document.body.contains(el)),
+    });
+    return false;
+  }
   if (state._userPaused) return null;
   stopCrossfadeDecks();
   pauseSoundCloudTransport();
   pauseSoundCloud();
   state.suspended = false;
   let started = false;
+  let buttonFound = false;
+  let clickIssued = false;
+  let nativeAudioFound = false;
+  let playerMatched = false;
+  let nativeTransportPaused = null;
+  let pollCount = 0;
   state._nativeTrack = ti;
+  recordPlaybackDiagnostic('native-fallback-started', {
+    attemptId: diagnosticTrace?.attemptId,
+    trackIndex: ti,
+    reason: meta.nativePlaybackReason || 'preview-only',
+    elementFound: true,
+    elementAttached: true,
+    pollLimit: 20,
+  });
   try {
     el.scrollIntoView({ block: 'center', behavior: 'smooth' });
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
@@ -4933,23 +6458,59 @@ async function playWithSoundCloudSession(ti, countPlay = true) {
     const button = el.querySelector(
       'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
     ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
-    if (!button) { state._nativeTrack = null; return false; }
+    buttonFound = Boolean(button);
+    if (!buttonFound) {
+      state._nativeTrack = null;
+      recordPlaybackDiagnostic('native-fallback-unavailable', {
+        attemptId: diagnosticTrace?.attemptId,
+        trackIndex: ti,
+        reason: 'play-button-missing',
+        elementFound: true,
+        elementAttached: true,
+        buttonFound: false,
+        clickIssued: false,
+      });
+      return false;
+    }
     button.click();
+    clickIssued = true;
+    recordPlaybackDiagnostic('native-fallback-command-issued', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: ti,
+      reason: meta.nativePlaybackReason || 'preview-only',
+      buttonFound,
+      clickIssued,
+      pollLimit: 20,
+    });
     const wanted = normalizeTrackUrl(meta.link);
     for (let attempt = 0; attempt < 20; attempt++) {
+      pollCount = attempt + 1;
       await withDeadline(() => wait(150), 1000, signal);
       if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
       const nativeAudio = [...document.querySelectorAll('audio')]
         .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
+      nativeAudioFound = Boolean(nativeAudio);
       const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
-      if (wanted && normalizeTrackUrl(playerLink?.href) === wanted && (nativeAudio || !soundCloudPaused())) {
+      playerMatched = Boolean(wanted && normalizeTrackUrl(playerLink?.href) === wanted);
+      nativeTransportPaused = Boolean(soundCloudPaused());
+      if (playerMatched && (nativeAudioFound || !nativeTransportPaused)) {
         started = true;
         break;
       }
     }
     if (!started) {
       state._nativeTrack = null;
-      recordPlaybackDiagnostic('native-track-not-acknowledged', { trackIndex: ti });
+      recordPlaybackDiagnostic('native-track-not-acknowledged', {
+        attemptId: diagnosticTrace?.attemptId,
+        trackIndex: ti,
+        reason: meta.nativePlaybackReason || 'preview-only',
+        buttonFound,
+        clickIssued,
+        pollCount,
+        playerMatched,
+        nativeAudioFound,
+        nativeTransportPaused,
+      });
       return false;
     }
     state._pendingPlaybackTrack = null;
@@ -4957,9 +6518,20 @@ async function playWithSoundCloudSession(ti, countPlay = true) {
     state.lastProgress = 0;
     state.suspended = false;
     if (countPlay) trackPlayed(ti);
+    recordPlaybackDiagnostic('native-fallback-succeeded', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: ti,
+      reason: meta.nativePlaybackReason || 'preview-only',
+      buttonFound,
+      clickIssued,
+      pollCount,
+      playerMatched,
+      nativeAudioFound,
+      nativeTransportPaused,
+    });
     if (!state._nativeSessionNoticeShown) {
       state._nativeSessionNoticeShown = true;
-      showMergeToast('Premium track: using your SoundCloud session (crossfade and EQ paused)');
+      showMergeToast('SoundCloud playback for this track; True Shuffle crossfade and audio processing are paused');
     }
     setTimeout(() => {
       if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
@@ -4968,7 +6540,15 @@ async function playWithSoundCloudSession(ti, countPlay = true) {
   } catch (error) {
     if (!isCurrent() || signal?.aborted) return null;
     state._nativeTrack = null;
-    recordPlaybackDiagnostic('native-start-failed', { error: String(error?.name || error) });
+    recordPlaybackDiagnostic('native-start-failed', {
+      attemptId: diagnosticTrace?.attemptId,
+      trackIndex: ti,
+      errorName: playbackErrorName(error),
+      reason: meta.nativePlaybackReason || 'preview-only',
+      buttonFound,
+      clickIssued,
+      pollCount,
+    });
     return false;
   } finally {
     if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
@@ -4981,7 +6561,7 @@ async function playWithSoundCloudSession(ti, countPlay = true) {
 }
 
 
-async function playAt(idx, countPlay = true, attemptedCustomTracks = null) {
+async function playAt(idx, countPlay = true, attemptedCustomTracks = null, priorFailedCandidates = 0) {
   const epoch = state._playbackEpoch;
   const request = state._playbackRequest;
   const meta = state.meta[idx];
@@ -4992,43 +6572,153 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null) {
     state._pendingPlaybackTrack = { ti: idx, countPlay, epoch };
     return null;
   }
+  const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(idx) : null;
+  priorFailedCandidates = Math.max(0, Number(priorFailedCandidates) || 0);
   const requestedFade = currentDeckAudio()
     ? (state._crossfadePending
       ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
       : (state.crossfadeManual ? state.crossfadeSeconds : 0))
     : 0;
-  const custom = await playWithCrossfadeDeck(idx, countPlay, requestedFade);
+  const custom = await playWithCrossfadeDeck(idx, countPlay, requestedFade, diagnosticTrace);
   if (!isCurrent() || state._userPaused || custom === null) return null;
-  if (custom) return true;
+  if (custom) {
+    if (state._diagnosticBuild) {
+      const precedingFailedCandidates = priorFailedCandidates + (attemptedCustomTracks?.size || 0);
+      recordPlaybackDiagnostic('custom-start-succeeded', {
+        ...(customStartDiagnosticDetails(diagnosticTrace, 'started') || {}),
+        trackIndex: idx,
+        deckIndex: state._deckIndex,
+        startedVia: 'custom-deck',
+        outcome: 'started',
+        precedingFailedCandidates,
+      });
+      if (precedingFailedCandidates) {
+        recordPlaybackDiagnostic('custom-start-recovered', {
+          attemptId: diagnosticTrace?.attemptId,
+          trackIndex: idx,
+          startedVia: 'custom-deck',
+          precedingFailedCandidates,
+        });
+      }
+    }
+    return true;
+  }
   stopCrossfadeDecks();
   setCrossfadeStatus('fallback');
   if (meta.requiresNativePlayback) {
-    const native = await playWithSoundCloudSession(idx, countPlay);
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'native-fallback';
+      diagnosticTrace.reason = 'native-start-pending';
+      diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+    }
+    const native = await playWithSoundCloudSession(idx, countPlay, diagnosticTrace);
     if (!isCurrent() || state._userPaused || native === null) return null;
-    if (native) return true;
+    if (native) {
+      if (diagnosticTrace) diagnosticTrace.nativeOutcome = 'started';
+      if (state._diagnosticBuild) {
+        const precedingFailedCandidates = priorFailedCandidates + (attemptedCustomTracks?.size || 0);
+        recordPlaybackDiagnostic('custom-start-succeeded', {
+          ...(customStartDiagnosticDetails(diagnosticTrace, 'started') || {}),
+          trackIndex: idx,
+          deckIndex: state._deckIndex,
+          startedVia: 'native-fallback',
+          outcome: 'started',
+          nativeFallbackReason: meta.nativePlaybackReason || 'preview-only',
+          precedingFailedCandidates,
+        });
+        if (precedingFailedCandidates) {
+          recordPlaybackDiagnostic('custom-start-recovered', {
+            attemptId: diagnosticTrace?.attemptId,
+            trackIndex: idx,
+            startedVia: 'native-fallback',
+            precedingFailedCandidates,
+          });
+        }
+      }
+      return true;
+    }
+    if (diagnosticTrace) {
+      diagnosticTrace.stage = 'native-fallback';
+      diagnosticTrace.reason = 'native-start-failed';
+      diagnosticTrace.nativeOutcome = 'not-acknowledged';
+    }
   }
   const attempted = attemptedCustomTracks || new Set();
   attempted.add(idx);
-  recordPlaybackDiagnostic('custom-start-exhausted', { trackIndex: idx, attempted: attempted.size });
   const currentQueueIndex = state.queue.indexOf(idx, state.pos);
   if (currentQueueIndex === state.pos && state.queue.length - state.pos > 1) {
     state.queue.splice(currentQueueIndex, 1);
     state.queue.push(idx);
   }
   const replacement = state.queue.slice(state.pos).find(ti => trackAvailable(ti) && !attempted.has(ti));
-  if (replacement !== undefined) return playAt(replacement, countPlay, attempted);
+  if (state._diagnosticBuild) {
+    const details = {
+      trackIndex: idx,
+      attempted: attempted.size,
+      priorFailedCandidates,
+      passExhausted: replacement === undefined,
+      queuePosition: state.pos,
+      queueLength: state.queue.length,
+    };
+    if (diagnosticTrace) Object.assign(details, customStartDiagnosticDetails(diagnosticTrace));
+    recordPlaybackDiagnostic(
+      replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
+      details,
+    );
+  } else {
+    recordPlaybackDiagnostic('custom-start-exhausted', { trackIndex: idx, attempted: attempted.size });
+  }
+  if (replacement !== undefined) return playAt(replacement, countPlay, attempted, priorFailedCandidates);
   state.suspended = true;
   showMergeToast('Custom playback unavailable — retrying shortly');
   updateHub();
   clearTimeout(state._customPlaybackRetryTimer);
+  if (state._diagnosticBuild) {
+    recordPlaybackDiagnostic('custom-retry-scheduled', {
+      trackIndex: state.queue[state.pos] ?? null,
+      attempted: attempted.size,
+      delayMs: 5000,
+      priorFailedCandidates: priorFailedCandidates + attempted.size,
+      queuePosition: state.pos,
+      queueLength: state.queue.length,
+    });
+  }
   const timer = setTimeout(() => {
     if (!isCurrent() || state._customPlaybackRetryTimer !== timer) return;
     state._customPlaybackRetryTimer = null;
-    if (state.busy || state._userPaused) return;
     const retryTrack = state.queue[state.pos];
-    if (retryTrack === undefined) return;
+    if (state._diagnosticBuild) {
+      recordPlaybackDiagnostic('custom-retry-fired', {
+        trackIndex: retryTrack ?? null,
+        queuePosition: state.pos,
+        queueLength: state.queue.length,
+        priorFailedCandidates: priorFailedCandidates + attempted.size,
+        busy: Boolean(state.busy),
+        userPaused: Boolean(state._userPaused),
+      });
+    }
+    if (state.busy || state._userPaused) {
+      if (state._diagnosticBuild) {
+        recordPlaybackDiagnostic('custom-retry-skipped', {
+          reason: state.busy ? 'busy' : 'user-paused',
+          priorFailedCandidates: priorFailedCandidates + attempted.size,
+          trackIndex: retryTrack ?? null,
+        });
+      }
+      return;
+    }
+    if (retryTrack === undefined) {
+      if (state._diagnosticBuild) {
+        recordPlaybackDiagnostic('custom-retry-skipped', {
+          reason: 'empty-queue',
+          priorFailedCandidates: priorFailedCandidates + attempted.size,
+        });
+      }
+      return;
+    }
     state.suspended = false;
-    void runPlaybackOperation('automatic retry', () => playAt(retryTrack, countPlay));
+    void runPlaybackOperation('automatic retry', () =>
+      playAt(retryTrack, countPlay, null, priorFailedCandidates + attempted.size));
   }, 5000);
   state._customPlaybackRetryTimer = timer;
   return false;
@@ -5085,7 +6775,7 @@ async function prevTrack() {
     if (historyIndex < 0) { seekTo(0); return; }
   } catch (error) {
     recordPlaybackDiagnostic('playback-operation-failed', {
-      operation: 'previous', error: String(error?.name || error),
+      operation: 'previous', errorName: playbackErrorName(error),
     });
     return false;
   }
@@ -5950,7 +7640,7 @@ function stop() {
   state._customPlaybackRetryTimer = null;
   const safely = operation => {
     try { operation(); } catch (error) {
-      recordPlaybackDiagnostic('stop-cleanup-failed', { error: String(error?.name || error) });
+      recordPlaybackDiagnostic('stop-cleanup-failed', { errorName: playbackErrorName(error) });
     }
   };
   safely(() => state._watcherCleanup?.());
@@ -6187,15 +7877,32 @@ function startWatcher() {
       deckStall.current = timing.current;
       deckStall.stalledSince = null;
     } else {
-      const stallKind = deckHasBufferedAhead(deck, timing.current) ? 'decoder' : 'network';
+      const bufferedDataAvailable = deckHasBufferedAhead(deck, timing.current);
+      const stallKind = bufferedDataAvailable ? 'decoder' : 'network';
       const stallThreshold = stallKind === 'decoder' ? 15000 : 12000;
       if (deckStall.stalledSince === null) deckStall.stalledSince = stallNow;
       const stalledFor = stallNow - deckStall.stalledSince;
       if (deckStall.retryPending || stalledFor >= stallThreshold) {
         if (deckStall.recoveryAttempts >= 2) {
           recordPlaybackDiagnostic('recovery-exhausted', {
-            reason: stallKind, attempts: deckStall.recoveryAttempts,
+            trackIndex: state._deckTrack,
+            deckIndex: index,
+            reason: stallKind,
+            attempts: deckStall.recoveryAttempts,
             position: Math.round(deckStall.position * 10) / 10,
+            stalledFor,
+            stallThresholdMs: stallThreshold,
+            duration: Number(deck?.duration) || 0,
+            readyState: Number(deck?.readyState) || 0,
+            networkState: Number(deck?.networkState) || 0,
+            mediaErrorCode: Number(deck?.error?.code) || 0,
+            playbackRate: Number(deck?.playbackRate) || 1,
+            bufferedDataAvailable,
+            streamKind: diagnosticDeckStreamKind(deck, index),
+            contextState: state._audioContext?.state || 'missing',
+            crossfading: Boolean(state._crossfading),
+            queuePosition: state.pos,
+            queueLength: state.queue.length,
           });
           resetDeckStall();
           await advanceAtNaturalEnd();

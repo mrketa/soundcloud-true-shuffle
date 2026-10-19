@@ -146,12 +146,22 @@ function harness({ stored = {}, deniedRead = false, deniedWrite = false, gm = nu
     syncCrossfadeVolume() {}, syncPlaybackVolumeControls() {}, setSoundCloudVolume() {},
     currentDeckAudio: () => sandbox.state?._decks[sandbox.state._deckIndex] || null,
     checkSleepTimerDeadline() {}, paused: () => false,
+    recordPlaybackDiagnostic() {},
     SVG: { close: '' }, esc: value => String(value),
   });
   const start = source.indexOf('const pageWindow =');
   const end = source.indexOf('\n};', source.indexOf('const state =', start)) + 3;
   sandbox.state = vm.runInContext(`${source.slice(start, end)}\nstate;`, sandbox);
-  const load = names => vm.runInContext(names.map(extractFunction).join('\n'), sandbox);
+  const diagnosticSupport = [
+    'safeDiagnosticVersion', 'playbackErrorName', 'sanitizeDiagnosticRecord',
+    'sanitizePlaybackDiagnostics', 'playbackDiagnosticHostWindow',
+    'playbackDiagnosticPageKind', 'playbackDiagnosticEnvironment',
+    'playbackDiagnosticCapabilities', 'diagnosticDeckStreamKind',
+  ];
+  const load = names => vm.runInContext(
+    [...new Set([...diagnosticSupport, ...names])].map(extractFunction).join('\n'),
+    sandbox,
+  );
   const graphFunctions = ['ensureCrossfadeDecks', 'retireAudioGraph', 'ensureAutoLevelAudioGraph', 'syncDeckProcessingRouting',
     'syncSafetyClipper', 'resumeAudioGraph', 'suspendAudioGraph', 'syncEqualizer', 'autoLevelTrackKey',
     'applyCachedAutoLevel', 'calculateAutoLevelGain', 'processAutoLevel', 'saveAutoLevelCacheSoon', 'setAudioParamImmediately'];
@@ -282,6 +292,14 @@ test('clipper-only saved settings build processing before preparation, while all
     h.state.active = true;
     h.state.meta = [{ id: 'full-track', link: '/artist/track' }];
     h.sandbox.resolveCrossfadeStreams = async () => ['https://media.example/stream'];
+    h.sandbox.isHlsStreamUrl = () => false;
+    h.sandbox.loadStreamOnDeck = async (audio, _index, url) => {
+      audio.preload = 'auto';
+      audio.src = url;
+      const source = audio.src;
+      audio.load();
+      return { supported: true, ready: true, player: null, source };
+    };
     h.sandbox.waitForDeck = async () => true;
     h.sandbox.deckIsPreviewLimited = () => false;
     h.sandbox.resetDeck = (audio, index) => {
@@ -290,17 +308,20 @@ test('clipper-only saved settings build processing before preparation, while all
       h.state._deckTracks[index] = null;
       h.state._deckGains[index] = 0;
     };
-    h.sandbox.recordPlaybackDiagnostic = (event, detail) => { throw new Error(`${event}: ${JSON.stringify(detail)}`); };
+    const diagnostics = [];
+    h.sandbox.recordPlaybackDiagnostic = (event, detail) => diagnostics.push({ event, detail });
     h.load(['prepareCrossfadeDeck']);
     const deck = await h.sandbox.prepareCrossfadeDeck(0, 0);
     assert.equal(deck.src, 'https://media.example/stream');
     if (enabled) {
       const graph = h.state._deckAudioGraphs[0];
       assert.equal(reaches(graph.source, h.state._audioClipper), true);
+      assert.equal(diagnostics.some(entry => entry.event === 'audio-graph-ready'), true);
       assert.equal(reaches(graph.source, h.state._audioContext.destination), true);
     } else {
       assert.equal(h.state._audioContext, null);
       assert.equal(h.bindings.has(deck), false);
+      assert.equal(diagnostics.some(entry => entry.event === 'audio-graph-ready'), false);
     }
   }
 });
@@ -397,7 +418,7 @@ test('pagehide flush includes elapsed listening delta and repeated exit cannot d
 test('legacy diagnostic records are purged without loading or rewriting them', async () => {
   const legacy = { at: '2026-01-01T00:00:00.000Z', event: 'recovery-failed', details: 'previous page fault' };
   const h = harness({ stored: { tss_playback_diagnostics: JSON.stringify([null, [], false, legacy]) } });
-  h.load(['safeMediaUrl', 'playbackDiagnosticSnapshot', 'showPlaybackDiagnostics',
+  h.load(['playbackDiagnosticSnapshot', 'showPlaybackDiagnostics',
     'showPlaybackReportHelp', 'recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton']);
   assert.equal(h.storage.has('tss_playback_diagnostics'), false);
   assert.deepEqual(plain(h.sandbox.playbackDiagnosticSnapshot().diagnostics), []);
@@ -407,17 +428,17 @@ test('legacy diagnostic records are purged without loading or rewriting them', a
   assert.deepEqual(JSON.parse(h.sandbox.copiedReport).diagnostics, []);
   overlay.querySelector('#tss-debug-close').onclick();
 
-  h.sandbox.recordPlaybackDiagnostic('recovery-failed', { reason: 'new page fault' });
+  h.sandbox.recordPlaybackDiagnostic('recovery-failed', { reason: 'media-error' });
   const current = h.sandbox.playbackDiagnosticSnapshot().diagnostics;
   assert.deepEqual(plain(current.map(entry => ({ event: entry.event, reason: entry.reason }))),
-    [{ event: 'recovery-failed', reason: 'new page fault' }]);
+    [{ event: 'recovery-failed', reason: 'media-error' }]);
   assert.equal(h.storage.has('tss_playback_diagnostics'), false);
   assert.equal(h.storageCalls.some(call => call.key === 'tss_playback_diagnostics' && call.operation !== 'remove'), false);
 });
 
 test('Copy report survives dispatch cleanup while clipboard access settles or rejects', async () => {
   const h = harness();
-  h.load(['safeMediaUrl', 'playbackDiagnosticSnapshot', 'showPlaybackDiagnostics',
+  h.load(['playbackDiagnosticSnapshot', 'showPlaybackDiagnostics',
     'showPlaybackReportHelp', 'updatePlaybackDiagnosticButton']);
   h.sandbox.showPlaybackDiagnostics();
   const overlay = h.elements.get('tss-debug-overlay');
@@ -446,7 +467,7 @@ test('Copy report survives dispatch cleanup while clipboard access settles or re
 test('only current page faults expose a report, with Clear allowing a later genuine fault', () => {
   const mount = stored => {
     const h = harness({ stored });
-    h.load(['recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton', 'safeMediaUrl',
+    h.load(['recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton',
       'playbackDiagnosticSnapshot', 'showPlaybackDiagnostics', 'showPlaybackReportHelp']);
     const button = h.sandbox.document.createElement('button');
     button.id = 'tss-playback-debug';
@@ -501,7 +522,7 @@ test('only current page faults expose a report, with Clear allowing a later genu
 
 test('frozen crossfade worker resolves despite invalid current diagnostic entries', () => {
   const h = harness();
-  h.load(['safeMediaUrl', 'playbackDiagnosticSnapshot', 'recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton', 'settleScheduledCrossfade']);
+  h.load(['playbackDiagnosticSnapshot', 'recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton', 'settleScheduledCrossfade']);
   h.sandbox.ensureAutoLevelAudioGraph();
   h.state.active = true;
   h.state._decks[1].paused = false;
@@ -518,7 +539,106 @@ test('frozen crossfade worker resolves despite invalid current diagnostic entrie
   assert.equal(resolved, false);
   const report = h.sandbox.playbackDiagnosticSnapshot();
   assert.equal(report.diagnostics.at(-1).event, 'crossfade-clock-stall');
-  assert.equal(report.decks[1].source, 'https://media.example/track');
+  assert.equal(report.decks[1].streamKind, 'progressive');
+  assert.equal(report.decks[1].hasCurrentSrc, true);
+  assert.equal(JSON.stringify(report).includes('secret'), false);
+  assert.equal(JSON.stringify(report).includes('media.example'), false);
+});
+
+test('diagnostic entries retain technical outcomes but discard arbitrary text and URLs', () => {
+  const h = harness();
+  h.load(['recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton']);
+  h.sandbox.recordPlaybackDiagnostic('custom-start-candidate-failed', {
+    attemptId: 17,
+    trackIndex: 3,
+    failureStage: 'hls-stream',
+    failureReason: 'fatal-hls-error',
+    status: 403,
+    error: 'NotAllowedError: private title https://media.example/track?signature=secret',
+    title: 'Private Song Title',
+    page: 'https://soundcloud.com/private-user/sets/private-playlist',
+    source: 'https://cf-media.sndcdn.com/private-path/playlist.m3u8?token=secret',
+    requestUrl: 'https://api.soundcloud.com/private-user?client_id=secret',
+    deckGain: 0.5,
+    mixGain: 0.25,
+    autoGain: 0.75,
+    stallThresholdMs: 12000,
+    bufferedDataAvailable: true,
+    requests: [{
+      stage: 'hls-stream', status: 403, elapsedMs: 25, errorName: 'NetworkError',
+      url: 'https://api.soundcloud.com/private-path?track_authorization=secret',
+    }],
+  });
+
+  const entry = h.state._playbackDiagnostics[0];
+  assert.equal(entry.attemptId, 17);
+  assert.equal(entry.failureStage, 'hls-stream');
+  assert.equal(entry.status, 403);
+  assert.equal(entry.errorName, 'UnknownError');
+  assert.equal(entry.deckGain, 0.5);
+  assert.equal(entry.mixGain, 0.25);
+  assert.equal(entry.autoGain, 0.75);
+  assert.equal(entry.stallThresholdMs, 12000);
+  assert.equal(entry.bufferedDataAvailable, true);
+  assert.deepEqual(plain(entry.requests), [{
+    stage: 'hls-stream', status: 403, elapsedMs: 25, errorName: 'NetworkError',
+  }]);
+  for (const sensitive of ['Private Song Title', 'private-user', 'private-playlist', 'media.example', 'secret']) {
+    assert.equal(JSON.stringify(entry).includes(sensitive), false);
+  }
+});
+
+test('playback report identifies browser capabilities without account paths or track titles', () => {
+  const h = harness();
+  const decks = h.sandbox.ensureCrossfadeDecks();
+  h.state.meta = [{ title: 'Private Track Title', link: 'https://soundcloud.com/private-user/private-track' }];
+  h.state._deckIndex = 0;
+  h.state._deckTrack = 0;
+  h.state._deckTracks[0] = 0;
+  h.state._deckHlsPlayers[0] = { media: decks[0], levels: [{}, {}], currentLevel: 0, loadingEnabled: true, bandwidthEstimate: 128000 };
+  decks[0].src = 'https://cf-media.sndcdn.com/private-path/playlist.m3u8?signature=secret';
+  decks[0].currentSrc = decks[0].src;
+  decks[0].readyState = 4;
+  decks[0].currentTime = 63;
+  decks[0].duration = 240;
+  h.sandbox.window.location = { pathname: '/private-user/sets/private-playlist' };
+  h.sandbox.window.navigator = {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
+    platform: 'Win32',
+    onLine: true,
+    userAgentData: { platform: 'Windows' },
+  };
+  h.sandbox.window.Hls = Object.assign(function Hls() {}, {
+    version: '1.7.3', Events: { ERROR: 'hlsError' }, isSupported: () => true,
+  });
+  h.sandbox.GM_info = {
+    scriptHandler: 'Tampermonkey', scriptHandlerVersion: '5.5.1', script: { version: '6.2.3' },
+  };
+  h.load(['hlsJsConstructor', 'playbackDiagnosticSnapshot']);
+
+  const report = h.sandbox.playbackDiagnosticSnapshot('https://soundcloud.com/private-user/sets/private-playlist?token=secret');
+  const serialized = JSON.stringify(report);
+
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.reason, 'manual');
+  assert.equal(report.pageKind, 'playlist');
+  assert.deepEqual(plain(report.environment), {
+    browser: 'chromium', browserMajorVersion: 138, platform: 'windows',
+    manager: 'tampermonkey', managerVersion: '5.5.1', scriptVersion: '6.2.3',
+    visible: true, focused: false, onLine: true,
+  });
+  assert.equal(report.capabilities.hlsLibraryVersion, '1.7.3');
+  assert.equal(report.capabilities.hlsMseSupported, true);
+  assert.equal(report.state.streamKind, 'hls-mse');
+  assert.equal(report.decks[0].hlsMediaAttached, true);
+  assert.equal(report.decks[0].hlsLevelCount, 2);
+  assert.equal('page' in report, false);
+  assert.equal('currentTrack' in report.state, false);
+  assert.equal('title' in report.decks[0], false);
+  assert.equal('source' in report.decks[0], false);
+  for (const sensitive of ['Private Track Title', 'private-user', 'private-playlist', 'sndcdn.com', 'signature=secret']) {
+    assert.equal(serialized.includes(sensitive), false);
+  }
 });
 
 test('invalid Auto Level cache entries cannot suppress learning and loaded cache is bounded', () => {

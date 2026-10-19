@@ -192,7 +192,7 @@ function createHarness(options = {}) {
     paused: () => decks[state._deckIndex].paused,
     wait: ms => new Promise(resolve => clock.setTimeout(resolve, ms)),
     next: async () => { counts.next++; state.active = false; },
-    resolveCrossfadeStream: async (_meta, { signal }) => {
+    resolveCrossfadeStreams: async (_meta, { signal }) => {
       counts.resolves++;
       counts.activeRequests++;
       counts.peakRequests = Math.max(counts.peakRequests, counts.activeRequests);
@@ -200,7 +200,8 @@ function createHarness(options = {}) {
       const release = () => { if (!released) { released = true; counts.activeRequests--; } };
       signal.addEventListener('abort', release, { once: true });
       try {
-        return options.resolve ? await options.resolve(signal) : `fresh-${counts.resolves}`;
+        const result = options.resolve ? await options.resolve(signal) : `fresh-${counts.resolves}`;
+        return Array.isArray(result) ? result : (result ? [result] : []);
       } finally { release(); signal.removeEventListener('abort', release); }
     },
     ensureAutoLevelAudioGraph: () => Boolean(audioContext),
@@ -219,12 +220,19 @@ function createHarness(options = {}) {
     pauseSoundCloud() {}, pauseSoundCloudTransport() {},
     runPlaybackOperation: async (_label, operation) => operation(), playAt: async () => true,
   });
+  context.loadStreamOnDeck = async (audio, _index, url, timeout, signal, isCurrent) => {
+    audio.src = String(url);
+    audio.preload = 'auto';
+    audio.load();
+    const ready = await context.waitForDeck(audio, timeout, signal, isCurrent);
+    return { supported: true, ready, player: null, source: audio.src };
+  };
   const names = [
     'withDeadline', 'invalidatePlaybackSession', 'waitForDeck', 'playDeckWithDeadline',
     'resumeAudioGraph', 'suspendAudioGraph', 'cancelCrossfadeForRecovery', 'recoverCurrentDeckStream',
     'pause', 'toggle', 'crossfadeGains', 'setAudioParamImmediately', 'scheduleAudioParamCurve',
     'waitForCrossfadeSchedule', 'settleScheduledCrossfade', 'animateDeckCrossfadeFallback', 'animateDeckCrossfade',
-    'mkWorker', 'nativePlaybackAllowed', 'startWatcher',
+    'mkWorker', 'nativePlaybackAllowed', 'startWatcher', 'playbackErrorName', 'diagnosticDeckStreamKind',
   ];
   vm.runInContext(names.map(extractFunction).join('\n\n'), context);
   const restart = () => {
