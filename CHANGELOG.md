@@ -1,5 +1,16 @@
 # Changelog
 
+## v6.2.5 - 2026-10-20
+
+### Adaptive short-track fades
+
+- Reserve six seconds of a short incoming track for preparing the following track; shorten or omit its fade-in while preserving the configured fade for longer tracks.
+- Keep the existing readiness gate and natural-end fallback; no third audio/HLS deck is created.
+
+### Verification
+
+- All 66 `node --test` tests pass. Production and diagnostic builds pass syntax checks and watcher smoke tests.
+
 ## v6.2.4 - 2026-10-20
 
 ### Short-track prefetch

@@ -83,7 +83,8 @@ function createHarness(options = {}) {
     const listeners = new Map();
     let src = `original-${index}`;
     const audio = {
-      tagName: 'AUDIO', currentTime: options.current ?? 60, duration: 180,
+      tagName: 'AUDIO', currentTime: options.current ?? 60,
+      duration: index === 1 ? (options.incomingDuration ?? 180) : 180,
       readyState: 4, networkState: 1, paused: false, ended: false, seeking: false,
       playbackRate: 1, preload: 'auto', volume: 1, playCalls: 0,
       buffered: { length: 1, start: () => 0, end: () => 180 },
@@ -152,7 +153,7 @@ function createHarness(options = {}) {
     _crossfading: false, _crossfadePausedByUser: false, _crossfadePending: false,
     crossfadeCurve: 'clean', crossfadeSeconds: options.crossfadeSeconds ?? 0,
     _streamCache: new Map(), playNext: [], queue: [0, 1, 2], pos: 0,
-    meta: [{ link: 'track-a' }, { link: 'track-b' }, { link: 'track-c' }],
+    meta: [{ link: 'track-a' }, { link: 'track-b', durationMs: options.metadataDurationMs }, { link: 'track-c' }],
     history: [], priority: {}, els: [{}], stopAfterRound: false,
     worker: null, _workerInterval: null, _endedHandler: null,
     roundPlayed: 0, roundTotal: 3, lastTitle: 'A', lastProgress: 0,
@@ -180,6 +181,7 @@ function createHarness(options = {}) {
   const context = vm.createContext({
     state, document, Worker, Blob, URL: { createObjectURL: () => 'blob:clock', revokeObjectURL: url => revoked.push(url) },
     AbortController, DOMException, Float32Array, console,
+    CROSSFADE_PRELOAD_RESERVE_SECONDS: 6, CROSSFADE_MIN_DURATION_SECONDS: 0.25,
     Date: { now: clock.now }, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     setInterval: clock.setInterval, clearInterval: clock.clearInterval,
     currentDeckAudio: () => Number.isInteger(state._deckTrack) ? state._decks[state._deckIndex] : null,
@@ -211,7 +213,8 @@ function createHarness(options = {}) {
     setCrossfadeStatus: status => { state.status = status; },
     syncCrossfadeVolume: () => { if (options.volumeError) throw new Error('volume failed'); },
     checkSleepTimerDeadline: () => { counts.sleepChecks++; return false; },
-    upcomingCrossfadeDeckReady: () => false,
+    upcomingTrackIndex: () => state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1],
+    upcomingCrossfadeDeckReady: () => Boolean(options.upcomingReady),
     prefetchUpcomingCrossfadeTrack: async () => {},
     refreshPlayBtn() {}, updateHub() {}, installBetterFeedPipBridge() {},
     syncOwnPipWindow() {}, syncBetterFeedPipWindow() {}, syncPlaybackVolumeFromSoundCloud() {}, processAutoLevel() {},
@@ -305,6 +308,70 @@ for (const scenario of [
     h.state._watcherCleanup?.();
   });
 }
+
+test('automatic fade uses the six-second incoming-track preparation reserve', async () => {
+  const makeReady = current => {
+    const h = createHarness({
+      current, crossfadeSeconds: 5, incomingDuration: 10, upcomingReady: true,
+    });
+    h.context.startWatcher();
+    h.workers[0].fail();
+    return h;
+  };
+
+  const atFive = makeReady(175);
+  await atFive.clock.advance(50);
+  assert.equal(atFive.counts.next, 0);
+  atFive.state._watcherCleanup?.();
+
+  const atFour = makeReady(176);
+  await atFour.clock.advance(50);
+  assert.equal(atFour.counts.next, 1);
+  atFour.state._watcherCleanup?.();
+});
+
+for (const incomingDuration of [6, 5]) {
+  test(`short incoming ${incomingDuration}s track skips automatic fade and advances at EOF`, async () => {
+    const h = createHarness({
+      current: 179, crossfadeSeconds: 5, incomingDuration, upcomingReady: true,
+    });
+    h.context.startWatcher();
+    h.workers[0].fail();
+    await h.clock.advance(50);
+    assert.equal(h.counts.next, 0);
+
+    h.decks[0].ended = true;
+    await h.clock.advance(50);
+    assert.equal(h.counts.next, 1);
+    assert.equal(h.state._crossfadePending, false);
+    h.state._watcherCleanup?.();
+  });
+}
+
+test('unknown and metadata-only incoming durations preserve configured automatic fade', async () => {
+  const unknown = createHarness({ current: 175, crossfadeSeconds: 5, incomingDuration: NaN, upcomingReady: true });
+  unknown.context.startWatcher();
+  unknown.workers[0].fail();
+  await unknown.clock.advance(50);
+  assert.equal(unknown.counts.next, 1);
+  unknown.state._watcherCleanup?.();
+
+  const long = createHarness({ current: 175, crossfadeSeconds: 5, incomingDuration: 30, upcomingReady: true });
+  long.context.startWatcher();
+  long.workers[0].fail();
+  await long.clock.advance(50);
+  assert.equal(long.counts.next, 1);
+  long.state._watcherCleanup?.();
+
+  const metadata = createHarness({
+    current: 176, crossfadeSeconds: 5, incomingDuration: NaN, metadataDurationMs: 10000, upcomingReady: true,
+  });
+  metadata.context.startWatcher();
+  metadata.workers[0].fail();
+  await metadata.clock.advance(50);
+  assert.equal(metadata.counts.next, 1);
+  metadata.state._watcherCleanup?.();
+});
 
 test('repeated five-second observation gaps accumulate frozen progress, but moving audio is harmless', async () => {
   const frozen = createHarness({ readiness: 'fail' });

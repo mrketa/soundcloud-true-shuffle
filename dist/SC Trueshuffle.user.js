@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.4
+// @version      6.2.5
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
@@ -19,6 +19,9 @@
 
 const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 const DIAGNOSTIC_BUILD = true;
+// Reserve the readiness timeout plus margin for preparing the track after a short bumper.
+const CROSSFADE_PRELOAD_RESERVE_SECONDS = 6;
+const CROSSFADE_MIN_DURATION_SECONDS = 0.25;
 const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
 const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
 const PLAYBACK_DIAGNOSTIC_FAULTS = new Set([
@@ -5718,7 +5721,7 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
   const epoch = state._playbackEpoch;
   const signal = state._playbackAbort.signal;
   const foreground = state._playbackRequest;
-  const duration = Math.max(0.25, seconds);
+  const duration = Math.max(CROSSFADE_MIN_DURATION_SECONDS, seconds);
   const graphAvailable = ensureAutoLevelAudioGraph();
   const outgoingIndex = state._decks.indexOf(outgoing);
   const incomingIndex = state._decks.indexOf(incoming);
@@ -7880,18 +7883,40 @@ function startWatcher() {
     const remainingSeconds = timing.duration > 0
       ? Math.max(0, timing.duration - timing.current)
       : Infinity;
-    const shouldCrossfade = state.crossfadeSeconds > 0
+    const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
+    const automaticFadeEligible = configuredFadeSeconds > 0
       && Number.isInteger(state._deckTrack)
       && !state._crossfading
       && !nearEnd
       && !state._userPaused
       && !paused()
-      && upcomingCrossfadeDeckReady()
       && !(state.stopAfterRound && state.pos >= state.queue.length - 1)
       && !(state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)
       && timing.current > 0
       && remainingSeconds > 0.05
-      && remainingSeconds <= state.crossfadeSeconds;
+      && remainingSeconds <= configuredFadeSeconds;
+    let standbyReady = false;
+    let effectiveFadeSeconds = configuredFadeSeconds;
+    if (automaticFadeEligible) {
+      standbyReady = upcomingCrossfadeDeckReady();
+      if (standbyReady) {
+        const nextTi = upcomingTrackIndex();
+        const standbyIndex = state._deckIndex === 0 ? 1 : 0;
+        const mediaDuration = Number(state._decks[standbyIndex]?.duration);
+        const incomingDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
+          ? mediaDuration : Number(state.meta[nextTi]?.durationMs) / 1000;
+        if (Number.isFinite(incomingDuration) && incomingDuration > 0) {
+          const availableFadeSeconds = Math.min(
+            configuredFadeSeconds,
+            incomingDuration - CROSSFADE_PRELOAD_RESERVE_SECONDS,
+          );
+          effectiveFadeSeconds = availableFadeSeconds >= CROSSFADE_MIN_DURATION_SECONDS
+            ? availableFadeSeconds : 0;
+        }
+      }
+    }
+    const shouldCrossfade = automaticFadeEligible && standbyReady
+      && remainingSeconds <= effectiveFadeSeconds;
     if (shouldCrossfade) {
       nearEnd = true;
       state._crossfadePending = remainingSeconds;

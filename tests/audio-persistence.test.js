@@ -612,7 +612,7 @@ test('playback report identifies browser capabilities without account paths or t
     version: '1.7.3', Events: { ERROR: 'hlsError' }, isSupported: () => true,
   });
   h.sandbox.GM_info = {
-    scriptHandler: 'Tampermonkey', scriptHandlerVersion: '5.5.1', script: { version: '6.2.4' },
+    scriptHandler: 'Tampermonkey', scriptHandlerVersion: '5.5.1', script: { version: '6.2.5' },
   };
   h.load(['hlsJsConstructor', 'playbackDiagnosticSnapshot']);
 
@@ -624,7 +624,7 @@ test('playback report identifies browser capabilities without account paths or t
   assert.equal(report.pageKind, 'playlist');
   assert.deepEqual(plain(report.environment), {
     browser: 'chromium', browserMajorVersion: 138, platform: 'windows',
-    manager: 'tampermonkey', managerVersion: '5.5.1', scriptVersion: '6.2.4',
+    manager: 'tampermonkey', managerVersion: '5.5.1', scriptVersion: '6.2.5',
     visible: true, focused: false, onLine: true,
   });
   assert.equal(report.capabilities.hlsLibraryVersion, '1.7.3');
