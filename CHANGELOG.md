@@ -1,5 +1,15 @@
 # Changelog
 
+## v6.2.4 - 2026-10-20
+
+### Short-track prefetch
+
+- Start resolving the following track's stream candidates during the current crossfade and reuse them for standby preparation. Cancel stale work on playback or queue changes; failed speculative resolution falls back to normal preparation.
+
+### Verification
+
+- All 62 `node --test` tests pass. Production and diagnostic artifacts pass syntax checks and crossfade smoke tests.
+
 ## v6.2.3 - 2026-10-19
 
 ### Privacy-first playback diagnostics

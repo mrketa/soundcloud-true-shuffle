@@ -264,6 +264,239 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
   assert.equal(standby.loadCalls, 1);
 });
 
+test('stream candidates warm during an incoming fade and are reused for the following track', async () => {
+  const makeAudio = (src, paused) => ({
+    src, currentSrc: src, readyState: src ? 2 : 0, volume: 0, paused, ended: false,
+    currentTime: 0, duration: 30, loadCalls: 0,
+    pause() { this.paused = true; },
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.currentSrc = ''; this.readyState = 0; } },
+    load() { this.loadCalls++; this.currentSrc = this.src; this.readyState = 2; },
+  });
+  const outgoing = makeAudio('outgoing-stream', false);
+  const incoming = makeAudio('', true);
+  const request = { operationId: 1 };
+  const state = {
+    active: true, _playbackEpoch: 3, _playbackRequest: request, _playbackAbort: new AbortController(),
+    _userPaused: false, _crossfading: false, _deckTrack: 0, _deckIndex: 0, _crossfadeToken: 0,
+    crossfadeSeconds: 5, autoLevel: false, eqEnabled: false, safetyClipper: false,
+    _audioContext: null, _audioGraphFailed: false, _diagnosticBuild: false,
+    _decks: [outgoing, incoming], _deckTracks: [0, null], _deckPrepareTokens: [0, 0],
+    _deckGains: [1, 0], _deckAudioGraphs: [null, null], _crossfadePrefetchToken: 0,
+    _crossfadeStreamWarmup: null, _deckPrepareAborts: [],
+    meta: [
+      { id: 'long', title: 'Long track', link: '/long' },
+      { id: 'bumper', title: 'Bumper', link: '/bumper' },
+      { id: 'following', title: 'Next long track', link: '/following' },
+    ],
+    queue: [0, 1, 2], playNext: [], pos: 1,
+  };
+  const lookups = [];
+  let resolveFollowing;
+  let warmStartedDuringFade = false;
+  let markFadeStarted;
+  let finishFade;
+  const fadeStarted = new Promise(resolve => { markFadeStarted = resolve; });
+  const fade = new Promise(resolve => { finishFade = resolve; });
+  const timers = [];
+  const functions = Function(
+    'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph', 'resolveCrossfadeStreams',
+    'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
+    'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl', 'loadStreamOnDeck',
+    'playbackErrorName', 'recordPlaybackDiagnostic', 'setCrossfadeStatus', 'currentDeckAudio',
+    'pauseSoundCloudTransport', 'pauseSoundCloud', 'resumeAudioGraph', 'playDeckWithDeadline',
+    'installBetterFeedPipBridge', 'animateDeckCrossfade', 'trackPlayed', 'clearTimeout', 'setTimeout',
+    `${extractFunction('upcomingTrackIndex')};
+     ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
+     ${extractFunction('warmUpcomingCrossfadeStreams')};
+     ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
+     ${extractFunction('playWithCrossfadeDeck').replace(/^function /, 'async function ')};
+     let lastPrefetchPromise = null;
+     const originalPrefetch = prefetchUpcomingCrossfadeTrack;
+     prefetchUpcomingCrossfadeTrack = (...args) => {
+       lastPrefetchPromise = originalPrefetch(...args);
+       return lastPrefetchPromise;
+     };
+     return {
+       playWithCrossfadeDeck, prefetchUpcomingCrossfadeTrack,
+       lastPrefetch: () => lastPrefetchPromise,
+     };`,
+  )(
+    state, () => state._decks, () => true,
+    meta => {
+      lookups.push(meta.id);
+      if (meta.id === 'bumper') return Promise.resolve(['bumper-stream']);
+      if (meta.id === 'following') {
+        warmStartedDuringFade = state._crossfading;
+        return new Promise(resolve => { resolveFollowing = resolve; });
+      }
+      throw new Error(`unexpected stream lookup: ${meta.id}`);
+    },
+    (audio, index) => {
+      audio.pause();
+      audio.removeAttribute('src');
+      state._deckTracks[index] = null;
+      state._deckGains[index] = 0;
+    },
+    () => {}, () => {}, async () => true,
+    value => String(value || ''), () => false, () => false, loadReadyDeck,
+    error => String(error?.name || 'UnknownError'), () => {},
+    status => { state.crossfadeStatus = status; },
+    () => state._decks[state._deckIndex],
+    () => {}, () => {}, async () => true,
+    async audio => { audio.paused = false; return true; },
+    () => {},
+    async () => {
+      state._crossfading = true;
+      markFadeStarted();
+      const result = await fade;
+      state._crossfading = false;
+      return result;
+    },
+    () => {}, () => {}, callback => { timers.push(callback); return timers.length; },
+  );
+
+  const playback = functions.playWithCrossfadeDeck(1, true, 5);
+  await fadeStarted;
+  await Promise.resolve();
+  assert.equal(state._crossfading, true);
+  assert.deepEqual(lookups, ['bumper', 'following']);
+  assert.equal(warmStartedDuringFade, true);
+  assert.equal(outgoing.loadCalls, 0);
+
+  finishFade(true);
+  assert.equal(await playback, true);
+  assert.equal(timers.length, 2);
+  timers[0]();
+  await Promise.resolve();
+  assert.equal(lookups.length, 2);
+  assert.equal(outgoing.loadCalls, 0);
+
+  resolveFollowing(['following-stream']);
+  assert.equal(await functions.lastPrefetch(), outgoing);
+  assert.equal(outgoing.src, 'following-stream');
+  assert.equal(state._deckTracks[0], 2);
+  assert.equal(outgoing.loadCalls, 1);
+  assert.equal(state.crossfadeStatus, 'ready');
+  assert.equal(state._crossfadeStreamWarmup, null);
+});
+
+test('invalidated crossfade warmup cannot install stale URLs and resolves the new upcoming track', async () => {
+  const standby = {
+    src: '', currentSrc: '', readyState: 0,
+    pause() {},
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.currentSrc = ''; } },
+    load() { this.currentSrc = this.src; this.readyState = 2; },
+  };
+  const state = {
+    active: true, _playbackEpoch: 0, _deckTrack: 0, _deckIndex: 0, _playbackAbort: new AbortController(),
+    _crossfading: true, crossfadeSeconds: 6, autoLevel: false, eqEnabled: false,
+    _decks: [{}, standby], _deckTracks: [0, null], _deckPrepareTokens: [0, 0],
+    _deckGains: [0, 0], _deckAudioGraphs: [null, null], _crossfadePrefetchToken: 0,
+    _crossfadeStreamWarmup: null, meta: [{ id: 0 }, { id: 1 }, { id: 2 }],
+    queue: [0, 1, 2], playNext: [], pos: 0, busy: false,
+  };
+  let staleResolve;
+  const lookups = [];
+  const funcs = Function(
+    'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph', 'resolveCrossfadeStreams',
+    'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
+    'normalizeTrackUrl', 'deckIsPreviewLimited', 'currentDeckAudio', 'setCrossfadeStatus',
+    'isHlsStreamUrl', 'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
+    `${extractFunction('upcomingTrackIndex')};
+     ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
+     ${extractFunction('warmUpcomingCrossfadeStreams')};
+     ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
+     ${extractFunction('refreshUpcomingCrossfadePreparation')};
+     return { warmUpcomingCrossfadeStreams, prefetchUpcomingCrossfadeTrack, refreshUpcomingCrossfadePreparation };`,
+  )(
+    state, () => state._decks, () => true,
+    meta => {
+      lookups.push(meta.id);
+      return meta.id === 1
+        ? new Promise(resolve => { staleResolve = resolve; })
+        : Promise.resolve([`stream-${meta.id}`]);
+    },
+    (audio, index) => { audio.pause(); audio.removeAttribute('src'); state._deckTracks[index] = null; },
+    () => {}, () => {}, async () => true, value => String(value || ''), () => false, () => standby,
+    () => {}, () => false, loadReadyDeck, error => String(error?.name || 'UnknownError'), () => {},
+  );
+  funcs.warmUpcomingCrossfadeStreams();
+  await Promise.resolve();
+  const staleWarmup = state._crossfadeStreamWarmup;
+  assert.equal(staleWarmup.controller.signal.aborted, false);
+
+  state._playbackAbort.abort();
+  assert.equal(staleWarmup.controller.signal.aborted, true);
+  state._playbackAbort = new AbortController();
+  state._playbackEpoch++;
+  state.playNext.push(2);
+  state.busy = true;
+  funcs.refreshUpcomingCrossfadePreparation();
+  assert.equal(state._crossfadeStreamWarmup, null);
+
+  state.busy = false;
+  state._crossfading = false;
+  await funcs.prefetchUpcomingCrossfadeTrack();
+  assert.deepEqual(lookups, [1, 2]);
+  assert.equal(standby.src, 'stream-2');
+  assert.equal(state._deckTracks[1], 2);
+
+  staleResolve(['stale-stream-1']);
+  await staleWarmup.promise;
+  assert.equal(standby.src, 'stream-2');
+  assert.equal(state._deckTracks[1], 2);
+});
+
+test('failed speculative stream warmup falls back to normal stream resolution', async () => {
+  const standby = {
+    src: '', currentSrc: '', readyState: 0,
+    pause() {},
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.currentSrc = ''; } },
+    load() { this.currentSrc = this.src; this.readyState = 2; },
+  };
+  const state = {
+    active: true, _playbackEpoch: 0, _deckTrack: 0, _deckIndex: 0, _playbackAbort: new AbortController(),
+    _crossfading: true, crossfadeSeconds: 6, autoLevel: false, eqEnabled: false,
+    _decks: [{}, standby], _deckTracks: [0, null], _deckPrepareTokens: [0, 0],
+    _deckGains: [0, 0], _deckAudioGraphs: [null, null], _crossfadePrefetchToken: 0,
+    _crossfadeStreamWarmup: null, meta: [{ id: 0 }, { id: 1 }], queue: [0, 1], playNext: [], pos: 0,
+  };
+  let lookups = 0;
+  const diagnostics = [];
+  const funcs = Function(
+    'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph', 'resolveCrossfadeStreams',
+    'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
+    'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl', 'loadStreamOnDeck',
+    'playbackErrorName', 'recordPlaybackDiagnostic', 'setCrossfadeStatus',
+    `${extractFunction('upcomingTrackIndex')};
+     ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
+     ${extractFunction('warmUpcomingCrossfadeStreams')};
+     ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
+     return { warmUpcomingCrossfadeStreams, prefetchUpcomingCrossfadeTrack };`,
+  )(
+    state, () => state._decks, () => true,
+    async meta => {
+      lookups++;
+      if (lookups === 1) throw new Error('speculative lookup failed');
+      return [`normal-${meta.id}`];
+    },
+    (audio, index) => { audio.pause(); audio.removeAttribute('src'); state._deckTracks[index] = null; },
+    () => {}, () => {}, async () => true, value => String(value || ''), () => false, () => false,
+    loadReadyDeck, error => String(error?.name || 'UnknownError'), (...args) => diagnostics.push(args), () => {},
+  );
+  funcs.warmUpcomingCrossfadeStreams();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(lookups, 1);
+  state._crossfading = false;
+  await funcs.prefetchUpcomingCrossfadeTrack();
+  assert.equal(lookups, 2);
+  assert.equal(standby.src, 'normal-1');
+  assert.equal(state._deckTracks[1], 1);
+  assert.deepEqual(diagnostics, []);
+});
+
+
 test('play-next and reorder invalidation prepare the authoritative standby track', async () => {
   const makeAudio = src => ({
     src, currentSrc: src, readyState: 2, volume: 0,

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.3
+// @version      6.2.4
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
@@ -398,8 +398,9 @@ const state = {
   _decks: [],
   _deckHlsPlayers: [null, null],
   _deckHlsFailed: [false, false],
-  _deckTracks: [null, null],
   _deckPrepareTokens: [0, 0],
+  _deckTracks: [null, null],
+  _crossfadeStreamWarmup: null,
   _crossfadePrefetchToken: 0,
   _deckGains: [0, 0],
   _audioContext: null,
@@ -5114,9 +5115,14 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
       diagnosticTrace.stage = 'stream-resolution';
       diagnosticTrace.reason = 'resolving-streams';
     }
-    const streamUrls = await resolveCrossfadeStreams(meta, {
-      ...options, signal: controller.signal, isCurrent: requestIsCurrent,
-    });
+    let streamUrls = options.resolvedStreamPromise
+      ? await options.resolvedStreamPromise
+      : null;
+    if (!streamUrls?.length) {
+      streamUrls = await resolveCrossfadeStreams(meta, {
+        ...options, signal: controller.signal, isCurrent: requestIsCurrent,
+      });
+    }
     if (!requestIsCurrent()) return null;
     if (!streamUrls.length) {
       if (diagnosticTrace && diagnosticTrace.reason === 'resolving-streams') {
@@ -5895,6 +5901,34 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
   }
 }
 
+function warmUpcomingCrossfadeStreams() {
+  // Resolve stream candidates during the fade; only load media after the outgoing deck is free.
+  state._crossfadeStreamWarmup?.controller?.abort();
+  state._crossfadeStreamWarmup = null;
+  const nextTi = upcomingTrackIndex();
+  if (!state.active || !Number.isInteger(state._deckTrack) || nextTi === undefined) return;
+  const meta = state.meta[nextTi];
+  if (!meta) return;
+  const epoch = state._playbackEpoch;
+  const currentTi = state._deckTrack;
+  const sessionSignal = state._playbackAbort?.signal;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (sessionSignal?.aborted) abort();
+  else sessionSignal?.addEventListener('abort', abort, { once: true });
+  const record = { epoch, currentTi, nextTi, meta, controller, promise: null };
+  state._crossfadeStreamWarmup = record;
+  record.promise = Promise.resolve().then(() => resolveCrossfadeStreams(meta, {
+    signal: controller.signal,
+    isCurrent: () => state._crossfadeStreamWarmup === record
+      && state.active && state._playbackEpoch === epoch
+      && state._deckTrack === currentTi && state.meta[nextTi] === meta
+      && upcomingTrackIndex() === nextTi,
+  })).catch(() => []).finally(() => {
+    sessionSignal?.removeEventListener('abort', abort);
+  });
+}
+
 async function prefetchUpcomingCrossfadeTrack() {
   if (!state.active || state._crossfading) return;
   const nextTi = upcomingTrackIndex();
@@ -5907,8 +5941,16 @@ async function prefetchUpcomingCrossfadeTrack() {
     && upcomingTrackIndex() === nextTi;
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
   let audio = null;
+  let warmup = null;
   try {
-    audio = await prepareCrossfadeDeck(standby, nextTi, { diagnosticTrace, isCurrent });
+    warmup = state._crossfadeStreamWarmup;
+    const resolvedStreamPromise = warmup?.epoch === state._playbackEpoch
+      && warmup.currentTi === state._deckTrack && warmup.nextTi === nextTi
+      && warmup.meta === state.meta[nextTi] && upcomingTrackIndex() === nextTi
+      ? warmup.promise : null;
+    audio = await prepareCrossfadeDeck(standby, nextTi, {
+      diagnosticTrace, isCurrent, ...(resolvedStreamPromise ? { resolvedStreamPromise } : {}),
+    });
   } catch (error) {
     recordPlaybackDiagnostic('prefetch-failed', {
       attemptId: diagnosticTrace?.attemptId,
@@ -5919,7 +5961,15 @@ async function prefetchUpcomingCrossfadeTrack() {
       elapsedMs: diagnosticTrace
         ? Math.max(0, Math.round(performance.now() - diagnosticTrace.startedAt)) : 0,
     });
+    if (state._crossfadeStreamWarmup === warmup) {
+      state._crossfadeStreamWarmup = null;
+      warmup?.controller?.abort();
+    }
     return null;
+  }
+  if (state._crossfadeStreamWarmup === warmup) {
+    state._crossfadeStreamWarmup = null;
+    warmup?.controller?.abort();
   }
   if (!isCurrent()) return null;
   if (state._diagnosticBuild) {
@@ -5949,6 +5999,9 @@ function upcomingTrackIndex() {
 
 function refreshUpcomingCrossfadePreparation() {
   state._crossfadePrefetchToken++;
+  const warmup = state._crossfadeStreamWarmup;
+  state._crossfadeStreamWarmup = null;
+  warmup?.controller?.abort();
   if (state.busy) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
   if (standby < 0 || standby >= state._decks.length) return;
@@ -6202,6 +6255,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   state._nativeTrack = null;
   installBetterFeedPipBridge();
   if (canMix) {
+    warmUpcomingCrossfadeStreams();
     const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token, diagnosticTrace);
     if (!ownsIncoming() || state._crossfadeToken !== token) return null;
     if (state._userPaused) return deferPaused();

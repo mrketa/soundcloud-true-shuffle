@@ -24,7 +24,7 @@ def diagnostic_source(source_bytes):
             b"// @name         SoundCloud True Shuffle (Temporary Diagnostic)",
         ),
         (
-            b"// @version      6.2.3",
+            b"// @version      6.2.4",
             b"// @version      6.2.6",
         ),
         (

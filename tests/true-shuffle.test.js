@@ -2195,7 +2195,7 @@ test('diagnostic build has distinct metadata and preserves production instrument
     const expected = canonical
       .replace('// @name         SoundCloud True Shuffle',
         '// @name         SoundCloud True Shuffle (Temporary Diagnostic)')
-      .replace('// @version      6.2.3', '// @version      6.2.6')
+      .replace('// @version      6.2.4', '// @version      6.2.6')
       .replace('// @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.',
         '// @description  Temporary diagnostic copy; disable the stable script while diagnosing playback.');
     assert.equal(fs.readFileSync(output, 'utf8'), expected);
