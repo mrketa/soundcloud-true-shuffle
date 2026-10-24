@@ -3,7 +3,7 @@
   "timestamp": "2026-10-24",
   "context": "release",
   "phase": null,
-  "phase_name": "Öffentlicher Cutover 6.3.0 verifiziert und auf GitHub ohne hochgeladene Assets veröffentlicht",
+  "phase_name": "Öffentliche 6.3.0 abgeschlossen: GitHub veröffentlicht, Greasy Fork laut Maintainer aktualisiert",
   "phase_dir": null,
   "plan": null,
   "task": null,
@@ -25,8 +25,21 @@
     "tag": "v6.3.0",
     "github_push_authorized": true,
     "github_release_authorized": true,
-    "uploaded_release_assets": [],
-    "uploaded_release_assets_allowed": false,
+    "uploaded_release_assets": [
+      {
+        "name": "SC.Trueshuffle.user.js",
+        "size": 564892,
+        "created_at": "2026-10-24T02:57:57Z",
+        "url": "https://github.com/mrketa/soundcloud-true-shuffle/releases/download/v6.3.0/SC.Trueshuffle.user.js",
+        "digest": "sha256:1fe179307575d7fa30b469ddb6f3129470641097d4d9f84894e1a2a450e8879e",
+        "matches_previously_tested_local_crlf_public_build": true,
+        "observation_source": "Current GitHub API read by Main",
+        "added_after_initial_release_creation": true,
+        "uploader_independently_verified": false
+      }
+    ],
+    "initial_assistant_creation_uploaded_assets": [],
+    "asset_policy": "Initial assistant creation was authorized without attachments. A later-added existing public asset is now observed; do not remove it or infer its uploader. Future release-text convention remains changelog-only, not a claim of zero assets.",
     "automatic_source_archives": "GitHub-generated, not uploaded attachments",
     "publication_status": "completed",
     "release_url": "https://github.com/mrketa/soundcloud-true-shuffle/releases/tag/v6.3.0",
@@ -38,7 +51,7 @@
     "is_draft": false,
     "is_prerelease": false,
     "latest_release_api_tag": "v6.3.0",
-    "uploaded_release_asset_count": 0,
+    "uploaded_release_asset_count": 1,
     "publication_verified_by": "Main release run via GitHub API",
     "release_git_blob": "dd8c12b7e6161d74516b6c958281c1ec44643184",
     "release_git_blob_matches_local_index": true,
@@ -79,6 +92,20 @@
     },
     "greasyfork_publication_in_scope": false,
     "greasyfork_version_sync_claimed": false,
+    "greasyfork": {
+      "url": "https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle",
+      "version": "6.3.0",
+      "status": "published_as_reported_by_maintainer",
+      "report": "ist jetzt auch auf greasyfork gepusht",
+      "maintainer_reported_publication": true,
+      "published_at": null,
+      "direct_assistant_web_verification": false,
+      "live_greasyfork_source_compared": false,
+      "image_upload_separately_confirmed": false,
+      "description_copy_live_use_separately_confirmed": false,
+      "automatic_sync_required": false,
+      "remaining_required_actions": []
+    },
     "install_url_main": "https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js",
     "install_url_release": "https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/v6.3.0/dist/SC%20Trueshuffle.user.js",
     "production": {
@@ -142,6 +169,48 @@
   "historical_remaining_tasks": [],
   "blockers": [],
   "human_actions_pending": [],
+  "remaining_tasks": [],
+  "completed_work": [
+    "Public 6.3.0 implementation, previous verification and GitHub release completed",
+    "Maintainer reports Greasy Fork 6.3.0 published",
+    "English Greasy Fork copy file and exactly five reviewed demo PNGs delivered locally",
+    "Latest human and machine handoff updated without code or remote publication changes"
+  ],
+  "local_publication_assets": {
+    "copy_file": "GreasyFork-6.3.0.md",
+    "copy_sections": ["English changelog", "short description", "long English description based on user's old text"],
+    "copy_scope": "Retains priorities, early-skip deprioritization and statistics; updates Start shuffle, Reshuffle beside Queue, Merge +, draggable player, resizable queue and fixed dark UI instead of dynamic artwork colors.",
+    "screenshots_directory": "screenshots/6.3.0/",
+    "screenshots": [
+      {"file": "01-mini-player.png", "width": 788, "height": 480},
+      {"file": "02-settings.png", "width": 788, "height": 1042, "view": "Audio tab"},
+      {"file": "03-queue.png", "width": 1428, "height": 1120, "view": "Queue with expanded player"},
+      {"file": "04-listening-stats.png", "width": 808, "height": 1028},
+      {"file": "05-equalizer.png", "width": 1248, "height": 1096, "view": "Bass Boost"}
+    ],
+    "screenshot_count": 5,
+    "rendered_public_version": "6.3.0",
+    "device_pixel_ratio": 2,
+    "each_png_under_200_kb": true,
+    "visually_reviewed": true,
+    "data": "Synthetic demo music, artwork and statistics; visible Demo data caption; no real personal data",
+    "sixth_image_or_zip": false,
+    "last_observed_git_status": "untracked",
+    "committed_by_assistant": false,
+    "pushed_by_assistant": false,
+    "live_greasyfork_image_upload_separately_confirmed": false,
+    "live_greasyfork_copy_use_separately_confirmed": false
+  },
+  "handoff_execution": {
+    "documentation_only": true,
+    "builds_tests_lint_formatters_run": false,
+    "git_commands_run_by_documentation_worker": false,
+    "remote_mutations_or_publication_actions": false,
+    "previous_verification_rerun": false,
+    "local_checkpoint_owner": "Main",
+    "local_checkpoint_completed_by_documentation_worker": false,
+    "remote_push_planned": false
+  },
   "decisions": [
     {
       "decision": "Öffentliche 6.3.0 aus geprüfter UI .19 übernehmen; private Originale erhalten.",
@@ -203,9 +272,13 @@
     ".planning/debug/abox-vm-crossfade-experiments-2026-10-22.json",
     ".planning/debug/abox-vm-crossfade-fix-verification-2026-10-22.json"
   ],
-  "background_processes": "Eigene Smoke-Prozesse/Browser/Server wurden beendet, generierte Medien und Runner entfernt; keine laufenden Dienste voraussetzen.",
-  "uncommitted_files": null,
-  "git_state": "Source/release commit c7474d9ce308d529204bde6f6b018365b18f1050 pushed to main; tag v6.3.0 targets that exact commit; public non-draft/non-prerelease release published at 2026-10-24T02:49:21Z with zero uploaded assets. Main verified via GitHub API. This publication-record documentation followup does not move the tag; no Git mutations by this documentation worker.",
+  "background_processes": "Prior smoke and screenshot fixtures cleaned: muted real WAV stopped, browser and AudioContext closed, Blob URL revoked, in-memory servers stopped; no running fixture assumed.",
+  "uncommitted_files": {
+    "scope": "Last observation before local handoff checkpoint; current documentation edits are additional changes",
+    "untracked_paths": ["GreasyFork-6.3.0.md", "screenshots/"],
+    "current_clean_state_claimed": false
+  },
+  "git_state": "Last observed before local handoff checkpoint: main...origin/main, HEAD 7e41416 (docs: keep GitHub release changelog-only), prior 322d189 publication docs; only GreasyFork-6.3.0.md and screenshots/ untracked. Assets not committed or pushed by assistant. Current handoff documentation edits are additional changes. Main owns a local docs-only checkpoint, no remote push; no completed checkpoint SHA or later clean state claimed. Release tag remains on c7474d9ce308d529204bde6f6b018365b18f1050. Release initially created without assets; current Main API observation has one later-added public asset, uploader not independently verified.",
   "known_implementation_files": [
     "SC Trueshuffle.js",
     "build.py",
@@ -219,6 +292,6 @@
     "HANDOFF.md",
     ".continue-here.md"
   ],
-  "next_action": "Keine offene Veröffentlichung: öffentliche 6.3.0 verifiziert, nach main gepusht und auf GitHub veröffentlicht. Dieser Publikationsnachtrag ist rein dokumentarisch; Release-Tag bleibt auf dem dokumentierten Source-/Release-Commit. Greasy Fork wurde nicht veröffentlicht/synchronisiert. Kein offener Audiofix oder externes Feedback-Warten zu Abox' ursprünglicher privater 6.2.9.",
-  "context_notes": "Kanonische öffentliche Quelle ist jetzt 6.3.0 aus geprüfter UI 6.2.9.19; öffentliche Identität wiederhergestellt. UI-Backup .19 und originale Abox-private 6.2.9 bleiben unverändert. Frühere 6.2.5-/keine-Migration-/alte-Builder-Aussagen und Flag-Befehle sind historische Belege, nicht aktive Anweisungen. Abox bestätigte laut Nutzer den ursprünglichen privaten Audiofix, getrennt von lokalen PCM-/HLS-/UI-Fixtures und ohne neuen Rohbericht. build.py kopiert die aktuelle kanonische Quelle und darf keine private Originaldatei überschreiben."
+  "next_action": "Read the latest handoff and await a new user request. Work completed; no remaining product/release tasks or blockers. Do not make speculative code changes, republish, retag or automate Greasy Fork synchronization.",
+  "context_notes": "Canonical/public 6.3.0 and same-version separate Temporary Diagnostic identity remain unchanged; production verbose=false, diagnostic verbose=true. Private UI .19 and original Abox-private 6.2.9 remain preserved. Greasy Fork publication is maintainer-reported, not live-source-compared; image/copy publication is not separately confirmed and is not a mandatory pending task. Local copy file and five PNGs delivered but last observed untracked. Historical private evidence, privacy redactions and .gitignore exclusions remain intact. No tests/builds or publication actions performed for this handoff."
 }
