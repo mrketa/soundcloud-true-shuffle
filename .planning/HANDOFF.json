@@ -10,6 +10,12 @@
   "historical_total_tasks": 5,
   "status": "released",
   "artifact": "dist/SC Trueshuffle.user.js",
+  "release_conventions": {
+    "github_description": "changelog_only",
+    "language": "en",
+    "scope": "concise user-facing changes and fixes",
+    "excluded_sections": ["installation", "tests", "build_reports", "attachments", "internal_workflow"]
+  },
   "release": {
     "version": "6.3.0",
     "canonical_source": "SC Trueshuffle.js",

@@ -115,6 +115,10 @@ Actual built-public Chrome fixtures exercised real local WAV playback through th
 
 `node --test tests/*.test.js` targets the current canonical source without private expectation flags. `TSS_SCRIPT` remains an explicit source/artifact override. Fade-policy and immediate-prefetch expectations use the selected script's metadata-version release contracts: half-duration budgeting from 6.2.6 and immediate prefetch from 6.2.7.
 
+## Release notes
+
+GitHub release descriptions contain only a concise, user-facing changelog in English. Keep installation instructions, test/build reports, attachment notes and internal workflow details in project documentation, not in the release description.
+
 ## License
 
 MIT
