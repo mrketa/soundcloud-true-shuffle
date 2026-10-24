@@ -43,6 +43,8 @@ SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happ
 
 [Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) remains an installation/feedback channel, but its version is managed separately; do not assume it already serves 6.3.0.
 
+**[Release v6.3.0](https://github.com/mrketa/soundcloud-true-shuffle/releases/tag/v6.3.0)** was published on **2026-10-24 at 02:49:21 UTC** from commit [`c7474d9`](https://github.com/mrketa/soundcloud-true-shuffle/commit/c7474d9ce308d529204bde6f6b018365b18f1050). It is a public, non-prerelease release with **zero uploaded assets**; GitHub's automatic source archives are separate. For the fixed release version, use the **[v6.3.0 userscript](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/v6.3.0/dist/SC%20Trueshuffle.user.js)**.
+
 > Designed for current mainstream browsers, not just Firefox. See browser support below for manager availability and capability differences.
 
 ## Usage
