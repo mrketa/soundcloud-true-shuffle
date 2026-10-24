@@ -3,7 +3,7 @@ const path = require('path');
 const vm = require('vm');
 const assert = require('assert');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+const source = fs.readFileSync(process.env.TSS_SCRIPT || path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
 
 const diagnosticConstants = [
   source.match(/const DIAGNOSTIC_NUMBER_FIELDS = new Set\([\s\S]*?\n\]\);/)?.[0],
@@ -18,6 +18,15 @@ const diagnosticHelpers = [
   'playbackDiagnosticPageKind', 'playbackDiagnosticEnvironment',
   'playbackDiagnosticCapabilities', 'diagnosticDeckStreamKind', 'diagnosticStreamQuality',
 ];
+diagnosticHelpers.push(...['playbackDiagnosticContext']
+  .filter(name => source.includes(`function ${name}(`)));
+const preparationHelpers = [
+  'crossfadePreparationMatches', 'runCrossfadeDeckPreparation',
+  'destroyCrossfadePreflight', 'upcomingTrackIndex', 'upcomingCrossfadeDeckReady',
+].filter(name => source.includes(`function ${name}(`));
+const identityHelpers = ['soundCloudInteger', 'soundCloudTrackMatches', 'soundCloudHref', 'getLink',
+  'soundCloudPermalinkConflicts', 'soundCloudLinkMatches', 'soundCloudPlayerMatches', 'boundSoundCloudRow', 'motionIsInstant']
+  .filter(name => source.includes(`function ${name}(`));
 function extractFunction(name) {
   const marker = `function ${name}(`;
   const start = source.indexOf(marker);
@@ -95,6 +104,7 @@ function fixture(names, overrides = {}) {
   const diagnostics = [];
   const context = {
     state, console, URL, DOMException, AbortController, ...timers,
+    window: {},
     document: { body: { contains: () => true }, querySelector: () => null, querySelectorAll: () => [], getElementById: () => null, removeEventListener() {} },
     normalizeTrackUrl: value => String(value || '').split(/[?#]/)[0].replace(/\/$/, '').toLowerCase(),
     ensureCrossfadeDecks: () => state._decks, ensureAutoLevelAudioGraph: () => true,
@@ -130,13 +140,173 @@ function fixture(names, overrides = {}) {
   };
   vm.createContext(context);
   vm.runInContext(diagnosticConstants, context);
-  vm.runInContext([...new Set([...diagnosticHelpers, ...names])].map(extractFunction).join('\n'), context);
+  vm.runInContext([...new Set([...diagnosticHelpers, ...preparationHelpers, ...identityHelpers, ...names])].map(extractFunction).join('\n'), context);
   return { context, state: context.state, timers, decks: context.state._decks, diagnostics };
 }
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 const deckFunctions = ['playbackErrorName', 'resetDeck', 'deckIsPreviewLimited', 'prepareCrossfadeDeck'];
 const foregroundFunctions = ['resetDeck', 'playDeckWithDeadline', 'playWithCrossfadeDeck', 'withDeadline'];
+
+const hardenedIdentity = source.includes('function soundCloudTrackMatches(');
+const streamFunctions = [
+  'resolveCrossfadeStreams', 'fetchPlaybackTrack', 'resolveProgressiveStreams',
+  'resolveHlsStreamUrls', 'directHlsStreamUrls', 'isHlsManifestUrl', 'isHlsStreamUrl',
+  'syncTrackPlaybackAccess', 'metaFromSoundCloudTrack', 'mergeTrackMeta',
+];
+function streamFixture(trackProvider, responses = () => ({ ok: false, status: 404 })) {
+  const requests = [];
+  const h = fixture(streamFunctions, {
+    hydrationTrackForPlayback: () => null,
+    discoverSoundCloudClientIdFromBundle: async () => 'client',
+    fetchSoundCloudResource: async (url, type, options) => {
+      requests.push(String(url));
+      if (options?.diagnosticStage === 'track-lookup' || options?.diagnosticStage === 'url-resolve') {
+        return { ok: true, status: 200, data: trackProvider() };
+      }
+      return responses(url);
+    },
+  });
+  h.state.meta[0].artist = 'Known artist';
+  h.state.meta[0].soundcloudId = 42;
+  return { ...h, requests };
+}
+
+if (hardenedIdentity) {
+  test('contradictory API IDs cannot use a matching permalink to mutate access, metadata, endpoints or cache', async () => {
+    for (const access of ['preview', 'playable']) {
+      let h;
+      h = streamFixture(() => ({
+        id: 999, permalink_url: h.state.meta[0].link, title: 'Wrong track', access,
+        duration: 1, user: { username: 'Wrong artist' },
+        streams: { hls_aac_160_url: 'https://media.example/wrong.m3u8' },
+        media: { transcodings: [
+          { url: 'https://api.soundcloud.com/wrong-progressive', format: { protocol: 'progressive' } },
+          { url: 'https://api.soundcloud.com/wrong-hls', format: { protocol: 'hls' } },
+        ] },
+      }), () => ({ ok: true, status: 200, data: { url: 'https://media.example/wrong' } }));
+      delete h.state.meta[0].artist;
+      const before = { ...h.state.meta[0] };
+      assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), []);
+      assert.deepEqual(h.state.meta[0], before);
+      assert.equal(h.state._streamCache.size, 0);
+      assert(h.requests.length > 0);
+      assert(h.requests.every(url => ['/tracks/42', '/resolve'].includes(new URL(url).pathname)));
+    }
+  });
+
+  test('matching API IDs or normalized permalinks still resolve and cache usable streams', async () => {
+    for (const byId of [true, false]) {
+      let h;
+      h = streamFixture(() => ({
+        ...(byId ? { id: '42', permalink_url: 'https://soundcloud.com/canonical/new' }
+          : { permalink_url: `${h.state.meta[0].link}/?tracking=yes` }),
+        media: { transcodings: [{ url: 'https://api.soundcloud.com/good',
+          format: { protocol: 'progressive', mime_type: 'audio/mpeg' } }] },
+      }), () => ({ ok: true, status: 200, data: { url: 'https://media.example/good' } }));
+      assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), ['https://media.example/good']);
+      assert.deepEqual(h.state._streamCache.get(h.state.meta[0].link).urls, ['https://media.example/good']);
+    }
+  });
+
+  test('ID-less stream resolution retains response identity across same-permalink requests', async () => {
+    const link = 'https://soundcloud.com/artist/shared-permalink';
+    const track11 = {
+      id: 11, permalink_url: link,
+      streams: { hls_aac_160_url: 'https://media.example/track11.m3u8' },
+    };
+    const track22 = {
+      id: 22, permalink_url: link,
+      streams: { hls_aac_160_url: 'https://media.example/track22.m3u8' },
+    };
+    let response = track11;
+    const h = streamFixture(() => response);
+    const meta = { link, title: 'Shared permalink', artist: 'Known artist' };
+    assert.deepEqual(await h.context.resolveCrossfadeStreams(meta), ['https://media.example/track11.m3u8']);
+    assert(h.requests.some(url => {
+      const request = new URL(url);
+      return request.pathname === '/resolve' && request.searchParams.get('url') === link;
+    }), 'ID-less metadata must resolve the permalink');
+
+    response = track22;
+    const before22 = h.requests.length;
+    assert.deepEqual(await h.context.resolveCrossfadeStreams({ ...meta, soundcloudId: 22 }),
+      ['https://media.example/track22.m3u8']);
+    assert(h.requests.slice(before22).some(url => new URL(url).pathname === '/tracks/22'),
+      'an explicit ID22 must fetch its own metadata rather than reuse the ID-less response for track11');
+
+    response = track11;
+    const before11 = h.requests.length;
+    assert.deepEqual(await h.context.resolveCrossfadeStreams({ ...meta, soundcloudId: 11 }),
+      ['https://media.example/track11.m3u8']);
+    assert(h.requests.slice(before11).some(url => new URL(url).pathname === '/tracks/11'),
+      'requesting ID11 again must fetch its metadata rather than reuse track22 at the same permalink');
+  });
+
+  test('API metadata without IDs requires the expected permalink before granting preview access', async () => {
+    let h;
+    let matching = false;
+    h = streamFixture(() => ({
+      permalink_url: matching ? `${h.state.meta[0].link}?tracking=yes` : 'https://soundcloud.com/other/preview',
+      access: 'preview', duration: 240000,
+    }));
+    const before = { ...h.state.meta[0] };
+    assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), []);
+    assert.deepEqual(h.state.meta[0], before);
+    assert.equal(h.state._streamCache.size, 0);
+    matching = true;
+    assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), []);
+    assert.equal(h.state.meta[0].requiresNativePlayback, true);
+    assert.equal(h.state.meta[0].durationMs, 240000);
+    assert.equal(h.state._streamCache.size, 0);
+  });
+
+  test('live enrichment retains hydration metadata on contradictory identity and accepts the matching API artist', async () => {
+    const track = { id: 42, permalink_url: 'https://soundcloud.com/artist/live', title: 'Hydrated title' };
+    let response = { ...track, id: 999, title: 'Wrong title', user: { username: 'Wrong artist' } };
+    const h = fixture(['resolveLiveTrackMeta', 'metaFromSoundCloudTrack', 'mergeTrackMeta', 'syncTrackPlaybackAccess'], {
+      discoverSoundCloudClientIdFromBundle: async () => 'client',
+      fetchSoundCloudResource: async () => ({ ok: true, data: response }),
+    });
+    const rejected = await h.context.resolveLiveTrackMeta(track, 'https://soundcloud.com/artist/likes', 3);
+    assert.equal(rejected.soundcloudId, 42);
+    assert.equal(rejected.title, 'Hydrated title');
+    assert.equal(rejected.artist, '—');
+    assert.equal(rejected.playlistPosition, 3);
+    response = { ...track, user: { username: 'Correct artist' } };
+    const enriched = await h.context.resolveLiveTrackMeta(track, 'https://soundcloud.com/artist/likes', 3);
+    assert.equal(enriched.soundcloudId, 42);
+    assert.equal(enriched.title, 'Hydrated title');
+    assert.equal(enriched.artist, 'Correct artist');
+    assert.equal(enriched.playlistPosition, 3);
+  });
+
+  test('empty root streams cannot hide nested HLS from real stream resolution', async () => {
+    const h = streamFixture(() => ({
+      id: 42, streams: {}, media: { streams: { hls_aac_160_url: 'https://cdn.example/nested.m3u8' } },
+    }));
+    assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), ['https://cdn.example/nested.m3u8']);
+    assert.deepEqual(h.state._streamCache.get(h.state.meta[0].link).urls, ['https://cdn.example/nested.m3u8']);
+  });
+
+  test('invalid progressive response values and null metadata entries cannot poison the stream cache', async () => {
+    for (const value of [null, {}, 9, '', ' ', '/relative', 'not a url', 'javascript:alert(1)', 'ftp://media.example/a']) {
+      const h = streamFixture(() => null, () => ({ ok: true, status: 200, data: { url: value } }));
+      const meta = h.state.meta[0];
+      meta.transcodings = [null, { url: 'https://api.soundcloud.com/progressive',
+        protocol: 'progressive', mimeType: 'audio/mpeg' }];
+      assert.deepEqual(await h.context.resolveCrossfadeStreams(meta), []);
+      assert.equal(h.state._streamCache.size, 0);
+      assert.equal(meta.requiresNativePlayback, undefined);
+    }
+    for (const url of ['http://media.example/a', 'https://media.example/b']) {
+      const h = streamFixture(() => null, () => ({ ok: true, status: 200, data: { url } }));
+      h.state.meta[0].transcodings = [null, { url: 'https://api.soundcloud.com/progressive', protocol: 'progressive' }];
+      assert.deepEqual(await h.context.resolveCrossfadeStreams(h.state.meta[0]), [url]);
+      assert.deepEqual(h.state._streamCache.get(h.state.meta[0].link).urls, [url]);
+    }
+  });
+}
 
 test('a rejected Next releases only its operation and the second Next still plays', async () => {
   let calls = 0;
@@ -1049,7 +1219,9 @@ test('a completed old crossfade cannot reset a restarted session or clear its re
 
 test('a stopped native pre-click delay never clicks an old queue row', async () => {
   let clicks = 0;
-  const row = { scrollIntoView() {}, dispatchEvent() {}, querySelector: () => ({ click() { clicks++; } }) };
+  const row = { scrollIntoView() {}, dispatchEvent() {}, querySelector: selector =>
+    selector.includes('trackTitle') ? { getAttribute: () => 'https://soundcloud.com/artist/0' }
+      : { click() { clicks++; } } };
   const h = fixture(['withDeadline', 'playWithSoundCloudSession', 'invalidatePlaybackSession'], {
     MouseEvent: function MouseEvent() {}, stopCrossfadeDecks() {},
   });
@@ -1074,16 +1246,22 @@ test('credential rejection skips obsolete A and B then reaches valid bundle C ac
   const tried = [];
   let bundles = 0;
   const h = fixture(resolverFunctions, {
-    performance: { getEntriesByType: () => [{ name: `https://api.example/?client_id=${B}` }, { name: `https://api.example/?client_id=${A}` }] },
+    performance: { getEntriesByType: () => [{ name: `https://api-v2.soundcloud.com/tracks?client_id=${B}` }, { name: `https://api.soundcloud.com/tracks?client_id=${A}` }] },
     document: { scripts: [{ src: 'https://a-v2.sndcdn.com/assets/current.js' }] },
     hydrationTrackForPlayback: () => null, syncTrackPlaybackAccess: () => false,
     fetchSoundCloudResource: async (url, format) => {
       if (format === 'text') { bundles++; return { ok: true, data: `client_id:"${C}"` }; }
-      const client = new URL(url).searchParams.get('client_id');
+      const endpoint = new URL(url);
+      const client = endpoint.searchParams.get('client_id');
       tried.push(client);
-      return client === C
-        ? { ok: true, status: 200, data: { url: 'https://media.example/valid' } }
-        : { ok: false, status: 401, data: null };
+      if (client !== C) return { ok: false, status: 401, data: null };
+      if (endpoint.pathname === '/resolve') {
+        return { ok: true, status: 200, data: {
+          id: 100, permalink_url: endpoint.searchParams.get('url'),
+          media: { transcodings: [{ url: 'https://api.example/progressive', format: { protocol: 'progressive', mime_type: 'audio/mpeg' } }] },
+        } };
+      }
+      return { ok: true, status: 200, data: { url: 'https://media.example/valid' } };
     },
   });
   const meta = h.state.meta[0];
@@ -1101,13 +1279,28 @@ test('credential rejection skips obsolete A and B then reaches valid bundle C ac
 
 test('a forbidden track cannot blacklist a valid client ID for an unrelated public track', async () => {
   const client = 'valid-client-for-public-tracks';
+  const publicClients = [];
   const h = fixture(resolverFunctions, {
-    performance: { getEntriesByType: () => [{ name: `https://api.example/?client_id=${client}` }] },
+    performance: { getEntriesByType: () => [{ name: `https://api-v2.soundcloud.com/tracks?client_id=${client}` }] },
     document: { scripts: [] }, hydrationTrackForPlayback: () => null,
     syncTrackPlaybackAccess: () => false,
     fetchSoundCloudResource: async endpoint => {
       const url = new URL(endpoint);
-      if (url.pathname === '/public-stream') return { ok: true, status: 200, data: { url: 'https://media.example/public' } };
+      if (url.pathname === '/resolve') {
+        const permalink = url.searchParams.get('url');
+        const isPublic = permalink === 'https://soundcloud.com/a/public';
+        return { ok: true, status: 200, data: {
+          id: isPublic ? 102 : 101, permalink_url: permalink,
+          media: { transcodings: [{
+            url: `https://api.example/${isPublic ? 'public' : 'private'}-stream`,
+            format: { protocol: 'progressive', mime_type: 'audio/mpeg' },
+          }] },
+        } };
+      }
+      if (url.pathname === '/public-stream') {
+        publicClients.push(url.searchParams.get('client_id'));
+        return { ok: true, status: 200, data: { url: 'https://media.example/public' } };
+      }
       return { ok: false, status: 403, data: null };
     },
   });
@@ -1117,6 +1310,7 @@ test('a forbidden track cannot blacklist a valid client ID for an unrelated publ
     transcodings: [{ url: 'https://api.example/public-stream', protocol: 'progressive', mimeType: 'audio/mpeg' }] };
   assert.deepEqual(await h.context.resolveCrossfadeStreams(privateTrack), []);
   assert.deepEqual(await h.context.resolveCrossfadeStreams(publicTrack), ['https://media.example/public']);
+  assert.deepEqual(publicClients, [client]);
 });
 
 for (const pendingBody of [false, true]) {

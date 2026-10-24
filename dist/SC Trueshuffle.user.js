@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.2.5
+// @version      6.3.0
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
@@ -18,9 +18,8 @@
 'use strict';
 
 const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-const DIAGNOSTIC_BUILD = true;
-// Reserve the readiness timeout plus margin for preparing the track after a short bumper.
-const CROSSFADE_PRELOAD_RESERVE_SECONDS = 6;
+const DIAGNOSTIC_BUILD = false;
+// Preserve time for the incoming track's fade-out while allowing short bumpers to fade in.
 const CROSSFADE_MIN_DURATION_SECONDS = 0.25;
 const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
 const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
@@ -68,7 +67,10 @@ const DIAGNOSTIC_NUMBER_FIELDS = new Set([
   'hlsManifestParsedElapsedMs', 'hlsFirstFragmentBufferedElapsedMs', 'mediaWaitElapsedMs',
   'playElapsedMs', 'pollCount', 'nativePollCount', 'pollLimit', 'maxPolls', 'attempts',
   'recoveryAttempts', 'elapsed', 'timeoutMs', 'waitMs', 'remainingMs', 'bufferedAhead',
-  'playbackRate', 'browserMajorVersion',
+  'playbackRate', 'browserMajorVersion', 'monotonicMs', 'previousToken', 'incomingDuration',
+  'sampledSchedulingLeadMs', 'schedulingSubmissionMs', 'estimatedSchedulingLeadMs',
+  'observationElapsedMs', 'audioClockFromFadeStartMs',
+  'incomingBaselineTime', 'incomingScheduledTime', 'incomingAdvanceMs',
 ]);
 const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
   'passExhausted', 'clientIdFound', 'authFailed', 'trackMetadataFound',
@@ -85,7 +87,8 @@ const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
   'outgoingPaused', 'nativeAudioFound', 'playerMatched', 'elementFound', 'elementAttached',
   'trackElementPresent', 'playButtonFound', 'playClickIssued', 'nativeAcknowledged', 'nativeTransportPaused',
   'bufferedDataAvailable',
-  'autoLevel', 'eqEnabled', 'safetyClipper',
+  'autoLevel', 'eqEnabled', 'safetyClipper', 'foreground', 'detached', 'fatal', 'transitionDiagnosticsEnabled',
+  'progressAlreadyAtSchedule',
 ]);
 const DIAGNOSTIC_STRING_FIELDS = new Set([
   'event', 'operation', 'stage', 'failureStage', 'failureReason', 'reason',
@@ -103,7 +106,7 @@ const DIAGNOSTIC_STRING_FIELDS = new Set([
 ]);
 const DIAGNOSTIC_NESTED_FIELDS = new Set([
   'requests', 'audioFeatures', 'state', 'audioContext', 'schedule', 'decks',
-  'diagnostics', 'environment', 'capabilities',
+  'diagnostics', 'environment', 'capabilities', 'incident', 'fault',
 ]);
 const DIAGNOSTIC_SAFE_LABELS = {
   browser: new Set(['chrome', 'chromium', 'edge', 'firefox', 'opera', 'safari', 'other', 'unknown']),
@@ -119,7 +122,7 @@ const DIAGNOSTIC_SAFE_LABELS = {
 
 function safeDiagnosticVersion(value) {
   const version = String(value || '');
-  return /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:[-+][A-Za-z0-9.-]+)?$/.test(version) ? version : 'unknown';
+  return version.length <= 64 && /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:\.\d{1,3})?(?:[-+][A-Za-z0-9.-]+)?$/.test(version) ? version : 'unknown';
 }
 
 function safeDiagnosticString(key, value) {
@@ -158,7 +161,7 @@ function sanitizeDiagnosticRecord(value, depth = 0) {
     }
     if (DIAGNOSTIC_STRING_FIELDS.has(key)) {
       const safe = safeDiagnosticString(key, item);
-      if (safe) clean[key === 'error' ? 'errorName' : key] = safe;
+      if (safe && (key !== 'error' || !clean.errorName)) clean[key === 'error' ? 'errorName' : key] = safe;
       continue;
     }
     if (!DIAGNOSTIC_NESTED_FIELDS.has(key)) continue;
@@ -175,7 +178,7 @@ function sanitizeDiagnosticRecord(value, depth = 0) {
       }
     } else if (key === 'diagnostics') {
       if (Array.isArray(item)) {
-        clean.diagnostics = item.slice(-40)
+        clean.diagnostics = item.slice(-80)
           .map(entry => sanitizeDiagnosticRecord(entry, depth + 1))
           .filter(entry => typeof entry.event === 'string' && typeof entry.at === 'string');
       }
@@ -334,6 +337,8 @@ const state = {
   lastTitle:    '',
   lastProgress: 0,
   sidebarOpen:  false,
+  reduceVisualEffects: safeStorage.getItem('tss_reduce_visual_effects') === 'true',
+  scrollLongTitles: safeStorage.getItem('tss_scroll_long_titles') !== 'false',
   _sidebarDirty: true,
   sidebarTab:   'queue',
   sidebarWidth: 320,
@@ -351,7 +356,6 @@ const state = {
   playlistUrl:  '',
   _savedStats:  null,
   _lifetimeBase: null,
-  _lastAccentArtwork: '',
   _lastWaveformKey: '',
   _waveformBars: null,
   _lastWaveformPlayed: 0,
@@ -392,6 +396,7 @@ const state = {
   _crossfadePending: false,
   _crossfading: false,
   _crossfadePausedByUser: false,
+  _crossfadePauseGeneration: 0,
   _crossfadeSchedule: null,
   _crossfadeToken: 0,
   _deckIndex: -1,
@@ -426,6 +431,8 @@ const state = {
   _soundCloudVolumeModel: null,
   _customPlaybackRetryTimer: null,
   _pipBridgePlayer: null,
+  _pipBridgeOriginals: null,
+  _pipBridgeWrappers: null,
   _ownPipWindow: null,
   _ownPipMode: null,
   pipArtworkMode: ['compact', 'full', 'focus'].includes(safeStorage.getItem('tss_pip_artwork_mode'))
@@ -450,6 +457,8 @@ const state = {
     return [];
   })(),
   _playbackDiagnosticFault: false,
+  _playbackDiagnosticIncident: null,
+  _transitionDiagnostics: true,
   _tabTitleBeforePlayback: null,
   _tabTitleValue: '',
   _browserMetadataKey: '',
@@ -724,14 +733,23 @@ function formatPlaybackClock(seconds) {
 function paused() {
   const deck = currentDeckAudio();
   if (deck) return deck.paused;
-  return soundCloudPaused();
+  let nativeAudioFound = false;
+  for (const audio of document.querySelectorAll('audio')) {
+    if (isTrueShuffleAudio(audio) || !audio.currentSrc) continue;
+    nativeAudioFound = true;
+    if (!audio.paused) return false;
+  }
+  if (nativeAudioFound) return true;
+  return soundCloudPaused() !== false;
 }
 
 function soundCloudPaused() {
   const btn = document.querySelector('.playControls__play');
-  if (!btn) return false;
-  const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-  return label.startsWith('play') || (btn.title || '').toLowerCase().startsWith('play');
+  if (!btn) return null;
+  const labels = [btn.getAttribute('aria-label') || '', btn.title || ''].map(value => value.trim().toLowerCase());
+  if (labels.some(label => label.startsWith('pause'))) return false;
+  if (labels.some(label => label.startsWith('play'))) return true;
+  return null;
 }
 
 function isTrueShuffleAudio(audio) {
@@ -754,7 +772,7 @@ function pauseSoundCloud() {
 
 function pauseSoundCloudTransport() {
   const button = document.querySelector('.playControls__play');
-  if (!button || soundCloudPaused()) return false;
+  if (!button || soundCloudPaused() !== false) return false;
   state._nativeGuardButtonAction = true;
   try {
     button.click();
@@ -812,7 +830,9 @@ function installNativePlaybackGuard() {
 
 function pause() {
   state._userPaused = true;
+  state._crossfadePauseGeneration = (state._crossfadePauseGeneration || 0) + 1;
   if (state._crossfading) state._crossfadePausedByUser = true;
+  if (state._crossfadeSchedule?.incomingClockObservation) delete state._crossfadeSchedule.incomingClockObservation;
   const deck = currentDeckAudio();
   if (deck) {
     state._decks.forEach(audio => {
@@ -900,10 +920,22 @@ async function toggle() {
     if (!paused()) {
       pause();
     } else {
-      state._userPaused = false;
+      const meta = state.meta[state._nativeTrack];
+      const playerMatched = soundCloudPlayerMatches(meta);
+      const button = document.querySelector('.playControls__play');
+      if (!button || soundCloudPaused() !== true || !playerMatched) {
+        showMergeToast('SoundCloud playback is unavailable until this track is visible');
+        refreshPlayBtn();
+        return false;
+      }
+      const userPaused = state._userPaused;
       state._nativeGuardButtonAction = true;
+      state._userPaused = false;
       try {
-        document.querySelector('.playControls__play')?.click();
+        button.click();
+      } catch (error) {
+        state._userPaused = userPaused;
+        throw error;
       } finally {
         state._nativeGuardButtonAction = false;
       }
@@ -940,13 +972,25 @@ function seekTo(ratio) {
 
 function refreshPlayBtn() {
   const p = document.getElementById('tss-hub-play');
-  if (p) p.innerHTML = paused() ? SVG.play : SVG.pause;
+  if (!p) return;
+  const label = paused() ? 'Play' : 'Pause';
+  if (p.getAttribute('aria-label') !== label) p.setAttribute('aria-label', label);
+  const icon = paused() ? SVG.play : SVG.pause;
+  // SVG serialization expands self-closing tags; compare the actual last render.
+  if (p._tssPlayIcon === icon && p.innerHTML === p._tssPlayMarkup) return;
+  p.innerHTML = icon;
+  p._tssPlayIcon = icon;
+  p._tssPlayMarkup = p.innerHTML;
 }
 
-function updateProgressBar() {
-  const ratio = Math.max(0, Math.min(1, progress()));
+function updateProgressBar(timing = playbackTiming()) {
+  const ratio = Math.max(0, Math.min(1, timing.duration ? timing.current / timing.duration : 0));
   const p = document.getElementById('tss-hub-prog');
-  if (p) p.style.width = `${(ratio * 100).toFixed(1)}%`;
+  const width = `${(ratio * 100).toFixed(1)}%`;
+  if (p && p.style.width !== width) p.style.width = width;
+  const seekbar = document.getElementById('tss-hub-seekbar');
+  const percent = String(Math.round(ratio * 100));
+  if (seekbar && seekbar.getAttribute('aria-valuenow') !== percent) seekbar.setAttribute('aria-valuenow', percent);
   if (!state._waveformBars?.[0]?.isConnected) {
     state._waveformBars = [...document.querySelectorAll('#tss-wave-bars i')];
   }
@@ -973,12 +1017,24 @@ function artwork(el) {
   return null;
 }
 
+function soundCloudInteger(value, minimum = 0) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+$/.test(value.trim()))) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= minimum ? number : null;
+}
+
+function soundCloudHref(href) {
+  if (typeof href !== 'string' || !href.trim()) return null;
+  try {
+    const url = new URL(href, 'https://soundcloud.com/');
+    return /^https?:$/.test(url.protocol) ? url.href : null;
+  } catch (_) { return null; }
+}
+
 function getLink(el) {
   const a = el.querySelector('.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary');
   if (!a) return null;
-  const href = a.getAttribute('href');
-  if (!href) return null;
-  return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
+  return soundCloudHref(a.getAttribute('href'));
 }
 
 function waveformUrl(el) {
@@ -992,9 +1048,7 @@ function getArtistLink(el) {
   const a = el.querySelector('.trackItem__username, .soundTitle__username')
     || el.querySelector('a.sc-link-secondary');
   if (!a) return null;
-  const href = a.getAttribute('href');
-  if (!href) return null;
-  return href.startsWith('http') ? href : 'https://soundcloud.com' + href;
+  return soundCloudHref(a.getAttribute('href'));
 }
 
 function trackId(m) {
@@ -1003,6 +1057,50 @@ function trackId(m) {
   const t = m.title, a = m.artist;
   if ((t && t !== '—') || (a && a !== '—')) return `${t}|||${a}`;
   return null;
+}
+
+function trackCacheKey(meta) {
+  const id = soundCloudInteger(meta?.soundcloudId ?? meta?.id, 1);
+  return id !== null ? `soundcloud:${id}` : trackId(meta);
+}
+
+function indexTrackMeta(index, meta, ti) {
+  const key = trackCacheKey(meta);
+  const previousKey = index.keys[ti];
+  if (previousKey && previousKey !== key && index.byKey.get(previousKey) === ti) index.byKey.delete(previousKey);
+  index.keys[ti] = key;
+  if (key) index.byKey.set(key, ti);
+  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl);
+  const previousLink = index.links[ti];
+  if (previousLink && previousLink !== link) index.byLink.get(previousLink)?.delete(ti);
+  index.links[ti] = link;
+  if (!link) return;
+  let members = index.byLink.get(link);
+  if (!members) index.byLink.set(link, members = new Set());
+  members.add(ti);
+}
+
+function trackIdentityIndex(metas) {
+  const index = { metas, byKey: new Map(), byLink: new Map(), keys: [], links: [] };
+  metas.forEach((meta, ti) => indexTrackMeta(index, meta, ti));
+  return index;
+}
+
+function matchingTrackIndex(index, meta) {
+  const key = trackCacheKey(meta);
+  if (!key) return undefined;
+  const exact = index.byKey.get(key);
+  if (exact !== undefined) return exact;
+  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl);
+  const candidates = index.byLink.get(link);
+  if (!candidates) return undefined;
+  let match;
+  for (const ti of candidates) {
+    if (!soundCloudTrackMatches(meta, index.metas[ti])) continue;
+    if (match !== undefined) return undefined;
+    match = ti;
+  }
+  return match;
 }
 
 function getMeta(el) {
@@ -1025,21 +1123,27 @@ function getMeta(el) {
 
 const LIVE_SYNC_INTERVAL_MS = 10_000;
 
-function playlistSnapshotFromHtml(html) {
-  const match = String(html || '').match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\]);<\/script>/);
+function playlistSnapshotFromHtml(html, sourcePage = '') {
+  const match = String(html || '').match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\])\s*;\s*<\/script\s*>/);
   if (!match) return null;
   try {
     const hydration = JSON.parse(match[1]);
-    const entry = hydration.find(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
+    if (!Array.isArray(hydration)) return null;
+    const entries = hydration.filter(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
+    const wanted = normalizeTrackUrl(sourcePage);
+    const matching = wanted ? entries.filter(item => normalizeTrackUrl(item.data.permalink_url || item.data.permalinkUrl) === wanted) : [];
+    const entry = matching.length === 1 ? matching[0]
+      : matching.length ? null
+        : entries.length === 1 && (!wanted || !normalizeTrackUrl(entries[0].data.permalink_url || entries[0].data.permalinkUrl)) ? entries[0] : null;
     if (!Array.isArray(entry?.data?.tracks)) return null;
-    const tracks = entry.data.tracks.filter(track => Number.isFinite(Number(track?.id)));
-    const reportedCount = Number(entry.data.track_count);
-    if (!tracks.length && entry.data.track_count !== 0) return null;
-    const trackCount = Number.isFinite(reportedCount) && reportedCount >= 0 ? reportedCount : tracks.length;
+    const rawTracks = entry.data.tracks;
+    const tracks = rawTracks.filter(track => soundCloudInteger(track?.id, 1) !== null);
+    const trackCount = soundCloudInteger(entry.data.track_count);
+    if (!tracks.length && !(trackCount === 0 && rawTracks.length === 0)) return null;
     return {
       id: entry.data.id || null,
       trackCount,
-      complete: tracks.length >= trackCount,
+      complete: trackCount !== null && rawTracks.length === tracks.length && tracks.length === trackCount,
       tracks,
     };
   } catch (_) {
@@ -1076,7 +1180,7 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
   if (!track?.permalink_url || !track?.title) return null;
   const artworkUrl = track.artwork_url || track.user?.avatar_url || null;
   const meta = {
-    soundcloudId: Number(track.id) || null,
+    soundcloudId: soundCloudInteger(track.id, 1),
     title: track.title || '—',
     artist: String(track.publisher_metadata?.artist || '').trim() || String(track.user?.username || '').trim() || '—',
     artwork: artworkUrl ? artworkUrl.replace(/-([a-z]+|t\d+x\d+)\.(jpg|png)$/i, '-t200x200.$2') : null,
@@ -1140,14 +1244,17 @@ const SVG = {
   next:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="11.5" y="2" width="2.5" height="12" rx="1"/><path d="M3 3v10l8-5z"/></svg>`,
   close:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M12.7 3.3a1 1 0 00-1.4 0L8 6.6 4.7 3.3a1 1 0 00-1.4 1.4L6.6 8l-3.3 3.3a1 1 0 101.4 1.4L8 9.4l3.3 3.3a1 1 0 001.4-1.4L9.4 8l3.3-3.3a1 1 0 000-1.4z"/></svg>`,
   chart:   `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="8" width="3" height="7" rx="1"/><rect x="6" y="5" width="3" height="10" rx="1"/><rect x="11" y="2" width="3" height="13" rx="1"/></svg>`,
-  equalizer:`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M3 2v12M8 2v12M13 2v12"/><circle cx="3" cy="6" r="1.7" fill="currentColor" stroke="none"/><circle cx="8" cy="10" r="1.7" fill="currentColor" stroke="none"/><circle cx="13" cy="5" r="1.7" fill="currentColor" stroke="none"/></svg>`,
-  pip:     `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="1.5" y="2.5" width="9" height="7" rx="1.4"/><rect x="5.5" y="6.5" width="9" height="7" rx="1.4" fill="currentColor" stroke="none"/></svg>`,
+  equalizer:`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M3 2v12M8 2v12M13 2v12"/><circle cx="3" cy="6" r="1.7" fill="currentColor" stroke="none"/><circle cx="8" cy="10" r="1.7" fill="currentColor" stroke="none"/><circle cx="13" cy="5" r="1.7" fill="currentColor" stroke="none"/></svg>`,
+  pip:     `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="1.5" y="2.5" width="9" height="7" rx="1.4"/><rect x="5.5" y="6.5" width="9" height="7" rx="1.4" fill="currentColor" stroke="none"/></svg>`,
+  gear:    `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="m6.6 1.5-.4 1.8-1.4.8L3 3.6 1.6 6l1.4 1.3v1.4L1.6 10 3 12.4l1.8-.5 1.4.8.4 1.8h2.8l.4-1.8 1.4-.8 1.8.5 1.4-2.4L13 8.7V7.3L14.4 6 13 3.6l-1.8.5-1.4-.8-.4-1.8z"/><circle cx="8" cy="8" r="2.25"/></svg>`,
+  back:    `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M13 8H3m4-4L3 8l4 4"/></svg>`,
+  timer:   `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><circle cx="8" cy="9" r="5"/><path d="M6 1.5h4M8 1.5V4m3.7 1.3L13 4M8 6v3l2 1"/></svg>`,
+  info:    `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><circle cx="8" cy="8" r="6"/><path d="M8 7.5v4"/><circle cx="8" cy="4.8" r=".8" fill="currentColor" stroke="none"/></svg>`,
   note:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:18px;height:18px;flex-shrink:0;opacity:0.25"><path d="M9 3v7.27A3 3 0 1 0 11 13V6h2V3H9zm-3 12a1 1 0 110-2 1 1 0 010 2z"/></svg>`,
   shuffle: `<svg viewBox="0 0 24 24" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>`,
   artwork: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="2" y="2" width="12" height="12" rx="2"/><circle cx="5.3" cy="5.3" r="1.3" fill="currentColor" stroke="none"/><path d="M3.5 12l3.2-3.5 2.1 2 1.5-1.6 2.2 3.1"/></svg>`,
   list:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="2.5" width="14" height="1.5" rx="0.75"/><rect x="1" y="7.25" width="14" height="1.5" rx="0.75"/><rect x="1" y="12" width="14" height="1.5" rx="0.75"/></svg>`,
   more:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>`,
-  moon:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:11px;height:11px;flex-shrink:0"><path d="M14 10.66A6.5 6.5 0 115.34 2a5 5 0 108.66 8.66z"/></svg>`,
   plus:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z"/></svg>`,
   search:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>`,
   volume:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M2 6h3l3-2.5v9L5 10H2z"/><path d="M11 5.5a4 4 0 010 5"/><path d="M13 3.5a7 7 0 010 9"/></svg>`,
@@ -1168,12 +1275,106 @@ function recordPlaybackDiagnostic(event, details = {}) {
   if (state._playbackDiagnostics.length > 80) {
     state._playbackDiagnostics.splice(0, state._playbackDiagnostics.length - 80);
   }
-  if (PLAYBACK_DIAGNOSTIC_FAULTS.has(entry.event)) state._playbackDiagnosticFault = true;
-  try { updatePlaybackDiagnosticButton(); } catch (_) {}
   if (PLAYBACK_DIAGNOSTIC_FAULTS.has(entry.event)) {
+    state._playbackDiagnosticFault = true;
+    try { capturePlaybackDiagnosticIncident(entry); } catch (_) {}
+    try { updatePlaybackDiagnosticButton(); } catch (_) {}
     try { console.info('[True Shuffle][playback]', entry); } catch (_) {}
   }
   return entry;
+}
+
+// Event-only observations share the existing memory ring; they never imply silence.
+function recordTransitionDiagnostic(event, details = {}) {
+  if (!state._transitionDiagnostics) return null;
+  switch (event) {
+    case 'preparation-start': case 'preparation-result': case 'preparation-reused':
+    case 'preparation-promoted': case 'preparation-replaced': case 'preparation-cancelled':
+    case 'streams-resolved': case 'deck-reset':
+    case 'hls-load': case 'hls-adopted': case 'hls-attached':
+    case 'hls-manifest': case 'hls-first-fragment-loaded': case 'hls-first-fragment-buffered': case 'hls-error':
+    case 'media-waiting': case 'media-stalled': case 'media-playing':
+    case 'transition-requested': case 'fade-window': case 'fade-trigger':
+    case 'fade-scheduled': case 'incoming-clock-progress': case 'fade-completed': case 'fade-fallback':
+    case 'transition-no-mix': case 'natural-end': case 'watcher-delay':
+      break;
+    default: return null;
+  }
+  const now = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+  if (!Number.isFinite(state._transitionDiagnosticOrigin)) state._transitionDiagnosticOrigin = now;
+  const clean = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (DIAGNOSTIC_NUMBER_FIELDS.has(key) && typeof value === 'number' && Number.isFinite(value)) clean[key] = value;
+    else if (DIAGNOSTIC_BOOLEAN_FIELDS.has(key) && typeof value === 'boolean') clean[key] = value;
+    else if (event === 'hls-error' && (key === 'errorType' || key === 'errorDetail')) clean[key] = hlsDiagnosticCode(value);
+  }
+  return recordPlaybackDiagnostic(event, {
+    playbackEpoch: state._playbackEpoch,
+    operationId: state._playbackRequest?.operationId,
+    ...clean,
+    monotonicMs: Math.max(0, now - state._transitionDiagnosticOrigin),
+  });
+}
+
+function observeTransitionMedia(audio, index) {
+  if (!state._transitionDiagnostics || audio._tssTransitionMedia) return;
+  const observation = { waiting: -Infinity, stalled: -Infinity, playing: -Infinity, token: null };
+  audio._tssTransitionMedia = observation;
+  for (const type of ['waiting', 'stalled', 'playing']) {
+    audio.addEventListener(type, () => {
+      if (!state._transitionDiagnostics || state._decks[index] !== audio || !audio.currentSrc) return;
+      const now = performance.now();
+      const token = state._deckPrepareTokens[index];
+      if (observation.token !== token) {
+        observation.waiting = observation.stalled = observation.playing = -Infinity;
+      }
+      if (now - observation[type] < 1000) return;
+      observation[type] = now;
+      observation.token = token;
+      recordTransitionDiagnostic(`media-${type}`, {
+        deckIndex: index, trackIndex: state._deckTracks[index], token,
+        readyState: audio.readyState, networkState: audio.networkState,
+        currentTime: audio.currentTime, paused: audio.paused,
+      });
+    });
+  }
+}
+
+function observeTransitionHls(player, events, details) {
+  if (!state._transitionDiagnostics) return;
+  details.playbackEpoch = state._playbackEpoch;
+  if (player._tssTransitionHls) {
+    player._tssTransitionHls.previousToken = player._tssTransitionHls.details.token;
+    Object.assign(player._tssTransitionHls.details, details);
+    return;
+  }
+  const observation = { details, startedAt: performance.now(), errorAt: -Infinity, errors: 0, fatal: false };
+  player._tssTransitionHls = observation;
+  for (const [type, event] of [
+    [events.MEDIA_ATTACHED, 'hls-attached'],
+    [events.MANIFEST_PARSED, 'hls-manifest'],
+    [events.FRAG_LOADED, 'hls-first-fragment-loaded'],
+    [events.FRAG_BUFFERED, 'hls-first-fragment-buffered'],
+  ]) {
+    if (!type) continue;
+    const once = () => {
+      player.off(type, once);
+      recordTransitionDiagnostic(event, { ...observation.details, elapsedMs: performance.now() - observation.startedAt });
+    };
+    player.on(type, once);
+  }
+  if (events.ERROR) player.on(events.ERROR, (_event, data) => {
+    if (!data) return;
+    const now = performance.now();
+    if (data.fatal ? observation.fatal : observation.errors >= 8 || now - observation.errorAt < 1000) return;
+    if (data.fatal) observation.fatal = true;
+    else { observation.errors++; observation.errorAt = now; }
+    recordTransitionDiagnostic('hls-error', {
+      ...observation.details, fatal: Boolean(data.fatal),
+      errorType: hlsDiagnosticCode(data.type), errorDetail: hlsDiagnosticCode(data.details),
+      status: Number(data.response?.code),
+    });
+  });
 }
 function playbackErrorName(error) {
   const name = typeof error?.name === 'string' ? error.name : '';
@@ -1433,21 +1634,18 @@ function customStartDiagnosticDetails(trace, outcome = 'failed') {
   };
 }
 
-function playbackDiagnosticSnapshot(reason = 'manual') {
+function playbackDiagnosticContext() {
   const schedule = state._crossfadeSchedule;
-  const environment = playbackDiagnosticEnvironment();
   const activeDeck = Number.isInteger(state._deckIndex) ? state._decks?.[state._deckIndex] || null : null;
-  const report = {
-    schemaVersion: 2,
-    scriptVersion: environment.scriptVersion,
-    at: new Date().toISOString(),
-    reason: safeDiagnosticString('reason', reason) || 'manual',
-    pageKind: playbackDiagnosticPageKind(),
-    environment,
-    capabilities: playbackDiagnosticCapabilities(),
+  const host = playbackDiagnosticHostWindow();
+  const documentObject = host.document || (typeof document !== 'undefined' ? document : null);
+  const navigatorObject = host.navigator || (typeof navigator !== 'undefined' ? navigator : null);
+  return {
     state: {
       active: state.active,
       loading: state.loading,
+      visible: documentObject?.visibilityState ? documentObject.visibilityState === 'visible' : undefined,
+      onLine: typeof navigatorObject?.onLine === 'boolean' ? navigatorObject.onLine : undefined,
       userPaused: Boolean(state._userPaused),
       crossfadePending: Boolean(state._crossfadePending),
       playbackEpoch: Number(state._playbackEpoch) || 0,
@@ -1462,16 +1660,17 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
       crossfadeManual: Boolean(state.crossfadeManual),
       crossfadeSeconds: state.crossfadeSeconds,
       queuePosition: state.pos,
-      queueLength: state.queue.length,
+      queueLength: state.queue?.length || 0,
       deckIndex: state._deckIndex,
       deckTrack: state._deckTrack,
       nativeTrackIndex: Number.isInteger(state._nativeTrack) ? state._nativeTrack : null,
       nativeFallbackReason: Number.isInteger(state._nativeTrack)
-        ? state.meta[state._nativeTrack]?.nativePlaybackReason || 'native-player'
+        ? state.meta?.[state._nativeTrack]?.nativePlaybackReason || 'native-player'
         : null,
       streamKind: activeDeck ? diagnosticDeckStreamKind(activeDeck, state._deckIndex) : 'none',
       retryPending: Boolean(state._customPlaybackRetryTimer),
       diagnosticsEnabled: Boolean(state._diagnosticBuild),
+      transitionDiagnosticsEnabled: Boolean(state._transitionDiagnostics),
       audioGraphFailed: Boolean(state._audioGraphFailed),
       contextState: state._audioContext?.state || 'missing',
       audioFeatures: {
@@ -1498,12 +1697,23 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
       lastIncomingTime: schedule.lastIncomingTime,
       lastIncomingAdvanceAt: schedule.lastIncomingAdvanceAt,
     } : null,
-    decks: state._decks.map((audio, index) => {
+    decks: (state._decks || []).slice(0, 2).map((audio, index) => {
       if (!audio) return null;
       const hls = state._deckHlsPlayers?.[index];
+      let bufferedAhead = null;
+      try {
+        const buffered = audio.buffered;
+        const time = audio.currentTime;
+        for (let range = 0; range < Math.min(buffered?.length || 0, 64); range++) {
+          if (buffered.start(range) <= time && buffered.end(range) >= time) {
+            bufferedAhead = Math.max(0, buffered.end(range) - time);
+            break;
+          }
+        }
+      } catch (_) {}
       return {
         index,
-        trackIndex: state._deckTracks[index],
+        trackIndex: state._deckTracks?.[index],
         streamKind: diagnosticDeckStreamKind(audio, index),
         paused: audio.paused,
         ended: audio.ended,
@@ -1511,13 +1721,14 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
         currentTime: Number(audio.currentTime) || 0,
         duration: Number(audio.duration) || 0,
         readyState: Number(audio.readyState) || 0,
+        bufferedAhead,
         networkState: Number(audio.networkState) || 0,
         errorCode: Number(audio.error?.code) || 0,
         hasCurrentSrc: Boolean(audio.currentSrc || audio.src),
         playbackRate: Number(audio.playbackRate) || 1,
-        deckGain: state._deckGains[index],
-        mixGain: state._deckAudioGraphs[index]?.mixGain?.gain?.value,
-        autoGain: state._deckAudioGraphs[index]?.autoGain?.gain?.value,
+        deckGain: state._deckGains?.[index],
+        mixGain: state._deckAudioGraphs?.[index]?.mixGain?.gain?.value,
+        autoGain: state._deckAudioGraphs?.[index]?.autoGain?.gain?.value,
         hlsMediaAttached: Boolean(hls?.media === audio),
         hlsLoading: Boolean(hls?.loadingEnabled),
         hlsLevelCount: Array.isArray(hls?.levels) ? hls.levels.length : 0,
@@ -1526,9 +1737,164 @@ function playbackDiagnosticSnapshot(reason = 'manual') {
           ? Math.round(Number(hls.bandwidthEstimate)) : null,
       };
     }),
-    diagnostics: sanitizePlaybackDiagnostics(state._playbackDiagnostics).slice(-40),
   };
-  return sanitizeDiagnosticRecord(report);
+}
+
+// Capture once per real fault, never from routine observations or a recursive snapshot.
+function capturePlaybackDiagnosticIncident(entry) {
+  const fault = sanitizeDiagnosticRecord(entry);
+  if (!PLAYBACK_DIAGNOSTIC_FAULTS.has(fault.event) || !fault.at) return null;
+  const prior = sanitizePlaybackDiagnostics(state._playbackDiagnostics);
+  if (prior.at(-1)?.event === fault.event && prior.at(-1)?.at === fault.at) prior.pop();
+  const incident = sanitizeDiagnosticRecord({
+    fault,
+    ...playbackDiagnosticContext(),
+    diagnostics: prior.slice(-12),
+  });
+  state._playbackDiagnosticIncident = incident;
+  return incident;
+}
+
+function playbackDiagnosticSnapshot(reason = 'manual') {
+  const environment = playbackDiagnosticEnvironment();
+  return sanitizeDiagnosticRecord({
+    schemaVersion: 2,
+    scriptVersion: environment.scriptVersion,
+    at: new Date().toISOString(),
+    reason: safeDiagnosticString('reason', reason) || 'manual',
+    pageKind: playbackDiagnosticPageKind(),
+    environment,
+    capabilities: playbackDiagnosticCapabilities(),
+    ...playbackDiagnosticContext(),
+    incident: state._playbackDiagnosticIncident,
+    diagnostics: sanitizePlaybackDiagnostics(state._playbackDiagnostics),
+  });
+}
+
+// Plain text for direct posting; sanitize again so malformed callers cannot bypass the allowlist.
+function compactPlaybackReport(snapshot) {
+  let report;
+  try { report = sanitizeDiagnosticRecord(snapshot); } catch (_) { report = {}; }
+  const environment = report.environment || {};
+  const events = sanitizePlaybackDiagnostics(report.diagnostics);
+  const saved = report.incident;
+  const incident = saved?.fault && PLAYBACK_DIAGNOSTIC_FAULTS.has(saved.fault.event) ? saved : null;
+  const fault = incident?.fault || events.slice().reverse().find(entry => PLAYBACK_DIAGNOSTIC_FAULTS.has(entry.event));
+  const context = incident || report;
+  const playback = context.state || {};
+  const audioContext = context.audioContext || {};
+  const schedule = context.schedule || {};
+  const number = value => typeof value === 'number' && Number.isFinite(value) ? String(value) : '?';
+  const flag = value => value === true ? 'yes' : value === false ? 'no' : '?';
+  const lines = [];
+  let length = 0;
+  const append = line => {
+    if (length + line.length + (lines.length ? 1 : 0) > 1800) return false;
+    length += line.length + (lines.length ? 1 : 0);
+    lines.push(line);
+    return true;
+  };
+  append(`True Shuffle playback report ${report.scriptVersion || environment.scriptVersion || 'unknown'}`);
+  append(`Browser: ${environment.browser || 'unknown'} ${number(environment.browserMajorVersion)}; OS: ${environment.platform || 'unknown'}; manager: ${environment.manager || 'unknown'} ${environment.managerVersion || 'unknown'}`);
+  append(fault ? `Latest fault: ${fault.event} at ${fault.at || 'unknown'}` : 'Latest fault: none recorded');
+  if (fault) {
+    const identity = [];
+    for (const [label, key] of [['stage', 'failureStage'], ['reason', 'failureReason'], ['reason', 'reason'], ['error', 'errorName']]) {
+      if (fault[key] && !(label === 'reason' && identity.some(item => item.startsWith('reason=')))) identity.push(`${label}=${fault[key]}`);
+    }
+    if (identity.length) append(`Fault: ${identity.join('; ')}`);
+    const errors = [];
+    for (const [label, key] of [['HTTP', 'status'], ['HLS HTTP', 'hlsStatus'], ['media error', 'mediaErrorCode'], ['error code', 'errorCode']]) {
+      if (typeof fault[key] === 'number') errors.push(`${label}=${number(fault[key])}`);
+    }
+    for (const [label, key] of [['HLS type', 'hlsErrorType'], ['HLS detail', 'hlsErrorDetail'], ['type', 'errorType'], ['detail', 'errorDetail']]) {
+      if (fault[key]) errors.push(`${label}=${fault[key]}`);
+    }
+    if (errors.length) append(`Errors: ${errors.join('; ')}`);
+  }
+  const prefix = incident ? 'At fault' : 'Current';
+  append(`${prefix}: active=${flag(playback.active)}; user paused=${flag(playback.userPaused)}; busy=${flag(playback.busy)}; visible=${flag(playback.visible)}; online=${flag(playback.onLine)}; deck=${number(playback.deckIndex)}; queue=${number(playback.queuePosition)}/${number(playback.queueLength)}; stream=${playback.streamKind || 'unknown'}`);
+  append(`Audio context: ${audioContext.contextState || playback.contextState || fault?.contextState || 'unknown'}; time=${number(audioContext.currentTime)}s; rate=${number(audioContext.sampleRate)}Hz; graph failed=${flag(playback.audioGraphFailed)}`);
+  const decks = Array.isArray(context.decks) ? context.decks : [];
+  for (let index = 0; index < 2; index++) {
+    const deck = decks[index];
+    if (!deck) { append(`Deck ${index}: unavailable`); continue; }
+    append(`Deck ${index}: ${deck.streamKind || 'unknown'}; paused=${flag(deck.paused)}; ready=${number(deck.readyState)}; network=${number(deck.networkState)}; error=${number(deck.errorCode)}; time=${number(deck.currentTime)}/${number(deck.duration)}s; buffered ahead=${number(deck.bufferedAhead)}s`);
+  }
+  append(`Crossfade: ${playback.crossfadeStatus || 'unknown'} ${number(playback.crossfadeSeconds)}s/${playback.crossfadeCurve || 'unknown'}; pending=${flag(playback.crossfadePending)}; mixing=${flag(playback.crossfading)}; decks=${number(schedule.outgoingIndex)}>${number(schedule.incomingIndex)}; clock=${number(schedule.startTime)}>${number(schedule.endTime)}s`);
+  const faultTime = fault?.at ? Date.parse(fault.at) : NaN;
+  if (incident && Number.isFinite(schedule.token) && Number.isFinite(faultTime)) {
+    const fades = (incident.diagnostics || []).filter(entry => entry.event === 'fade-scheduled'
+      && entry.crossfadeToken === schedule.token && Date.parse(entry.at) <= faultTime);
+    const metrics = ['sampledSchedulingLeadMs', 'schedulingSubmissionMs', 'estimatedSchedulingLeadMs'];
+    if (fades.length === 1 && metrics.every(key => typeof fades[0][key] === 'number')) {
+      const fade = fades[0];
+      append(`Fade timing (main thread): sampled lead=${number(fade.sampledSchedulingLeadMs)}ms; submission=${number(fade.schedulingSubmissionMs)}ms; estimated lead=${number(fade.estimatedSchedulingLeadMs)}ms`);
+    }
+  }
+  if (fault) {
+    const timing = [];
+    for (const [label, key] of [['elapsed', 'elapsedMs'], ['clock stalled', 'clockStalledFor'], ['media stalled', 'mediaStalledFor'], ['stalled', 'stalledFor']]) {
+      if (typeof fault[key] === 'number') timing.push(`${label}=${number(fault[key])}ms`);
+    }
+    if (typeof fault.elapsed === 'number') timing.push(`fade elapsed=${number(fault.elapsed)}s`);
+    if (typeof fault.duration === 'number') timing.push(`duration=${number(fault.duration)}s`);
+    if (timing.length) append(`Fault timing: ${timing.join('; ')}`);
+  }
+  const before = Number.isFinite(faultTime)
+    ? (incident?.diagnostics || events).filter(entry => Date.parse(entry.at) < faultTime
+      || (incident && Date.parse(entry.at) === faultTime))
+    : [];
+  // Record order disambiguates observations sharing the fault's millisecond.
+  let faultIndex = -1;
+  if (fault) {
+    for (let index = events.length - 1; index >= 0; index--) {
+      if (events[index].event === fault.event && events[index].at === fault.at) {
+        faultIndex = index;
+        break;
+      }
+    }
+  }
+  const after = (faultIndex >= 0 ? events.slice(faultIndex + 1)
+    : events.filter(entry => !Number.isFinite(faultTime) || Date.parse(entry.at) > faultTime))
+    .filter(entry => !(entry.event === fault?.event && entry.at === fault?.at));
+  const timelineLines = entries => {
+    const seen = new Set();
+    const relevant = [];
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (!/^(?:recovery-|crossfade-|custom-start-|hls-|audio-|native-|playback-|fade-|transition-|preparation-|media-(?:waiting|stalled))/.test(entry.event || '')) continue;
+      const detail = entry.failureReason || entry.reason || entry.recoveryOutcome || entry.outcome || entry.errorName || entry.errorDetail || '';
+      const key = `${entry.event}|${detail}|${entry.status ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const delta = Number.isFinite(faultTime) ? Math.round(Date.parse(entry.at) - faultTime) : null;
+      let line = `${delta === null ? entry.at : `${delta >= 0 ? '+' : ''}${delta}ms`}: ${entry.event}`;
+      if (detail) line += ` ${detail}`;
+      if (typeof entry.status === 'number') line += ` HTTP=${number(entry.status)}`;
+      if (typeof entry.elapsedMs === 'number') line += ` elapsed=${number(entry.elapsedMs)}ms`;
+      relevant.unshift(line);
+      if (relevant.length >= 3) break;
+    }
+    return relevant;
+  };
+  // Preserve each causal side independently: later repetitions cannot erase pre-fault evidence.
+  const selected = [];
+  let remaining = 1800 - length - '\nTimeline (relative to fault):'.length;
+  for (const group of [timelineLines(before), timelineLines(after)]) {
+    const side = [];
+    for (let index = group.length - 1; index >= 0; index--) {
+      if (group[index].length + 1 > remaining) continue;
+      side.unshift(group[index]);
+      remaining -= group[index].length + 1;
+    }
+    selected.push(...side);
+  }
+  if (selected.length) {
+    append('Timeline (relative to fault):');
+    for (const line of selected) append(line);
+  }
+  return lines.join('\n');
 }
 
 function updatePlaybackDiagnosticButton() {
@@ -1536,6 +1902,9 @@ function updatePlaybackDiagnosticButton() {
   if (!button) return;
   button.hidden = !state._playbackDiagnosticFault;
   button.dataset.status = state._playbackDiagnosticFault ? 'current' : 'none';
+  button.setAttribute('aria-label', state._playbackDiagnosticFault ? 'Playback issue: open report' : 'Playback report');
+  button.title = state._playbackDiagnosticFault ? 'Playback issue: open report'
+    : 'Playback report — copy soon after an audible issue; timings cannot detect silence';
 }
 
 function showPlaybackReportHelp() {
@@ -1549,8 +1918,9 @@ function showPlaybackReportHelp() {
       <div class="tss-debug-head"><strong id="tss-debug-help-title">How to report a playback issue</strong><button id="tss-debug-help-close" type="button" aria-label="Close reporting instructions">${SVG.close}</button></div>
       <ol class="tss-debug-help-steps">
         <li><strong>Keep this page open.</strong> Reports exist only until you reload or close the page. Copy the report first.</li>
-        <li><strong>Choose “Copy report”.</strong> Return to the report and copy it. If copying is blocked, select the report text and copy it manually.</li>
-        <li><strong>Add what happened.</strong> Include your browser and version, Tampermonkey or Violentmonkey and its version, what you clicked, and what you expected versus what happened. Mention the track and whether the tab was in the background.</li>
+        <li><strong>Copy soon after the issue.</strong> The latest fault keeps its playback context and nearby events. Timings describe activity; they cannot detect silence or prove a CPU cause.</li>
+        <li><strong>Choose “Copy report”.</strong> Paste this short report directly into your message. “Full technical details” is optional; use “Copy full report” only if more detail is requested. If copying is blocked, copy the selected report text manually.</li>
+        <li><strong>Add what happened.</strong> Describe what you clicked and what you expected versus what happened. Mention whether the tab was in the background. Browser, OS and userscript-manager details are already included when available.</li>
         <li><strong>Post on <a href="https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback" target="_blank" rel="noopener noreferrer">Greasy Fork feedback</a>.</strong> Open the feedback page in a new tab, sign in if needed, and start a new discussion. Paste the copied report as a code block together with the details above.</li>
       </ol>
       <p>Greasy Fork feedback is public. Reports exclude track titles, account/page paths, media and stream URLs, query strings, credentials, and exception text. They contain technical browser/OS and playback details. Nothing is transmitted automatically; review the copied report before posting.</p>
@@ -1585,12 +1955,16 @@ function showPlaybackDiagnostics() {
   const opener = document.activeElement;
   const overlay = document.createElement('div');
   overlay.id = 'tss-debug-overlay';
-  const report = JSON.stringify(playbackDiagnosticSnapshot('user-opened-report'), null, 2);
+  const snapshot = playbackDiagnosticSnapshot('user-opened-report');
+  const report = compactPlaybackReport(snapshot);
+  let fullReport = null;
   overlay.innerHTML = `
     <div class="tss-debug-dialog" role="dialog" aria-modal="true" aria-labelledby="tss-debug-title">
       <div class="tss-debug-head"><div><strong id="tss-debug-title">Playback report</strong><span>Browser diagnostics</span></div><button id="tss-debug-close" type="button" aria-label="Close">${SVG.close}</button></div>
-      <p>Copy this report before reloading or closing the page. Reports stay in memory and omit track titles, account/page paths, stream URLs, query strings, credentials, and exception text.</p>
-      <pre id="tss-debug-report"></pre>
+      <p>Copy this short report directly into your message, with a description of what happened. It keeps the latest fault context until Clear or reload. No track titles, URLs, credentials or exception text; timings cannot detect silence.</p>
+      <pre id="tss-debug-report" tabindex="0" aria-label="Short playback report"></pre>
+      <details id="tss-debug-details"><summary>Full technical details (optional)</summary><pre id="tss-debug-full-report" tabindex="0" aria-label="Full sanitized playback report"></pre><div class="tss-debug-actions"><button id="tss-debug-copy-full" type="button" hidden>Copy full report</button></div></details>
+      <p id="tss-debug-copy-status" role="status" aria-live="polite" hidden></p>
       <div class="tss-debug-actions"><button id="tss-debug-help" type="button">How to report</button><button id="tss-debug-clear" type="button">Clear</button><button id="tss-debug-copy" type="button">Copy report</button></div>
     </div>`;
   document.body.appendChild(overlay);
@@ -1598,7 +1972,8 @@ function showPlaybackDiagnostics() {
   const close = () => {
     document.getElementById('tss-debug-help-close')?.click();
     overlay.remove();
-    const target = opener?.isConnected && !opener.hidden ? opener : document.getElementById('tss-hub-start');
+    const target = opener?.isConnected && !opener.hidden && !opener.closest?.('[hidden]') && !opener.closest?.('[inert]')
+      ? opener : document.getElementById('tss-hub-settings');
     target?.focus();
   };
   overlay.querySelector('#tss-debug-close').onclick = close;
@@ -1616,18 +1991,56 @@ function showPlaybackDiagnostics() {
   overlay.querySelector('#tss-debug-clear').onclick = () => {
     state._playbackDiagnostics = [];
     state._playbackDiagnosticFault = false;
+    state._playbackDiagnosticIncident = null;
     updatePlaybackDiagnosticButton();
     close();
   };
-  overlay.querySelector('#tss-debug-copy').onclick = async event => {
+  const details = overlay.querySelector('#tss-debug-details');
+  const fullText = overlay.querySelector('#tss-debug-full-report');
+  const fullButton = overlay.querySelector('#tss-debug-copy-full');
+  const ensureFullReport = () => {
+    if (fullReport === null) {
+      fullReport = JSON.stringify(snapshot, null, 2);
+      fullText.textContent = fullReport;
+    }
+    return fullReport;
+  };
+  details.ontoggle = () => {
+    fullButton.hidden = !details.open;
+    if (details.open) ensureFullReport();
+  };
+  const copy = async (event, verbose) => {
     const button = event.currentTarget;
+    if (verbose && !details.open) return;
+    const text = verbose ? ensureFullReport() : report;
+    const reportElement = verbose ? fullText : overlay.querySelector('#tss-debug-report');
     try {
-      await navigator.clipboard.writeText(report);
-      button.textContent = 'Copied';
+      await navigator.clipboard.writeText(text);
+      if (overlay.isConnected && button.isConnected) button.textContent = 'Copied';
     } catch (_) {
-      button.textContent = 'Copy failed';
+      if (!overlay.isConnected || !button.isConnected) return;
+      button.textContent = 'Copy blocked';
+      reportElement.focus();
+      let selected = false;
+      try {
+        const selection = document.getSelection?.() || window.getSelection?.();
+        if (selection) {
+          const range = document.createRange();
+          range.selectNodeContents(reportElement);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          selected = true;
+        }
+      } catch (_) {}
+      const status = overlay.querySelector('#tss-debug-copy-status');
+      status.hidden = false;
+      status.textContent = selected
+        ? 'Copy blocked. Report selected — press Ctrl+C or Cmd+C to copy.'
+        : 'Copy blocked. Select the report text, then press Ctrl+C or Cmd+C to copy.';
     }
   };
+  overlay.querySelector('#tss-debug-copy').onclick = event => copy(event, false);
+  fullButton.onclick = event => copy(event, true);
   overlay.querySelector('#tss-debug-copy').focus();
 }
 
@@ -1650,16 +2063,33 @@ const EQ_PRESETS = {
 };
 
 const DEFAULT_WAVE_HEIGHTS = [34,58,82,48,72,96,62,42,78,54,88,66,38,74,100,56,84,46,68,92,52,76,40,86,64,98,44,72,58,90,50,80,36,70,94,60,84,46,76,54,100,68,42,88,58,74,48,92,64,82,38,70,56,86];
+const WAVEFORM_CACHE_LIMIT = 300;
 const waveformCache = new Map();
 let waveformRequest = 0;
 
+function waveformTrackKey(meta) {
+  const id = soundCloudInteger(meta?.soundcloudId, 1);
+  return id !== null ? `soundcloud:${id}` : trackId(meta) || meta?.title || '';
+}
+
 function normalizeTrackUrl(url) {
+  if (typeof url !== 'string' || !url.trim()) return '';
   try {
     const parsed = new URL(url, location.origin);
-    return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, '').toLowerCase();
-  } catch (_) {
-    return String(url || '').split(/[?#]/)[0].replace(/\/$/, '').toLowerCase();
-  }
+    return /^https?:$/.test(parsed.protocol)
+      ? `${parsed.origin}${parsed.pathname}`.replace(/\/$/, '').toLowerCase() : '';
+  } catch (_) { return ''; }
+}
+
+function soundCloudTrackMatches(meta, track) {
+  if (!meta || !track) return false;
+  if (track === meta) return true;
+  const expectedId = soundCloudInteger(meta.soundcloudId ?? meta.id, 1);
+  const actualId = soundCloudInteger(track.id ?? track.soundcloudId, 1);
+  if (expectedId !== null && actualId !== null) return expectedId === actualId;
+  const expectedUrl = normalizeTrackUrl(meta.link || meta.permalink_url || meta.permalinkUrl);
+  const actualUrl = normalizeTrackUrl(track.permalink_url || track.permalinkUrl || track.link);
+  return Boolean(expectedUrl && actualUrl === expectedUrl);
 }
 
 function hydrationWaveformUrl(meta) {
@@ -1733,7 +2163,7 @@ function renderWaveform(heights = DEFAULT_WAVE_HEIGHTS) {
 }
 
 async function loadTrackWaveform(meta) {
-  const key = trackId(meta) || meta?.title || '';
+  const key = waveformTrackKey(meta);
   const request = ++waveformRequest;
   const epoch = state._playbackEpoch;
   const signal = state._playbackAbort?.signal;
@@ -1751,6 +2181,8 @@ async function loadTrackWaveform(meta) {
     const heights = downsampleWaveform(payload?.samples || payload?.data || payload);
     if (!heights) throw new Error('waveform samples missing');
     waveformCache.set(key, heights);
+    // Older evicted waveforms can be fetched again when revisited.
+    if (waveformCache.size > WAVEFORM_CACHE_LIMIT) waveformCache.delete(waveformCache.keys().next().value);
     renderWaveform(heights);
   } catch (error) {
     if (isCurrent()) {
@@ -1831,54 +2263,6 @@ function saveLifetimeStats() {
 }
 
 
-function extractAccentColor(imgUrl, cb) {
-  try {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = canvas.height = 12;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, 12, 12);
-        const data = ctx.getImageData(0, 0, 12, 12).data;
-        let best = null, bestScore = -1;
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i], g = data[i + 1], b = data[i + 2];
-          const max = Math.max(r, g, b) / 255;
-          const min = Math.min(r, g, b) / 255;
-          const sat = max > 0 ? (max - min) / max : 0;
-          const midScore = 1 - Math.abs(max - 0.55);
-          const score = sat * midScore;
-          if (score > bestScore) { bestScore = score; best = [r, g, b]; }
-        }
-        if (best && bestScore > 0.05) cb(best);
-      } catch (_) {}
-    };
-    img.src = imgUrl;
-  } catch (_) {}
-}
-
-function normalizeAccentColor(r, g, b) {
-  [r, g, b] = [r, g, b].map(value => Math.max(0, Math.min(255, Math.round(value || 0))));
-  const perceived = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-  if (perceived < 0.38) {
-    const mix = (0.38 - perceived) / (1 - perceived);
-    r = Math.round(r + (255 - r) * mix);
-    g = Math.round(g + (255 - g) * mix);
-    b = Math.round(b + (255 - b) * mix);
-  }
-  return [r, g, b];
-}
-
-function applyAccentColor(r, g, b) {
-  [r, g, b] = normalizeAccentColor(r, g, b);
-  const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
-  document.documentElement.style.setProperty('--tss-a',  hex);
-  document.documentElement.style.setProperty('--tss-ar', String(r));
-  document.documentElement.style.setProperty('--tss-ag', String(g));
-  document.documentElement.style.setProperty('--tss-ab', String(b));
-}
 
 
 function showMergeToast(count) {
@@ -1888,11 +2272,12 @@ function showMergeToast(count) {
     toast.id = 'tss-merge-toast';
     toast.style.cssText = `
       position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
-      background:rgba(12,12,12,0.96); color:#c0c0c0;
+      background:var(--tss-glass-surface,#080b12); color:#d3d7df;
       border-radius:8px; font-size:12px; font-weight:500;
       padding:8px 20px; z-index:999999;
-      border:1px solid rgba(255,255,255,0.07);
-      -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px);
+      border:1px solid var(--tss-glass-rim,rgba(183,199,232,.12));
+      box-shadow:var(--tss-glass-shadow);
+      -webkit-backdrop-filter:var(--tss-glass-filter,none); backdrop-filter:var(--tss-glass-filter,none);
       white-space:nowrap; pointer-events:none;
       transition:opacity 0.3s;
       font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
@@ -1920,14 +2305,15 @@ function updateSleepDisplay(now = Date.now()) {
   const el = document.getElementById('tss-hub-sleep-display');
   if (!el) return;
   const t = state.sleepTimer;
-  if (!t) { el.textContent = ''; return; }
-  if (t.type === 'time') {
+  let text = '';
+  if (t?.type === 'time') {
     t.remaining = timedSleepRemaining(t, now);
     const m = Math.floor(t.remaining / 60), s = t.remaining % 60;
-    el.textContent = m > 0 ? `${m}m` : `${s}s`;
-  } else {
-    el.textContent = `${t.remaining}`;
+    text = m > 0 ? `${m}m` : `${s}s`;
+  } else if (t) {
+    text = `${t.remaining}`;
   }
+  if (el.textContent !== text) el.textContent = text;
 }
 
 
@@ -2023,12 +2409,12 @@ function syncBetterFeedPipWindow() {
     if (!ctx) return true;
 
     const meta = state.meta[state._deckTrack];
-    const key = trackId(meta) || meta?.title || '';
+    const key = waveformTrackKey(meta);
     const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
     const styles = typeof pipWindow.getComputedStyle === 'function'
       ? pipWindow.getComputedStyle(pipDoc.documentElement)
       : null;
-    const activeColor = styles?.getPropertyValue('--special-color')?.trim() || '#ff5500';
+    const activeColor = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#aebaf3';
     const dimColor = styles?.getPropertyValue('--secondary-color')?.trim() || '#666';
     const barWidth = 2;
     const barGap = 1;
@@ -2103,13 +2489,18 @@ function ownPipIsOpen() {
 function setOwnPipButtonState() {
   const button = document.getElementById('tss-hub-pip');
   if (!button) return;
-  button.style.display = '';
-  button.dataset.open = ownPipIsOpen() ? 'true' : 'false';
-  button.setAttribute('aria-pressed', ownPipIsOpen() ? 'true' : 'false');
+  const open = ownPipIsOpen();
+  const openValue = String(open);
+  if (button.style.display !== '') button.style.display = '';
+  if (button.dataset.open !== openValue) button.dataset.open = openValue;
+  if (button.getAttribute('aria-pressed') !== openValue) button.setAttribute('aria-pressed', openValue);
+  const label = open ? 'Show True Shuffle picture in picture' : 'Open True Shuffle picture in picture';
+  if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label);
   const mode = state._ownPipMode === 'video' ? 'native video PiP'
     : state._ownPipMode === 'inline' ? 'floating player'
     : 'True Shuffle PiP';
-  button.title = ownPipIsOpen() ? `${mode} is open` : 'Open True Shuffle PiP';
+  const title = open ? `${mode} is open` : 'Open True Shuffle PiP';
+  if (button.title !== title) button.title = title;
 }
 
 function pipTransactionIsCurrent(transaction) {
@@ -2162,7 +2553,7 @@ function drawOwnPipWaveform(canvas, meta, current, duration, accent) {
 
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  const key = trackId(meta) || meta?.title || '';
+  const key = waveformTrackKey(meta);
   const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
   const barWidth = Math.max(2, Math.round(2 * ratio));
   const gap = Math.max(2, Math.round(2 * ratio));
@@ -2208,7 +2599,8 @@ function renderOwnPipQueue(pipDocument, currentTi) {
     const meta = state.meta[ti];
     return meta && (!query || String(meta.title || '').toLowerCase().includes(query) || String(meta.artist || '').toLowerCase().includes(query));
   });
-  count.textContent = `${order.length} ${tab === 'history' ? 'played' : `track${order.length === 1 ? '' : 's'}`}`;
+  const countText = `${order.length} ${tab === 'history' ? 'played' : `track${order.length === 1 ? '' : 's'}`}`;
+  if (count.textContent !== countText) count.textContent = countText;
   const priorityKey = order.map(ti => state.priority[ti] ?? 1).join(',');
   const key = `${tab}|${query}|${currentTi}|${order.join(',')}|${priorityKey}|${state.roundPlayed}|${state.roundTotal}`;
   if (list.dataset.key === key) return;
@@ -2494,24 +2886,85 @@ function soundCloudLikeButtonState(button) {
   return button.classList.contains('sc-button-selected') || /\bunlike\b/i.test(label);
 }
 
-function findSoundCloudLikeButton(ti) {
+function soundCloudPermalinkConflicts(meta, metas = state.meta) {
+  const wanted = normalizeTrackUrl(meta?.link);
+  if (!wanted) return false;
+  const ids = new Set();
+  const ownId = soundCloudInteger(meta?.soundcloudId, 1);
+  if (ownId !== null) ids.add(ownId);
+  const indexed = !Array.isArray(metas);
+  const candidates = indexed ? metas.byLink.get(wanted) || [] : metas;
+  for (const candidate of candidates) {
+    const item = indexed ? metas.metas[candidate] : candidate;
+    if (normalizeTrackUrl(item?.link) !== wanted) continue;
+    const id = soundCloudInteger(item.soundcloudId, 1);
+    if (id !== null) ids.add(id);
+    if (ids.size > 1) return true;
+  }
+  return false;
+}
+
+function soundCloudLinkMatches(meta, href, metas = state.meta) {
+  const wanted = normalizeTrackUrl(meta?.link);
+  // SoundCloud exposes no independently verified ID in these DOM bindings.
+  // A permalink shared by known IDs therefore cannot authorize a native action.
+  return Boolean(wanted && normalizeTrackUrl(href) === wanted && !soundCloudPermalinkConflicts(meta, metas));
+}
+
+function soundCloudPlayerMatches(meta) {
+  const link = document.querySelector('.playbackSoundBadge__titleLink');
+  return soundCloudLinkMatches(meta, link?.href);
+}
+
+function soundCloudRowsByLink(rows) {
+  const byLink = new Map();
+  for (const row of rows) {
+    const link = normalizeTrackUrl(getLink(row));
+    if (link && !byLink.has(link)) byLink.set(link, row);
+  }
+  return byLink;
+}
+
+function matchingSoundCloudRow(meta, rowsByLink, metas = state.meta) {
+  if (soundCloudPermalinkConflicts(meta, metas)) return null;
+  return rowsByLink.get(normalizeTrackUrl(meta?.link)) || null;
+}
+
+function boundSoundCloudRow(ti) {
   const meta = state.meta[ti];
   const wanted = normalizeTrackUrl(meta?.link);
   if (!wanted) return null;
-
+  const matches = row => row && document.body.contains(row) && soundCloudLinkMatches(meta, getLink(row));
   const bound = state.els[ti];
-  if (bound && document.body.contains(bound)) {
+  if (matches(bound)) return bound;
+  for (const link of document.querySelectorAll('a[href]')) {
+    if (normalizeTrackUrl(link.href) !== wanted) continue;
+    const row = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound');
+    if (!matches(row)) continue;
+    state.els[ti] = row;
+    return row;
+  }
+  return null;
+}
+
+function findSoundCloudLikeButton(ti) {
+  const meta = state.meta[ti];
+  const wanted = normalizeTrackUrl(meta?.link);
+  if (!wanted || soundCloudPermalinkConflicts(meta)) return null;
+
+  const bound = boundSoundCloudRow(ti);
+  if (bound) {
     const button = bound.querySelector('.sc-button-like');
     if (button) return button;
   }
 
   const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
-  if (playerLink && normalizeTrackUrl(playerLink.href) === wanted) {
+  if (playerLink && soundCloudPlayerMatches(meta)) {
     const button = playerLink.closest('.playbackSoundBadge')?.querySelector('.playbackSoundBadge__like, .sc-button-like');
     if (button) return button;
   }
 
-  if (normalizeTrackUrl(location.href) === wanted) {
+  if (normalizeTrackUrl(location.href) === wanted && !soundCloudPermalinkConflicts(meta)) {
     const button = document.querySelector('.listenEngagement__actions .sc-button-like, .soundActions .sc-button-like');
     if (button) return button;
   }
@@ -2519,7 +2972,7 @@ function findSoundCloudLikeButton(ti) {
   for (const link of document.querySelectorAll('a[href]')) {
     if (normalizeTrackUrl(link.href) !== wanted) continue;
     const root = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound');
-    const button = root?.querySelector('.sc-button-like');
+    const button = root && soundCloudLinkMatches(meta, getLink(root)) ? root.querySelector('.sc-button-like') : null;
     if (button) return button;
   }
   return null;
@@ -2646,15 +3099,19 @@ function setOwnPipArtworkMode(mode, pipDocument = state._ownPipWindow?.document)
 function syncOwnPipMarquee(viewport, text) {
   if (!viewport || !text) return false;
   const value = text.textContent || '—';
-  viewport.title = value;
-  viewport.setAttribute('aria-label', value);
+  if (viewport.title !== value) viewport.title = value;
+  if (viewport.getAttribute('aria-label') !== value) viewport.setAttribute('aria-label', value);
   const width = Math.max(0, Number(viewport.clientWidth) || 0);
   const overflow = Math.max(0, (Number(text.scrollWidth) || 0) - width);
-  const active = width > 0 && overflow > 2;
-  viewport.dataset.overflow = active ? 'true' : 'false';
+  const stage = viewport.ownerDocument?.getElementById('tss-pip-stage');
+  const active = state.scrollLongTitles && stage?.dataset.view === 'player' && width > 0 && overflow > 2;
+  const activeValue = active ? 'true' : 'false';
+  if (viewport.dataset.overflow !== activeValue) viewport.dataset.overflow = activeValue;
   if (active) {
-    text.style.setProperty('--tss-pip-marquee-distance', `${-overflow}px`);
-    text.style.setProperty('--tss-pip-marquee-duration', `${Math.max(7, Math.min(18, 5 + overflow / 18)).toFixed(1)}s`);
+    const distance = `${-overflow}px`;
+    const duration = `${Math.max(7, Math.min(18, 5 + overflow / 18)).toFixed(1)}s`;
+    if (text.style.getPropertyValue('--tss-pip-marquee-distance') !== distance) text.style.setProperty('--tss-pip-marquee-distance', distance);
+    if (text.style.getPropertyValue('--tss-pip-marquee-duration') !== duration) text.style.setProperty('--tss-pip-marquee-duration', duration);
   }
   return active;
 }
@@ -2682,24 +3139,32 @@ function syncOwnPipWindow() {
   const queuedNext = upcomingTrackIndex();
   const nextMeta = queuedNext !== undefined ? state.meta[queuedNext] : null;
   const timing = playbackTiming();
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#ff5500';
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#aebaf3';
   const total = Math.max(1, state.roundTotal || state.queue.length);
   const inRound = Math.min(total, Math.max(1, state.roundPlayed + 1));
 
-  pipDocument.title = ownPipWindowTitle(meta, paused());
-  pipDocument.documentElement.style.setProperty('--accent', accent);
+  const windowTitle = ownPipWindowTitle(meta, paused());
+  if (pipDocument.title !== windowTitle) pipDocument.title = windowTitle;
+  if (pipDocument.documentElement.style.getPropertyValue('--accent') !== accent) {
+    pipDocument.documentElement.style.setProperty('--accent', accent);
+  }
   const titleViewport = pipDocument.getElementById('tss-pip-title');
   const title = pipDocument.getElementById('tss-pip-title-text');
   const artist = pipDocument.getElementById('tss-pip-artist');
   const position = pipDocument.getElementById('tss-pip-position');
   const currentTime = pipDocument.getElementById('tss-pip-current');
   const remaining = pipDocument.getElementById('tss-pip-remaining');
-  if (title) title.textContent = meta?.title || playerTitle() || '—';
+  const titleText = meta?.title || playerTitle() || '—';
+  const artistText = meta?.artist || '—';
+  const positionText = `${inRound} / ${total}`;
+  const currentText = formatPlaybackClock(timing.current);
+  const remainingText = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
+  if (title && title.textContent !== titleText) title.textContent = titleText;
   syncOwnPipMarquee(titleViewport, title);
-  if (artist) artist.textContent = meta?.artist || '—';
-  if (position) position.textContent = `${inRound} / ${total}`;
-  if (currentTime) currentTime.textContent = formatPlaybackClock(timing.current);
-  if (remaining) remaining.textContent = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
+  if (artist && artist.textContent !== artistText) artist.textContent = artistText;
+  if (position && position.textContent !== positionText) position.textContent = positionText;
+  if (currentTime && currentTime.textContent !== currentText) currentTime.textContent = currentText;
+  if (remaining && remaining.textContent !== remainingText) remaining.textContent = remainingText;
 
   const artwork = pipDocument.getElementById('tss-pip-artwork');
   const artworkFallback = pipDocument.getElementById('tss-pip-artwork-fallback');
@@ -2713,22 +3178,39 @@ function syncOwnPipWindow() {
 
   const play = pipDocument.getElementById('tss-pip-play');
   if (play) {
-    play.innerHTML = paused() ? SVG.play : SVG.pause;
-    play.setAttribute('aria-label', paused() ? 'Play' : 'Pause');
+    const isPaused = paused();
+    const icon = isPaused ? SVG.play : SVG.pause;
+    if (play._tssPlayIcon !== icon || play.innerHTML !== play._tssPlayMarkup) {
+      play.innerHTML = icon;
+      play._tssPlayIcon = icon;
+      play._tssPlayMarkup = play.innerHTML;
+    }
+    const label = isPaused ? 'Play' : 'Pause';
+    if (play.getAttribute('aria-label') !== label) play.setAttribute('aria-label', label);
   }
 
   const like = pipDocument.getElementById('tss-pip-like');
   if (like) {
     const likeState = currentTrackLikeState(currentTi);
-    like.innerHTML = likeState.liked ? SVG.heartFilled : SVG.heart;
-    like.dataset.liked = likeState.liked ? 'true' : 'false';
-    like.dataset.available = likeState.available ? 'true' : 'false';
-    like.disabled = state._likeBusy || !likeState.available;
-    like.setAttribute('aria-pressed', likeState.liked ? 'true' : 'false');
-    like.setAttribute('aria-label', likeState.liked ? 'Unlike current track' : 'Like current track');
-    like.title = likeState.available
+    const icon = likeState.liked ? SVG.heartFilled : SVG.heart;
+    if (like._tssLikeIcon !== icon || like.innerHTML !== like._tssLikeMarkup) {
+      like.innerHTML = icon;
+      like._tssLikeIcon = icon;
+      like._tssLikeMarkup = like.innerHTML;
+    }
+    const liked = likeState.liked ? 'true' : 'false';
+    const available = likeState.available ? 'true' : 'false';
+    const disabled = state._likeBusy || !likeState.available;
+    const label = likeState.liked ? 'Unlike current track' : 'Like current track';
+    const title = likeState.available
       ? (likeState.liked ? 'Unlike on SoundCloud' : 'Like on SoundCloud')
       : 'Like is available when the track is visible on SoundCloud';
+    if (like.dataset.liked !== liked) like.dataset.liked = liked;
+    if (like.dataset.available !== available) like.dataset.available = available;
+    if (like.disabled !== disabled) like.disabled = disabled;
+    if (like.getAttribute('aria-pressed') !== liked) like.setAttribute('aria-pressed', liked);
+    if (like.getAttribute('aria-label') !== label) like.setAttribute('aria-label', label);
+    if (like.title !== title) like.title = title;
   }
 
   const nextRow = pipDocument.getElementById('tss-pip-up-next-row');
@@ -2738,10 +3220,14 @@ function syncOwnPipWindow() {
   const nextArtwork = pipDocument.getElementById('tss-pip-next-artwork');
   const nextFallback = pipDocument.getElementById('tss-pip-next-fallback');
   const nextSettings = pipDocument.getElementById('tss-pip-next-settings');
-  if (nextRow) nextRow.dataset.empty = nextMeta ? 'false' : 'true';
-  if (nextTitle) nextTitle.textContent = nextMeta?.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle');
-  if (nextArtist) nextArtist.textContent = nextMeta?.artist || (state.stopAfterRound ? 'Playback will stop' : 'A new round will begin');
-  if (nextNumber) nextNumber.textContent = nextMeta ? String(Math.min(total, inRound + 1)) : '—';
+  const empty = nextMeta ? 'false' : 'true';
+  const nextTitleText = nextMeta?.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle');
+  const nextArtistText = nextMeta?.artist || (state.stopAfterRound ? 'Playback will stop' : 'A new round will begin');
+  const nextNumberText = nextMeta ? String(Math.min(total, inRound + 1)) : '—';
+  if (nextRow && nextRow.dataset.empty !== empty) nextRow.dataset.empty = empty;
+  if (nextTitle && nextTitle.textContent !== nextTitleText) nextTitle.textContent = nextTitleText;
+  if (nextArtist && nextArtist.textContent !== nextArtistText) nextArtist.textContent = nextArtistText;
+  if (nextNumber && nextNumber.textContent !== nextNumberText) nextNumber.textContent = nextNumberText;
   if (nextArtwork && nextArtwork.dataset.src !== (nextMeta?.artwork || '')) {
     nextArtwork.dataset.src = nextMeta?.artwork || '';
     nextArtwork.src = nextMeta?.artwork || '';
@@ -2749,9 +3235,12 @@ function syncOwnPipWindow() {
     if (nextFallback) nextFallback.hidden = Boolean(nextMeta?.artwork);
   }
   if (nextSettings) {
-    nextSettings.disabled = queuedNext === undefined;
-    nextSettings.dataset.ti = queuedNext === undefined ? '' : String(queuedNext);
-    nextSettings.setAttribute('aria-label', `Settings for ${nextMeta?.title || 'up next'}`);
+    const disabled = queuedNext === undefined;
+    const ti = disabled ? '' : String(queuedNext);
+    const label = `Settings for ${nextMeta?.title || 'up next'}`;
+    if (nextSettings.disabled !== disabled) nextSettings.disabled = disabled;
+    if (nextSettings.dataset.ti !== ti) nextSettings.dataset.ti = ti;
+    if (nextSettings.getAttribute('aria-label') !== label) nextSettings.setAttribute('aria-label', label);
   }
 
   const crossfade = pipDocument.getElementById('tss-pip-crossfade');
@@ -2760,15 +3249,20 @@ function syncOwnPipWindow() {
   const processing = pipDocument.getElementById('tss-pip-processing');
   const pipState = pipDocument.getElementById('tss-pip-state');
   if (crossfade) {
-    crossfade.dataset.active = state.crossfadeSeconds > 0 ? 'true' : 'false';
-    crossfade.hidden = state.crossfadeSeconds <= 0;
+    const active = state.crossfadeSeconds > 0 ? 'true' : 'false';
+    const hidden = state.crossfadeSeconds <= 0;
+    if (crossfade.dataset.active !== active) crossfade.dataset.active = active;
+    if (crossfade.hidden !== hidden) crossfade.hidden = hidden;
   }
-  if (crossfadeValue) crossfadeValue.textContent = `${state.crossfadeSeconds}s fade`;
+  const fadeText = `${state.crossfadeSeconds}s fade`;
+  if (crossfadeValue && crossfadeValue.textContent !== fadeText) crossfadeValue.textContent = fadeText;
   if (autoLevel) {
-    autoLevel.dataset.active = state.autoLevel ? 'true' : 'false';
-    autoLevel.hidden = !state.autoLevel;
+    const active = state.autoLevel ? 'true' : 'false';
+    if (autoLevel.dataset.active !== active) autoLevel.dataset.active = active;
+    if (autoLevel.hidden !== !state.autoLevel) autoLevel.hidden = !state.autoLevel;
   }
-  if (processing) processing.hidden = state.crossfadeSeconds <= 0 && !state.autoLevel;
+  const processingHidden = state.crossfadeSeconds <= 0 && !state.autoLevel;
+  if (processing && processing.hidden !== processingHidden) processing.hidden = processingHidden;
   if (pipState) {
     const status = state.suspended ? 'external playback'
       : state.loading ? 'loading'
@@ -2777,11 +3271,11 @@ function syncOwnPipWindow() {
       : state.crossfadeStatus === 'loading' ? 'loading next'
       : state.crossfadeStatus === 'fallback' ? 'fallback'
       : '';
-    pipState.textContent = status;
-    pipState.hidden = !status;
+    if (pipState.textContent !== status) pipState.textContent = status;
+    if (pipState.hidden !== !status) pipState.hidden = !status;
   }
 
-  renderOwnPipQueue(pipDocument, currentTi);
+  if (pipDocument.getElementById('tss-pip-stage')?.dataset.view === 'queue') renderOwnPipQueue(pipDocument, currentTi);
 
   drawOwnPipWaveform(
     pipDocument.getElementById('tss-pip-waveform'),
@@ -2805,14 +3299,14 @@ function drawVideoPipFrame(canvas) {
   const timing = playbackTiming();
   const duration = Math.max(1, timing.duration || 1);
   const ratio = Math.max(0, Math.min(1, timing.current / duration));
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#ff5500';
-  const key = trackId(meta) || meta.title || '';
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#aebaf3';
+  const key = waveformTrackKey(meta);
   const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
 
-  ctx.fillStyle = '#080808';
+  ctx.fillStyle = '#05080e';
   ctx.fillRect(0, 0, width, height);
   const glow = ctx.createRadialGradient(width * .2, 0, 0, width * .2, 0, width * .72);
-  glow.addColorStop(0, `${accent}32`);
+  glow.addColorStop(0, `${accent}1a`);
   glow.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = glow;
   ctx.fillRect(0, 0, width, height);
@@ -2956,10 +3450,10 @@ function openInPagePipFallback() {
   host.setAttribute('role', 'dialog');
   host.setAttribute('aria-label', 'True Shuffle floating player');
   const dimensions = ownPipDimensions();
-  host.style.cssText = `position:fixed;right:20px;bottom:90px;width:${dimensions.width}px;height:${dimensions.height}px;min-width:330px;min-height:280px;max-width:min(92vw,760px);max-height:min(86vh,820px);z-index:999999;resize:both;overflow:hidden;border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.72);background:#080808`;
+  host.style.cssText = `position:fixed;right:20px;bottom:90px;width:${dimensions.width}px;height:${dimensions.height}px;min-width:330px;min-height:280px;max-width:min(92vw,760px);max-height:min(86vh,820px);z-index:999999;resize:both;overflow:hidden;border-radius:14px;--tss-glass-base:#090a0c;--tss-glass-filter:none;box-shadow:var(--tss-glass-shadow);background:var(--tss-glass-surface,#090a0c);-webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none)`;
   const iframe = document.createElement('iframe');
   iframe.title = 'True Shuffle floating player';
-  iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;background:#080808';
+  iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;background:transparent';
   host.appendChild(iframe);
   document.body.appendChild(host);
   state._ownPipHost = host;
@@ -3095,11 +3589,11 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   pipDocument.title = 'True Shuffle';
   const style = pipDocument.createElement('style');
   style.textContent = `
-    :root{color-scheme:dark;--accent:#ff5500;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+    :root{color-scheme:dark;--accent:#aebaf3;--pip-glass-base:#090a0c;--pip-glass-light:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%);--pip-glass-surface:var(--pip-glass-light),var(--pip-glass-base);--pip-glass-inset:rgba(0,0,0,.08);--pip-menu-surface:var(--pip-glass-light),rgba(9,10,12,.12);--pip-glass-filter:none;--pip-glass-rim:rgba(255,255,255,.12);--pip-glass-edge:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12);--pip-glass-shadow:var(--pip-glass-edge),0 20px 54px rgba(0,0,0,.38);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
     *{box-sizing:border-box}
-    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#080808;color:#f4f4f4}
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#090a0c;color:#f4f4f4}
     button{font:inherit}
-    #tss-pip-player{height:100%;min-height:300px;padding:12px 14px;display:flex;flex-direction:column;position:relative;overflow:hidden;background:radial-gradient(circle at 50% -12%,rgba(255,255,255,.045),transparent 42%),#080808;border:1px solid rgba(255,255,255,.14)}
+    #tss-pip-player{height:100%;min-height:300px;padding:12px 14px;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--pip-glass-surface);border:1px solid var(--pip-glass-rim);box-shadow:${mode === 'inline' ? 'none' : 'var(--pip-glass-edge)'};-webkit-backdrop-filter:var(--pip-glass-filter);backdrop-filter:var(--pip-glass-filter)}
     .tss-pip-header{height:31px;display:flex;align-items:center;gap:9px;flex:0 0 auto}
     .tss-pip-brandmark,.tss-pip-close{display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.035);color:#fff;cursor:pointer}
     .tss-pip-brandmark{width:30px;height:30px;border-radius:8px;color:var(--accent)}
@@ -3121,15 +3615,15 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-wave{margin-top:8px}
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-controls{margin:6px 0 7px}
     #tss-pip-player[data-artwork-mode="full"] .tss-pip-up-next{display:none}
-    #tss-pip-player[data-artwork-mode="focus"]{padding:12px;background:#080808}
-    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header{position:absolute;top:8px;right:8px;z-index:12;width:68px;height:32px;padding:1px;gap:2px;border:1px solid rgba(255,255,255,.14);border-radius:9px;background:#111;opacity:0;transform:translateY(-4px);transition:opacity .18s ease,transform .18s cubic-bezier(.22,1,.36,1)}
+    #tss-pip-player[data-artwork-mode="focus"]{padding:12px}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header{position:absolute;top:8px;right:8px;z-index:12;width:68px;height:32px;padding:1px;gap:2px;border:1px solid var(--pip-glass-rim);border-radius:9px;background:var(--pip-menu-surface);box-shadow:inset 0 1px 0 rgba(232,239,255,.06),0 5px 16px rgba(2,5,12,.28);opacity:0;transform:translateY(-4px);transition:opacity .18s ease,transform .18s cubic-bezier(.22,1,.36,1)}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header:hover,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-header:focus-within{opacity:1;transform:none}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header>*{display:none}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-header #tss-pip-artwork-toggle,#tss-pip-player[data-artwork-mode="focus"] .tss-pip-header #tss-pip-close{display:flex}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-stage{margin-top:0}
     #tss-pip-player[data-artwork-mode="focus"] #tss-pip-now-view{display:flex}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-track{height:100%;min-height:0;display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:12px}
-    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-art{flex:0 0 auto;width:100%;height:auto;min-height:0;aspect-ratio:1;border-radius:12px;background:#111;box-shadow:0 12px 34px rgba(0,0,0,.52),0 0 0 1px rgba(255,255,255,.08)}
+    #tss-pip-player[data-artwork-mode="focus"] .tss-pip-art{flex:0 0 auto;width:100%;height:auto;min-height:0;aspect-ratio:1;border-radius:12px;background:rgba(255,255,255,.035);box-shadow:0 12px 34px rgba(0,0,0,.52),0 0 0 1px rgba(255,255,255,.08)}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-track-copy{order:-1;flex:0 0 auto;width:100%;padding:1px 2px 0;display:flex;flex-direction:column;align-items:center;text-align:center}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-artist{order:-1;margin:0 0 5px;color:var(--accent);font-size:11px;font-weight:650;text-align:center}
     #tss-pip-player[data-artwork-mode="focus"] .tss-pip-title{width:100%;font-size:19px;line-height:1.18;text-align:center}
@@ -3143,13 +3637,13 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-stage[data-view="queue"] #tss-pip-now-view{transform:translateX(-34px);opacity:0;pointer-events:none}
     .tss-pip-stage[data-view="queue"] #tss-pip-queue-view{transform:translateX(0);opacity:1;pointer-events:auto}
     .tss-pip-track{display:grid;grid-template-columns:clamp(96px,28vw,124px) minmax(0,1fr);align-items:center;gap:15px;min-height:96px}
-    .tss-pip-art{width:100%;height:auto;aspect-ratio:1;border-radius:12px;overflow:hidden;position:relative;background:#151515;box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
+    .tss-pip-art{width:100%;height:auto;aspect-ratio:1;border-radius:12px;overflow:hidden;position:relative;background:rgba(255,255,255,.035);box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
     .tss-pip-art img{display:block;width:100%;height:100%;object-fit:cover}
     .tss-pip-art-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.26)}
     .tss-pip-art-fallback[hidden],.tss-pip-art img[hidden]{display:none}
     .tss-pip-title{min-width:0;overflow:hidden;white-space:nowrap;font-size:18px;line-height:1.2;font-weight:720;letter-spacing:-.025em}
-    .tss-pip-title-text{display:inline-block;min-width:100%;width:max-content;will-change:transform}
-    .tss-pip-title[data-overflow="true"] .tss-pip-title-text{animation:tssPipMarquee var(--tss-pip-marquee-duration,9s) ease-in-out infinite alternate}
+    .tss-pip-title-text{display:inline-block;min-width:100%;width:max-content}
+    .tss-pip-stage[data-view="player"] .tss-pip-title[data-overflow="true"] .tss-pip-title-text{animation:tssPipMarquee var(--tss-pip-marquee-duration,9s) ease-in-out infinite alternate}
     .tss-pip-artist{margin-top:5px;color:rgba(255,255,255,.58);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .tss-pip-track-meta{display:flex;align-items:center;gap:8px;margin-top:7px;min-width:0}.tss-pip-position{color:rgba(255,255,255,.68);font-size:9px;font-weight:620;letter-spacing:.08em;white-space:nowrap}
     .tss-pip-processing{display:flex;align-items:center;gap:5px;min-width:0;color:rgba(255,255,255,.27);font-size:8px;font-weight:560;white-space:nowrap}.tss-pip-processing[hidden],.tss-pip-processing span[hidden]{display:none}.tss-pip-processing::before{content:'·';color:rgba(255,255,255,.18)}.tss-pip-processing span+span::before{content:'·';margin-right:5px;color:rgba(255,255,255,.18)}
@@ -3157,17 +3651,17 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     #tss-pip-waveform{display:block;width:100%;height:28px;cursor:pointer}
     .tss-pip-times{display:flex;justify-content:space-between;margin-top:3px;color:rgba(255,255,255,.47);font-size:8px;font-variant-numeric:tabular-nums}
     .tss-pip-controls{display:flex;align-items:center;justify-content:center;gap:22px;margin:9px 0 11px}
-    .tss-pip-control{display:flex;align-items:center;justify-content:center;width:39px;height:39px;padding:0;border:1px solid rgba(255,255,255,.08);border-radius:50%;background:#1a1a1a;color:rgba(255,255,255,.82);cursor:pointer;transition:transform .14s,background .14s,color .14s}
-    .tss-pip-control:hover{transform:translateY(-1px);background:#222;color:#fff}
+    .tss-pip-control{display:flex;align-items:center;justify-content:center;width:39px;height:39px;padding:0;border:1px solid rgba(255,255,255,.10);border-radius:50%;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 3px 9px rgba(0,0,0,.2);color:rgba(255,255,255,.82);cursor:pointer;transition:transform .14s,background .14s,color .14s}
+    .tss-pip-control:hover{transform:translateY(-1px);background:rgba(255,255,255,.13);color:#fff}
     .tss-pip-control:active{transform:scale(.96)}
-    .tss-pip-control-primary{width:52px;height:52px;background:var(--accent);border-color:color-mix(in srgb,var(--accent),white 18%);color:#fff;box-shadow:0 8px 21px color-mix(in srgb,var(--accent),transparent 72%)}
-    .tss-pip-control-primary:hover{background:color-mix(in srgb,var(--accent),white 8%)}
+    .tss-pip-control-primary{width:52px;height:52px;background:color-mix(in srgb,var(--accent) 80%,transparent);border-color:color-mix(in srgb,var(--accent),white 18%);color:#101522;box-shadow:0 8px 21px color-mix(in srgb,var(--accent),transparent 72%)}
+    .tss-pip-control-primary:hover{background:color-mix(in srgb,var(--accent) 90%,transparent);color:#101522}
     .tss-pip-control svg{width:15px!important;height:15px!important}
     .tss-pip-control-primary svg{width:17px!important;height:17px!important}
     .tss-pip-up-next{border-top:1px solid rgba(255,255,255,.08);padding-top:9px}
     .tss-pip-kicker{font-size:9px;font-weight:790;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.82)}
     .tss-pip-next-row{display:grid;grid-template-columns:39px minmax(0,1fr) auto 28px;align-items:center;gap:9px;margin-top:7px;min-height:39px}
-    .tss-pip-next-art{width:39px;height:39px;border-radius:7px;overflow:hidden;position:relative;background:#151515;box-shadow:0 0 0 1px rgba(255,255,255,.07)}
+    .tss-pip-next-art{width:39px;height:39px;border-radius:7px;overflow:hidden;position:relative;background:rgba(255,255,255,.035);box-shadow:0 0 0 1px rgba(255,255,255,.07)}
     .tss-pip-next-art img{display:block;width:100%;height:100%;object-fit:cover}
     .tss-pip-next-art img[hidden],.tss-pip-next-art .tss-pip-art-fallback[hidden]{display:none}
     .tss-pip-next-title{font-size:11px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3177,15 +3671,15 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-queue-head{display:flex;align-items:center;justify-content:space-between;padding:7px 1px 6px;border-top:1px solid rgba(255,255,255,.08)}
     .tss-pip-queue-count{color:rgba(255,255,255,.34);font-size:9px;font-variant-numeric:tabular-nums}
     .tss-pip-queue-tools{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px;padding-bottom:7px;border-bottom:1px solid rgba(255,255,255,.06)}
-    .tss-pip-tabs{display:flex;align-items:center;padding:2px;border-radius:7px;background:rgba(255,255,255,.035)}.tss-pip-tab{height:25px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.32);font-size:8px;font-weight:720;letter-spacing:.07em;text-transform:uppercase;cursor:pointer}.tss-pip-tab[aria-selected="true"]{background:rgba(255,255,255,.08);color:#fff}
-    .tss-pip-search-wrap{position:relative;min-width:0}.tss-pip-search-wrap svg{position:absolute;left:8px;top:50%;width:10px!important;height:10px!important;transform:translateY(-50%);color:rgba(255,255,255,.25);pointer-events:none}.tss-pip-queue-search{width:100%;height:29px;padding:0 9px 0 25px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(255,255,255,.025);color:#fff;font:500 9px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;outline:0}.tss-pip-queue-search::placeholder{color:rgba(255,255,255,.22)}.tss-pip-queue-search:focus{border-color:color-mix(in srgb,var(--accent),transparent 35%)}
+    .tss-pip-tabs{display:flex;align-items:center;padding:2px;border-radius:7px;background:var(--pip-glass-inset)}.tss-pip-tab{height:25px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:720;letter-spacing:.07em;text-transform:uppercase;cursor:pointer}.tss-pip-tab[aria-selected="true"]{background:rgba(174,186,243,.12);color:#fff}
+    .tss-pip-search-wrap{position:relative;min-width:0}.tss-pip-search-wrap svg{position:absolute;left:8px;top:50%;width:10px!important;height:10px!important;transform:translateY(-50%);color:rgba(255,255,255,.25);pointer-events:none}.tss-pip-queue-search{width:100%;height:29px;padding:0 9px 0 25px;border:1px solid rgba(204,218,255,.10);border-radius:7px;background:var(--pip-glass-inset);color:#fff;font:500 9px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;outline:0}.tss-pip-queue-search::placeholder{color:rgba(255,255,255,.22)}.tss-pip-queue-search:focus{border-color:color-mix(in srgb,var(--accent),transparent 35%)}
     .tss-pip-queue-list{min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.18) transparent}
     .tss-pip-queue-list::-webkit-scrollbar{width:5px}.tss-pip-queue-list::-webkit-scrollbar-track{background:transparent}.tss-pip-queue-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:9px}
     .tss-pip-queue-row{width:100%;min-height:49px;padding:5px 3px 5px 6px;display:grid;grid-template-columns:36px minmax(0,1fr) auto 28px;align-items:center;gap:8px;border:0;border-bottom:1px solid rgba(255,255,255,.055);background:transparent;color:#fff;text-align:left;transition:background .14s,opacity .18s,transform .22s cubic-bezier(.22,1,.36,1)}
     .tss-pip-queue-row[data-playable="true"]{cursor:pointer}
     .tss-pip-queue-row:hover{background:rgba(255,255,255,.045)}
     .tss-pip-queue-row[data-current="true"]{background:color-mix(in srgb,var(--accent),transparent 92%);box-shadow:inset 2px 0 var(--accent);cursor:default}
-    .tss-pip-queue-art{width:36px;height:36px;border-radius:7px;overflow:hidden;background:#151515;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.24)}
+    .tss-pip-queue-art{width:36px;height:36px;border-radius:7px;overflow:hidden;background:rgba(255,255,255,.035);display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.24)}
     .tss-pip-queue-art img{display:block;width:100%;height:100%;object-fit:cover}
     .tss-pip-queue-copy{display:block;min-width:0}.tss-pip-queue-title{display:block;font-size:10px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tss-pip-queue-artist{display:block;margin-top:3px;color:rgba(255,255,255,.35);font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .tss-pip-queue-number{color:rgba(255,255,255,.34);font-size:9px;font-variant-numeric:tabular-nums}
@@ -3193,23 +3687,27 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-queue-empty{padding:34px 12px;text-align:center;color:rgba(255,255,255,.25);font-size:10px}
     .tss-pip-track-settings{width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.35);cursor:pointer}
     .tss-pip-track-settings:hover,.tss-pip-track-settings[aria-expanded="true"]{background:rgba(255,255,255,.07);color:#fff}.tss-pip-track-settings:disabled{opacity:.22;cursor:default;background:transparent;color:rgba(255,255,255,.25)}
-    .tss-pip-track-menu{position:absolute;z-index:20;width:210px;padding:9px;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:rgba(19,19,19,.97);box-shadow:0 18px 45px rgba(0,0,0,.65);backdrop-filter:blur(18px);animation:tssPipMenuIn .16s cubic-bezier(.22,1,.36,1)}
+    .tss-pip-track-menu{position:absolute;z-index:20;width:210px;padding:9px;border:1px solid var(--pip-glass-rim);border-radius:12px;background:var(--pip-menu-surface);box-shadow:var(--pip-glass-shadow);animation:tssPipMenuIn .16s cubic-bezier(.22,1,.36,1)}
     .tss-pip-menu-title{display:flex;align-items:center;gap:8px;padding:2px 2px 9px;color:rgba(255,255,255,.78);font-size:10px;font-weight:680;border-bottom:1px solid rgba(255,255,255,.07)}
     .tss-pip-menu-title span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tss-pip-menu-title button{width:24px;height:24px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.42);cursor:pointer}.tss-pip-menu-title button:hover{background:rgba(255,255,255,.07);color:#fff}
-    .tss-pip-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.tss-pip-menu-actions button,.tss-pip-menu-remove{height:30px;border:1px solid rgba(255,255,255,.09);border-radius:7px;background:rgba(255,255,255,.045);color:rgba(255,255,255,.78);font-size:9px;font-weight:650;cursor:pointer}.tss-pip-menu-actions button:hover{border-color:color-mix(in srgb,var(--accent),transparent 45%);color:#fff}.tss-pip-menu-actions button:disabled,.tss-pip-menu-remove:disabled{opacity:.28;cursor:default}
-    .tss-pip-menu-label{margin:10px 2px 6px;color:rgba(255,255,255,.34);font-size:8px;font-weight:720;letter-spacing:.1em;text-transform:uppercase}.tss-pip-priority{display:grid;grid-template-columns:repeat(3,1fr);padding:2px;border-radius:8px;background:rgba(255,255,255,.04)}.tss-pip-priority button{height:27px;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.35);font-size:8px;font-weight:700;cursor:pointer}.tss-pip-priority button[aria-pressed="true"]{background:var(--accent);color:#fff;box-shadow:0 3px 10px color-mix(in srgb,var(--accent),transparent 68%)}
+    .tss-pip-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.tss-pip-menu-actions button,.tss-pip-menu-remove{height:30px;border:1px solid rgba(255,255,255,.09);border-radius:7px;background:var(--pip-glass-inset);color:rgba(255,255,255,.78);font-size:9px;font-weight:650;cursor:pointer}.tss-pip-menu-actions button:hover{border-color:color-mix(in srgb,var(--accent),transparent 45%);color:#fff}.tss-pip-menu-actions button:disabled,.tss-pip-menu-remove:disabled{opacity:.28;cursor:default}
+    .tss-pip-menu-label{margin:10px 2px 6px;color:rgba(255,255,255,.34);font-size:8px;font-weight:720;letter-spacing:.1em;text-transform:uppercase}.tss-pip-priority{display:grid;grid-template-columns:repeat(3,1fr);padding:2px;border-radius:8px;background:rgba(255,255,255,.04)}.tss-pip-priority button{height:27px;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.35);font-size:8px;font-weight:700;cursor:pointer}.tss-pip-priority button[aria-pressed="true"]{background:color-mix(in srgb,var(--accent) 72%,transparent);color:#101522;box-shadow:0 3px 10px color-mix(in srgb,var(--accent),transparent 68%)}
     .tss-pip-menu-remove{width:100%;margin-top:8px;background:rgba(255,74,74,.055);border-color:rgba(255,74,74,.12);color:#d87878}.tss-pip-menu-remove:not(:disabled):hover{background:rgba(255,74,74,.11);color:#ff9292}
-    .tss-pip-sound-menu{position:absolute;z-index:19;inset:48px 12px 12px;padding:12px;overflow-y:auto;overscroll-behavior:contain;border:1px solid rgba(255,255,255,.13);border-radius:13px;background:rgba(14,14,14,.985);box-shadow:0 20px 55px rgba(0,0,0,.72);backdrop-filter:blur(20px);animation:tssPipMenuIn .18s cubic-bezier(.22,1,.36,1);scrollbar-width:thin}
+    .tss-pip-sound-menu{position:absolute;z-index:19;inset:48px 12px 12px;padding:12px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--pip-glass-rim);border-radius:13px;background:var(--pip-menu-surface);box-shadow:var(--pip-glass-shadow);animation:tssPipMenuIn .18s cubic-bezier(.22,1,.36,1);scrollbar-width:thin}
     .tss-pip-sound-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.07)}.tss-pip-sound-head>div{display:flex;flex-direction:column;gap:2px}.tss-pip-sound-head span{font-size:11px;font-weight:720}.tss-pip-sound-head small{color:rgba(255,255,255,.3);font-size:8px}.tss-pip-sound-head button,.tss-pip-mini-icon{display:flex;align-items:center;justify-content:center;border:0;background:transparent;color:rgba(255,255,255,.45);cursor:pointer}.tss-pip-sound-head button{width:26px;height:26px;border-radius:6px}.tss-pip-sound-head button:hover,.tss-pip-mini-icon:hover{background:rgba(255,255,255,.07);color:#fff}
     .tss-pip-setting-row{display:flex;align-items:center;gap:9px;padding:11px 0}.tss-pip-mini-icon{width:28px;height:28px;border-radius:7px}.tss-pip-setting-row output,.tss-pip-setting-label output{color:rgba(255,255,255,.4);font-size:8px;font-variant-numeric:tabular-nums}.tss-pip-setting-row output{width:30px;text-align:right}
-    .tss-pip-sound-menu input[type="range"]{--fill:0%;width:100%;height:3px;margin:0;appearance:none;border:0;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--fill),rgba(255,255,255,.11) var(--fill));cursor:pointer}.tss-pip-sound-menu input[type="range"]::-webkit-slider-thumb{width:12px;height:12px;appearance:none;border:2px solid #fff;border-radius:50%;background:var(--accent);box-shadow:0 2px 7px rgba(0,0,0,.5)}.tss-pip-sound-menu input[type="range"]::-moz-range-thumb{width:9px;height:9px;border:2px solid #fff;border-radius:50%;background:var(--accent)}
-    .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.65);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(255,255,255,.035)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.3);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[aria-pressed="true"]{background:rgba(255,255,255,.09);color:#fff}
-    .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:rgba(255,255,255,.025);color:rgba(255,255,255,.58);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(255,255,255,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.58);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
-    .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.72);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#151515}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.38);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
+    .tss-pip-sound-menu input[type="range"]{--fill:0%;width:100%;height:3px;margin:0;appearance:none;border:0;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--fill),rgba(114,130,165,.18) var(--fill));box-shadow:inset 0 1px 2px rgba(3,4,10,.3);cursor:pointer}.tss-pip-sound-menu input[type="range"]::-webkit-slider-thumb{width:12px;height:12px;appearance:none;border:2px solid #fff;border-radius:50%;background:var(--accent);box-shadow:0 2px 7px rgba(0,0,0,.5)}.tss-pip-sound-menu input[type="range"]::-moz-range-thumb{width:9px;height:9px;border:2px solid #fff;border-radius:50%;background:var(--accent)}
+    .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.78);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(0,0,0,.04)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[aria-pressed="true"]{background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:#fff}
+    .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:var(--pip-glass-inset);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:rgba(255,255,255,.78);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 3px rgba(0,0,0,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.78);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
+    .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.78);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#101113}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
     .tss-pip-stage[data-view="queue"] .tss-pip-queue-row{animation:tssPipRowIn .26s both cubic-bezier(.22,1,.36,1);animation-delay:calc(var(--row-index) * 18ms)}
     @keyframes tssPipMarquee{0%,15%{transform:translateX(0)}85%,100%{transform:translateX(var(--tss-pip-marquee-distance,0))}}
     @keyframes tssPipRowIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}@keyframes tssPipMenuIn{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
     @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu,.tss-pip-title-text{transition:none!important;animation:none!important}.tss-pip-title{overflow:hidden;text-overflow:ellipsis}}
+    :root[data-tss-reduce-visual-effects="true"]{--pip-menu-surface:var(--pip-glass-surface)}
+    :root[data-tss-reduce-visual-effects="true"] *, :root[data-tss-reduce-visual-effects="true"] *::before, :root[data-tss-reduce-visual-effects="true"] *::after{transition:none!important;animation:none!important;scroll-behavior:auto!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+    :root[data-tss-reduce-visual-effects="true"] .tss-pip-control{transform:none!important}
+    @media(prefers-reduced-motion:no-preference){:root[data-tss-reduce-visual-effects="true"] .tss-pip-stage[data-view="player"] .tss-pip-title[data-overflow="true"] .tss-pip-title-text{animation:tssPipMarquee var(--tss-pip-marquee-duration,9s) ease-in-out infinite alternate!important}}
     @media(max-width:420px){.tss-pip-brand{display:none}.tss-pip-header{gap:6px}.tss-pip-state{max-width:58px}.tss-pip-live span{display:none}.tss-pip-track{grid-template-columns:88px minmax(0,1fr);min-height:88px}}
     @media(max-height:300px){#tss-pip-player{min-height:280px;padding:10px 13px}.tss-pip-stage{margin-top:6px}.tss-pip-track{grid-template-columns:70px minmax(0,1fr);min-height:70px}.tss-pip-art{width:70px;height:70px}.tss-pip-wave{margin-top:7px}#tss-pip-waveform{height:24px}.tss-pip-controls{margin:5px 0 7px}.tss-pip-control-primary{width:47px;height:47px}.tss-pip-up-next{padding-top:6px}.tss-pip-next-row{grid-template-columns:34px minmax(0,1fr) auto 28px;min-height:34px;margin-top:5px}.tss-pip-next-art{width:34px;height:34px}}
   `;
@@ -3308,7 +3806,12 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     viewToggle.setAttribute('aria-label', showQueue ? 'Show player' : 'Show queue');
     viewToggle.title = showQueue ? 'Show player' : 'Show queue';
     viewToggle.innerHTML = showQueue ? SVG.equalizer : SVG.list;
-    if (showQueue) renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+    if (showQueue) {
+      const list = pipDocument.getElementById('tss-pip-queue-list');
+      if (list) delete list.dataset.key;
+      renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+    }
+    syncOwnPipMarquee(pipDocument.getElementById('tss-pip-title'), pipDocument.getElementById('tss-pip-title-text'));
   };
   const setPipQueueTab = tab => {
     const queueView = pipDocument.getElementById('tss-pip-queue-view');
@@ -3368,6 +3871,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   pipWindow.addEventListener('resize', syncOwnPipWindow);
   if (mode === 'document') pipWindow.addEventListener('pagehide', onPageHide, { once: true });
 
+  applyVisualEffects(pipDocument);
   setOwnPipArtworkMode(state.pipArtworkMode, pipDocument);
   setOwnPipButtonState();
   syncOwnPipWindow();
@@ -3377,7 +3881,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
 function installBetterFeedPipBridge() {
   const player = pageWindow.scPlayer;
   if (!player || typeof player !== 'object') return false;
-  if (state._pipBridgePlayer === player) return true;
+  const samePlayer = state._pipBridgePlayer === player;
 
   const methodNames = [
     'getCurrentSound', 'getCurrentQueueItem', 'isPlaying', 'toggleCurrent',
@@ -3386,11 +3890,14 @@ function installBetterFeedPipBridge() {
   const originals = {};
   const descriptors = {};
   try {
+    if (samePlayer && state._pipBridgeWrappers
+        && methodNames.every(name => player[name] === state._pipBridgeWrappers[name])) return true;
     for (const name of methodNames) {
       const descriptor = Object.getOwnPropertyDescriptor(player, name);
       if (descriptor ? !('value' in descriptor) || !descriptor.writable : !Object.isExtensible(player)) return false;
       descriptors[name] = descriptor;
-      originals[name] = player[name];
+      originals[name] = samePlayer && player[name] === state._pipBridgeWrappers?.[name]
+        ? state._pipBridgeOriginals[name] : player[name];
     }
   } catch (_) { return false; }
   const callOriginal = (name, args) => {
@@ -3461,12 +3968,15 @@ function installBetterFeedPipBridge() {
   }
 
   state._pipBridgePlayer = player;
+  state._pipBridgeOriginals = originals;
+  state._pipBridgeWrappers = patched;
   return true;
 }
 
 function ensureCrossfadeDecks() {
   if (state._decks.length === 2 && state._decks.every(Boolean)) {
     state._deckHlsPlayers ||= [null, null];
+    if (state._transitionDiagnostics) state._decks.forEach(observeTransitionMedia);
     state._deckHlsFailed ||= [false, false];
     return state._decks;
   }
@@ -3479,6 +3989,7 @@ function ensureCrossfadeDecks() {
     audio.dataset.tssCrossfadeDeck = String(index);
     audio.style.display = 'none';
     document.body.appendChild(audio);
+    if (state._transitionDiagnostics) observeTransitionMedia(audio, index);
     return audio;
   });
   state._deckHlsPlayers = [null, null];
@@ -3606,6 +4117,8 @@ function retireAudioGraph() {
   const context = state._audioContext;
   state._crossfadeToken++;
   state._crossfadePrefetchToken++;
+  destroyCrossfadePreflight(state._crossfadeStreamWarmup);
+  state._crossfadeStreamWarmup?.controller?.abort();
   state._deckPrepareTokens = state._deckPrepareTokens.map(token => token + 1);
   for (const controller of state._deckPrepareAborts || []) {
     try { controller?.abort(); } catch (_) {}
@@ -3749,6 +4262,8 @@ function ensureAutoLevelAudioGraph() {
 function syncDeckProcessingRouting() {
   state._deckAudioGraphs.forEach(graph => {
     if (!graph) return;
+    // Each new graph starts unrouted; EQ band targets are applied separately.
+    if (graph.routedEq === state.eqEnabled && graph.routedAutoLevel === state.autoLevel) return;
     for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain]) {
       try { node.disconnect(); } catch (_) {}
     }
@@ -3756,6 +4271,8 @@ function syncDeckProcessingRouting() {
     if (!state.eqEnabled && !state.autoLevel) {
       graph.source.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
+      graph.routedEq = state.eqEnabled;
+      graph.routedAutoLevel = state.autoLevel;
       graph.appliedAutoGain = 1;
       return;
     }
@@ -3778,6 +4295,8 @@ function syncDeckProcessingRouting() {
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
       graph.appliedAutoGain = 1;
     }
+    graph.routedEq = state.eqEnabled;
+    graph.routedAutoLevel = state.autoLevel;
   });
 }
 
@@ -3977,7 +4496,15 @@ function normalizeSoundCloudVolume(value, maxValue) {
 }
 
 function soundCloudVolumeModel() {
-  if (state._soundCloudVolumeModel) return state._soundCloudVolumeModel;
+  const cachedModel = state._soundCloudVolumeModel;
+  if (cachedModel) {
+    try {
+      if (typeof cachedModel.getVolume === 'function' && typeof cachedModel.getMuted === 'function'
+          && typeof cachedModel.setVolumeAndMuted === 'function') return cachedModel;
+    } catch (_) {}
+    state._soundCloudVolumeModel = null;
+    return null;
+  }
   const registry = pageWindow.webpackJsonp;
   if (!registry || typeof registry.push !== 'function') return null;
 
@@ -4023,8 +4550,11 @@ function soundCloudVolumeSlider() {
 function soundCloudVolume() {
   const model = soundCloudVolumeModel();
   if (model) {
-    const value = model.getMuted() ? 0 : Number(model.getVolume());
-    if (Number.isFinite(value)) return Math.max(0, Math.min(1, value));
+    try {
+      const value = model.getMuted() ? 0 : Number(model.getVolume());
+      if (Number.isFinite(value)) return Math.max(0, Math.min(1, value));
+    } catch (_) {}
+    state._soundCloudVolumeModel = null;
   }
   const slider = soundCloudVolumeSlider();
   const sliderVolume = normalizeSoundCloudVolume(
@@ -4044,9 +4574,13 @@ function setSoundCloudVolume(value) {
   const level = Math.max(0, Math.min(1, Number(value) || 0));
   const model = soundCloudVolumeModel();
   if (model) {
-    model.setVolumeAndMuted({ volume: level, muted: level === 0 });
-    state._lastSoundCloudVolume = level;
-    return true;
+    try {
+      model.setVolumeAndMuted({ volume: level, muted: level === 0 });
+      state._lastSoundCloudVolume = level;
+      return true;
+    } catch (_) {
+      state._soundCloudVolumeModel = null;
+    }
   }
 
   const slider = soundCloudVolumeSlider();
@@ -4125,7 +4659,7 @@ function syncCrossfadeVolume() {
     if (automatedGain !== null) state._deckGains[index] = automatedGain;
     const graph = state._deckAudioGraphs?.[index];
     if (graph) {
-      audio.volume = 1;
+      if (audio.volume !== 1) audio.volume = 1;
       if (state.autoLevel && graph.settled && (
         !Number.isFinite(graph.autoGainMaster)
         || Math.abs(graph.autoGainMaster - master) > 0.0001
@@ -4153,7 +4687,8 @@ function syncCrossfadeVolume() {
         graph.appliedAutoGain = targetAutoGain;
       }
     } else {
-      audio.volume = Math.max(0, Math.min(1, master * gain));
+      const volume = Math.max(0, Math.min(1, master * gain));
+      if (audio.volume !== volume) audio.volume = volume;
     }
   });
 }
@@ -4164,18 +4699,23 @@ function syncPlaybackVolumeControls() {
   const readout = document.getElementById('tss-hub-volume-value');
   if (slider) {
     if (slider.value !== String(percent)) slider.value = String(percent);
-    slider.style.setProperty('--tss-volume-fill', `${percent}%`);
+    const fill = `${percent}%`;
+    if (slider.style.getPropertyValue('--tss-volume-fill') !== fill) slider.style.setProperty('--tss-volume-fill', fill);
   }
-  if (readout) readout.textContent = `${percent}%`;
+  const text = `${percent}%`;
+  if (readout && readout.textContent !== text) readout.textContent = text;
   const auto = document.getElementById('tss-auto-level');
   if (auto) {
-    auto.dataset.active = String(state.autoLevel);
-    auto.setAttribute('aria-pressed', String(state.autoLevel));
+    const active = String(state.autoLevel);
+    if (auto.dataset.active !== active) auto.dataset.active = active;
+    if (auto.getAttribute('aria-pressed') !== active) auto.setAttribute('aria-pressed', active);
     const label = auto.querySelector('.tss-auto-label');
-    if (label) label.textContent = state.autoLevel ? 'AUTO ON' : 'AUTO OFF';
-    auto.title = state.autoLevel
+    const labelText = state.autoLevel ? 'On' : 'Off';
+    if (label && label.textContent !== labelText) label.textContent = labelText;
+    const title = state.autoLevel
       ? 'Auto Level is reducing louder tracks'
       : 'Automatically reduce louder tracks';
+    if (auto.title !== title) auto.title = title;
   }
 }
 
@@ -4237,30 +4777,32 @@ function setCrossfadeStatus(status) {
     mixing: 'mixing',
     fallback: 'custom retry',
   };
-  el.textContent = labels[status] || status;
-  el.dataset.status = status;
+  const text = labels[status] || status;
+  if (el.textContent !== text) el.textContent = text;
+  if (el.dataset.status !== status) el.dataset.status = status;
 }
 
 function syncCrossfadeControls() {
   const seconds = Math.max(0, Math.min(12, Math.round(state.crossfadeSeconds)));
   const valueText = seconds > 0 ? `${seconds} sec` : 'off';
   const card = document.getElementById('tss-crossfade-card');
-  if (card) card.dataset.enabled = seconds > 0 ? 'true' : 'false';
+  const enabled = seconds > 0 ? 'true' : 'false';
+  if (card && card.dataset.enabled !== enabled) card.dataset.enabled = enabled;
 
   const slider = document.getElementById('tss-hub-crossfade');
   if (slider) {
     if (slider.value !== String(seconds)) slider.value = String(seconds);
-    slider.style.setProperty('--tss-crossfade-fill', `${(seconds / 12) * 100}%`);
+    const fill = `${(seconds / 12) * 100}%`;
+    if (slider.style.getPropertyValue('--tss-crossfade-fill') !== fill) slider.style.setProperty('--tss-crossfade-fill', fill);
   }
-  const summary = document.getElementById('tss-crossfade-summary-seconds');
   const readout = document.getElementById('tss-crossfade-seconds');
-  if (summary) summary.textContent = valueText;
-  if (readout) readout.textContent = valueText;
+  if (readout && readout.textContent !== valueText) readout.textContent = valueText;
 
   document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
     const active = button.dataset.curve === state.crossfadeCurve;
-    button.dataset.active = active ? 'true' : 'false';
-    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    const value = active ? 'true' : 'false';
+    if (button.dataset.active !== value) button.dataset.active = value;
+    if (button.getAttribute('aria-pressed') !== value) button.setAttribute('aria-pressed', value);
   });
   const manual = document.getElementById('tss-crossfade-manual');
   if (manual && manual.checked !== state.crossfadeManual) manual.checked = state.crossfadeManual;
@@ -4274,11 +4816,15 @@ function discoverSoundCloudClientId(excluded = new Set()) {
   try {
     const entries = performance.getEntriesByType('resource');
     for (let i = entries.length - 1; i >= 0; i--) {
-      const match = String(entries[i].name || '').match(/[?&]client_id=([A-Za-z0-9_-]+)/);
-      if (match && usable(match[1])) {
-        state._clientId = match[1];
-        return state._clientId;
-      }
+      try {
+        const url = new URL(entries[i].name);
+        if (!/^https?:$/.test(url.protocol) || !['api-v2.soundcloud.com', 'api.soundcloud.com'].includes(url.hostname)) continue;
+        const id = url.searchParams.get('client_id');
+        if (id && /^[A-Za-z0-9_-]+$/.test(id) && usable(id)) {
+          state._clientId = id;
+          return id;
+        }
+      } catch (_) {}
     }
   } catch (_) {}
   return '';
@@ -4350,7 +4896,7 @@ function syncBrowserNowPlaying() {
     }
     if (mediaSession && 'playbackState' in mediaSession) {
       const playbackState = paused() ? 'paused' : 'playing';
-      mediaSession.playbackState = playbackState;
+      if (mediaSession.playbackState !== playbackState) mediaSession.playbackState = playbackState;
       owner.playbackValue = playbackState;
     }
   } catch (_) {}
@@ -4403,8 +4949,8 @@ async function resolveProgressiveStreams(track, clientId, options = {}) {
     ? track.media.transcodings
     : (Array.isArray(track?.transcodings)
       ? track.transcodings.map(item => ({
-        url: item.url,
-        format: { protocol: item.protocol, mime_type: item.mimeType },
+        url: item?.url,
+        format: { protocol: item?.protocol, mime_type: item?.mimeType },
       }))
       : []);
   const progressive = transcodings
@@ -4435,8 +4981,9 @@ async function resolveProgressiveStreams(track, clientId, options = {}) {
       if (response.status === 401 || response.status === 403) authFailed = true;
       if (!response.ok) continue;
       const stream = response.data;
-      if (stream?.url && !urls.includes(stream.url)) {
-        urls.push(stream.url);
+      const streamUrl = typeof stream?.url === 'string' && stream.url.trim() ? new URL(stream.url) : null;
+      if (streamUrl && /^https?:$/.test(streamUrl.protocol) && !urls.includes(streamUrl.href)) {
+        urls.push(streamUrl.href);
         if (diagnosticTrace) diagnosticTrace.progressiveUrls++;
       }
     } catch (error) {
@@ -4465,17 +5012,19 @@ function isHlsStreamUrl(value) {
 
 function isHlsManifestUrl(value) {
   try {
-    return new URL(value).pathname.toLowerCase().endsWith('.m3u8');
+    if (typeof value !== 'string') return false;
+    const url = new URL(value);
+    return /^https?:$/.test(url.protocol) && url.pathname.toLowerCase().endsWith('.m3u8');
   } catch (_) {
     return false;
   }
 }
 
 function directHlsStreamUrls(track) {
-  const streams = track?.streams || track?.media?.streams || {};
   return [
     track?.hls_aac_160_url, track?.hls_aac_96_url,
-    streams.hls_aac_160_url, streams.hls_aac_96_url,
+    track?.streams?.hls_aac_160_url, track?.streams?.hls_aac_96_url,
+    track?.media?.streams?.hls_aac_160_url, track?.media?.streams?.hls_aac_96_url,
     track?.media?.hls_aac_160_url, track?.media?.hls_aac_96_url,
   ].filter(isHlsManifestUrl);
 }
@@ -4531,7 +5080,7 @@ function hlsDiagnosticCode(value) {
   return /^[A-Za-z0-9_-]{1,48}$/.test(code) ? code : 'unknown';
 }
 
-async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace) {
+async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options = {}) {
   const HlsCtor = hlsJsConstructor();
   if (diagnosticTrace) {
     diagnosticTrace.hlsLibraryAvailable = Boolean(HlsCtor);
@@ -4549,21 +5098,37 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     return { supported: false, ready: false, player: null, source: '' };
   }
   let player;
-  try {
-    player = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
-  } catch (error) {
-    if (diagnosticTrace) {
-      diagnosticTrace.stage = 'hls-mse';
-      diagnosticTrace.reason = 'hls-initialization-error';
-      diagnosticTrace.hlsMode = 'unsupported';
-      diagnosticTrace.errorName = playbackErrorName(error);
+  const preflight = options.preflight?.streamUrl === streamUrl
+    && !options.preflight.failed && !options.preflight.adopted ? options.preflight : null;
+  if (preflight?.player) {
+    player = preflight.player;
+    try { if (preflight.onError) player.off(HlsCtor.Events.ERROR, preflight.onError); } catch (_) {}
+    preflight.onError = null;
+  } else {
+    try {
+      player = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
+    } catch (error) {
+      if (diagnosticTrace) {
+        diagnosticTrace.stage = 'hls-mse';
+        diagnosticTrace.reason = 'hls-initialization-error';
+        diagnosticTrace.hlsMode = 'unsupported';
+        diagnosticTrace.errorName = playbackErrorName(error);
+      }
+      return { supported: false, ready: false, player: null, source: '' };
     }
-    return { supported: false, ready: false, player: null, source: '' };
   }
   state._deckHlsPlayers ||= [null, null];
   state._deckHlsFailed ||= [false, false];
   state._deckHlsFailed[index] = false;
   state._deckHlsPlayers[index] = player;
+  if (preflight) preflight.adopted = true;
+  if (state._transitionDiagnostics) {
+    const details = { deckIndex: index, trackIndex: state._deckTracks[index], token: state._deckPrepareTokens[index], detached: false };
+    observeTransitionHls(player, HlsCtor.Events, details);
+    recordTransitionDiagnostic(preflight ? 'hls-adopted' : 'hls-load', {
+      ...details, previousToken: preflight?.player?._tssTransitionHls?.previousToken,
+    });
+  }
   const waitController = new AbortController();
   const abortWait = () => { if (!waitController.signal.aborted) waitController.abort(); };
   signal?.addEventListener('abort', abortWait, { once: true });
@@ -4671,7 +5236,7 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     if (HlsCtor.Events.MANIFEST_PARSED) player.on(HlsCtor.Events.MANIFEST_PARSED, onManifestParsed);
     if (HlsCtor.Events.FRAG_BUFFERED) player.on(HlsCtor.Events.FRAG_BUFFERED, onFragmentBuffered);
     const readiness = waitForDeck(audio, timeout, waitController.signal, isCurrent, diagnosticTrace);
-    player.loadSource(streamUrl);
+    if (!preflight) player.loadSource(streamUrl);
     player.attachMedia(audio);
     const ready = await readiness;
     readinessSettled = true;
@@ -4730,10 +5295,10 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
   }
 }
 
-async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace) {
+async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options = {}) {
   audio.preload = 'auto';
   if (isHlsStreamUrl(streamUrl)) {
-    return prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace);
+    return prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options);
   }
   audio.src = streamUrl;
   const source = audio.src;
@@ -4745,19 +5310,13 @@ async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurr
 function hydrationTrackForPlayback(meta) {
   const roots = pageWindow.__sc_hydration;
   if (!Array.isArray(roots)) return null;
-  const wantedId = Number(meta?.soundcloudId);
-  const wantedUrl = normalizeTrackUrl(meta?.link);
   const seen = new WeakSet();
   const stack = [...roots];
   while (stack.length) {
     const value = stack.pop();
     if (!value || typeof value !== 'object' || seen.has(value)) continue;
     seen.add(value);
-    const candidateId = Number(value.id);
-    const candidateUrl = normalizeTrackUrl(value.permalink_url || value.permalinkUrl || '');
-    const exact = (Number.isFinite(wantedId) && wantedId > 0 && candidateId === wantedId)
-      || (wantedUrl && candidateUrl === wantedUrl);
-    if (exact && Array.isArray(value.media?.transcodings)) return value;
+    if (soundCloudTrackMatches(meta, value) && Array.isArray(value.media?.transcodings)) return value;
     for (const child of Object.values(value)) {
       if (child && typeof child === 'object') stack.push(child);
     }
@@ -4805,7 +5364,13 @@ async function resolveCrossfadeStreams(meta, options = {}) {
     if (now - value.ts >= 30 * 60 * 1000) state._streamCache.delete(cachedKey);
   }
   if (options.forceRefresh) state._streamCache.delete(key);
-  const cached = state._streamCache.get(key);
+  let cached = state._streamCache.get(key);
+  const expectedId = soundCloudInteger(meta.soundcloudId, 1);
+  const cachedId = soundCloudInteger(cached?.soundcloudId, 1);
+  if (cached && expectedId !== null && cachedId !== null && expectedId !== cachedId) {
+    state._streamCache.delete(key);
+    cached = null;
+  }
   if (cached?.urls?.length) {
     state._streamCache.delete(key);
     state._streamCache.set(key, cached);
@@ -4841,17 +5406,9 @@ async function resolveCrossfadeStreams(meta, options = {}) {
     const resolveTrack = async (track, source) => {
       checkCurrent();
       if (diagnosticTrace && source) diagnosticTrace.streamSource = source;
-      if (!track) return [];
-      const trackId = Number(track.id);
-      const expectedId = Number(meta.soundcloudId);
-      const trackUrl = normalizeTrackUrl(track.permalink_url || track.permalinkUrl || '');
-      const exactTrack = track === meta
-        || (Number.isFinite(expectedId) && expectedId > 0 && trackId === expectedId)
-        || (trackUrl && trackUrl === key);
-      if (exactTrack) {
-        trackMetadataFound = true;
-        if (diagnosticTrace) diagnosticTrace.trackMetadataFound = true;
-      }
+      if (!soundCloudTrackMatches(meta, track)) return [];
+      trackMetadataFound = true;
+      if (diagnosticTrace) diagnosticTrace.trackMetadataFound = true;
       if (!meta.artist || meta.artist === '—') {
         Object.assign(meta, mergeTrackMeta(meta, metaFromSoundCloudTrack(track, meta.sourcePage, meta.playlistPosition)));
       }
@@ -4866,29 +5423,27 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       const transcodings = Array.isArray(track.media?.transcodings)
         ? track.media.transcodings
         : (Array.isArray(track.transcodings) ? track.transcodings : []);
-      const directHlsUrls = exactTrack ? directHlsStreamUrls(track) : [];
+      const directHlsUrls = directHlsStreamUrls(track);
       let hlsCandidateCount = directHlsUrls.length;
-      if (exactTrack) {
-        const hasHls160 = Boolean(track.hls_aac_160_url || track.streams?.hls_aac_160_url
-          || track.media?.hls_aac_160_url || track.media?.streams?.hls_aac_160_url);
-        const hasHls96 = Boolean(track.hls_aac_96_url || track.streams?.hls_aac_96_url
-          || track.media?.hls_aac_96_url || track.media?.streams?.hls_aac_96_url);
-        for (const transcoding of transcodings) {
-          const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '');
-          if (!transcoding?.url) continue;
-          if (protocol === 'progressive') progressiveMetadataAvailable = true;
-          if (!protocol.toLowerCase().includes('hls') && !isHlsStreamUrl(transcoding.url)) continue;
-          hlsCandidateCount++;
-          const quality = `${transcoding.preset || ''} ${transcoding.quality || ''}`.toLowerCase();
-          if (diagnosticTrace && /aac[_-]?160|160k/.test(quality)) diagnosticTrace.hlsAac160Candidates++;
-          else if (diagnosticTrace && /aac[_-]?96|96k/.test(quality)) diagnosticTrace.hlsAac96Candidates++;
-          else if (diagnosticTrace) diagnosticTrace.hlsOtherCandidates++;
-        }
-        if (diagnosticTrace) {
-          diagnosticTrace.hlsAac160Candidates += Number(hasHls160);
-          diagnosticTrace.hlsAac96Candidates += Number(hasHls96);
-          diagnosticTrace.hlsOtherCandidates += Math.max(0, directHlsUrls.length - Number(hasHls160) - Number(hasHls96));
-        }
+      const hasHls160 = Boolean(track.hls_aac_160_url || track.streams?.hls_aac_160_url
+        || track.media?.hls_aac_160_url || track.media?.streams?.hls_aac_160_url);
+      const hasHls96 = Boolean(track.hls_aac_96_url || track.streams?.hls_aac_96_url
+        || track.media?.hls_aac_96_url || track.media?.streams?.hls_aac_96_url);
+      for (const transcoding of transcodings) {
+        const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '');
+        if (!transcoding?.url) continue;
+        if (protocol === 'progressive') progressiveMetadataAvailable = true;
+        if (!protocol.toLowerCase().includes('hls') && !isHlsStreamUrl(transcoding.url)) continue;
+        hlsCandidateCount++;
+        const quality = `${transcoding.preset || ''} ${transcoding.quality || ''}`.toLowerCase();
+        if (diagnosticTrace && /aac[_-]?160|160k/.test(quality)) diagnosticTrace.hlsAac160Candidates++;
+        else if (diagnosticTrace && /aac[_-]?96|96k/.test(quality)) diagnosticTrace.hlsAac96Candidates++;
+        else if (diagnosticTrace) diagnosticTrace.hlsOtherCandidates++;
+      }
+      if (diagnosticTrace) {
+        diagnosticTrace.hlsAac160Candidates += Number(hasHls160);
+        diagnosticTrace.hlsAac96Candidates += Number(hasHls96);
+        diagnosticTrace.hlsOtherCandidates += Math.max(0, directHlsUrls.length - Number(hasHls160) - Number(hasHls96));
       }
       if (diagnosticTrace) diagnosticTrace.progressiveMetadataAvailable = progressiveMetadataAvailable;
       if (hlsCandidateCount) hlsAvailable = true;
@@ -4913,7 +5468,11 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       }
       if (urls.length) {
         state._streamCache.delete(key);
-        state._streamCache.set(key, { urls, ts: Date.now() });
+        state._streamCache.set(key, {
+          urls, ts: Date.now(),
+          soundcloudId: soundCloudInteger(track.id, 1) ?? soundCloudInteger(track.soundcloudId, 1)
+            ?? soundCloudInteger(meta.soundcloudId, 1),
+        });
         while (state._streamCache.size > 128) state._streamCache.delete(state._streamCache.keys().next().value);
       }
       return urls;
@@ -4931,8 +5490,8 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       }
       return [];
     }
-    if (Number.isFinite(Number(meta.soundcloudId)) && Number(meta.soundcloudId) > 0) {
-      const endpoint = new URL(`https://api-v2.soundcloud.com/tracks/${Number(meta.soundcloudId)}`);
+    if (soundCloudInteger(meta.soundcloudId, 1) !== null) {
+      const endpoint = new URL(`https://api-v2.soundcloud.com/tracks/${soundCloudInteger(meta.soundcloudId, 1)}`);
       endpoint.searchParams.set('client_id', clientId);
       if (meta.trackAuthorization) endpoint.searchParams.set('track_authorization', meta.trackAuthorization);
       const result = await fetchPlaybackTrack(endpoint, {
@@ -4994,6 +5553,11 @@ async function resolveCrossfadeStreams(meta, options = {}) {
 
 function resetDeck(audio, index) {
   if (!audio) return;
+  const schedule = state._crossfadeSchedule;
+  if (schedule && (schedule.incomingIndex === index || schedule.outgoingIndex === index)) delete schedule.incomingClockObservation;
+  if (state._transitionDiagnostics) recordTransitionDiagnostic('deck-reset', {
+    deckIndex: index, trackIndex: state._deckTracks[index], token: state._deckPrepareTokens[index],
+  });
   const safely = operation => {
     try { operation(); } catch (error) {
       recordPlaybackDiagnostic('deck-reset-failed', { errorName: playbackErrorName(error) });
@@ -5048,6 +5612,9 @@ function stopCrossfadeDecks() {
   state._crossfadePausedByUser = false;
   state._crossfadePending = false;
   state._crossfadeSchedule?.resolve?.(false);
+  destroyCrossfadePreflight(state._crossfadeStreamWarmup);
+  state._crossfadeStreamWarmup?.controller?.abort();
+  state._crossfadeStreamWarmup = null;
   state._crossfadeSchedule = null;
   state._decks.forEach((audio, index) => resetDeck(audio, index));
   state._deckIndex = -1;
@@ -5056,8 +5623,80 @@ function stopCrossfadeDecks() {
   setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'armed' : 'off');
 }
 
-async function prepareCrossfadeDeck(index, ti, options = {}) {
+function crossfadePreparationMatches(record, index, ti) {
+  return Boolean(record && record.epoch === state._playbackEpoch
+    && record.index === index && record.ti === ti && record.meta === state.meta[ti]
+    && record.audio === state._decks[index]
+    && record.token === state._deckPrepareTokens[index]
+    && !record.controller?.signal.aborted && !record.signal?.aborted);
+}
+
+function prepareCrossfadeDeck(index, ti, options = {}) {
+  const signal = options.signal || state._playbackAbort?.signal;
+  if (!state.active || signal?.aborted || (options.isCurrent && !options.isCurrent())) return Promise.resolve(null);
+  const records = state._deckPreparations || (state._deckPreparations = []);
+  const previous = records[index];
+  if (!options.forceRefresh && crossfadePreparationMatches(previous, index, ti)
+      && previous.pending && previous.signal === signal
+      && (options.foreground || !previous.isCurrent || previous.isCurrent())) {
+    if (options.foreground) {
+      if (state._transitionDiagnostics && !previous.foreground) recordTransitionDiagnostic('preparation-promoted', {
+        deckIndex: index, trackIndex: ti, token: previous.token,
+      });
+      // next() consumes the upcoming item before entering here. Transfer ownership
+      // rather than retaining the speculative "still upcoming" predicate.
+      previous.isCurrent = options.isCurrent;
+      previous.foreground = true;
+      const warmup = previous.warmup;
+      if (warmup && warmup === state._crossfadeStreamWarmup
+          && warmup.epoch === previous.epoch && warmup.nextTi === ti
+          && warmup.meta === previous.meta) warmup.isCurrent = () => !options.isCurrent || options.isCurrent();
+    }
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('preparation-reused', {
+      deckIndex: index, trackIndex: ti, token: previous.token, ready: false, foreground: Boolean(options.foreground),
+    });
+    return previous.promise;
+  }
+  if (state._transitionDiagnostics && previous && (options.forceRefresh || !crossfadePreparationMatches(previous, index, ti))) {
+    recordTransitionDiagnostic('preparation-replaced', {
+      deckIndex: index, trackIndex: previous.ti, token: previous.token, foreground: Boolean(options.foreground),
+    });
+  }
+  if (state._transitionDiagnostics && options.foreground && !previous?.foreground
+      && crossfadePreparationMatches(previous, index, ti)) recordTransitionDiagnostic('preparation-promoted', {
+    deckIndex: index, trackIndex: ti, token: previous.token,
+  });
+  const record = {
+    epoch: state._playbackEpoch, index, ti, meta: state.meta[ti],
+    audio: state._decks[index], signal, isCurrent: options.isCurrent,
+    foreground: Boolean(options.foreground), warmup: state._crossfadeStreamWarmup,
+    pending: true, promise: null, token: null, controller: null,
+  };
+  records[index] = record;
+  const startedAt = state._transitionDiagnostics ? performance.now() : 0;
+  const isCurrent = () => records[index] === record
+    && (!record.isCurrent || record.isCurrent());
+  const preparation = runCrossfadeDeckPreparation(index, ti, {
+    ...options, isCurrent,
+    preparedMeta: crossfadePreparationMatches(previous, index, ti) ? previous.meta : null,
+  });
+  record.promise = (state._transitionDiagnostics ? preparation.then(audio => {
+    if (state._transitionDiagnostics) recordTransitionDiagnostic(
+      record.controller?.signal.aborted || signal?.aborted || !isCurrent() ? 'preparation-cancelled' : 'preparation-result', {
+        playbackEpoch: record.epoch, deckIndex: index, trackIndex: ti, token: record.token, foreground: record.foreground,
+        ready: Boolean(audio), elapsedMs: performance.now() - startedAt,
+      });
+    return audio;
+  }) : preparation).finally(() => { record.pending = false; });
+  record.audio = state._decks[index];
+  record.token = state._deckPrepareTokens[index];
+  record.controller = state._deckPrepareAborts?.[index];
+  return record.promise;
+}
+
+async function runCrossfadeDeckPreparation(index, ti, options = {}) {
   const epoch = state._playbackEpoch;
+  const warmup = state._crossfadeStreamWarmup;
   const sessionSignal = options.signal || state._playbackAbort?.signal;
   const diagnosticTrace = options.diagnosticTrace || null;
   if (!state.active || sessionSignal?.aborted || (options.isCurrent && !options.isCurrent())) return null;
@@ -5093,14 +5732,20 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
   sessionSignal?.addEventListener('abort', abort, { once: true });
   const requestToken = (state._deckPrepareTokens[index] || 0) + 1;
   state._deckPrepareTokens[index] = requestToken;
+  if (state._transitionDiagnostics) recordTransitionDiagnostic('preparation-start', {
+    deckIndex: index, trackIndex: ti, token: requestToken, foreground: Boolean(options.foreground),
+  });
   const requestIsCurrent = () => state.active && epoch === state._playbackEpoch
     && !controller.signal.aborted && !sessionSignal?.aborted
     && state._deckPrepareTokens[index] === requestToken
     && state._decks[index] === audio && state.meta[ti] === meta
     && (!options.isCurrent || options.isCurrent());
   try {
-    if (!options.forceRefresh && state._deckTracks[index] === ti
+    if (!options.forceRefresh && options.preparedMeta === meta && state._deckTracks[index] === ti
         && audio.currentSrc && audio.readyState >= 2 && !state._deckHlsFailed?.[index]) {
+      if (state._transitionDiagnostics) recordTransitionDiagnostic('preparation-reused', {
+        deckIndex: index, trackIndex: ti, token: requestToken, ready: true, foreground: Boolean(options.foreground),
+      });
       if (diagnosticTrace) {
         diagnosticTrace.stage = 'deck-readiness';
         diagnosticTrace.reason = 'prepared-deck-reused';
@@ -5118,6 +5763,7 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
       diagnosticTrace.stage = 'stream-resolution';
       diagnosticTrace.reason = 'resolving-streams';
     }
+    const streamsStartedAt = state._transitionDiagnostics ? performance.now() : 0;
     let streamUrls = options.resolvedStreamPromise
       ? await options.resolvedStreamPromise
       : null;
@@ -5126,6 +5772,10 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
         ...options, signal: controller.signal, isCurrent: requestIsCurrent,
       });
     }
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('streams-resolved', {
+      deckIndex: index, trackIndex: ti, token: requestToken,
+      streamCandidateCount: streamUrls?.length || 0, elapsedMs: performance.now() - streamsStartedAt,
+    });
     if (!requestIsCurrent()) return null;
     if (!streamUrls.length) {
       if (diagnosticTrace && diagnosticTrace.reason === 'resolving-streams') {
@@ -5153,10 +5803,19 @@ async function prepareCrossfadeDeck(index, ti, options = {}) {
       state._deckGains[index] = 0;
       applyCachedAutoLevel(index, ti);
       syncCrossfadeVolume();
+      const preflight = warmup && warmup === state._crossfadeStreamWarmup
+          && warmup.epoch === epoch && warmup.nextTi === ti
+          && warmup.meta === meta && warmup.preflight?.streamUrl === streamUrl
+          && !warmup.preflight.adopted
+        ? warmup.preflight : null;
       const loaded = await loadStreamOnDeck(
         audio, index, streamUrl, options.timeout || 5000,
-        controller.signal, requestIsCurrent, diagnosticTrace,
+        controller.signal, requestIsCurrent, diagnosticTrace, { preflight },
       );
+      if (preflight && loaded.player === preflight.player) {
+        preflight.adopted = true;
+        warmup.preflight = null;
+      }
       const sourceIsCurrent = loaded.player
         ? state._deckHlsPlayers[index] === loaded.player
         : audio.src === loaded.source;
@@ -5458,6 +6117,8 @@ async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () 
 
 function crossfadeGains(t, curve = state.crossfadeCurve) {
   const clamped = Math.max(0, Math.min(1, t));
+  if (clamped === 0) return [1, 0];
+  if (clamped === 1) return [0, 1];
   if (curve === 'clean') return [1 - clamped, clamped];
 
   const phase = curve === 'dj'
@@ -5503,15 +6164,56 @@ function setAudioParamImmediately(param, value, now) {
   }
 }
 
-function scheduleAudioParamCurve(param, values, startTime, duration) {
-  // Use timeline ramps instead of setValueCurveAtTime. Firefox rejects
-  // setValueAtTime/cancel operations while a curve event is active, which can
-  // reject the transition promise and leave the player stuck on `mixing`.
-  param.cancelScheduledValues(0);
-  param.setValueAtTime(values[0], startTime);
-  for (let i = 1; i < values.length; i++) {
-    param.linearRampToValueAtTime(values[i], startTime + duration * (i / (values.length - 1)));
+function crossfadeAutomationPlan(curve) {
+  // Shared knots keep both decks complementary between every pair of ramps.
+  // Clean is exactly linear; nonlinear profiles need only 49 uniform knots.
+  const times = curve === 'clean' ? [0, 1] : Array.from({ length: 49 }, (_, i) => i / 48);
+  if (curve === 'dj') {
+    times.push(0.5 - 0.5 / 1.35, 0.5 + 0.5 / 1.35);
+    times.sort((a, b) => a - b);
   }
+  const outgoing = [];
+  const incoming = [];
+  for (const time of times) {
+    const gains = crossfadeGains(time, curve);
+    outgoing.push(gains[0]);
+    incoming.push(gains[1]);
+  }
+  return { times, outgoing, incoming };
+}
+
+function schedulePairedCrossfade(outParam, inParam, plan, startTime, rampDuration) {
+  // Cancelable LINEAR ramps only: active curve events cannot be cancelled
+  // safely in Firefox. Pair submissions so neither deck waits for a full curve.
+  outParam.cancelScheduledValues(0);
+  inParam.cancelScheduledValues(0);
+  outParam.setValueAtTime(plan.outgoing[0], startTime);
+  inParam.setValueAtTime(plan.incoming[0], startTime);
+  for (let i = 1; i < plan.times.length; i++) {
+    const time = startTime + rampDuration * plan.times[i];
+    outParam.linearRampToValueAtTime(plan.outgoing[i], time);
+    inParam.linearRampToValueAtTime(plan.incoming[i], time);
+  }
+}
+
+function crossfadeAutomationTiming(context, anchorAudioTime, anchorMonotonicMs, windowDuration, monotonicNow) {
+  const sampledNow = Number(context.currentTime);
+  if (!Number.isFinite(anchorAudioTime) || !Number.isFinite(windowDuration)) return null;
+  const elapsed = context.state === 'running' && Number.isFinite(anchorMonotonicMs) && Number.isFinite(monotonicNow)
+    ? Math.max(0, monotonicNow - anchorMonotonicMs) / 1000 : 0;
+  const estimatedNow = Math.max(Number.isFinite(sampledNow) ? sampledNow : anchorAudioTime, anchorAudioTime + elapsed);
+  const endTime = anchorAudioTime + windowDuration;
+  const remaining = endTime - estimatedNow;
+  if (!(remaining > 0)) return null;
+  // Lead is part of the requested window, not extra overlap. Tiny windows
+  // trade active-ramp length for submission headroom without moving the end.
+  // An unpredictable main-thread interruption can still outlast this bounded
+  // lead; neither this estimate nor a cached clock proves render delivery.
+  const lead = Math.min(0.128, remaining / 2);
+  const startTime = estimatedNow + lead;
+  const duration = endTime - startTime;
+  if (!(duration > 0) || !(startTime > estimatedNow)) return null;
+  return { startTime, endTime, duration, estimatedNow, lead };
 }
 
 function waitForCrossfadeSchedule(schedule, token) {
@@ -5529,6 +6231,7 @@ function waitForCrossfadeSchedule(schedule, token) {
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       delete schedule.resolve;
+      delete schedule.incomingClockObservation;
       resolve(completed);
     };
     const onAbort = () => finish(false);
@@ -5542,7 +6245,39 @@ function waitForCrossfadeSchedule(schedule, token) {
         finish(false);
         return;
       }
-      const clockValue = Number(context?.currentTime) || 0;
+      const sampledClock = context?.currentTime;
+      const clockValue = Number(sampledClock) || 0;
+      const observation = schedule.incomingClockObservation;
+      if (observation) {
+        const incoming = state._decks[schedule.incomingIndex];
+        if (!state._transitionDiagnostics || state._userPaused || state._crossfadePausedByUser
+            || incoming !== observation.audio || incoming.paused || incoming.ended || incoming.seeking
+            || !observation.isCurrent()) {
+          delete schedule.incomingClockObservation;
+        } else {
+          const incomingTime = incoming.currentTime;
+          if (!Number.isFinite(incomingTime) || incomingTime < observation.scheduledTime) {
+            delete schedule.incomingClockObservation;
+          } else if (observation.progressAlreadyAtSchedule || incomingTime > observation.scheduledTime) {
+            // This is sampled media-clock movement, not proof of audible output.
+            // Already-running media has an unknown first-advance time before this sample.
+            delete schedule.incomingClockObservation;
+            const observedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
+              ? performance.now() : null;
+            recordTransitionDiagnostic('incoming-clock-progress', {
+              outgoingIndex: schedule.outgoingIndex, incomingIndex: schedule.incomingIndex,
+              token: observation.token, crossfadeToken: token,
+              progressAlreadyAtSchedule: observation.progressAlreadyAtSchedule,
+              observationElapsedMs: Number.isFinite(observedAt) && Number.isFinite(observation.scheduledAt)
+                ? observedAt - observation.scheduledAt : undefined,
+              audioClockFromFadeStartMs: Number.isFinite(sampledClock)
+                ? (sampledClock - schedule.startTime) * 1000 : undefined,
+              incomingBaselineTime: observation.baselineTime, incomingScheduledTime: observation.scheduledTime,
+              incomingCurrentTime: incomingTime, incomingAdvanceMs: (incomingTime - observation.baselineTime) * 1000,
+            });
+          }
+        }
+      }
       if (state._userPaused || state._crossfadePausedByUser) {
         lastClockValue = clockValue;
         lastClockAdvanceAt = Date.now();
@@ -5717,11 +6452,24 @@ function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
   });
 }
 
-async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnosticTrace = null) {
+async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnosticTrace = null, incomingBaselineTime = null) {
+  // AudioContext.currentTime can be cached for this entire JS task. Anchor
+  // before status/graph/curve work, then account for monotonic elapsed time.
+  const entryContext = state._audioContext;
+  const entryWasRunning = entryContext?.state === 'running';
+  const pauseGeneration = state._crossfadePauseGeneration || 0;
+  let anchorAudioTime = Number(entryContext?.currentTime);
+  let anchorMonotonicMs = typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now() : null;
+  const outgoingRemaining = Number.isFinite(outgoing.duration)
+    ? Math.max(0, outgoing.duration - (Number(outgoing.currentTime) || 0)) : Infinity;
+  const incomingHalfRemaining = Number.isFinite(incoming.duration)
+    ? Math.max(0, incoming.duration / 2 - (Number(incoming.currentTime) || 0)) : Infinity;
   const epoch = state._playbackEpoch;
   const signal = state._playbackAbort.signal;
   const foreground = state._playbackRequest;
-  const duration = Math.max(CROSSFADE_MIN_DURATION_SECONDS, seconds);
+  const duration = Math.max(0, Number(seconds) || 0);
+  let windowDuration = Math.min(duration, outgoingRemaining, incomingHalfRemaining);
   const graphAvailable = ensureAutoLevelAudioGraph();
   const outgoingIndex = state._decks.indexOf(outgoing);
   const incomingIndex = state._decks.indexOf(incoming);
@@ -5729,6 +6477,8 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
   const outgoingToken = state._deckPrepareTokens[outgoingIndex];
   const incomingToken = state._deckPrepareTokens[incomingIndex];
   const context = state._audioContext;
+  const wasRunning = context === entryContext && entryWasRunning;
+  if (context !== entryContext) anchorAudioTime = Number(context?.currentTime);
   const curve = state.crossfadeCurve;
   const ownsTransition = () => state.active && state._playbackEpoch === epoch
     && !signal.aborted && state._playbackRequest === foreground && token === state._crossfadeToken
@@ -5736,17 +6486,24 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
     && state._deckPrepareTokens[outgoingIndex] === outgoingToken
     && state._deckPrepareTokens[incomingIndex] === incomingToken && state._audioContext === context;
   if (!ownsTransition() || state._userPaused) return null;
+  if (state._transitionDiagnostics && !Number.isFinite(incomingBaselineTime)) incomingBaselineTime = incoming.currentTime;
   let schedule = null;
   let succeeded = false;
   state._crossfading = true;
   state._crossfadePausedByUser = false;
   let failureStage = 'crossfade-start';
   let recoveredSchedule = false;
-  const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
+  const startedAt = (diagnosticTrace || state._transitionDiagnostics) && typeof performance !== 'undefined'
+    && typeof performance.now === 'function' ? performance.now() : 0;
   if (diagnosticTrace) {
     diagnosticTrace.stage = 'crossfade';
     diagnosticTrace.reason = 'handoff-started';
   }
+  if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-trigger', {
+    outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration,
+    incomingDuration: incoming.duration, remainingMs: (outgoing.duration - outgoing.currentTime) * 1000,
+    crossfadeSeconds: state.crossfadeSeconds,
+  });
   if (state._diagnosticBuild) {
     recordPlaybackDiagnostic('crossfade-started', {
       attemptId: diagnosticTrace?.attemptId,
@@ -5766,6 +6523,10 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
     });
   }
   const reportHandoffFailure = (stage, failureReason, error = null) => {
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-fallback', {
+      outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration,
+      ready: false, incomingPaused: Boolean(incoming.paused), incomingCurrentTime: incoming.currentTime,
+    });
     if (diagnosticTrace) {
       diagnosticTrace.stage = 'crossfade';
       diagnosticTrace.reason = failureReason;
@@ -5803,34 +6564,89 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
         reportHandoffFailure(failureStage, 'audio-context-resume-failed');
         return false;
       }
-      const startTime = context.currentTime + 0.015;
-      const steps = 129;
-      const outgoingValues = new Float32Array(steps);
-      const incomingValues = new Float32Array(steps);
-      for (let i = 0; i < steps; i++) {
-        const [outGain, inGain] = crossfadeGains(i / (steps - 1), curve);
-        outgoingValues[i] = outGain;
-        incomingValues[i] = inGain;
+      if (!wasRunning || (state._crossfadePauseGeneration || 0) !== pauseGeneration) {
+        // Never extrapolate across suspension/resume or a replacement graph.
+        if (wasRunning) windowDuration = Math.max(0, anchorAudioTime + windowDuration - Number(context.currentTime));
+        anchorAudioTime = Number(context.currentTime);
+        anchorMonotonicMs = typeof performance !== 'undefined' && typeof performance.now === 'function'
+          ? performance.now() : null;
       }
-      schedule = {
-        token, attemptId: diagnosticTrace?.attemptId, outgoingIndex, incomingIndex,
-        startTime, duration, endTime: startTime + duration, createdAt: Date.now(),
-        lastClockValue: context.currentTime, lastClockAdvanceAt: Date.now(),
-        lastIncomingTime: Number(incoming.currentTime) || 0, lastIncomingAdvanceAt: Date.now(),
-        faultRecorded: false,
-      };
-      state._crossfadeSchedule = schedule;
-      failureStage = 'audio-clock-schedule';
-      scheduleAudioParamCurve(state._deckAudioGraphs[outgoingIndex].mixGain.gain, outgoingValues, startTime, duration);
-      scheduleAudioParamCurve(state._deckAudioGraphs[incomingIndex].mixGain.gain, incomingValues, startTime, duration);
-      completed = await waitForCrossfadeSchedule(schedule, token);
+      const plan = crossfadeAutomationPlan(curve);
+      const schedulingAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now() : null;
+      let timing = crossfadeAutomationTiming(context, anchorAudioTime, anchorMonotonicMs, windowDuration, schedulingAt);
+      if (timing) {
+        // Fresh media samples may reveal more consumption than the elapsed
+        // estimate. Never extend the original window or either media budget.
+        const sampledRemaining = Math.min(
+          Number.isFinite(outgoing.duration) ? Math.max(0, outgoing.duration - outgoing.currentTime) : Infinity,
+          Number.isFinite(incoming.duration) ? Math.max(0, incoming.duration / 2 - incoming.currentTime) : Infinity,
+        );
+        windowDuration = Math.min(windowDuration, timing.estimatedNow - anchorAudioTime + sampledRemaining);
+        timing = crossfadeAutomationTiming(context, anchorAudioTime, anchorMonotonicMs, windowDuration, schedulingAt);
+      }
+      if (!timing) {
+        // The existing schedule-recovery handoff retains a playing incoming
+        // track. An exhausted overlap is not a failed playback/track rotation.
+        completed = false;
+      } else {
+        const { startTime, endTime } = timing;
+        schedule = {
+          token, attemptId: diagnosticTrace?.attemptId, outgoingIndex, incomingIndex, curve,
+          startTime, duration: timing.duration, endTime, createdAt: Date.now(),
+          lastClockValue: context.currentTime, lastClockAdvanceAt: Date.now(),
+          lastIncomingTime: Number(incoming.currentTime) || 0, lastIncomingAdvanceAt: Date.now(),
+          faultRecorded: false,
+        };
+        state._crossfadeSchedule = schedule;
+        failureStage = 'audio-clock-schedule';
+        schedulePairedCrossfade(state._deckAudioGraphs[outgoingIndex].mixGain.gain,
+          state._deckAudioGraphs[incomingIndex].mixGain.gain, plan, startTime, timing.duration);
+        if (state._transitionDiagnostics) {
+          // Sample after BOTH submissions. The monotonic estimate accounts for
+          // cached clocks; it does not prove render-thread delivery or output.
+          const submittedClock = context.currentTime;
+          const scheduledAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
+            ? performance.now() : null;
+          const submittedElapsed = context.state === 'running' && Number.isFinite(anchorMonotonicMs) && Number.isFinite(scheduledAt)
+            ? Math.max(0, scheduledAt - anchorMonotonicMs) / 1000 : 0;
+          const estimatedSubmittedClock = Math.max(Number.isFinite(submittedClock) ? submittedClock : anchorAudioTime,
+            anchorAudioTime + submittedElapsed);
+          const scheduledTime = incoming.currentTime;
+          if (Number.isFinite(incomingBaselineTime) && Number.isFinite(scheduledTime)
+              && scheduledTime >= incomingBaselineTime) {
+            schedule.incomingClockObservation = {
+              audio: incoming, token: incomingToken, isCurrent: ownsTransition,
+              baselineTime: incomingBaselineTime, scheduledTime, scheduledAt,
+              progressAlreadyAtSchedule: scheduledTime > incomingBaselineTime,
+            };
+          }
+          recordTransitionDiagnostic('fade-scheduled', {
+            outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration: timing.duration, startTime,
+            sampledSchedulingLeadMs: Number.isFinite(submittedClock) ? (startTime - submittedClock) * 1000 : undefined,
+            schedulingSubmissionMs: Number.isFinite(scheduledAt) && Number.isFinite(schedulingAt)
+              ? Math.max(0, scheduledAt - schedulingAt) : undefined,
+            estimatedSchedulingLeadMs: Number.isFinite(estimatedSubmittedClock)
+              ? (startTime - estimatedSubmittedClock) * 1000 : undefined,
+            incomingBaselineTime, incomingScheduledTime: scheduledTime,
+            progressAlreadyAtSchedule: schedule.incomingClockObservation?.progressAlreadyAtSchedule,
+          });
+        }
+        completed = await waitForCrossfadeSchedule(schedule, token);
+      }
     } else {
       failureStage = 'media-clock-fallback';
+      if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-fallback', {
+        outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration,
+      });
       completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
     }
     if (!ownsTransition() || state._userPaused) return null;
     if (!completed) {
       recoveredSchedule = true;
+      if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-fallback', {
+        outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, recoveredSchedule: true,
+      });
       failureStage = 'crossfade-recovery-resume';
       if (diagnosticTrace) {
         diagnosticTrace.stage = 'crossfade';
@@ -5885,6 +6701,11 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
         incomingCurrentTime: Number(incoming.currentTime) || 0,
       });
     }
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-completed', {
+      outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration, recoveredSchedule,
+      elapsedMs: typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now() - startedAt : undefined,
+    });
     succeeded = true;
     return true;
   } catch (error) {
@@ -5903,9 +6724,67 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
     }
   }
 }
+function destroyCrossfadePreflight(record) {
+  const preflight = record?.preflight;
+  if (!preflight) return;
+  record.preflight = null;
+  if (preflight.adopted) return;
+  if (state._transitionDiagnostics) recordTransitionDiagnostic('preparation-cancelled', {
+    playbackEpoch: record.epoch, trackIndex: record.nextTi, token: record.token, detached: true, ready: false,
+  });
+  try {
+    if (preflight.onError) preflight.player?.off?.(preflight.events?.ERROR, preflight.onError);
+  } catch (_) {}
+  try { preflight.player?.destroy?.(); } catch (_) {}
+}
+
+function preflightCrossfadeHls(record, streamUrls) {
+  if (!record || record.preflight || record.controller.signal.aborted) return;
+  const streamUrl = streamUrls.find(isHlsStreamUrl);
+  if (!streamUrl) return;
+  const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
+  const currentAudio = state._decks[state._deckIndex];
+  const mediaDuration = Number(currentAudio?.duration);
+  const currentDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
+    ? mediaDuration : Number(state.meta[record.currentTi]?.durationMs) / 1000;
+  if (configuredFadeSeconds <= 0 || !Number.isFinite(currentDuration)
+      || currentDuration <= 0 || currentDuration > configuredFadeSeconds * 2) return;
+  const HlsCtor = hlsJsConstructor();
+  let supported = false;
+  try { supported = Boolean(HlsCtor?.isSupported()); } catch (_) {}
+  if (!supported) return;
+  let player;
+  try {
+    player = new HlsCtor({ enableWorker: true, lowLatencyMode: false, startFragPrefetch: true });
+    const preflight = {
+      player, streamUrl, failed: false, adopted: false,
+      events: HlsCtor.Events, onError: null,
+    };
+    if (state._transitionDiagnostics) observeTransitionHls(player, HlsCtor.Events, {
+      trackIndex: record.nextTi, deckIndex: state._deckIndex === 0 ? 1 : 0,
+      token: record.token, detached: true,
+    });
+    preflight.onError = (_event, data) => {
+      if (record.preflight !== preflight || preflight.adopted || !data?.fatal) return;
+      preflight.failed = true;
+      destroyCrossfadePreflight(record);
+    };
+    player.on(HlsCtor.Events.ERROR, preflight.onError);
+    record.preflight = preflight;
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('hls-load', {
+      trackIndex: record.nextTi, deckIndex: state._deckIndex === 0 ? 1 : 0, token: record.token, detached: true,
+    });
+    player.loadSource(streamUrl);
+  } catch (_) {
+    if (record.preflight?.player === player) destroyCrossfadePreflight(record);
+    else { try { player?.destroy?.(); } catch (_) {} }
+  }
+}
+
 
 function warmUpcomingCrossfadeStreams() {
   // Resolve stream candidates during the fade; only load media after the outgoing deck is free.
+  destroyCrossfadePreflight(state._crossfadeStreamWarmup);
   state._crossfadeStreamWarmup?.controller?.abort();
   state._crossfadeStreamWarmup = null;
   const nextTi = upcomingTrackIndex();
@@ -5916,18 +6795,35 @@ function warmUpcomingCrossfadeStreams() {
   const currentTi = state._deckTrack;
   const sessionSignal = state._playbackAbort?.signal;
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  const record = { epoch, currentTi, nextTi, meta, controller, promise: null, preflight: null };
+  if (state._transitionDiagnostics) record.token = (state._deckPrepareTokens[state._deckIndex === 0 ? 1 : 0] || 0) + 1;
+  const streamsStartedAt = state._transitionDiagnostics ? performance.now() : 0;
+  record.isCurrent = () => state._crossfadeStreamWarmup === record
+    && state.active && state._playbackEpoch === epoch
+    && state._deckTrack === currentTi && state.meta[nextTi] === meta
+    && upcomingTrackIndex() === nextTi;
+  state._crossfadeStreamWarmup = record;
+  const abort = () => {
+    controller.abort();
+    if (state._transitionDiagnostics && !record.preflight) recordTransitionDiagnostic('preparation-cancelled', {
+      playbackEpoch: record.epoch, trackIndex: nextTi, token: record.token, detached: true, ready: false,
+    });
+    destroyCrossfadePreflight(record);
+  };
   if (sessionSignal?.aborted) abort();
   else sessionSignal?.addEventListener('abort', abort, { once: true });
-  const record = { epoch, currentTi, nextTi, meta, controller, promise: null };
-  state._crossfadeStreamWarmup = record;
   record.promise = Promise.resolve().then(() => resolveCrossfadeStreams(meta, {
     signal: controller.signal,
-    isCurrent: () => state._crossfadeStreamWarmup === record
-      && state.active && state._playbackEpoch === epoch
-      && state._deckTrack === currentTi && state.meta[nextTi] === meta
-      && upcomingTrackIndex() === nextTi,
-  })).catch(() => []).finally(() => {
+    isCurrent: () => record.isCurrent(),
+  })).then(urls => {
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('streams-resolved', {
+      trackIndex: nextTi, token: record.token, detached: true,
+      streamCandidateCount: urls.length, elapsedMs: performance.now() - streamsStartedAt,
+    });
+    if (state._crossfadeStreamWarmup === record && !controller.signal.aborted
+        && record.isCurrent()) preflightCrossfadeHls(record, urls);
+    return urls;
+  }).catch(() => []).finally(() => {
     sessionSignal?.removeEventListener('abort', abort);
   });
 }
@@ -5937,6 +6833,11 @@ async function prefetchUpcomingCrossfadeTrack() {
   const nextTi = upcomingTrackIndex();
   if (nextTi === undefined) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
+  const preparation = state._deckPreparations?.[standby];
+  if (crossfadePreparationMatches(preparation, standby, nextTi)
+      && preparation.pending && (!preparation.isCurrent || preparation.isCurrent())) {
+    return preparation.promise;
+  }
   const requestToken = ++state._crossfadePrefetchToken;
   const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(nextTi) : null;
   const isCurrent = () => requestToken === state._crossfadePrefetchToken
@@ -5952,7 +6853,8 @@ async function prefetchUpcomingCrossfadeTrack() {
       && warmup.meta === state.meta[nextTi] && upcomingTrackIndex() === nextTi
       ? warmup.promise : null;
     audio = await prepareCrossfadeDeck(standby, nextTi, {
-      diagnosticTrace, isCurrent, ...(resolvedStreamPromise ? { resolvedStreamPromise } : {}),
+      diagnosticTrace, isCurrent, warmup,
+      ...(resolvedStreamPromise ? { resolvedStreamPromise } : {}),
     });
   } catch (error) {
     recordPlaybackDiagnostic('prefetch-failed', {
@@ -5964,12 +6866,14 @@ async function prefetchUpcomingCrossfadeTrack() {
       elapsedMs: diagnosticTrace
         ? Math.max(0, Math.round(performance.now() - diagnosticTrace.startedAt)) : 0,
     });
+    destroyCrossfadePreflight(warmup);
     if (state._crossfadeStreamWarmup === warmup) {
       state._crossfadeStreamWarmup = null;
       warmup?.controller?.abort();
     }
     return null;
   }
+  destroyCrossfadePreflight(warmup);
   if (state._crossfadeStreamWarmup === warmup) {
     state._crossfadeStreamWarmup = null;
     warmup?.controller?.abort();
@@ -6001,23 +6905,35 @@ function upcomingTrackIndex() {
 }
 
 function refreshUpcomingCrossfadePreparation() {
-  state._crossfadePrefetchToken++;
+  const nextTi = upcomingTrackIndex();
   const warmup = state._crossfadeStreamWarmup;
-  state._crossfadeStreamWarmup = null;
-  warmup?.controller?.abort();
-  if (state.busy) return;
+  const warmupMatches = warmup && !warmup.controller.signal.aborted
+    && warmup.epoch === state._playbackEpoch && warmup.currentTi === state._deckTrack
+    && warmup.nextTi === nextTi && warmup.meta === state.meta[nextTi];
+  // Both decks belong to a running fade. Queue changes may retire stale
+  // lookahead, but must not invalidate either transition preparation token.
+  if (!warmupMatches && warmup && !(
+    state.busy && state._deckPreparations?.some(record =>
+      record?.pending && record.foreground && record.warmup === warmup
+      && crossfadePreparationMatches(record, record.index, record.ti)
+      && (!record.isCurrent || record.isCurrent()))
+  )) {
+    destroyCrossfadePreflight(warmup);
+    state._crossfadeStreamWarmup = null;
+    warmup.controller.abort();
+  }
+  if (state._crossfading || state.busy) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
-  if (standby < 0 || standby >= state._decks.length) return;
+  if (standby < 0 || standby >= state._decks.length || standby === state._deckIndex) return;
+  const preparation = state._deckPreparations?.[standby];
+  if (crossfadePreparationMatches(preparation, standby, nextTi)
+      && (preparation.pending || upcomingCrossfadeDeckReady())) return;
 
+  state._crossfadePrefetchToken++;
   state._deckPrepareTokens[standby] = (state._deckPrepareTokens[standby] || 0) + 1;
   state._deckPrepareAborts?.[standby]?.abort();
-  if (state._crossfading || standby === state._deckIndex) return;
-
-  const nextTi = upcomingTrackIndex();
-  if (state._deckTracks[standby] !== null && state._deckTracks[standby] !== nextTi) {
-    resetDeck(state._decks[standby], standby);
-  }
-  if (state.active && !state.busy && currentDeckAudio()) {
+  if (state._deckTracks[standby] !== null) resetDeck(state._decks[standby], standby);
+  if (state.active && currentDeckAudio()) {
     void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
   }
 }
@@ -6141,6 +7057,16 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   const isCurrent = () => state.active && epoch === state._playbackEpoch
     && state._playbackRequest === request && state.meta[ti] === meta && !signal?.aborted;
   if (!isCurrent()) return null;
+  if (state._transitionDiagnostics) {
+    const observedOutgoing = state._decks[state._deckIndex];
+    recordTransitionDiagnostic('transition-requested', {
+      trackIndex: ti, outgoingIndex: state._deckIndex, incomingIndex: state._deckIndex === 0 ? 1 : 0,
+      token: state._deckPrepareTokens[state._deckIndex === 0 ? 1 : 0],
+      crossfadeSeconds: state.crossfadeSeconds, crossfadeDuration: requestedFade,
+      incomingDuration: Number(meta?.durationMs) / 1000,
+      remainingMs: observedOutgoing ? (observedOutgoing.duration - observedOutgoing.currentTime) * 1000 : 0,
+    });
+  }
   if (meta?.requiresNativePlayback) {
     if (diagnosticTrace) {
       diagnosticTrace.stage = 'native-fallback';
@@ -6167,6 +7093,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
   let incoming = null;
   let canMix = false;
+  let incomingBaselineTime = null;
   let ownsIncoming = isCurrent;
   const deferPaused = () => {
     if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
@@ -6174,7 +7101,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   };
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!isCurrent()) return null;
-    const prepareOptions = { forceRefresh: attempt > 0, signal, isCurrent };
+    const prepareOptions = { forceRefresh: attempt > 0, signal, isCurrent, foreground: true };
     if (diagnosticTrace) prepareOptions.diagnosticTrace = diagnosticTrace;
     incoming = await prepareCrossfadeDeck(incomingIndex, ti, prepareOptions);
     if (!isCurrent()) return null;
@@ -6215,6 +7142,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
         if (diagnosticTrace) diagnosticTrace.reason = 'audio-context-resume-failed';
         throw new Error('Audio graph did not resume');
       }
+      if (state._transitionDiagnostics) incomingBaselineTime = incoming.currentTime;
       const played = await playDeckWithDeadline(incoming, incomingIndex, signal, ownsIncoming, diagnosticTrace);
       if (!ownsIncoming()) return null;
       if (state._userPaused) return deferPaused();
@@ -6259,13 +7187,17 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   installBetterFeedPipBridge();
   if (canMix) {
     warmUpcomingCrossfadeStreams();
-    const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token, diagnosticTrace);
+    const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token, diagnosticTrace, incomingBaselineTime);
     if (!ownsIncoming() || state._crossfadeToken !== token) return null;
     if (state._userPaused) return deferPaused();
     if (mixed !== true) {
       return mixed === false ? false : null;
     }
   }
+  else if (state._transitionDiagnostics) recordTransitionDiagnostic('transition-no-mix', {
+    trackIndex: ti, outgoingIndex, incomingIndex, token: state._deckPrepareTokens[incomingIndex],
+    crossfadeDuration: requestedFade, outgoingPaused: Boolean(outgoing?.paused), ended: Boolean(outgoing?.ended),
+  });
   if (!ownsIncoming()) return null;
   if (outgoing && outgoing !== incoming && state._decks[outgoingIndex] === outgoing) resetDeck(outgoing, outgoingIndex);
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
@@ -6280,9 +7212,10 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
     diagnosticTrace.stage = 'custom-deck';
     diagnosticTrace.reason = 'started';
   }
-  setTimeout(() => {
-    if (isCurrent()) void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
-  }, 0);
+  if (isCurrent()) {
+    void prefetchUpcomingCrossfadeTrack().catch(error =>
+      recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
+  }
   setTimeout(() => {
     if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
   }, 80);
@@ -6359,8 +7292,7 @@ function currentPageTrackElements() {
 
   const seen = new Set();
   return elements.filter(el => {
-    const link = getLink(el);
-    const id = link ? normalizeTrackUrl(link) : el;
+    const id = trackCacheKey(getMeta(el)) || el;
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
@@ -6423,7 +7355,7 @@ async function loadTracks(request = null) {
     current = currentPageTrackElements();
     if (!preserveScrolledLikes) return;
     for (const el of current) {
-      const id = trackId(getMeta(el));
+      const id = trackCacheKey(getMeta(el));
       if (id && !seen.has(id)) seen.set(id, el);
     }
   };
@@ -6449,13 +7381,10 @@ async function loadTracks(request = null) {
 }
 
 function bindCurrentPageElements(pageEls) {
-  const byId = new Map();
-  pageEls.forEach(el => {
-    const id = trackId(getMeta(el));
-    if (id && !byId.has(id)) byId.set(id, el);
-  });
+  const identities = trackIdentityIndex(state.meta);
+  const rows = soundCloudRowsByLink(pageEls);
   state.els = state.meta.map(meta => {
-    const el = byId.get(trackId(meta)) || null;
+    const el = matchingSoundCloudRow(meta, rows, identities);
     if (el && !meta.removedFromPlaylist) delete meta.unavailable;
     return el;
   });
@@ -6471,9 +7400,9 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
   const request = state._playbackRequest;
   const signal = state._playbackAbort?.signal;
   const meta = state.meta[ti];
-  const el = state.els[ti];
+  const el = boundSoundCloudRow(ti);
   const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request
-    && state.meta[ti] === meta && state.els[ti] === el && !signal?.aborted;
+    && state.meta[ti] === meta && !signal?.aborted;
   if (!isCurrent()) return null;
   if (!meta?.requiresNativePlayback) return false;
   if (!el || !document.body.contains(el)) {
@@ -6508,16 +7437,16 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
     pollLimit: 20,
   });
   try {
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.scrollIntoView({ block: 'center', behavior: motionIsInstant() ? 'instant' : 'smooth' });
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
     await withDeadline(() => wait(80), 1000, signal);
     if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
+    if (!document.body.contains(el) || !soundCloudLinkMatches(meta, getLink(el))) return false;
     const button = el.querySelector(
       'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
     ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
     buttonFound = Boolean(button);
     if (!buttonFound) {
-      state._nativeTrack = null;
       recordPlaybackDiagnostic('native-fallback-unavailable', {
         attemptId: diagnosticTrace?.attemptId,
         trackIndex: ti,
@@ -6539,7 +7468,6 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
       clickIssued,
       pollLimit: 20,
     });
-    const wanted = normalizeTrackUrl(meta.link);
     for (let attempt = 0; attempt < 20; attempt++) {
       pollCount = attempt + 1;
       await withDeadline(() => wait(150), 1000, signal);
@@ -6547,16 +7475,14 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
       const nativeAudio = [...document.querySelectorAll('audio')]
         .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
       nativeAudioFound = Boolean(nativeAudio);
-      const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
-      playerMatched = Boolean(wanted && normalizeTrackUrl(playerLink?.href) === wanted);
-      nativeTransportPaused = Boolean(soundCloudPaused());
-      if (playerMatched && (nativeAudioFound || !nativeTransportPaused)) {
+      playerMatched = soundCloudPlayerMatches(meta);
+      nativeTransportPaused = soundCloudPaused();
+      if (playerMatched && (nativeAudioFound || nativeTransportPaused === false)) {
         started = true;
         break;
       }
     }
     if (!started) {
-      state._nativeTrack = null;
       recordPlaybackDiagnostic('native-track-not-acknowledged', {
         attemptId: diagnosticTrace?.attemptId,
         trackIndex: ti,
@@ -6595,8 +7521,7 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
     }, 80);
     return true;
   } catch (error) {
-    if (!isCurrent() || signal?.aborted) return null;
-    state._nativeTrack = null;
+    if (!isCurrent() || state._nativeTrack !== ti || signal?.aborted) return null;
     recordPlaybackDiagnostic('native-start-failed', {
       attemptId: diagnosticTrace?.attemptId,
       trackIndex: ti,
@@ -6608,8 +7533,8 @@ async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace =
     });
     return false;
   } finally {
-    if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
-    if (isCurrent() && !started) {
+    if (isCurrent() && state._nativeTrack === ti && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
+    if (isCurrent() && state._nativeTrack === ti && !started) {
       state._nativeTrack = null;
       pauseSoundCloudTransport();
       pauseSoundCloud();
@@ -6960,7 +7885,7 @@ async function fetchLivePlaylistSnapshot(sourcePage, signal = null) {
       headers: { Accept: 'text/html' },
     });
     if (!response.ok) return null;
-    return playlistSnapshotFromHtml(response.data);
+    return playlistSnapshotFromHtml(response.data, sourcePage);
   } catch (_) {
     return null;
   }
@@ -6983,13 +7908,13 @@ async function resolveLiveTrackMeta(track, sourcePage, playlistPosition = null, 
   const hydrated = metaFromSoundCloudTrack(track, sourcePage, playlistPosition);
   if (hydrated?.artist && hydrated.artist !== '—') return hydrated;
 
-  const id = Number(track?.id);
-  if (!Number.isFinite(id)) return hydrated;
+  const id = soundCloudInteger(track?.id, 1);
+  if (id === null) return hydrated;
   const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
   if (!clientId || signal?.aborted) return hydrated;
   try {
     const response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`, 'json', { signal });
-    if (!response.ok || signal?.aborted) return hydrated;
+    if (!response.ok || signal?.aborted || !soundCloudTrackMatches(track, response.data)) return hydrated;
     return mergeTrackMeta(hydrated, metaFromSoundCloudTrack(response.data, sourcePage, playlistPosition));
   } catch (_) {
     return hydrated;
@@ -7000,16 +7925,13 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas 
   if (!snapshot?.tracks?.length) return [];
   const resolvedById = new Map();
   const positionsById = new Map();
-  const existingByLink = new Map();
-  existingMetas.forEach(meta => {
-    if (meta.link) existingByLink.set(normalizeTrackUrl(meta.link), meta);
-  });
   const unresolvedIds = [];
+  const existingIndex = trackIdentityIndex(existingMetas);
 
   snapshot.tracks.forEach((track, index) => {
     const id = Number(track.id);
     positionsById.set(id, index + 1);
-    const existing = track.permalink_url ? existingByLink.get(normalizeTrackUrl(track.permalink_url)) : null;
+    const existing = existingMetas[matchingTrackIndex(existingIndex, track)];
     const meta = mergeTrackMeta(existing, metaFromSoundCloudTrack(track, sourcePage, index + 1));
     if (meta) {
       meta.soundcloudId = id;
@@ -7040,7 +7962,7 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas 
             if (!position) return;
             const meta = metaFromSoundCloudTrack(track, sourcePage, position);
             if (meta) {
-              const existing = meta.link ? existingByLink.get(normalizeTrackUrl(meta.link)) : null;
+              const existing = existingMetas[matchingTrackIndex(existingIndex, track)];
               resolvedById.set(id, mergeTrackMeta(existing, mergeTrackMeta(resolvedById.get(id), meta)));
             }
           });
@@ -7058,30 +7980,35 @@ async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise =
   const domByLink = new Map();
   for (const el of pageEls) {
     const meta = getMeta(el);
-    const key = normalizeTrackUrl(meta.link || '');
+    const key = trackCacheKey(meta);
     if (!key) continue;
     const previous = domByLink.get(key);
     domByLink.set(key, { el: previous?.el || el, meta: mergeTrackMeta(previous?.meta, meta) });
   }
   const dom = [...domByLink.values()];
+  const domMeta = dom.map(item => item.meta);
   const fallback = () => ({ els: dom.map(item => item.el), meta: dom.map(item => item.meta), complete: false });
   if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) {
     return { ...fallback(), complete: true };
   }
   const snapshot = await (snapshotPromise || fetchLivePlaylistSnapshot(sourcePage, signal));
   if (signal?.aborted || !snapshot?.complete) return fallback();
-  const snapshotMeta = await resolvePlaylistSnapshotMetas(snapshot, sourcePage, dom.map(item => item.meta), signal);
+  const snapshotMeta = await resolvePlaylistSnapshotMetas(snapshot, sourcePage, domMeta, signal);
   if (signal?.aborted) return fallback();
   const resolved = new Map();
+  const domIndex = trackIdentityIndex(domMeta);
+  const snapshotIndex = trackIdentityIndex(snapshotMeta);
+  const rows = soundCloudRowsByLink(pageEls);
   for (const meta of snapshotMeta) {
-    const key = normalizeTrackUrl(meta.link || '');
+    const key = trackCacheKey(meta);
     if (!key || resolved.has(key)) continue;
-    const matching = domByLink.get(key);
+    const matching = soundCloudPermalinkConflicts(meta, snapshotIndex)
+      ? null : dom[matchingTrackIndex(domIndex, meta)];
     const merged = mergeTrackMeta(matching?.meta, meta);
     merged.sourcePage = sourcePage;
     merged.playlistPosition = meta.playlistPosition;
     if (meta.soundcloudId != null) merged.soundcloudId = meta.soundcloudId;
-    resolved.set(key, { el: matching?.el || null, meta: merged });
+    resolved.set(key, { el: matchingSoundCloudRow(meta, rows, snapshotIndex), meta: merged });
   }
   const complete = resolved.size === new Set(snapshot.tracks.map(track => Number(track.id))).size;
   // A complete identity snapshot is authoritative; counts of rendered rows are not.
@@ -7097,27 +8024,20 @@ async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise =
 function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
   if (!state.active || state.suspended || !Array.isArray(metas) || !metas.length) return 0;
 
-  const existingById = new Map();
-  state.meta.forEach((meta, ti) => {
-    const id = trackId(meta);
-    if (id) existingById.set(id, ti);
-  });
-  const elementsById = new Map();
-  pageEls.forEach(el => {
-    const id = trackId(getMeta(el));
-    if (id && !elementsById.has(id)) elementsById.set(id, el);
-  });
-
+  const identities = trackIdentityIndex(state.meta);
+  const rows = soundCloudRowsByLink(pageEls);
   const added = [];
   for (const meta of metas) {
-    const id = trackId(meta);
-    if (!id || existingById.has(id)) continue;
+    if (!trackCacheKey(meta) || matchingTrackIndex(identities, meta) !== undefined) continue;
     const ti = state.meta.length;
     state.meta.push(meta);
-    state.els.push(elementsById.get(id) || null);
-    existingById.set(id, ti);
+    indexTrackMeta(identities, meta, ti);
+    state.els.push(matchingSoundCloudRow(meta, rows, identities));
     added.push(ti);
   }
+  state.els.forEach((el, ti) => {
+    if (el && soundCloudPermalinkConflicts(state.meta[ti], identities)) state.els[ti] = null;
+  });
   if (!added.length) return 0;
 
   insertTracksRandomlyAfterCurrent(state.queue, state.pos, fisherYates(added));
@@ -7159,11 +8079,8 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
   if (!members) return 0;
   const snapshotIds = new Set(snapshot.tracks.map(track => Number(track.id)));
   const positions = new Map(snapshot.tracks.map((track, index) => [Number(track.id), index + 1]));
-  const elementsByLink = new Map();
-  pageEls.forEach(el => {
-    const id = trackId(getMeta(el));
-    if (id && !elementsByLink.has(id)) elementsByLink.set(id, el);
-  });
+  const identities = trackIdentityIndex(state.meta);
+  const rows = soundCloudRowsByLink(pageEls);
 
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
   let removed = 0;
@@ -7202,8 +8119,8 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
       meta.playlistPosition = positions.get(id);
     }
     reviveRemovedQueueTrack(ti);
-    const el = elementsByLink.get(trackId(meta));
-    if (el) state.els[ti] = el;
+    const el = matchingSoundCloudRow(meta, rows, identities);
+    if (el || soundCloudPermalinkConflicts(meta, identities)) state.els[ti] = el;
   });
 
   recountRoundTotal();
@@ -7267,20 +8184,23 @@ async function syncLiveQueue(options) {
       ? currentPageTrackElements()
       : [];
     const existingById = new Map();
-    const existingByLink = new Map();
+    const identities = trackIdentityIndex(state.meta);
     state.meta.forEach((meta, ti) => {
       const id = Number(meta?.soundcloudId);
       if (Number.isFinite(id)) existingById.set(id, ti);
-      const link = trackId(meta);
-      if (link) existingByLink.set(link, ti);
     });
     const metas = [];
     for (const [id, meta] of resolved) {
       if (!meta || existingById.has(id)) continue;
-      const ti = existingByLink.get(trackId(meta));
-      if (ti === undefined) metas.push(meta);
-      else {
+      const ti = matchingTrackIndex(identities, meta);
+      if (ti === undefined) {
+        if (meta.link && identities.byLink.has(normalizeTrackUrl(meta.link))) {
+          state._streamCache.delete(normalizeTrackUrl(meta.link));
+        }
+        metas.push(meta);
+      } else {
         state.meta[ti].soundcloudId = id;
+        indexTrackMeta(identities, state.meta[ti], ti);
         existingById.set(id, ti);
       }
     }
@@ -7340,12 +8260,11 @@ async function mergeCurrentPage() {
     const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
     if (!collectionRequestCurrent(request) || !state.active) return;
     if (!collection.meta.length && !collection.complete) { showMergeToast(0); return; }
-    const existingById = new Map(state.meta.map((meta, ti) => [trackId(meta), ti]));
+    const identities = trackIdentityIndex(state.meta);
     const added = [];
     const members = [];
     collection.meta.forEach((meta, index) => {
-      const id = trackId(meta);
-      let ti = existingById.get(id);
+      let ti = matchingTrackIndex(identities, meta);
       if (ti !== undefined) {
         if (collection.els[index]) state.els[ti] = collection.els[index];
         const previous = state.meta[ti];
@@ -7358,10 +8277,13 @@ async function mergeCurrentPage() {
         ti = state.meta.length;
         state.meta.push(meta);
         state.els.push(collection.els[index] || null);
-        existingById.set(id, ti);
         added.push(ti);
       }
+      indexTrackMeta(identities, state.meta[ti], ti);
       members.push(ti);
+    });
+    state.els.forEach((el, ti) => {
+      if (el && soundCloudPermalinkConflicts(state.meta[ti], identities)) state.els[ti] = null;
     });
     registerLiveQueueSource(pageUrl, members);
     if (added.length) {
@@ -7502,16 +8424,19 @@ async function reshuffleCurrentPage() {
 }
 
 function remapCachedQueue(cache, meta) {
-  const idToNew = new Map(meta.map((item, ti) => [trackId(item), ti]));
-  const remapOld = oldTi => idToNew.get(cache.metaKeys[oldTi]);
+  const identities = trackIdentityIndex(meta);
+  const cachedMeta = Array.isArray(cache.meta) ? cache.meta : null;
+  const cachedKeys = cachedMeta ? cachedMeta.map(trackCacheKey) : cache.metaKeys;
+  const remapOld = oldTi => cachedMeta
+    ? matchingTrackIndex(identities, cachedMeta[oldTi]) : identities.byKey.get(cachedKeys[oldTi]);
   const available = ti => ti !== undefined && !meta[ti].unavailable;
   const cachedPos = Math.max(0, Number(cache.pos) || 0);
   const prefix = cache.queue.slice(0, cachedPos).map(remapOld).filter(ti => ti !== undefined);
   const remainingSet = new Set(cache.queue.slice(cachedPos).map(remapOld).filter(available));
   const remaining = [...remainingSet];
-  const cachedIds = new Set(cache.metaKeys.filter(Boolean));
+  const cachedIndices = new Set(cachedKeys.map((_, ti) => remapOld(ti)));
   const extras = fisherYates(meta.map((_, ti) => ti).filter(ti => available(ti)
-    && (!cachedIds.has(trackId(meta[ti]))
+    && (!cachedIndices.has(ti)
       || (meta[ti]._restoreUpcoming && !meta[ti].removedFromPlaylist && !remainingSet.has(ti)))));
   const currentTi = remaining[0];
   const upcoming = remaining.slice(1).concat(extras);
@@ -7545,7 +8470,7 @@ function saveQueueSessionCache() {
     sessionStorage.setItem('tss_queue_cache', JSON.stringify({
       queue: state.queue, pos: state.pos, history: state.history, priority: state.priority,
       playNext: state.playNext, playlistUrl: state.playlistUrl, ts: Date.now(),
-      meta: state.meta, metaKeys: state.meta.map(trackId),
+      meta: state.meta, metaKeys: state.meta.map(trackCacheKey),
       sources: [...state._liveSyncSources].map(([sourcePage, members]) => [sourcePage, [...members]]),
       roundPlayed: state.roundPlayed, roundTotal: state.roundTotal,
     }));
@@ -7556,24 +8481,27 @@ function saveQueueSessionCache() {
 function restoreQueueSessionCache(cache, collection, pageUrl) {
   if (!Array.isArray(cache.meta) || !Array.isArray(cache.sources)) return remapCachedQueue(cache, state.meta);
   const meta = cache.meta.map(item => ({ ...item }));
-  const byId = new Map(meta.map((item, ti) => [trackId(item), ti]));
+  const identities = trackIdentityIndex(meta);
   const els = meta.map(() => null);
   const pageMembers = new Set();
   collection.meta.forEach((item, index) => {
-    let ti = byId.get(trackId(item));
+    let ti = matchingTrackIndex(identities, item);
     if (ti === undefined) {
       ti = meta.length;
       meta.push(item);
       els.push(null);
-      byId.set(trackId(item), ti);
     } else {
       meta[ti] = mergeTrackMeta(meta[ti], item);
       if (playlistBase(meta[ti].sourcePage || '') === pageUrl) meta[ti].playlistPosition = item.playlistPosition;
       delete meta[ti].removedFromPlaylist;
       delete meta[ti].unavailable;
     }
+    indexTrackMeta(identities, meta[ti], ti);
     els[ti] = collection.els[index] || null;
     pageMembers.add(ti);
+  });
+  els.forEach((el, ti) => {
+    if (el && soundCloudPermalinkConflicts(meta[ti], identities)) els[ti] = null;
   });
   const sources = new Map(cache.sources.map(([sourcePage, members]) => [sourcePage, new Set(members.filter(ti => meta[ti]))]));
   if (collection.complete) sources.set(pageUrl, pageMembers);
@@ -7752,6 +8680,9 @@ function startWatcher() {
   let lastRemaining = Infinity;
   let endpointTicks = 0;
   let uiTicks = 0;
+  let lastDiagnosticTick = state._transitionDiagnostics ? performance.now() : 0;
+  let lastDiagnosticDelay = -Infinity;
+  let fadeWindowTrack = null, fadeWindowToken = null;
   let deckStall;
   const resetDeckStall = (deck = null, current = 0, now = Date.now()) => {
     const index = deck ? state._decks.indexOf(deck) : -1;
@@ -7808,6 +8739,11 @@ function startWatcher() {
   const advanceAtNaturalEnd = async () => {
     if (!watcherIsCurrent() || state._userPaused || state.busy || nearEnd) return;
     nearEnd = true;
+    if (state._transitionDiagnostics) recordTransitionDiagnostic('natural-end', {
+      trackIndex: state._deckTrack, deckIndex: state._deckIndex,
+      token: state._deckPrepareTokens[state._deckIndex], crossfadeSeconds: state.crossfadeSeconds,
+      ready: upcomingCrossfadeDeckReady(),
+    });
 
     try {
       if (state.suspended) {
@@ -7836,6 +8772,22 @@ function startWatcher() {
 
   const tick = async () => {
     if (!watcherIsCurrent()) return;
+    if (state._transitionDiagnostics) {
+      const now = performance.now();
+      const delayMs = now - lastDiagnosticTick;
+      lastDiagnosticTick = now;
+      if (delayMs > 250 && now - lastDiagnosticDelay >= 1000) {
+        lastDiagnosticDelay = now;
+        recordTransitionDiagnostic('watcher-delay', {
+          delayMs, trackIndex: state._deckTrack, deckIndex: state._deckIndex,
+          token: state._deckPrepareTokens[state._deckIndex], visible: document.visibilityState === 'visible',
+          userPaused: Boolean(state._userPaused), busy: Boolean(state.busy), crossfading: Boolean(state._crossfading),
+          readyState: state._decks[state._deckIndex]?.readyState,
+          ready: upcomingCrossfadeDeckReady(),
+          incomingReadyState: state._decks[state._deckIndex === 0 ? 1 : 0]?.readyState,
+        });
+      }
+    }
     if (checkSleepTimerDeadline()) return;
     if (!state.busy && Number.isFinite(state._liveSyncLastCheck)
         && Date.now() - state._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS) {
@@ -7858,7 +8810,6 @@ function startWatcher() {
     if (++uiTicks >= 6) {
       uiTicks = 0;
       syncPlaybackVolumeFromSoundCloud();
-      refreshPlayBtn();
       updateHub();
       syncOwnPipWindow();
       syncBetterFeedPipWindow();
@@ -7906,14 +8857,21 @@ function startWatcher() {
         const incomingDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
           ? mediaDuration : Number(state.meta[nextTi]?.durationMs) / 1000;
         if (Number.isFinite(incomingDuration) && incomingDuration > 0) {
-          const availableFadeSeconds = Math.min(
-            configuredFadeSeconds,
-            incomingDuration - CROSSFADE_PRELOAD_RESERVE_SECONDS,
-          );
-          effectiveFadeSeconds = availableFadeSeconds >= CROSSFADE_MIN_DURATION_SECONDS
-            ? availableFadeSeconds : 0;
+          const fadeBudget = Math.min(configuredFadeSeconds, incomingDuration / 2);
+          effectiveFadeSeconds = fadeBudget >= CROSSFADE_MIN_DURATION_SECONDS ? fadeBudget : 0;
         }
       }
+    }
+    if (state._transitionDiagnostics && automaticFadeEligible
+        && (fadeWindowTrack !== state._deckTrack || fadeWindowToken !== state._deckPrepareTokens[state._deckIndex])) {
+      fadeWindowTrack = state._deckTrack;
+      fadeWindowToken = state._deckPrepareTokens[state._deckIndex];
+      recordTransitionDiagnostic('fade-window', {
+        trackIndex: state._deckTrack, deckIndex: state._deckIndex, token: fadeWindowToken,
+        remainingMs: remainingSeconds * 1000, ready: standbyReady, crossfadeSeconds: configuredFadeSeconds,
+        crossfadeDuration: effectiveFadeSeconds,
+        incomingDuration: Number(state._decks[state._deckIndex === 0 ? 1 : 0]?.duration),
+      });
     }
     const shouldCrossfade = automaticFadeEligible && standbyReady
       && remainingSeconds <= effectiveFadeSeconds;
@@ -8140,21 +9098,30 @@ function startWatcher() {
 
 
 function badges() {
-  document.querySelectorAll('.tss-badge').forEach(b => b.remove());
+  const stale = new Set(document.querySelectorAll('.tss-badge'));
 
   state.queue.forEach((ti, qi) => {
     const el = state.els[ti];
-    if (!el || !document.body.contains(el) || el.querySelector('.tss-badge')) return;
+    if (!el || !document.body.contains(el)) return;
+    const existing = el.querySelector('.tss-badge');
+    // Duplicate queue entries can refer to the same mounted SoundCloud row.
+    if (existing && !stale.has(existing)) return;
+    const title = el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
+    if (!title) return;
 
     const cur = qi === state.pos;
-    const b   = document.createElement('span');
-    b.className = `tss-badge${cur ? ' tss-badge-cur' : ''}`;
+    const badge = existing || document.createElement('span');
+    const className = `tss-badge${cur ? ' tss-badge-cur' : ''}`;
     const n = state.stats.played + (qi - state.pos);
-    b.textContent = cur ? `▶ ${n}` : `${n}`;
-
-    const t = el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
-    if (t) t.parentNode.insertBefore(b, t);
+    const text = cur ? `▶ ${n}` : `${n}`;
+    if (badge.className !== className) badge.className = className;
+    if (badge.textContent !== text) badge.textContent = text;
+    stale.delete(badge);
+    if (badge.parentNode !== title.parentNode || badge.nextSibling !== title) {
+      title.parentNode.insertBefore(badge, title);
+    }
   });
+  stale.forEach(badge => badge.remove());
 }
 
 
@@ -8210,8 +9177,10 @@ function renderStats() {
 
   const tp = overlay.querySelector('#tss-stats-played');
   const tt = overlay.querySelector('#tss-stats-time');
-  if (tp) tp.textContent = state.stats.played;
-  if (tt) tt.textContent = fmtTime(state.stats.elapsed || 0);
+  const playedText = String(state.stats.played);
+  const elapsedText = fmtTime(state.stats.elapsed || 0);
+  if (tp && tp.textContent !== playedText) tp.textContent = playedText;
+  if (tt && tt.textContent !== elapsedText) tt.textContent = elapsedText;
 
   const ltEl = overlay.querySelector('#tss-stats-lifetime');
   if (ltEl) {
@@ -8219,28 +9188,37 @@ function renderStats() {
     const base = state._lifetimeBase || { played: 0, elapsed: 0 };
     const totalPlayed  = (lt.played  || 0) + Math.max(0, (state.stats.played  || 0) - (base.played  || 0));
     const totalElapsed = (lt.elapsed || 0) + Math.max(0, (state.stats.elapsed || 0) - (base.elapsed || 0));
-    ltEl.textContent = `${totalPlayed} tracks / ${fmtTime(totalElapsed)}`;
+    const text = `${totalPlayed} tracks / ${fmtTime(totalElapsed)}`;
+    if (ltEl.textContent !== text) ltEl.textContent = text;
   }
 
-  const top = Object.entries(state.stats.playCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  // Counts only mutate in trackPlayed; reset/reshuffle replace the counts object.
+  if (overlay._tssCounts !== state.stats.playCounts || overlay._tssPlayed !== state.stats.played) {
+    overlay._tssTop = Object.entries(state.stats.playCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    overlay._tssCounts = state.stats.playCounts;
+    overlay._tssPlayed = state.stats.played;
+  }
+  const top = overlay._tssTop;
 
   const list = overlay.querySelector('#tss-stats-toplist');
   if (!list) return;
 
-  list.innerHTML = top.map(([ti, count]) => {
+  const markup = top.length ? top.map(([ti, count]) => {
     const meta  = state.meta[+ti] || {};
     const w     = state.priority[+ti] ?? 1.0;
     const label = w <= 0.25 ? 'low' : w >= 2.0 ? 'high' : 'normal';
-    const col   = w <= 0.25 ? '#ff7b58' : w >= 2.0 ? '#65d5a3' : 'rgba(255,255,255,.38)';
+    const col   = w <= 0.25 ? '#aeb5c4' : w >= 2.0 ? 'var(--tss-a,#aebaf3)' : 'rgba(255,255,255,.38)';
     return `
       <div class="tss-stat-track" style="grid-template-columns:minmax(0,1fr) auto auto;">
         <span style="color:#909090;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${esc(meta.title || '—')}</span>
-        <span style="color:#ff5500;font-size:11px;flex-shrink:0;">${count}×</span>
+        <span style="color:#aebaf3;font-size:11px;flex-shrink:0;">${count}×</span>
         <button class="tss-stat-priority" data-ti="${ti}" style="color:${col};">${label}</button>
       </div>`;
-  }).join('');
-
-  if (!top.length) list.innerHTML = '<div class="tss-stats-empty">No listening data yet</div>';
+  }).join('') : '<div class="tss-stats-empty">No listening data yet</div>';
+  if (list._tssStatsMarkup === markup && list.innerHTML === list._tssStatsRendered) return;
+  list.innerHTML = markup;
+  list._tssStatsMarkup = markup;
+  list._tssStatsRendered = list.innerHTML;
 
   list.querySelectorAll('[data-ti]').forEach(btn => {
     btn.onclick = e => {
@@ -8249,8 +9227,8 @@ function renderStats() {
       const cur = state.priority[ti] ?? 1.0;
       let next2, label, col;
       if      (cur >= 2.0) { next2 = 1.0;  label = 'normal'; col = 'rgba(255,255,255,.38)'; }
-      else if (cur >= 1.0) { next2 = 0.25; label = 'low';    col = '#ff7b58'; }
-      else                 { next2 = 2.0;  label = 'high';   col = '#65d5a3'; }
+      else if (cur >= 1.0) { next2 = 0.25; label = 'low';    col = '#aeb5c4'; }
+      else                 { next2 = 2.0;  label = 'high';   col = 'var(--tss-a,#aebaf3)'; }
       state.priority[ti] = next2;
       btn.textContent    = label;
       btn.style.color    = col;
@@ -8268,13 +9246,11 @@ function showStats() {
   overlay.id = 'tss-stats-overlay';
   overlay.style.cssText = `
     position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
-    background:rgba(10,10,10,0.98); border:1px solid rgba(255,255,255,0.09);
-    border-radius:18px; padding:0; z-index:999999;
+    padding:0; z-index:999999;
     font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
     width:340px; max-width:calc(100vw - 32px); box-sizing:border-box;
-    box-shadow:0 30px 90px rgba(0,0,0,0.78),0 0 0 1px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.035);
     cursor:default; -webkit-user-select:none; user-select:none;
-    -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px);
+    -webkit-backdrop-filter:var(--tss-glass-filter,none); backdrop-filter:var(--tss-glass-filter,none);
   `;
 
   overlay.innerHTML = `
@@ -8313,7 +9289,20 @@ function showStats() {
   document.body.appendChild(overlay);
   renderStats();
 
-  document.getElementById('tss-stats-close').onclick = () => overlay.remove();
+  const close = () => {
+    overlay.remove();
+    document.getElementById('tss-hub-stats')?.focus({ preventScroll: true });
+  };
+  document.getElementById('tss-stats-close').onclick = close;
+  overlay.onkeydown = event => {
+    if (event.key !== 'Escape' || event.defaultPrevented) return;
+    event.preventDefault();
+    event.stopPropagation();
+    close();
+  };
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-label', 'Listening stats');
+  document.getElementById('tss-stats-close').focus({ preventScroll: true });
   document.getElementById('tss-stats-reset').onclick = () => {
     state.stats        = { played: 0, playCounts: {}, elapsed: 0 };
     state._playTimeLastAt = Date.now();
@@ -8414,6 +9403,7 @@ function closeEqualizer() {
   if (overlay?._onKeydown) document.removeEventListener('keydown', overlay._onKeydown);
   overlay?.remove();
   document.getElementById('tss-modal-backdrop')?.remove();
+  if (overlay?._opener?.isConnected) overlay._opener.focus({ preventScroll: true });
 }
 
 function setEqualizerBand(index, value) {
@@ -8481,8 +9471,8 @@ function showEqualizer() {
         <svg id="tss-eq-graph" class="tss-eq-graph" viewBox="0 0 520 230" role="group" aria-label="Five band equalizer curve">
           <defs>
             <linearGradient id="tss-eq-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="#ff5500" stop-opacity=".48"/>
-              <stop offset="100%" stop-color="#ff5500" stop-opacity=".025"/>
+              <stop offset="0%" stop-color="#aebaf3" stop-opacity=".20"/>
+              <stop offset="100%" stop-color="#aebaf3" stop-opacity=".025"/>
             </linearGradient>
           </defs>
           <g class="tss-eq-grid" aria-hidden="true">
@@ -8491,7 +9481,7 @@ function showEqualizer() {
             <line x1="470" y1="25" x2="470" y2="190"/><line class="tss-eq-zero" x1="28" y1="107.5" x2="492" y2="107.5"/>
           </g>
           <path id="tss-eq-area" fill="url(#tss-eq-fill)" aria-hidden="true"/>
-          <path id="tss-eq-curve" fill="none" stroke="#ff5b0a" stroke-width="3" stroke-linecap="round" aria-hidden="true"/>
+          <path id="tss-eq-curve" fill="none" stroke="var(--tss-a,#aebaf3)" stroke-width="3" stroke-linecap="round" aria-hidden="true"/>
           ${EQ_BANDS.map((band, index) => `
             <text class="tss-eq-point-value" data-band="${index}" x="${EQ_GRAPH_X[index]}" y="90" text-anchor="middle">0</text>
             <circle class="tss-eq-point tss-eq-point-visible" data-band="${index}" cx="${EQ_GRAPH_X[index]}" cy="107.5" r="5" aria-hidden="true"/>
@@ -8510,6 +9500,9 @@ function showEqualizer() {
       <div class="tss-eq-footer"><span>Drag points to fine-tune</span><button id="tss-eq-reset" type="button">Reset</button></div>
     </div>
   `;
+  overlay._opener = document.activeElement;
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-label', 'Equalizer');
   document.body.appendChild(overlay);
 
   backdrop.onclick = closeEqualizer;
@@ -8654,9 +9647,260 @@ function showEqualizer() {
       setEqualizerBand(index, nextValue);
     };
   });
-  overlay._onKeydown = event => { if (event.key === 'Escape') closeEqualizer(); };
+  overlay._onKeydown = event => {
+    if (event.key !== 'Escape' || event.defaultPrevented) return;
+    event.preventDefault();
+    closeEqualizer();
+  };
   document.addEventListener('keydown', overlay._onKeydown);
   updateEqualizerPopup();
+  overlay.querySelector('#tss-eq-close').focus({ preventScroll: true });
+}
+
+function applyVisualEffects(documentLike = document) {
+  const root = documentLike?.documentElement;
+  if (!root) return;
+  const attribute = 'data-tss-reduce-visual-effects';
+  if (state.reduceVisualEffects) {
+    if (root.getAttribute(attribute) !== 'true') root.setAttribute(attribute, 'true');
+    // Settle owned finite motion through its real cleanup/render callback.
+    for (const element of documentLike.querySelectorAll('[data-surface-open]')) {
+      const animation = element._tssMotion;
+      if (!animation) continue;
+      try { animation.finish(); } catch (_) {}
+      if (element._tssMotion === animation) animation.onfinish?.();
+    }
+  } else if (root.hasAttribute(attribute)) {
+    root.removeAttribute(attribute);
+  }
+  const control = documentLike.getElementById('tss-reduce-visual-effects');
+  if (control && control.checked !== state.reduceVisualEffects) control.checked = state.reduceVisualEffects;
+  const scrollControl = documentLike.getElementById('tss-scroll-long-titles');
+  if (scrollControl && scrollControl.checked !== state.scrollLongTitles) scrollControl.checked = state.scrollLongTitles;
+  syncOwnPipMarquee(documentLike.getElementById('tss-pip-title'), documentLike.getElementById('tss-pip-title-text'));
+}
+
+function setReducedVisualEffects(enabled) {
+  const next = Boolean(enabled);
+  if (state.reduceVisualEffects !== next) {
+    state.reduceVisualEffects = next;
+    safeStorage.setItem('tss_reduce_visual_effects', String(next));
+  }
+  applyVisualEffects(document);
+  if (state._ownPipWindow?.document) applyVisualEffects(state._ownPipWindow.document);
+  return next;
+}
+
+function setScrollLongTitles(enabled) {
+  const next = Boolean(enabled);
+  if (state.scrollLongTitles !== next) {
+    state.scrollLongTitles = next;
+    safeStorage.setItem('tss_scroll_long_titles', String(next));
+  }
+  applyVisualEffects(document);
+  if (state._ownPipWindow?.document) applyVisualEffects(state._ownPipWindow.document);
+  return next;
+}
+
+function motionIsInstant(event) {
+  // A zero-detail click can also come from pointer delivery or script. Only an
+  // observed keyboard activation makes that click instant.
+  const keyboardClick = event?.type === 'click' && event.detail === 0 && !event.pointerType && event.isTrusted !== false
+    && motionIsInstant.keyboardTarget
+    && (event.target === motionIsInstant.keyboardTarget || event.currentTarget === motionIsInstant.keyboardTarget);
+  if (event?.type === 'click') motionIsInstant.keyboardTarget = null;
+  return state.reduceVisualEffects || event?.instant === true || event?.type === 'keydown' || event?.type === 'keyup' || Boolean(keyboardClick)
+    || (typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+function animateSurface(element, visible, { instant = false, onFinish = null, duration = null, restart = false, kind = 'view' } = {}) {
+  if (!element) return;
+  const open = String(visible);
+  // Routine playback/layout sync owns no transition: never settle or restart
+  // an already-requested target, even when that sync requests instant rendering.
+  if (element.dataset.surfaceOpen === open && !restart) return;
+  const queue = kind === 'queue';
+  const content = queue ? element.querySelector?.('#tss-sidebar-content') : null;
+  const previous = element._tssMotion;
+  const previousContent = element._tssContentMotion;
+  const current = previous && typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
+  const currentContent = previousContent && content && typeof getComputedStyle === 'function' ? getComputedStyle(content) : null;
+  const from = current ? queue
+    ? { transform: current.transform, clipPath: current.clipPath }
+    : { opacity: current.opacity, transform: current.transform } : null;
+  const fromContent = currentContent ? { opacity: currentContent.opacity } : null;
+  if (previous) {
+    previous.onfinish = null;
+    previous.cancel();
+    element._tssMotion = null;
+  }
+  if (previousContent) {
+    previousContent.cancel();
+    element._tssContentMotion = null;
+  }
+  const wasHidden = element.hidden;
+  // Logical closure is immediate; keep the painted surface until its exit finishes.
+  element.dataset.surfaceOpen = open;
+  element.inert = !visible;
+  element.setAttribute('aria-hidden', String(!visible));
+  const finish = () => {
+    if (element.dataset.surfaceOpen !== open) return;
+    element.hidden = !visible;
+    element.dataset.motion = visible ? 'open' : 'closed';
+    onFinish?.();
+  };
+  if (instant || motionIsInstant() || typeof element.animate !== 'function'
+    || (queue && (!content || typeof content.animate !== 'function')) || (!visible && wasHidden)) {
+    finish();
+    return;
+  }
+  element.hidden = false;
+  element.dataset.motion = visible ? 'entering' : 'exiting';
+  let closedTransform = kind === 'tab' ? 'translateY(6px)' : 'translateY(8px)';
+  let closedClip = 'inset(0 0 0 0)';
+  if (queue) {
+    const narrow = element.dataset.layout === 'narrow';
+    const left = element.dataset.side === 'left';
+    // Keep the attachment edge fixed: translation would pull retracting glass
+    // across the player. Edge-anchored scale and clipping supply the pop-out.
+    closedTransform = narrow ? 'scale(.98,.9)' : 'scale(.975,.9)';
+    closedClip = narrow ? 'inset(0 0 100% 0)'
+      : left ? 'inset(0 0 0 100%)' : 'inset(0 100% 0 0)';
+  }
+  // Never fade the backdrop-bearing root. Exit clears every foreground pixel
+  // before retracting the glass; entry unfolds the glass before revealing text.
+  const closed = queue ? { transform: closedTransform, clipPath: closedClip }
+    : { opacity: 0, transform: closedTransform };
+  const opened = queue ? { transform: 'none', clipPath: 'inset(0 0 0 0)' }
+    : { opacity: 1, transform: 'none' };
+  const easing = 'cubic-bezier(0.23, 1, 0.32, 1)';
+  const timing = {
+    duration: duration ?? (kind === 'tab' ? 210 : queue ? (visible ? 260 : 220) : 240),
+    easing: queue ? 'linear' : easing,
+    fill: 'both',
+  };
+  const start = from || (visible ? closed : opened);
+  const phase = visible ? 190 / 260 : 60 / 220;
+  const frames = queue ? [
+    { ...start, offset: 0, easing: visible ? easing : 'linear' },
+    { ...(visible ? opened : start), offset: phase, easing: visible ? 'linear' : easing },
+    { ...(visible ? opened : closed), offset: 1 },
+  ] : [start, visible ? opened : closed];
+  const animation = element.animate(frames, timing);
+  const contentStart = fromContent || { opacity: visible ? 0 : 1 };
+  const contentAnimation = content ? content.animate([
+    { ...contentStart, offset: 0, easing: visible ? 'linear' : easing },
+    { ...(visible ? contentStart : { opacity: 0 }), offset: phase, easing: visible ? easing : 'linear' },
+    { opacity: visible ? 1 : 0, offset: 1 },
+  ], timing) : null;
+  // Pin both effects to one timeline instant, including interrupted reversals.
+  // Otherwise separate animate() calls can disagree at the phase boundary.
+  const startTime = animation.timeline?.currentTime;
+  if (contentAnimation && typeof startTime === 'number') {
+    animation.startTime = startTime;
+    contentAnimation.startTime = startTime;
+  }
+  element._tssMotion = animation;
+  element._tssContentMotion = contentAnimation;
+  animation.onfinish = () => {
+    if (element._tssMotion !== animation) return;
+    element._tssMotion = null;
+    element._tssContentMotion = null;
+    contentAnimation?.cancel();
+    finish();
+    animation.cancel();
+  };
+}
+
+function syncSettingsTabs(instant = true) {
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const selected = hub.dataset.settingsTab || 'audio';
+  for (const tab of ['audio', 'session', 'info']) {
+    const button = document.getElementById(`tss-settings-tab-${tab}`);
+    const active = tab === selected;
+    if (button) {
+      if (button.getAttribute('aria-selected') !== String(active)) button.setAttribute('aria-selected', String(active));
+      if (button.tabIndex !== (active ? 0 : -1)) button.tabIndex = active ? 0 : -1;
+    }
+    animateSurface(document.getElementById(`tss-settings-panel-${tab}`), active, { instant, kind: 'tab' });
+  }
+}
+
+function setSettingsTab(tab, focus = false, event = null) {
+  if (!['audio', 'session', 'info'].includes(tab)) return;
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const focusedPanel = document.activeElement?.closest?.('.tss-settings-panel');
+  const moveFocus = focus || (focusedPanel && focusedPanel.id !== `tss-settings-panel-${tab}`);
+  hub.dataset.settingsTab = tab;
+  syncSettingsTabs(motionIsInstant(event));
+  syncSidebarToHub();
+  if (moveFocus) document.getElementById(`tss-settings-tab-${tab}`)?.focus({ preventScroll: true });
+}
+
+function syncHubView(instant = true) {
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const start = document.getElementById('tss-hub-start');
+  const actionFocused = document.activeElement === start;
+  const settings = hub.dataset.view === 'settings';
+  const main = document.getElementById('tss-hub-main-view');
+  const panel = document.getElementById('tss-hub-settings-view');
+  const button = document.getElementById('tss-hub-settings');
+  animateSurface(main, !settings, { instant });
+  animateSurface(panel, settings, { instant });
+  syncSettingsTabs();
+  if (button) {
+    const expanded = String(settings);
+    if (button.getAttribute('aria-expanded') !== expanded) button.setAttribute('aria-expanded', expanded);
+    const label = settings ? 'Back to player' : 'Settings';
+    if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label);
+    if (button.title !== label) button.title = label;
+  }
+  const actions = document.getElementById('tss-hub-actions');
+  const sessionAction = document.getElementById('tss-settings-session-action');
+  const target = settings || (state.active && !state.loading) ? sessionAction : actions;
+  const moved = start && target && start.parentElement !== target;
+  if (moved) target.appendChild(start);
+  if (actions && actions.hidden !== (start?.parentElement !== actions)) actions.hidden = start?.parentElement !== actions;
+  if (sessionAction && sessionAction.hidden !== (start?.parentElement !== sessionAction)) sessionAction.hidden = start?.parentElement !== sessionAction;
+  if (moved && actionFocused) {
+    if (settings && (hub.dataset.settingsTab || 'audio') !== 'session') setSettingsTab('session', false, { instant: true });
+    const actionVisible = hub.dataset.queueView !== 'true' && (settings || target === actions);
+    const focusTarget = actionVisible ? start
+      : state.active && hub.dataset.queueView !== 'true' ? document.getElementById('tss-hub-play') : button;
+    focusTarget?.focus({ preventScroll: true });
+  }
+}
+
+function setHubView(view, focus = true, event = null) {
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const settings = view === 'settings';
+  const instant = motionIsInstant(event);
+  if (settings && state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') toggleSidebar({ instant });
+  hub.dataset.view = settings ? 'settings' : 'main';
+  syncHubView(instant);
+  syncSidebarToHub();
+  if (focus) document.getElementById(settings ? 'tss-settings-title' : 'tss-hub-settings')?.focus({ preventScroll: true });
+}
+
+function setHubMini(mini, focus = true, event = null) {
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const instant = motionIsInstant(event);
+  if (state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') toggleSidebar({ instant });
+  hub.dataset.mini = String(Boolean(mini));
+  const button = document.getElementById('tss-hub-col');
+  if (button) {
+    button.setAttribute('aria-expanded', String(!mini));
+    const label = mini ? 'Expand player' : 'Minimize player';
+    button.setAttribute('aria-label', label);
+    button.title = label;
+  }
+  setHubView('main', false, { instant });
+  if (focus) button?.focus({ preventScroll: true });
 }
 
 function mkHub() {
@@ -8666,18 +9910,33 @@ function mkHub() {
     const s = document.createElement('style');
     s.id = 'tss-hub-style';
     s.textContent = `
-      #tss-hub-bg { position:absolute; inset:0; z-index:0; overflow:hidden; border-radius:18px; }
-      #tss-hub-bgimg {
-        position:absolute; inset:-30px;
-        background-color:#111; background-size:cover; background-position:center;
-        filter:blur(48px) brightness(0.12) saturate(0.65);
-        opacity:0; transition:opacity 0.7s ease;
+      #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast {
+        --tss-a:#aebaf3;--tss-ar:174;--tss-ag:186;--tss-ab:243;
+        --tss-glass-base:rgba(9,10,12,.98);
+        --tss-glass-surface:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%),var(--tss-glass-base);
+        --tss-glass-inset:rgba(0,0,0,.08);
+        --tss-glass-filter:none;
+        --tss-glass-rim:rgba(255,255,255,.12);
+        --tss-glass-shadow:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12),0 20px 54px rgba(0,0,0,.38);
       }
-      #tss-hub-bgmask {
-        position:absolute; inset:0;
-        background:linear-gradient(160deg, rgba(9,9,9,0.86) 0%, rgba(7,7,7,0.97) 100%);
+      @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
+        #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast {
+          --tss-glass-base:rgba(9,10,12,.54);
+          --tss-glass-filter:blur(20px);
+        }
       }
-      #tss-hub-inner { position:relative; z-index:1; }
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) {
+        --tss-glass-base:rgba(9,10,12,.98);--tss-glass-filter:none;
+      }
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay),
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay) *,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) *::before,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) *::after {
+        transition:none!important;animation:none!important;scroll-behavior:auto!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;
+      }
+      :root[data-tss-reduce-visual-effects="true"] .tss-hub-btn:active { transform:none!important; }
+      /* The header never scrolls; only the active view owns vertical overflow. */
+      #tss-hub-inner { position:relative;display:flex;flex-direction:column;max-height:calc(100dvh - 26px);overflow:hidden; }
 
       .tss-hub-btn {
         border:none; cursor:pointer; flex-shrink:0;
@@ -8685,25 +9944,25 @@ function mkHub() {
         transition:background 0.15s, color 0.15s, transform 0.1s;
         -webkit-user-select:none; user-select:none;
       }
-      .tss-hub-btn:active { transform:scale(0.86); }
+      .tss-hub-btn:active { transform:scale(0.97); }
       .tss-hub-btn-icon {
-        background:none; color:rgba(255,255,255,0.28);
-        padding:5px; border-radius:6px;
+        background:none; color:rgba(255,255,255,0.68);
+        padding:5px; border-radius:7px;
       }
       .tss-hub-btn-icon:hover { color:rgba(255,255,255,0.72); background:rgba(255,255,255,0.08); }
       .tss-hub-btn-sm {
         width:36px; height:36px; border-radius:50%;
         background:rgba(255,255,255,0.08); color:rgba(255,255,255,0.72);
       }
-      .tss-hub-btn-sm:hover { background:rgba(255,255,255,0.16); }
+      .tss-hub-btn-sm:hover,.tss-deck-controls .tss-hub-btn-sm:hover { background:rgba(255,255,255,.10); }
       .tss-hub-btn-lg {
         width:46px; height:46px; border-radius:50%;
-        background:var(--tss-a,#ff5500); color:#fff;
-        box-shadow:0 4px 18px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.45);
+        background:color-mix(in srgb,var(--tss-a,#aebaf3) 80%,transparent); color:#101522;
+        box-shadow:0 3px 10px rgba(0,0,0,0.24);
       }
       .tss-hub-btn-lg:hover {
         filter:brightness(1.12);
-        box-shadow:0 4px 22px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.6);
+        box-shadow:0 4px 12px rgba(0,0,0,0.3);
       }
 
       #tss-hub-start {
@@ -8714,12 +9973,12 @@ function mkHub() {
         transition:background 0.2s, color 0.2s;
       }
       #tss-hub-start:not([data-active="true"]):not([data-loading="true"]) {
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.14);
-        color:var(--tss-a,#ff5500);
-        border:1px solid rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.28);
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.14);
+        color:var(--tss-a,#aebaf3);
+        border:1px solid rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.28);
       }
       #tss-hub-start:not([data-active="true"]):not([data-loading="true"]):hover {
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.26);
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.26);
       }
       #tss-hub-start[data-active="true"] {
         background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.78);
@@ -8734,22 +9993,14 @@ function mkHub() {
         cursor:pointer;
       }
 
-      #tss-hub-seekbar { transform-origin:center; transition:transform 0.15s; }
-      #tss-hub-seekbar:hover { transform:scaleY(2.5); }
 
-      #tss-hub-qico[data-open="true"] { color:var(--tss-a,#ff5500) !important; }
-      #tss-hub-pip[data-open="true"] { color:var(--tss-a,#ff5500) !important;border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.44) !important;background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.12) !important; }
+      #tss-hub-qico[data-open="true"] { color:var(--tss-a,#aebaf3) !important; }
+      #tss-hub-pip[data-open="true"] { color:var(--tss-a,#aebaf3) !important;border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.44) !important;background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12) !important; }
 
-      #tss-hub-reshuffle {
-        width:28px; height:28px; padding:0; border-radius:8px;
-        color:rgba(255,255,255,0.28); background:transparent;
-      }
+      #tss-hub-reshuffle { color:rgba(255,255,255,.8); }
       #tss-hub-reshuffle:hover {
-        color:var(--tss-a,#ff5500);
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.12);
-      }
-      #tss-hub-reshuffle:focus-visible {
-        outline:2px solid var(--tss-a,#ff5500); outline-offset:2px;
+        color:var(--tss-a,#aebaf3);
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.12);
       }
       #tss-hub-reshuffle:disabled { cursor:wait; opacity:0.55; }
       #tss-hub-reshuffle[data-loading="true"] svg { animation:tss-spin 0.8s linear infinite; }
@@ -8760,200 +10011,167 @@ function mkHub() {
 
       .tss-badge {
         display:inline-flex; align-items:center; justify-content:center;
-        background:#1e1e1e; color:#545454;
-        border-radius:4px; font-size:9.5px; padding:1px 6px;
+        background:rgba(255,255,255,.08); color:#b9bec5;
+        border-radius:4px; font-size:10px; padding:2px 6px;
         margin-right:6px; font-weight:700; vertical-align:middle;
         border:1px solid #2a2a2a; letter-spacing:0.03em;
       }
       .tss-badge-cur {
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.12);
-        color:var(--tss-a,#ff5500);
-        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.28);
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.12);
+        color:var(--tss-a,#aebaf3);
+        border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.28);
       }
 
       #tss-sidebar-list::-webkit-scrollbar { width:3px; }
-      #tss-sidebar-list::-webkit-scrollbar-thumb { background:#282828; border-radius:2px; }
+      #tss-sidebar-list::-webkit-scrollbar-thumb { background:#555b64; border-radius:2px; }
       #tss-sidebar-list::-webkit-scrollbar-track { background:transparent; }
 
       #tss-ctx {
-        position:fixed; background:#181818; border:1px solid #2c2c2c;
-        border-radius:8px; z-index:999999; overflow:hidden; min-width:172px;
+        position:fixed; background:var(--tss-glass-surface,#080b12); border:1px solid var(--tss-glass-rim);
+        border-radius:10px; z-index:999999; overflow:hidden; min-width:172px;
         font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
-        box-shadow:0 8px 28px rgba(0,0,0,0.78);
+        box-shadow:var(--tss-glass-shadow);
+        -webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);
       }
       .tss-ctx-item { padding:9px 15px; cursor:pointer; color:#c0c0c0; font-size:12px; transition:background 0.1s; }
-      .tss-ctx-item:hover { background:#222; }
-      .tss-ctx-disabled { color:#3a3a3a !important; cursor:not-allowed; }
+      .tss-ctx-item:hover { background:rgba(255,255,255,.08); }
+      .tss-ctx-disabled { color:#8d949e !important; cursor:not-allowed; }
       .tss-ctx-disabled:hover { background:transparent !important; }
 
       #tss-hub-sleep {
-        background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
-        color:rgba(255,255,255,0.38); font-size:10px; border-radius:4px;
-        padding:2px 5px; cursor:pointer; outline:none;
+        background:var(--tss-glass-inset); border:1px solid rgba(204,218,255,.10);box-shadow:inset 0 1px 0 rgba(213,225,250,.025);
+        color:rgba(255,255,255,0.72); font-size:10px; border-radius:7px;
+        padding:4px 6px; cursor:pointer;
         font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
         transition:border-color 0.15s;
       }
       #tss-hub-sleep:hover { border-color:rgba(255,255,255,0.18); }
-      #tss-hub-sleep option { background:#1a1a1a; }
+      #tss-hub-sleep option { background:#101113; }
 
-      .tss-crossfade-card {
-        margin:0 14px 13px;border:1px solid rgba(255,255,255,.075);
-        border-radius:10px;background:rgba(255,255,255,.025);overflow:hidden;
-        transition:border-color .18s ease,background .18s ease;
-      }
-      .tss-crossfade-card[data-open="true"] {
-        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.22);
-        background:rgba(255,255,255,.035);
-      }
-      #tss-crossfade-summary {
-        width:100%;min-height:38px;padding:0 10px;border:0;background:transparent;color:#fff;
-        display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;
-        font-family:-apple-system,'Segoe UI',system-ui,sans-serif;text-align:left;
-      }
-      #tss-crossfade-summary:hover { background:rgba(255,255,255,.025); }
-      #tss-crossfade-summary:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:-2px; }
-      .tss-crossfade-copy { display:flex;align-items:center;gap:8px;min-width:0; }
-      .tss-crossfade-dot { width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.16);box-shadow:0 0 0 3px rgba(255,255,255,.035); }
-      .tss-crossfade-card[data-enabled="true"] .tss-crossfade-dot { background:var(--tss-a,#ff5500);box-shadow:0 0 0 3px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.12); }
-      .tss-crossfade-label { color:rgba(255,255,255,.72);font-size:8px;font-weight:760;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap; }
-      #tss-hub-crossfade-status { color:rgba(255,255,255,.3);font-size:8px;white-space:nowrap; }
-      #tss-hub-crossfade-status[data-status="mixing"] { color:var(--tss-a,#ff5500); }
+      .tss-crossfade-card { padding:0 0 12px; }
+      .tss-crossfade-heading { display:flex;align-items:center;justify-content:space-between;color:rgba(255,255,255,.88);font-size:12px;font-weight:600; }
+      #tss-hub-crossfade-status { color:rgba(255,255,255,.7);font-size:10px; }
+      #tss-hub-crossfade-status[data-status="mixing"] { color:var(--tss-a,#aebaf3); }
       #tss-hub-crossfade-status[data-status="fallback"] { color:#d39a62; }
-      .tss-crossfade-summary-value { display:flex;align-items:center;gap:7px;color:rgba(255,255,255,.48);font-size:9px;font-weight:700; }
-      #tss-crossfade-chevron { width:10px;height:10px;transition:transform .18s ease; }
-      .tss-crossfade-card[data-open="true"] #tss-crossfade-chevron { transform:rotate(180deg); }
-      .tss-crossfade-reveal { display:grid;grid-template-rows:0fr;transition:grid-template-rows .2s ease; }
-      .tss-crossfade-card[data-open="true"] .tss-crossfade-reveal { grid-template-rows:1fr; }
-      .tss-crossfade-settings { min-height:0;overflow:hidden; }
-      .tss-crossfade-settings-inner { padding:2px 10px 11px;border-top:1px solid rgba(255,255,255,.06); }
-      .tss-crossfade-setting-head { display:flex;align-items:center;justify-content:space-between;margin:9px 0 7px;color:rgba(255,255,255,.42);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.08em; }
+      .tss-crossfade-setting-head { display:flex;align-items:center;justify-content:space-between;margin:9px 0 7px;color:rgba(255,255,255,.7);font-size:10px;font-weight:600;letter-spacing:.02em; }
       #tss-crossfade-seconds { color:#fff;font-size:9px;letter-spacing:0;text-transform:none; }
       #tss-hub-crossfade {
-        width:100%;height:16px;margin:0;appearance:none;background:transparent;cursor:pointer;accent-color:var(--tss-a,#ff5500);
+        width:100%;height:16px;margin:0;appearance:none;background:transparent;cursor:pointer;accent-color:var(--tss-a,#aebaf3);
       }
-      #tss-hub-crossfade::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#ff5500) var(--tss-crossfade-fill,0%),rgba(255,255,255,.11) var(--tss-crossfade-fill,0%)); }
+      #tss-hub-crossfade::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-crossfade-fill,0%),rgba(114,130,165,.18) var(--tss-crossfade-fill,0%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
       #tss-hub-crossfade::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
-      #tss-hub-crossfade:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:3px;border-radius:4px; }
-      .tss-crossfade-ticks { display:flex;justify-content:space-between;color:rgba(255,255,255,.22);font-size:7px;margin-top:1px; }
-      .tss-crossfade-modes { display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;background:rgba(0,0,0,.26);border-radius:7px; }
-      .tss-crossfade-mode { border:0;border-radius:5px;padding:6px 3px;background:transparent;color:rgba(255,255,255,.34);font:700 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s; }
+      #tss-hub-crossfade:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
+      .tss-crossfade-ticks { display:flex;justify-content:space-between;color:rgba(255,255,255,.65);font-size:9px;margin-top:1px; }
+      .tss-crossfade-modes { display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;background:rgba(0,0,0,.04);border-radius:7px;box-shadow:inset 0 1px 3px rgba(0,0,0,.08); }
+      .tss-crossfade-mode { border:0;border-radius:5px;padding:7px 3px;background:transparent;color:rgba(255,255,255,.7);font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s; }
       .tss-crossfade-mode:hover { color:rgba(255,255,255,.72); }
-      .tss-crossfade-mode[data-active="true"] { color:#fff;background:rgba(255,255,255,.09);box-shadow:0 1px 4px rgba(0,0,0,.25); }
-      .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:1px; }
-      .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.42);font-size:8px;cursor:pointer; }
-      .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#ff5500);cursor:pointer; }
-      #tss-playback-debug { color:#ff5353; }
-      #tss-playback-debug:hover { color:#ff8585;background:rgba(255,70,70,.12); }
-      #tss-playback-debug:focus-visible { outline:2px solid #ff5353;outline-offset:2px; }
+      .tss-crossfade-mode[data-active="true"] { color:#fff;background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 2px 5px rgba(0,0,0,.12); }
+      .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:1px; }
+      .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.7);font-size:10px;cursor:pointer; }
+      .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#aebaf3);cursor:pointer; }
+      #tss-playback-debug { color:var(--tss-t2,#aaa); }
+      #tss-playback-debug:hover { color:var(--tss-t,#eee);background:rgba(255,255,255,.08); }
+      #tss-playback-debug:focus-visible { outline:2px solid currentColor;outline-offset:2px; }
+      #tss-playback-debug[data-status="current"] { color:#ff5353; }
+      #tss-playback-debug[data-status="current"]:hover { color:#ff8585;background:rgba(255,70,70,.12); }
       #tss-playback-debug[hidden] { display:none!important; }
-      #tss-debug-overlay,#tss-debug-help-overlay { position:fixed;inset:0;z-index:1000002;display:flex;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.72);backdrop-filter:blur(10px); }
+      #tss-debug-overlay,#tss-debug-help-overlay { position:fixed;inset:0;z-index:1000002;display:flex;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.04); }
       #tss-debug-help-overlay { z-index:1000003; }
-      .tss-debug-dialog { box-sizing:border-box;width:min(620px,calc(100vw - 28px));max-height:min(680px,calc(100vh - 44px));overflow:auto;display:flex;flex-direction:column;gap:10px;padding:15px;border:1px solid rgba(255,255,255,.11);border-radius:13px;background:#0b0b0b;box-shadow:0 22px 70px rgba(0,0,0,.75);color:#eee;font-family:-apple-system,'Segoe UI',system-ui,sans-serif; }
+      .tss-debug-dialog { box-sizing:border-box;width:min(620px,calc(100vw - 28px));max-height:min(680px,calc(100dvh - 44px));overflow:auto;display:flex;flex-direction:column;gap:10px;padding:16px;border:1px solid var(--tss-glass-rim);border-radius:14px;background:var(--tss-glass-surface,#080b12);-webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);box-shadow:var(--tss-glass-shadow);color:#eee;font-family:-apple-system,'Segoe UI',system-ui,sans-serif; }
       .tss-debug-head { display:flex;align-items:center;justify-content:space-between;gap:15px; }
       .tss-debug-head strong { display:block;font-size:13px;letter-spacing:.02em; }
-      .tss-debug-head span { display:block;margin-top:2px;color:rgba(255,255,255,.38);font-size:9px; }
+      .tss-debug-head span { display:block;margin-top:2px;color:rgba(255,255,255,.7);font-size:10px; }
       .tss-debug-head button { width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.65);cursor:pointer; }
-      .tss-debug-dialog p { margin:0;color:rgba(255,255,255,.45);font-size:10px;line-height:1.45; }
-      #tss-debug-report { min-height:180px;max-height:460px;margin:0;padding:11px;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#050505;color:#b7c3cc;font:9px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word; }
+      .tss-debug-dialog p { margin:0;color:rgba(255,255,255,.72);font-size:11px;line-height:1.5; }
+      #tss-debug-report,#tss-debug-full-report { min-height:180px;max-height:460px;margin:0;padding:11px;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:var(--tss-glass-inset,#10131d);color:#b7c3cc;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word;-webkit-user-select:text;user-select:text;scrollbar-color:#555b64 transparent; }
+      #tss-debug-report:focus-visible,#tss-debug-full-report:focus-visible,#tss-debug-details summary:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      .tss-debug-dialog ::selection { background:rgba(174,186,243,.3);color:#fff; }
+      #tss-debug-details summary { padding:5px 0;color:#b7c3cc;font-size:11px;cursor:pointer; }
+      #tss-debug-details[open] summary { margin-bottom:8px; }
+      #tss-debug-details .tss-debug-actions { margin-top:8px; }
+      #tss-debug-copy-full[hidden] { display:none!important; }
       .tss-debug-actions { display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px; }
-      .tss-debug-actions button { min-width:92px;padding:8px 11px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#151515;color:#ddd;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
-      #tss-debug-copy { border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.35);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.13);color:#fff; }
+      .tss-debug-actions button { min-width:92px;padding:8px 11px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:rgba(255,255,255,.055);color:#ddd;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      #tss-debug-copy { border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.35);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.13);color:#fff; }
       .tss-debug-help-dialog { width:min(480px,calc(100vw - 28px));gap:16px; }
       .tss-debug-help-steps { margin:0;padding-left:22px;color:#bbb;font-size:14px;line-height:1.55; }
       .tss-debug-help-steps li + li { margin-top:12px; }
-      .tss-debug-help-steps a { color:#ffb08c;text-decoration:underline;text-underline-offset:3px; }
+      .tss-debug-help-steps a { color:var(--tss-a,#aebaf3);text-decoration:underline;text-underline-offset:3px; }
       .tss-debug-help-steps strong { color:#eee; }
       .tss-debug-help-dialog p { color:#aaa;font-size:12px;line-height:1.5; }
       @media (prefers-reduced-motion:reduce) {
-        .tss-crossfade-reveal,#tss-crossfade-chevron { transition:none; }
+        #tss-hub *,#tss-sidebar { transition:none !important;animation:none !important; }
       }
 
       #tss-hub {
-        --tss-panel:rgba(10,10,10,0.96);
-        --tss-line:rgba(255,255,255,0.09);
-        --tss-muted:rgba(255,255,255,0.48);
+        --tss-panel:#10131d;
+        --tss-line:rgba(204,218,255,.08);
+        --tss-muted:rgba(255,255,255,0.7);
         box-sizing:border-box;
       }
-      #tss-hub-bgmask {
-        background:linear-gradient(155deg,rgba(11,11,11,0.9) 0%,rgba(7,7,7,0.985) 72%);
-      }
-      #tss-hub-hdr { min-height:34px; }
-      .tss-deck-brand { display:flex;align-items:center;gap:9px;min-width:0; }
-      .tss-deck-brandmark {
-        width:32px !important;height:32px !important;border-radius:9px !important;
-        color:rgba(255,255,255,0.8) !important;
-        border:1px solid rgba(255,255,255,0.12) !important;
-        background:rgba(255,255,255,0.035) !important;
-      }
-      .tss-deck-brandmark:hover {
-        color:var(--tss-a,#ff5500) !important;
-        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.42) !important;
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.1) !important;
-      }
+      #tss-hub-hdr { flex-shrink:0;min-height:34px;cursor:move;padding:11px 13px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px; }
+      .tss-hub-navigation { display:flex;align-items:center;gap:4px;flex-shrink:0; }
+      .tss-hub-navigation .tss-hub-btn-icon { width:32px;min-width:32px;min-height:32px;color:rgba(255,255,255,.88); }
+      .tss-hub-navigation .tss-hub-btn-icon svg { width:16px !important;height:16px !important; }
+      #tss-hub-settings[aria-expanded="false"] .tss-settings-back-icon,
+      #tss-hub-settings[aria-expanded="true"] .tss-settings-gear-icon { display:none; }
+      .tss-deck-brand { display:flex;align-items:center;gap:8px;min-width:0; }
+      .tss-deck-brandmark { display:flex;align-items:center;color:rgba(255,255,255,.8); }
+      .tss-deck-brandmark svg { width:17px;height:17px; }
+      .tss-hub-text-button { gap:7px;min-height:32px;padding:0 9px;border-radius:7px;background:rgba(255,255,255,.055);color:rgba(255,255,255,.88);font:600 11px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      .tss-hub-text-button:hover { background:rgba(255,255,255,.1); }
+      #tss-hub-settings[aria-expanded="true"] { color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
+      #tss-hub-col { min-width:32px;min-height:32px; }
+      #tss-hub-col[aria-expanded="false"] svg { transform:rotate(180deg); }
       .tss-deck-label {
-        color:rgba(255,255,255,0.88);font-size:10px;font-weight:760;
-        letter-spacing:0.14em;text-transform:uppercase;white-space:nowrap;
+        color:rgba(255,255,255,0.9);font-size:11px;font-weight:650;
+        letter-spacing:0.015em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
       }
       .tss-deck-track {
         display:grid;grid-template-columns:78px minmax(0,1fr);gap:13px;
         align-items:center;padding:5px 14px 12px;
       }
-      #tss-hub-art {
-        width:78px !important;height:78px !important;border-radius:13px !important;
-        box-shadow:0 14px 34px rgba(0,0,0,0.56),0 0 0 1px rgba(255,255,255,0.08) !important;
-      }
-      #tss-hub-title { font-size:15.5px !important;font-weight:740 !important;letter-spacing:-0.02em;line-height:1.16 !important; }
-      #tss-hub-artist { font-size:11px !important;color:rgba(255,255,255,.52) !important;margin-top:4px !important; }
-      #tss-hub-qpos {
-        display:inline-block;max-width:100%;margin-top:8px;
-        border:0;border-radius:0;background:transparent;padding:0;
-        color:rgba(255,255,255,0.42) !important;font-size:10px !important;font-weight:650;
-        letter-spacing:0.045em;text-transform:none;font-variant-numeric:tabular-nums;
-      }
-      #tss-hub-nextup { display:none !important; }
+      #tss-hub-art { width:78px;height:78px;border-radius:13px;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;box-shadow:0 5px 14px rgba(0,0,0,.24); }
+      .tss-deck-track-copy { min-width:0; }
+      #tss-hub-title { color:#fff;font-size:15.5px;font-weight:740;letter-spacing:-.02em;line-height:1.2; }
+      #tss-hub-artist { font-size:11px;color:rgba(255,255,255,.72);margin-top:5px;line-height:1.3; }
+      #tss-hub-title,#tss-hub-artist { overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+      #tss-hub-qpos { margin-left:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:rgba(255,255,255,.72);font-size:10px;font-weight:500;font-variant-numeric:tabular-nums; }
+      .tss-main-queue { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:0 14px 14px; }
+      #tss-hub-qico { min-width:0;width:100%;flex-shrink:1;justify-content:flex-start;min-height:36px; }
+      #tss-hub-reshuffle { min-height:36px; }
+      #tss-hub-actions { padding:0 14px 14px; }
       .tss-deck-timeline { padding:0 14px 1px; }
       #tss-hub-seekbar {
-        margin:0 !important;height:13px !important;border-radius:2px !important;
-        background:transparent !important;
-        overflow:hidden;transform:none !important;
+        position:relative;cursor:pointer;margin:0;height:16px;border-radius:2px;
+        background:transparent;overflow:hidden;transform:none;
       }
       #tss-hub-seekbar:hover { transform:none !important; }
       #tss-hub-prog { position:absolute;left:0;bottom:0;height:1px;background:transparent !important;opacity:0;pointer-events:none; }
       .tss-wave-bars { position:absolute;inset:0;display:flex;align-items:center;gap:3px; }
       .tss-wave-bars i { display:block;flex:1;min-width:1px;height:var(--h);border-radius:2px;background:rgba(255,255,255,.2);transition:background .12s ease,filter .12s ease; }
-      .tss-wave-bars i[data-played="true"] { background:var(--tss-a,#ff5500);filter:drop-shadow(0 0 3px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.42)); }
-      .tss-deck-times { display:flex;justify-content:space-between;margin-top:5px;color:rgba(255,255,255,.5);font-size:9px;font-variant-numeric:tabular-nums; }
+      .tss-wave-bars i[data-played="true"] { background:var(--tss-a,#aebaf3); }
+      .tss-deck-times { display:flex;justify-content:space-between;margin-top:5px;color:rgba(255,255,255,.7);font-size:10px;font-variant-numeric:tabular-nums; }
       .tss-deck-controls { display:flex;align-items:center;justify-content:center;gap:16px;padding:9px 14px 15px; }
-      .tss-deck-controls .tss-hub-btn-sm { width:40px;height:40px;background:rgba(255,255,255,0.095);color:rgba(255,255,255,.82); }
-      .tss-deck-controls .tss-hub-btn-lg { width:54px;height:54px;box-shadow:0 7px 24px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.34),0 0 0 1px rgba(255,255,255,.14); }
-      .tss-master-volume { display:grid;grid-template-columns:14px minmax(0,1fr) 31px 62px;align-items:center;gap:9px;margin:-3px 14px 13px;color:rgba(255,255,255,.38); }
+      .tss-deck-controls .tss-hub-btn-sm { width:40px;height:40px;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 3px 9px rgba(0,0,0,.2);color:rgba(255,255,255,.82); }
+      .tss-deck-controls .tss-hub-btn-lg { width:54px;height:54px;box-shadow:0 4px 12px rgba(0,0,0,.25); }
+      .tss-master-volume { display:grid;grid-template-columns:14px minmax(0,1fr) 31px;align-items:center;gap:9px;margin:-3px 14px 16px;color:rgba(255,255,255,.7); }
       #tss-hub-volume { width:100%;height:18px;margin:0;appearance:none;background:transparent;cursor:pointer; }
-      #tss-hub-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#ff5500) var(--tss-volume-fill,10%),rgba(255,255,255,.12) var(--tss-volume-fill,10%)); }
+      #tss-hub-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-volume-fill,10%),rgba(114,130,165,.18) var(--tss-volume-fill,10%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
       #tss-hub-volume::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
-      #tss-hub-volume:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:3px;border-radius:4px; }
-      #tss-hub-volume-value { color:rgba(255,255,255,.48);font-size:9px;font-weight:700;text-align:right;font-variant-numeric:tabular-nums; }
-      #tss-auto-level {
-        height:22px;padding:0 7px;display:flex;align-items:center;justify-content:center;gap:5px;
-        border:1px solid #555;border-radius:7px;background:#171717;
-        color:#c8c8c8;font:700 8px/1 Arial,sans-serif;letter-spacing:.06em;cursor:pointer;
-        box-shadow:0 1px 3px rgba(0,0,0,.55);transition:color .16s,border-color .16s,background .16s,box-shadow .16s;
-      }
-      #tss-auto-level:hover { color:#fff;background:#242424;border-color:#777; }
-      #tss-auto-level[data-active="true"] { color:#fff;border-color:#ff7a33;background:#e84d00;box-shadow:0 0 0 1px rgba(255,255,255,.16),0 0 10px rgba(255,85,0,.34); }
-      #tss-auto-level:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px; }
-      .tss-auto-dot { width:5px;height:5px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor; }
-      #tss-auto-level[data-active="true"] .tss-auto-dot { box-shadow:0 0 6px currentColor; }
+      #tss-hub-volume:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
+      #tss-hub-volume-value { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums; }
+      #tss-auto-level { justify-content:space-between; }
+      #tss-auto-level:hover { color:#fff;background:rgba(255,255,255,.1);border-color:#777; }
+      #tss-auto-level[data-active="true"] { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
+      #tss-auto-level:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
       .tss-hub-btn:focus-visible,#tss-hub-start:focus-visible,#tss-hub-sleep:focus-visible {
-        outline:2px solid var(--tss-a,#ff5500);outline-offset:2px;
-      }
-      .tss-deck-utilities {
-        display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 9px 14px;
-        border-top:1px solid rgba(255,255,255,0.055);
+        outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;
       }
       #tss-hub-stop-after {
         appearance:none;-webkit-appearance:none;width:31px;height:18px;margin:0;
-        border-radius:999px;background:rgba(255,255,255,0.1);
-        border:1px solid rgba(255,255,255,0.09);position:relative;cursor:pointer;
+        border-radius:999px;background:rgba(0,0,0,.12);
+        border:1px solid rgba(204,218,255,.11);box-shadow:inset 0 1px 3px rgba(2,4,10,.3);position:relative;cursor:pointer;
         transition:background .18s,border-color .18s;vertical-align:middle;
       }
       #tss-hub-stop-after::after {
@@ -8961,48 +10179,70 @@ function mkHub() {
         background:rgba(255,255,255,0.72);transition:transform .18s,background .18s;
       }
       #tss-hub-stop-after:checked {
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.35);
-        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.58);
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.35);
+        border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.58);
       }
       #tss-hub-stop-after:checked::after { transform:translateX(13px);background:#fff; }
-      #tss-hub-stop-after:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px; }
-      .tss-deck-switch { display:flex;align-items:center;gap:8px;min-width:0;cursor:pointer;position:relative;left:-37px; }
-      .tss-deck-switch input { position:absolute;opacity:0;pointer-events:none; }
-      .tss-deck-switch-track {
-        width:30px;height:18px;border-radius:999px;background:rgba(255,255,255,0.1);
-        border:1px solid rgba(255,255,255,0.09);box-sizing:border-box;position:relative;flex-shrink:0;transition:background .18s,border-color .18s;
+      #tss-hub-stop-after:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      #tss-hub [hidden],#tss-sidebar[hidden] { display:none !important; }
+      #tss-hub-body { position:relative;display:flex;flex-direction:column;min-height:0;overflow:hidden; }
+      #tss-hub-main-view,#tss-hub-settings-view {
+        min-height:0;flex:0 1 auto;overflow-x:hidden;overflow-y:auto;
+        scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:#555b64 transparent;
       }
-      .tss-deck-switch-track::after {
-        content:'';position:absolute;width:12px;height:12px;left:2px;top:2px;border-radius:50%;
-        background:rgba(255,255,255,0.72);transition:transform .18s,background .18s;
-      }
-      .tss-deck-switch input:checked + .tss-deck-switch-track {
-        background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.35);
-        border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.58);
-      }
-      .tss-deck-switch input:checked + .tss-deck-switch-track::after { transform:translateX(12px);background:#fff; }
-      .tss-deck-switch input:focus-visible + .tss-deck-switch-track { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px; }
-      .tss-deck-switch-label { color:rgba(255,255,255,0.46);font-size:8px;font-weight:680;letter-spacing:0.045em;text-transform:uppercase;white-space:nowrap; }
-      .tss-deck-sleep {
-        display:flex;align-items:center;gap:6px;margin-left:auto;flex-shrink:0;
-      }
+      #tss-hub-main-view::-webkit-scrollbar,#tss-hub-settings-view::-webkit-scrollbar { width:6px; }
+      #tss-hub-main-view::-webkit-scrollbar-thumb,#tss-hub-settings-view::-webkit-scrollbar-thumb { background:#555b64;border-radius:3px; }
+      #tss-hub-main-view::-webkit-scrollbar-track,#tss-hub-settings-view::-webkit-scrollbar-track { background:transparent; }
+      #tss-hub-main-view[data-motion="exiting"],#tss-hub-settings-view[data-motion="exiting"],
+      .tss-settings-panel[data-motion="exiting"] { position:absolute;top:0;left:0;right:0;z-index:2;pointer-events:none; }
+      /* Preserve the tab footprint as viewport space, not artificial scrollable content. */
+      #tss-hub-settings-view { box-sizing:border-box;height:384px;padding:2px 14px 14px; }
+      #tss-settings-title { margin:0 0 13px;color:#fff;font-size:18px;line-height:1.3;font-weight:650;letter-spacing:-.02em; }
+      .tss-settings-tabs { display:flex;gap:20px;margin-bottom:16px;border-bottom:1px solid rgba(255,255,255,.09); }
+      .tss-settings-tab { display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:0 0 10px;border:0;border-bottom:2px solid transparent;background:transparent;color:rgba(255,255,255,.72);font:600 11px/1.2 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      .tss-settings-tab:hover { color:#fff; }
+      .tss-settings-tab[aria-selected="true"] { color:var(--tss-a,#aebaf3);border-bottom-color:var(--tss-a,#aebaf3); }
+      .tss-settings-tab:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:2px; }
+      .tss-settings-panels { position:relative;min-height:0;overflow:clip;padding:4px;margin:-4px; }
+      .tss-settings-action { display:flex;align-items:center;justify-content:flex-start;gap:9px;width:100%;min-height:36px;padding:8px 9px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);text-align:left;font:500 11px/1.4 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      .tss-settings-action:hover { background:rgba(255,255,255,.075);color:#fff; }
+      .tss-settings-action svg { width:16px;height:16px;flex-shrink:0; }
+      .tss-settings-action:focus-visible,.tss-settings-row input:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      .tss-settings-row { display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:36px;color:rgba(255,255,255,.8);font-size:11px;cursor:pointer; }
+      #tss-reduce-visual-effects,#tss-scroll-long-titles { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#aebaf3);cursor:pointer; }
+      #tss-visual-effects-help,#tss-scroll-long-titles-help { margin:0 0 10px;color:rgba(255,255,255,.7);font-size:10px;line-height:1.5; }
+      #tss-hub-sleep { font-size:11px;padding:6px 8px;max-width:120px; }
+      #tss-hub-sleep-display { display:block;color:var(--tss-a,#aebaf3);font-size:10px;text-align:right;font-variant-numeric:tabular-nums; }
       #tss-hub-sleep-display:empty { display:none; }
-      #tss-hub-sleep { border-radius:7px;padding:5px 7px;font-size:9px; }
-      #tss-hub-start { min-height:44px;border-radius:10px;text-transform:uppercase;letter-spacing:0.08em;font-size:10px; }
-      #tss-hub-start[data-active="true"]:hover { color:rgba(255,255,255,0.78);border-color:rgba(255,255,255,0.16); }
-      .tss-deck-utilities label { color:rgba(255,255,255,0.4) !important;font-size:9px !important; }
+      #tss-settings-session-action { margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,.09); }
+      #tss-hub-start { min-height:42px;border-radius:9px;letter-spacing:0;font-size:11px; }
+      #tss-hub-start[data-active="true"]:hover { color:rgba(255,255,255,.9);border-color:rgba(255,255,255,.25); }
+      #tss-hub[data-mini="true"][data-view="main"] .tss-deck-track,
+      #tss-hub[data-mini="true"][data-view="main"] .tss-deck-timeline,
+      #tss-hub[data-mini="true"][data-view="main"] .tss-master-volume { display:none; }
+      #tss-hub[data-mini="true"] .tss-deck-controls { padding:3px 14px 12px;gap:18px; }
+      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-lg { width:42px;height:42px; }
+      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-sm { width:34px;height:34px; }
+      #tss-hub[data-mini="true"] .tss-main-queue { padding-bottom:10px; }
+      #tss-hub[data-queue-view="true"] #tss-hub-main-view,
+      #tss-hub[data-queue-view="true"] #tss-hub-settings-view { display:none !important; }
+      #tss-hub-queue-space { height:min(420px,calc(100dvh - 180px)); }
+      #tss-hub,#tss-sidebar { max-width:calc(100vw - 24px); }
+      #tss-hub::selection,#tss-hub ::selection,#tss-sidebar ::selection { background:rgba(174,186,243,.3);color:#fff; }
+      #tss-sidebar [tabindex]:focus-visible,#tss-sidebar button:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:-2px; }
+      #tss-sidebar[data-layout="narrow"] { z-index:99997;border-radius:0 0 17px 17px !important;box-shadow:none;border-top:0; }
+      #tss-sidebar[data-layout="narrow"] .tss-sidebar-resize,
+      #tss-sidebar[data-layout="narrow"] .tss-sidebar-height-resize { display:none; }
+      #tss-sidebar[data-layout="narrow"] #tss-sidebar-content { overflow-y:auto; }
+      #tss-sidebar[data-layout="narrow"] #tss-sidebar-list { flex:1 0 100px; }
 
-      .tss-side-head { padding:14px 14px 11px;border-bottom:1px solid var(--tss-line);flex-shrink:0; }
-      #tss-sidebar > div:first-child {
-        padding:14px 14px 11px !important;border-bottom:1px solid rgba(255,255,255,.08) !important;
-        background:linear-gradient(180deg,rgba(255,255,255,.025),transparent) !important;
-      }
-      .tss-side-titlebar { display:flex;align-items:center;gap:8px;margin-bottom:9px; }
-      .tss-side-title { color:rgba(255,255,255,0.9);font-size:11px;font-weight:780;letter-spacing:.13em;text-transform:uppercase; }
+      .tss-side-head { padding:10px 12px 8px;border-bottom:1px solid var(--tss-line);flex-shrink:0; }
+      .tss-side-titlebar { display:flex;align-items:center;gap:6px;margin-bottom:6px; }
+      .tss-side-title { color:rgba(255,255,255,0.94);font-size:13px;font-weight:650;letter-spacing:-.01em; }
       .tss-side-action {
         display:flex;align-items:center;justify-content:center;gap:7px;min-height:34px;padding:0 11px;
-        border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.035);
-        color:rgba(255,255,255,.52);cursor:pointer;font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+        border:1px solid rgba(204,218,255,.10);border-radius:8px;background:var(--tss-glass-inset);
+        color:rgba(255,255,255,.74);cursor:pointer;font-size:10px;font-weight:600;letter-spacing:.02em;
         transition:color .18s,border-color .18s,background .18s;
       }
       .tss-side-action:hover { color:#fff;border-color:rgba(255,255,255,.2);background:rgba(255,255,255,.07); }
@@ -9012,26 +10252,26 @@ function mkHub() {
         font:700 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.1em;text-transform:uppercase;
         border-bottom:2px solid transparent;transition:color .18s,border-color .18s;
       }
-      .tss-side-tab[data-active="true"] { color:var(--tss-a,#ff5500);border-bottom-color:var(--tss-a,#ff5500); }
+      .tss-side-tab[data-active="true"] { color:var(--tss-a,#aebaf3);border-bottom-color:var(--tss-a,#aebaf3); }
       #tss-tab-queue,#tss-tab-history {
         background:transparent !important;border:0 !important;border-radius:0 !important;
-        padding:5px 0 10px !important;color:rgba(255,255,255,.3) !important;
-        font-size:9px !important;font-weight:750 !important;letter-spacing:.09em;text-transform:uppercase;
+        padding:5px 0 10px !important;color:rgba(255,255,255,.7) !important;
+        font-size:11px !important;font-weight:600 !important;letter-spacing:.02em;
         border-bottom:2px solid transparent !important;
       }
       #tss-tab-queue[data-active="true"],#tss-tab-history[data-active="true"] {
-        color:var(--tss-a,#ff5500) !important;border-bottom-color:var(--tss-a,#ff5500) !important;
+        color:var(--tss-a,#aebaf3) !important;border-bottom-color:var(--tss-a,#aebaf3) !important;
       }
       #tss-merge-btn {
-        color:rgba(255,255,255,.45) !important;display:flex !important;align-items:center;justify-content:center;
+        color:rgba(255,255,255,.74) !important;display:flex !important;align-items:center;justify-content:center;
         min-height:30px;padding:0 9px !important;border:1px solid rgba(255,255,255,.09);border-radius:8px !important;
         background:rgba(255,255,255,.025) !important;cursor:pointer;transition:color .18s,border-color .18s,background .18s;
       }
       #tss-merge-btn:hover { color:#fff !important;border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.065) !important; }
       .tss-side-searchwrap { position:relative;margin-top:13px; }
-      .tss-side-searchicon { position:absolute;left:11px;top:50%;transform:translateY(-50%);color:rgba(255,255,255,.28);pointer-events:none;display:flex; }
-      #tss-search { width:100% !important;box-sizing:border-box !important;background:rgba(255,255,255,.025) !important;border:1px solid rgba(255,255,255,.09) !important;border-radius:9px !important;color:#dedede !important;font-size:11px !important;padding:9px 11px !important;outline:none !important;font-family:-apple-system,'Segoe UI',system-ui,sans-serif !important;transition:border-color .18s,background .18s !important; }
-      #tss-search:focus { border-color:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.55);background:rgba(255,255,255,.04); }
+      .tss-side-searchicon { position:absolute;left:11px;top:50%;transform:translateY(-50%);color:rgba(255,255,255,.65);pointer-events:none;display:flex; }
+      #tss-search { width:100% !important;box-sizing:border-box !important;background:var(--tss-glass-inset) !important;border:1px solid rgba(204,218,255,.10) !important;border-radius:9px !important;color:#dedede !important;font-size:11px !important;padding:9px 11px !important;outline:none !important;font-family:-apple-system,'Segoe UI',system-ui,sans-serif !important;transition:border-color .18s,background .18s !important; }
+      #tss-search:focus { border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.75) !important;background:rgba(255,255,255,.06) !important;outline:2px solid #d9dfe7 !important;outline-offset:2px; }
       .tss-queue-row { border-bottom:1px solid rgba(255,255,255,.055); }
       .tss-queue-handle { color:rgba(255,255,255,.18);font-size:14px;letter-spacing:-2px;width:10px;overflow:hidden;flex-shrink:0; }
       .tss-queue-status { border-radius:5px;padding:3px 7px;font-size:8px;font-weight:750;letter-spacing:.07em;text-transform:uppercase;flex-shrink:0; }
@@ -9039,12 +10279,11 @@ function mkHub() {
       #tss-sidebar[data-side="right"] { border-radius:0 16px 16px 0 !important; }
       #tss-hub[data-sidebar-side="right"] { border-radius:18px 0 0 18px !important; }
       #tss-hub[data-sidebar-side="left"] { border-radius:0 18px 18px 0 !important; }
-      #tss-hub[data-sidebar-side="right"] #tss-hub-bg { border-radius:18px 0 0 18px; }
-      #tss-hub[data-sidebar-side="left"] #tss-hub-bg { border-radius:0 18px 18px 0; }
-      #tss-sidebar[data-open="false"] { opacity:0;pointer-events:none;transform:translateX(-8px); }
-      #tss-sidebar[data-open="true"] { opacity:1;pointer-events:auto;transform:translateX(0); }
-      #tss-sidebar { box-sizing:border-box; }
-      #tss-sidebar-list { min-height:0; }
+      #tss-sidebar[data-open="false"] { pointer-events:none; }
+      /* Docked glass unfolds behind the player; the narrow replacement stays above it. */
+      #tss-sidebar { box-sizing:border-box;z-index:99993; }
+      #tss-sidebar-content { position:relative;display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden; }
+      #tss-sidebar-list { flex:1;min-height:0; }
       .tss-sidebar-resize {
         position:absolute;top:0;bottom:0;width:10px;padding:0;border:0;background:transparent;
         cursor:ew-resize;z-index:5;outline:none;
@@ -9056,7 +10295,7 @@ function mkHub() {
         background:rgba(255,255,255,.11);transform:translate(-50%,-50%);transition:height .18s,background .18s;
       }
       .tss-sidebar-resize:hover::after,.tss-sidebar-resize[data-dragging="true"]::after {
-        height:54px;background:var(--tss-a,#ff5500);
+        height:54px;background:var(--tss-a,#aebaf3);
       }
       .tss-sidebar-height-resize {
         position:absolute;left:50%;top:-1px;width:76px;height:10px;padding:0;border:0;background:transparent;
@@ -9067,81 +10306,80 @@ function mkHub() {
         background:rgba(255,255,255,.11);transform:translate(-50%,-50%);transition:width .18s,background .18s;
       }
       .tss-sidebar-height-resize:hover::after,.tss-sidebar-height-resize[data-dragging="true"]::after {
-        width:54px;background:var(--tss-a,#ff5500);
+        width:54px;background:var(--tss-a,#aebaf3);
       }
 
-      #tss-hub-eq[data-active="true"] { color:#fff !important;border-color:#ff7a33 !important;background:#e84d00 !important;box-shadow:0 0 9px rgba(255,85,0,.3); }
-      #tss-modal-backdrop { position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.42);-webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);animation:tss-backdrop-in .18s ease-out; }
+      #tss-hub-eq[data-active="true"] { color:#fff !important;border-color:var(--tss-a,#aebaf3) !important;background:rgba(174,186,243,.12) !important; }
+      #tss-modal-backdrop { position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.04);animation:tss-backdrop-in .18s ease-out; }
       @keyframes tss-backdrop-in { from { opacity:0; } to { opacity:1; } }
       #tss-eq-overlay {
         position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;
         width:560px;max-width:calc(100vw - 28px);box-sizing:border-box;color:#eee;
-        background:rgba(9,9,9,.99);border:1px solid rgba(255,255,255,.12);border-radius:18px;
-        box-shadow:0 30px 90px rgba(0,0,0,.82),0 0 0 1px rgba(255,85,0,.035);
+        max-height:calc(100dvh - 28px);overflow-y:auto;
+        background:var(--tss-glass-surface,#080b12);border:1px solid var(--tss-glass-rim);border-radius:16px;
+        box-shadow:var(--tss-glass-shadow);
         font-family:-apple-system,'Segoe UI',system-ui,sans-serif;-webkit-user-select:none;user-select:none;
-        -webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);
-        animation:tss-eq-in .18s cubic-bezier(.2,.8,.2,1);
+        -webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);
       }
-      @keyframes tss-eq-in { from { opacity:0;transform:translate(-50%,-48%) scale(.985); } to { opacity:1;transform:translate(-50%,-50%) scale(1); } }
       .tss-eq-head { display:flex;align-items:center;justify-content:space-between;padding:17px 18px 14px;border-bottom:1px solid rgba(255,255,255,.075); }
-      .tss-eq-kicker { color:#ff6a1f;font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
+      .tss-eq-kicker { color:var(--tss-a,#aebaf3);font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
       .tss-eq-title { margin-top:4px;color:#f3f3f3;font-size:17px;font-weight:680;letter-spacing:-.02em; }
       .tss-eq-head-actions { display:flex;align-items:center;gap:7px; }
-      #tss-eq-power { height:32px;padding:0 10px;border:1px solid #555;border-radius:8px;background:#171717;color:#c8c8c8;cursor:pointer;font:750 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.08em;transition:all .18s; }
-      #tss-eq-power[data-active="true"] { color:#fff;border-color:#ff7a33;background:#e84d00;box-shadow:0 0 9px rgba(255,85,0,.3); }
-      #tss-eq-power:focus-visible,.tss-eq-preset:focus-visible,.tss-eq-point-hit:focus-visible,#tss-eq-reset:focus-visible { outline:2px solid #ff6a1f;outline-offset:2px; }
+      #tss-eq-power { height:32px;padding:0 10px;border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.04);color:#c8cdd4;cursor:pointer;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-power[data-active="true"] { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
+      #tss-eq-power:focus-visible,.tss-eq-preset:focus-visible,.tss-eq-point-hit:focus-visible,#tss-eq-reset:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
       .tss-eq-body { position:relative;padding:15px 18px 16px; }
       .tss-eq-presets { display:flex;gap:7px;overflow-x:auto;padding:1px 1px 12px;scrollbar-width:none; }
       .tss-eq-presets::-webkit-scrollbar { display:none; }
-      .tss-eq-preset { flex:0 0 auto;height:30px;padding:0 11px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.035);color:rgba(255,255,255,.56);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
+      .tss-eq-preset { flex:0 0 auto;height:30px;padding:0 11px;border:1px solid rgba(204,218,255,.12);border-radius:8px;background:var(--tss-glass-inset);color:rgba(255,255,255,.75);cursor:pointer;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
       .tss-eq-preset:hover { color:#fff;border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.07); }
-      .tss-eq-preset[data-active="true"] { color:#fff;border-color:rgba(255,106,31,.7);background:rgba(255,85,0,.18); }
+      .tss-eq-preset[data-active="true"] { color:#fff;border-color:rgba(174,186,243,.7);background:rgba(174,186,243,.12); }
       .tss-eq-custom-preset { display:inline-flex;flex:0 0 auto; }
       .tss-eq-custom-preset .tss-eq-preset { border-radius:8px 0 0 8px;border-right:0; }
       .tss-eq-preset-remove { width:25px;height:30px;padding:0;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.1);border-radius:0 8px 8px 0;background:rgba(255,255,255,.035);color:rgba(255,255,255,.3);cursor:pointer;transition:color .18s,border-color .18s,background .18s; }
-      .tss-eq-preset-remove:hover { color:#ff8050;border-color:rgba(255,128,80,.4);background:rgba(255,85,0,.1); }
+      .tss-eq-preset-remove:hover { color:#ff9292;border-color:rgba(255,74,74,.4);background:rgba(255,74,74,.1); }
       #tss-eq-save-open { flex:0 0 auto;height:30px;padding:0 11px;border:1px dashed rgba(255,255,255,.2);border-radius:8px;background:transparent;color:rgba(255,255,255,.48);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
-      #tss-eq-save-open:hover { color:#fff;border-color:#ff6a1f;background:rgba(255,85,0,.08); }
-      #tss-eq-save-row { display:none;grid-template-columns:minmax(0,1fr) auto 30px;align-items:end;gap:7px;margin:-2px 1px 12px;padding:10px;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:rgba(255,255,255,.025); }
+      #tss-eq-save-open:hover { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.08); }
+      #tss-eq-save-row { display:none;grid-template-columns:minmax(0,1fr) auto 30px;align-items:end;gap:7px;margin:-2px 1px 12px;padding:10px;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:var(--tss-glass-inset); }
       #tss-eq-save-row[data-open="true"] { display:grid; }
       .tss-eq-save-field { display:grid;gap:5px;min-width:0; }
-      .tss-eq-save-field span { color:rgba(255,255,255,.38);font-size:8px;font-weight:700;letter-spacing:.08em;text-transform:uppercase; }
-      #tss-eq-save-name { width:100%;height:31px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:#111;color:#eee;outline:none;font:500 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
-      #tss-eq-save-name:focus { border-color:#ff6a1f;box-shadow:0 0 0 2px rgba(255,85,0,.12); }
+      .tss-eq-save-field span { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;letter-spacing:.02em; }
+      #tss-eq-save-name { width:100%;height:31px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:rgba(0,0,0,.08);color:#eee;outline:none;font:500 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-eq-save-name:focus { border-color:var(--tss-a,#aebaf3);box-shadow:0 0 0 2px rgba(174,186,243,.12); }
       #tss-eq-save-confirm,#tss-eq-save-cancel { height:31px;border:1px solid rgba(255,255,255,.13);border-radius:7px;cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
-      #tss-eq-save-confirm { padding:0 12px;background:#e84d00;border-color:#ff7130;color:#fff; }
-      #tss-eq-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:#171717;color:rgba(255,255,255,.5); }
+      #tss-eq-save-confirm { padding:0 12px;background:var(--tss-a,#aebaf3);border-color:var(--tss-a,#aebaf3);color:#101522; }
+      #tss-eq-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.045);color:rgba(255,255,255,.5); }
       #tss-eq-save-error { grid-column:1/-1;min-height:0;color:#ff805f;font-size:8px; }
-      .tss-eq-graph-wrap { border-top:1px solid rgba(255,255,255,.055);border-bottom:1px solid rgba(255,255,255,.055);padding:4px 0 1px; }
+      .tss-eq-graph-wrap { border-top:1px solid rgba(255,255,255,.055);border-bottom:1px solid rgba(255,255,255,.055);padding:4px 0 1px;background:var(--tss-glass-inset); }
       .tss-eq-safety { display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px 2px 0;color:#ddd;cursor:pointer; }
       .tss-eq-safety span { display:grid;gap:3px; }
       .tss-eq-safety strong { font-size:10px;font-weight:750; }
-      .tss-eq-safety small { color:rgba(255,255,255,.38);font-size:8px;line-height:1.35; }
-      .tss-eq-safety input { width:15px;height:15px;flex:0 0 auto;accent-color:var(--tss-a,#ff5500); }
+      .tss-eq-safety small { color:rgba(255,255,255,.72);font-size:10px;line-height:1.45; }
+      .tss-eq-safety input { width:15px;height:15px;flex:0 0 auto;accent-color:var(--tss-a,#aebaf3); }
       .tss-eq-graph { display:block;width:100%;height:auto;overflow:visible;touch-action:none; }
       .tss-eq-grid line { stroke:rgba(255,255,255,.105);stroke-width:1;stroke-dasharray:3 4; }
       .tss-eq-grid .tss-eq-zero { stroke:rgba(255,255,255,.28);stroke-dasharray:none; }
-      .tss-eq-point-visible { fill:#ff5b0a;stroke:#fff;stroke-width:2.5;filter:drop-shadow(0 2px 4px rgba(0,0,0,.8));pointer-events:none; }
+      .tss-eq-point-visible { fill:var(--tss-a,#aebaf3);stroke:#fff;stroke-width:2.5;filter:drop-shadow(0 2px 4px rgba(0,0,0,.8));pointer-events:none; }
       .tss-eq-point-hit { fill:transparent;stroke:transparent;cursor:ns-resize;pointer-events:all;touch-action:none; }
       .tss-eq-point-visible:has(+ .tss-eq-point-hit:hover),.tss-eq-point-visible:has(+ .tss-eq-point-hit:focus-visible) { fill:#fff; }
       .tss-eq-point-value { fill:rgba(255,255,255,.72);font-size:9px;font-weight:750;font-variant-numeric:tabular-nums;pointer-events:none; }
-      .tss-eq-frequency { fill:rgba(255,255,255,.48);font-size:10px;font-weight:700;pointer-events:none; }
-      .tss-eq-axis-label { fill:rgba(255,255,255,.3);font-size:8px;font-weight:700;pointer-events:none; }
-      .tss-eq-footer { display:flex;align-items:center;justify-content:space-between;margin-top:11px;color:rgba(255,255,255,.3);font-size:8px;font-weight:700;letter-spacing:.07em;text-transform:uppercase; }
+      .tss-eq-frequency { fill:rgba(255,255,255,.74);font-size:10px;font-weight:600;pointer-events:none; }
+      .tss-eq-axis-label { fill:rgba(255,255,255,.7);font-size:9px;font-weight:600;pointer-events:none; }
+      .tss-eq-footer { display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:11px;color:rgba(255,255,255,.72);font-size:10px;font-weight:500;letter-spacing:.01em; }
       #tss-eq-reset { height:30px;padding:0 13px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:transparent;color:rgba(255,255,255,.68);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
       #tss-eq-reset:hover { color:#fff;border-color:rgba(255,255,255,.34);background:rgba(255,255,255,.055); }
       @media (max-width:520px) { #tss-eq-overlay { width:calc(100vw - 20px); } .tss-eq-body { padding-inline:10px; } .tss-eq-head { padding-inline:12px; } .tss-eq-preset { padding-inline:9px; } }
 
       #tss-stats-overlay {
-        color:#eeeeee;background:rgba(10,10,10,.985) !important;
-        border:1px solid rgba(255,255,255,.09) !important;border-radius:18px !important;
-        box-shadow:0 30px 90px rgba(0,0,0,.78),0 0 0 1px rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.035) !important;
+        color:#eeeeee;background:var(--tss-glass-surface,#080b12) !important;
+        border:1px solid var(--tss-glass-rim) !important;border-radius:16px !important;
+        box-shadow:var(--tss-glass-shadow) !important;
       }
       .tss-stats-head {
         display:flex;align-items:center;justify-content:space-between;padding:14px 15px 12px;
         border-bottom:1px solid rgba(255,255,255,.07);cursor:move;
       }
-      .tss-stats-kicker { color:var(--tss-a,#ff5500);font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
+      .tss-stats-kicker { color:var(--tss-a,#aebaf3);font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
       .tss-stats-title { margin-top:3px;color:#f1f1f1;font-size:14px;font-weight:680;letter-spacing:-.01em; }
       .tss-stats-close {
         width:32px;height:32px;border:1px solid rgba(255,255,255,.08);border-radius:8px;
@@ -9149,25 +10387,38 @@ function mkHub() {
         color:rgba(255,255,255,.38);cursor:pointer;transition:color .18s,border-color .18s,background .18s;
       }
       .tss-stats-close:hover { color:#fff;border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.06); }
-      .tss-stats-close:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px; }
+      .tss-stats-close:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
       .tss-stats-body { padding:15px; }
       .tss-stats-metrics { display:grid;grid-template-columns:1fr 1px 1fr;align-items:end;gap:15px;padding:2px 2px 14px; }
       .tss-stats-divider { width:1px;height:42px;background:rgba(255,255,255,.08);align-self:center; }
       .tss-stats-value { color:#f3f3f3;font-size:25px;font-weight:680;letter-spacing:-.035em;line-height:1;font-variant-numeric:tabular-nums; }
-      .tss-stats-label { margin-top:7px;color:rgba(255,255,255,.34);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase; }
+      .tss-stats-label { margin-top:7px;color:rgba(255,255,255,.72);font-size:10px;font-weight:600;letter-spacing:.02em; }
       .tss-stats-lifetime { display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-top:1px solid rgba(255,255,255,.065);border-bottom:1px solid rgba(255,255,255,.065); }
-      .tss-stats-lifetime-label,.tss-stats-section-label { color:rgba(255,255,255,.34);font-size:8px;font-weight:720;letter-spacing:.1em;text-transform:uppercase; }
-      #tss-stats-lifetime { color:rgba(255,255,255,.54);font-size:10px;font-variant-numeric:tabular-nums; }
+      .tss-stats-lifetime-label,.tss-stats-section-label { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;letter-spacing:.02em; }
+      #tss-stats-lifetime { color:rgba(255,255,255,.78);font-size:11px;font-variant-numeric:tabular-nums; }
       .tss-stats-section { display:flex;align-items:center;justify-content:space-between;padding:13px 0 6px; }
       .tss-stat-track { display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05); }
       .tss-stat-priority { min-width:52px;border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:4px 7px;background:rgba(255,255,255,.025);font:700 8px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;cursor:pointer; }
       .tss-stat-priority:hover { background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.15); }
       .tss-stat-track > span:first-child { color:rgba(255,255,255,.7) !important;font-size:10.5px !important;font-weight:560; }
-      .tss-stat-track > span:nth-child(2) { color:var(--tss-a,#ff5500) !important;font-size:10px !important;font-weight:700; }
-      .tss-stats-empty { padding:18px 0;color:rgba(255,255,255,.25);font-size:10px;text-align:center; }
-      .tss-stats-reset { width:100%;margin-top:15px;border:0;background:transparent;color:rgba(255,255,255,.26);padding:7px;cursor:pointer;font-size:9px;font-family:-apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s; }
+      .tss-stat-track > span:nth-child(2) { color:var(--tss-a,#aebaf3) !important;font-size:10px !important;font-weight:700; }
+      .tss-stats-empty { padding:18px 0;color:rgba(255,255,255,.7);font-size:11px;text-align:center; }
+      .tss-stats-reset { width:100%;margin-top:15px;border:0;background:transparent;color:rgba(255,255,255,.7);padding:7px;cursor:pointer;font-size:10px;font-family:-apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s; }
       .tss-stats-reset:hover { color:rgba(255,255,255,.62); }
-      .tss-stats-reset:focus-visible { outline:2px solid var(--tss-a,#ff5500);outline-offset:2px;border-radius:6px; }
+      .tss-stats-reset:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;border-radius:6px; }
+      #tss-sidebar button:focus-visible,#tss-eq-overlay button:focus-visible,#tss-stats-overlay button:focus-visible,.tss-debug-dialog button:focus-visible {
+        outline:2px solid #d9dfe7;outline-offset:2px;
+      }
+      #tss-hub button:disabled,#tss-sidebar button:disabled,#tss-eq-overlay button:disabled { opacity:.5;cursor:not-allowed; }
+      #tss-search::placeholder,#tss-eq-save-name::placeholder { color:#aeb5bf;opacity:1; }
+      #tss-hub ::selection,#tss-sidebar ::selection,#tss-eq-overlay ::selection { background:rgba(174,186,243,.3);color:#fff; }
+      #tss-sidebar-list { scrollbar-color:#555b64 transparent; }
+      @media (max-width:360px) {
+        #tss-hub-hdr { gap:6px;padding-left:10px;padding-right:10px; }
+        .tss-deck-brandmark { display:none; }
+        .tss-deck-label { font-size:10px; }
+        .tss-eq-footer { flex-wrap:wrap; }
+      }
       @media (prefers-reduced-motion:reduce) {
         #tss-hub *,#tss-sidebar * { animation-duration:0.01ms !important;transition-duration:0.01ms !important;scroll-behavior:auto !important; }
       }
@@ -9179,149 +10430,113 @@ function mkHub() {
   hub.id = 'tss-hub';
   hub.style.cssText = `
     position:fixed; bottom:80px; left:20px; width:min(330px,calc(100vw - 24px));
-    background:rgba(9,9,9,0.985); border:1px solid rgba(195,176,142,0.18);
+    background:var(--tss-glass-surface,#080b12); border:1px solid var(--tss-glass-rim,rgba(183,199,232,.12));
     border-radius:18px; z-index:99994;
     overflow:hidden; -webkit-user-select:none; user-select:none;
-    box-shadow:0 30px 82px rgba(0,0,0,0.84), 0 0 0 1px rgba(255,255,255,0.02);
-    -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px);
+    box-shadow:var(--tss-glass-shadow);
+    -webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);
     font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
   `;
 
   const waveform = DEFAULT_WAVE_HEIGHTS.map(height => `<i style="--h:${height}%" data-played="false"></i>`).join('');
 
+  hub.dataset.view = 'main';
+  hub.dataset.mini = 'false';
+  hub.dataset.settingsTab = 'audio';
   hub.innerHTML = `
-    <div id="tss-hub-bg">
-      <div id="tss-hub-bgimg"></div>
-      <div id="tss-hub-bgmask"></div>
-    </div>
-
     <div id="tss-hub-inner">
-
-      <div id="tss-hub-hdr" style="cursor:move; padding:11px 13px 8px; display:flex; align-items:center; justify-content:space-between;">
-        <div class="tss-deck-brand">
-          <button id="tss-hub-reshuffle" class="tss-hub-btn tss-deck-brandmark" data-loading="false" aria-label="Re-shuffle current playlist" title="Re-shuffle upcoming tracks">${SVG.shuffle}</button>
-          <span class="tss-deck-label">True Shuffle</span>
-        </div>
-        <div style="display:flex; gap:3px; align-items:center;">
-          <button id="tss-playback-debug" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Playback issue: open report" title="Playback issue: open report" hidden><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6.75"/><circle cx="8" cy="12.5" r="1" fill="currentColor" stroke="none"/></svg></button>
-          <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP" style="display:none;">${SVG.pip}</button>
-          <button id="tss-hub-eq" class="tss-hub-btn tss-hub-btn-icon" data-active="false" aria-label="Equalizer" aria-pressed="false" title="Equalizer off">${SVG.equalizer}</button>
-          <button id="tss-hub-stats" class="tss-hub-btn tss-hub-btn-icon" aria-label="Session stats" title="session stats">${SVG.chart}</button>
-          <button id="tss-hub-qico"  class="tss-hub-btn tss-hub-btn-icon" data-open="false" aria-label="Queue panel" title="queue panel">${SVG.list}</button>
-          <button id="tss-hub-col"   class="tss-hub-btn tss-hub-btn-icon" title="collapse" style="font-size:15px; line-height:1; padding:3px 6px;">−</button>
+      <div id="tss-hub-hdr">
+        <div class="tss-deck-brand"><span class="tss-deck-brandmark" aria-hidden="true">${SVG.shuffle}</span><span class="tss-deck-label">True Shuffle</span></div>
+        <div class="tss-hub-navigation">
+          <button id="tss-playback-debug" class="tss-hub-btn tss-hub-btn-icon" type="button" hidden aria-label="Playback issue: open report" title="Playback issue: open report"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6.75"/><circle cx="8" cy="12.5" r="1" fill="currentColor" stroke="none"/></svg></button>
+          <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" type="button" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP">${SVG.pip}</button>
+          <button id="tss-hub-col" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Minimize player" aria-expanded="true" title="Minimize player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
+          <button id="tss-hub-settings" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-controls="tss-hub-settings-view" aria-expanded="false" aria-label="Settings" title="Settings"><span class="tss-settings-gear-icon">${SVG.gear}</span><span class="tss-settings-back-icon">${SVG.back}</span></button>
         </div>
       </div>
-
       <div id="tss-hub-body">
-
-        <div id="tss-hub-active-view" style="display:none;">
-
-          <div class="tss-deck-track">
-            <div id="tss-hub-art" style="
-              width:76px; height:76px; border-radius:14px; flex-shrink:0;
-              background:#1a1a1a; overflow:hidden;
-              display:flex; align-items:center; justify-content:center;
-              box-shadow:0 14px 34px rgba(0,0,0,0.56), 0 0 0 1px rgba(255,255,255,0.08);
-            ">${SVG.note}</div>
-            <div style="min-width:0; flex:1;">
-              <div id="tss-hub-title"  style="color:#fff; font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.3;">—</div>
-              <div id="tss-hub-artist" style="color:rgba(255,255,255,0.38); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:3px; line-height:1.3;">—</div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; gap:6px;">
-                <span id="tss-hub-qpos"   style="color:rgba(255,255,255,0.18); font-size:10px; flex-shrink:0;">—</span>
-                <span id="tss-hub-nextup" style="color:rgba(255,255,255,0.18); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:right; min-width:0;">—</span>
+        <div id="tss-hub-main-view">
+          <div id="tss-hub-active-view" style="display:none;">
+            <div class="tss-deck-track">
+              <div id="tss-hub-art">${SVG.note}</div>
+              <div class="tss-deck-track-copy">
+                <div id="tss-hub-title">—</div>
+                <div id="tss-hub-artist">—</div>
               </div>
             </div>
-          </div>
-
-          <div class="tss-deck-timeline">
-          <div id="tss-hub-seekbar" title="seek" style="
-            height:3px;
-            background:rgba(255,255,255,0.09); border-radius:2px;
-            cursor:pointer; position:relative;
-          ">
-            <div id="tss-wave-bars" class="tss-wave-bars" aria-hidden="true">${waveform}</div>
-            <div id="tss-hub-prog" style="width:0%;"></div>
-          </div>
-          <div class="tss-deck-times">
-            <span id="tss-hub-time-current">0:00</span>
-            <span id="tss-hub-time-remaining">-0:00</span>
-          </div>
-          </div>
-
-          <div class="tss-deck-controls">
-            <button id="tss-hub-prev" class="tss-hub-btn tss-hub-btn-sm" aria-label="Previous track">${SVG.prev}</button>
-            <button id="tss-hub-play" class="tss-hub-btn tss-hub-btn-lg" aria-label="Play or pause">${SVG.play}</button>
-            <button id="tss-hub-next" class="tss-hub-btn tss-hub-btn-sm" aria-label="Next track">${SVG.next}</button>
-          </div>
-
-          <div class="tss-master-volume">
-            <span aria-hidden="true">${SVG.volume}</span>
-            <input id="tss-hub-volume" type="range" min="0" max="100" step="1" value="10" aria-label="True Shuffle volume">
-            <span id="tss-hub-volume-value" aria-live="polite">10%</span>
-            <button id="tss-auto-level" type="button" aria-pressed="false" title="Automatically reduce louder tracks"><span class="tss-auto-dot" aria-hidden="true"></span><span class="tss-auto-label">AUTO OFF</span></button>
-          </div>
-
-          <div class="tss-crossfade-card" id="tss-crossfade-card" data-open="false" data-enabled="false">
-            <button id="tss-crossfade-summary" type="button" aria-expanded="false" aria-controls="tss-crossfade-settings">
-              <span class="tss-crossfade-copy">
-                <span class="tss-crossfade-dot" aria-hidden="true"></span>
-                <span class="tss-crossfade-label">Crossfade</span>
-                <span id="tss-hub-crossfade-status" data-status="off" aria-live="polite">off</span>
-              </span>
-              <span class="tss-crossfade-summary-value">
-                <span id="tss-crossfade-summary-seconds">off</span>
-                <svg id="tss-crossfade-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </span>
-            </button>
-            <div class="tss-crossfade-reveal" id="tss-crossfade-settings">
-              <div class="tss-crossfade-settings">
-                <div class="tss-crossfade-settings-inner">
-                  <div class="tss-crossfade-setting-head"><span>Duration</span><span id="tss-crossfade-seconds">off</span></div>
-                  <input id="tss-hub-crossfade" type="range" min="0" max="12" step="1" value="0" aria-label="Crossfade duration in seconds">
-                  <div class="tss-crossfade-ticks" aria-hidden="true"><span>off</span><span>3</span><span>6</span><span>9</span><span>12s</span></div>
-                  <div class="tss-crossfade-setting-head"><span>Mix style</span></div>
-                  <div class="tss-crossfade-modes" role="group" aria-label="Crossfade mix style">
-                    <button type="button" class="tss-crossfade-mode" data-curve="smooth" title="Gentle, rounded handoff">Smooth</button>
-                    <button type="button" class="tss-crossfade-mode" data-curve="clean" title="Linear blend with minimal coloration">Clean</button>
-                    <button type="button" class="tss-crossfade-mode" data-curve="dj" title="Faster handoff around the midpoint">DJ</button>
-                  </div>
-                  <label class="tss-crossfade-manual"><span>Fade manual skips</span><input id="tss-crossfade-manual" type="checkbox"></label>
-                </div>
+            <div class="tss-deck-timeline">
+              <div id="tss-hub-seekbar" role="slider" tabindex="0" aria-label="Seek track" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" title="Seek track">
+                <div id="tss-wave-bars" class="tss-wave-bars" aria-hidden="true">${waveform}</div>
+                <div id="tss-hub-prog" style="width:0%;"></div>
               </div>
+              <div class="tss-deck-times"><span id="tss-hub-time-current">0:00</span><span id="tss-hub-time-remaining">-0:00</span></div>
+            </div>
+            <div class="tss-deck-controls">
+              <button id="tss-hub-prev" class="tss-hub-btn tss-hub-btn-sm" type="button" aria-label="Previous track">${SVG.prev}</button>
+              <button id="tss-hub-play" class="tss-hub-btn tss-hub-btn-lg" type="button" aria-label="Play or pause">${SVG.play}</button>
+              <button id="tss-hub-next" class="tss-hub-btn tss-hub-btn-sm" type="button" aria-label="Next track">${SVG.next}</button>
+            </div>
+            <div class="tss-master-volume">
+              <span aria-hidden="true">${SVG.volume}</span>
+              <input id="tss-hub-volume" type="range" min="0" max="100" step="1" value="10" aria-label="True Shuffle volume">
+              <span id="tss-hub-volume-value" aria-live="polite">10%</span>
             </div>
           </div>
-
-        </div>
-
-        <div id="tss-hub-actions" style="padding:0 14px 14px;">
-          <button id="tss-hub-start" data-active="false" data-loading="false">True Shuffle</button>
-          <div class="tss-deck-utilities">
-            <label class="tss-deck-switch">
-              <input id="tss-hub-stop-after" type="checkbox">
-              <span class="tss-deck-switch-track"></span>
-              <span class="tss-deck-switch-label">Stop after this round</span>
-            </label>
-            <label class="tss-deck-sleep">
-              ${SVG.moon}
-              <select id="tss-hub-sleep">
-                <option value="off">sleep: off</option>
-                <option value="t15">15 min</option>
-                <option value="t30">30 min</option>
-                <option value="t60">1 hour</option>
-                <option value="n5">5 tracks</option>
-                <option value="n10">10 tracks</option>
-                <option value="n25">25 tracks</option>
-              </select>
-              <span id="tss-hub-sleep-display" style="font-size:10px; color:var(--tss-a,#ff5500); min-width:24px; text-align:right;"></span>
-            </label>
+          <div class="tss-main-queue">
+            <button id="tss-hub-qico" class="tss-hub-btn tss-hub-text-button" type="button" data-open="false" aria-controls="tss-sidebar" aria-expanded="false">${SVG.list}<span>Queue</span><span id="tss-hub-qpos">—</span></button>
+            <button id="tss-hub-reshuffle" class="tss-hub-btn tss-hub-text-button" type="button" data-loading="false" aria-label="Reshuffle upcoming tracks" title="Reshuffle upcoming tracks">${SVG.shuffle}<span>Reshuffle</span></button>
           </div>
+          <div id="tss-hub-actions"><button id="tss-hub-start" type="button" data-active="false" data-loading="false">Start shuffle</button></div>
         </div>
-
+        <section id="tss-hub-settings-view" aria-labelledby="tss-settings-title" hidden>
+          <h2 id="tss-settings-title" tabindex="-1">Settings</h2>
+          <div class="tss-settings-tabs" role="tablist" aria-label="Settings">
+            <button id="tss-settings-tab-audio" class="tss-settings-tab" type="button" role="tab" aria-selected="true" aria-controls="tss-settings-panel-audio">${SVG.equalizer}<span>Audio</span></button>
+            <button id="tss-settings-tab-session" class="tss-settings-tab" type="button" role="tab" aria-selected="false" aria-controls="tss-settings-panel-session" tabindex="-1">${SVG.timer}<span>Session</span></button>
+            <button id="tss-settings-tab-info" class="tss-settings-tab" type="button" role="tab" aria-selected="false" aria-controls="tss-settings-panel-info" tabindex="-1">${SVG.info}<span>Info</span></button>
+          </div>
+          <div class="tss-settings-panels">
+          <section id="tss-settings-panel-audio" class="tss-settings-panel" role="tabpanel" aria-labelledby="tss-settings-tab-audio">
+            <div class="tss-crossfade-card" id="tss-crossfade-card" data-enabled="false">
+              <div class="tss-crossfade-heading"><span>Crossfade</span><span id="tss-hub-crossfade-status" data-status="off" aria-live="polite">off</span></div>
+              <div class="tss-crossfade-setting-head"><label for="tss-hub-crossfade">Duration</label><span id="tss-crossfade-seconds">off</span></div>
+              <input id="tss-hub-crossfade" type="range" min="0" max="12" step="1" value="0" aria-label="Crossfade duration in seconds">
+              <div class="tss-crossfade-ticks" aria-hidden="true"><span>off</span><span>3</span><span>6</span><span>9</span><span>12s</span></div>
+              <div class="tss-crossfade-setting-head">Profile</div>
+              <div class="tss-crossfade-modes" role="group" aria-label="Crossfade profile">
+                <button type="button" class="tss-crossfade-mode" data-curve="smooth" title="Gentle, rounded handoff">Smooth</button>
+                <button type="button" class="tss-crossfade-mode" data-curve="clean" title="Linear blend with minimal coloration">Clean</button>
+                <button type="button" class="tss-crossfade-mode" data-curve="dj" title="Faster handoff around the midpoint">DJ</button>
+              </div>
+              <label class="tss-crossfade-manual"><span>Fade manual skips</span><input id="tss-crossfade-manual" type="checkbox"></label>
+            </div>
+            <button id="tss-auto-level" class="tss-settings-action" type="button" aria-label="Auto Level" aria-pressed="false" title="Automatically reduce louder tracks"><span>Auto Level</span><span class="tss-auto-label">Off</span></button>
+            <button id="tss-hub-eq" class="tss-hub-btn tss-settings-action" type="button" data-active="false" aria-label="Open equalizer" aria-pressed="false" title="Open equalizer">${SVG.equalizer}<span>Open equalizer</span></button>
+          </section>
+          <section id="tss-settings-panel-session" class="tss-settings-panel" role="tabpanel" aria-labelledby="tss-settings-tab-session" hidden>
+            <label class="tss-settings-row" for="tss-hub-sleep"><span>Sleep timer</span><select id="tss-hub-sleep"><option value="off">Off</option><option value="t15">15 min</option><option value="t30">30 min</option><option value="t60">1 hour</option><option value="n5">5 tracks</option><option value="n10">10 tracks</option><option value="n25">25 tracks</option></select></label>
+            <span id="tss-hub-sleep-display" aria-live="polite"></span>
+            <label class="tss-settings-row" for="tss-hub-stop-after"><span>Stop after this round</span><input id="tss-hub-stop-after" type="checkbox"></label>
+            <div id="tss-settings-session-action"></div>
+          </section>
+          <section id="tss-settings-panel-info" class="tss-settings-panel" role="tabpanel" aria-labelledby="tss-settings-tab-info" hidden>
+            <label class="tss-settings-row" for="tss-reduce-visual-effects"><span>Reduce visual effects</span><input id="tss-reduce-visual-effects" type="checkbox" aria-describedby="tss-visual-effects-help"></label>
+            <p id="tss-visual-effects-help">Less blur and motion. Audio is unchanged.</p>
+            <label class="tss-settings-row" for="tss-scroll-long-titles"><span>Scroll long titles</span><input id="tss-scroll-long-titles" type="checkbox" aria-describedby="tss-scroll-long-titles-help"></label>
+            <p id="tss-scroll-long-titles-help">Scroll overflowing PiP titles independently of reduced visual effects. Respects your system’s reduced-motion preference.</p>
+            <button id="tss-hub-stats" class="tss-hub-btn tss-settings-action" type="button" aria-label="Listening stats">${SVG.chart}<span>Listening stats</span></button>
+          </section>
+          </div>
+        </section>
+        <div id="tss-hub-queue-space" hidden></div>
       </div>
     </div>
   `;
 
   document.body.appendChild(hub);
+  applyVisualEffects(document);
+  document.getElementById('tss-reduce-visual-effects').onchange = event => setReducedVisualEffects(event.currentTarget.checked);
+  document.getElementById('tss-scroll-long-titles').onchange = event => setScrollLongTitles(event.currentTarget.checked);
 
   document.getElementById('tss-hub-play').onclick  = toggle;
   document.getElementById('tss-hub-prev').onclick  = () => prevTrack();
@@ -9342,8 +10557,17 @@ function mkHub() {
     const r = e.currentTarget.getBoundingClientRect();
     seekTo((e.clientX - r.left) / r.width);
   };
+  document.getElementById('tss-hub-seekbar').onkeydown = e => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const timing = playbackTiming();
+    if (!timing.duration) return;
+    const target = e.key === 'Home' ? 0 : e.key === 'End' ? 1
+      : (timing.current + (e.key === 'ArrowRight' ? 5 : -5)) / timing.duration;
+    seekTo(Math.max(0, Math.min(1, target)));
+  };
 
-  document.getElementById('tss-hub-qico').onclick = e => { e.stopPropagation(); toggleSidebar(); };
+  document.getElementById('tss-hub-qico').onclick = e => { e.stopPropagation(); toggleSidebar(e); };
 
   const stopAfterRound = document.getElementById('tss-hub-stop-after');
   stopAfterRound.checked  = state.stopAfterRound;
@@ -9359,13 +10583,6 @@ function mkHub() {
     setSleepTimer(e.target.value);
   };
 
-  const crossfadeCard = document.getElementById('tss-crossfade-card');
-  const crossfadeSummary = document.getElementById('tss-crossfade-summary');
-  crossfadeSummary.onclick = () => {
-    const open = crossfadeCard.dataset.open !== 'true';
-    crossfadeCard.dataset.open = open ? 'true' : 'false';
-    crossfadeSummary.setAttribute('aria-expanded', open ? 'true' : 'false');
-  };
   document.getElementById('tss-playback-debug').onclick = showPlaybackDiagnostics;
   updatePlaybackDiagnosticButton();
 
@@ -9402,18 +10619,49 @@ function mkHub() {
   syncEqualizer();
   initializePlaybackVolume();
 
-  const colBtn  = document.getElementById('tss-hub-col');
-  const hubBody = document.getElementById('tss-hub-body');
-  colBtn.onclick = () => {
-    const open            = hubBody.style.display !== 'none';
-    hubBody.style.display = open ? 'none' : '';
-    requestAnimationFrame(syncSidebarToHub);
-    colBtn.textContent    = open ? '+' : '−';
-  };
+  document.getElementById('tss-hub-col').onclick = event => setHubMini(hub.dataset.mini !== 'true', true, event);
+  // Track activation modality, not click.detail: synthetic/forwarded pointer
+  // clicks can legitimately have detail=0. Native Enter/Space stays instant.
+  hub.addEventListener('pointerdown', () => { motionIsInstant.keyboardTarget = null; }, true);
+  hub.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') motionIsInstant.keyboardTarget = event.target;
+  }, true);
+  document.getElementById('tss-hub-settings').onclick = event => setHubView(hub.dataset.view === 'settings' ? 'main' : 'settings', true, event);
+  const settingsTabs = ['audio', 'session', 'info'];
+  settingsTabs.forEach((tab, index) => {
+    const button = document.getElementById(`tss-settings-tab-${tab}`);
+    button.onclick = event => setSettingsTab(tab, false, event);
+    button.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? settingsTabs.length - 1
+        : (index + (event.key === 'ArrowRight' ? 1 : -1) + settingsTabs.length) % settingsTabs.length;
+      setSettingsTab(settingsTabs[next], true, event);
+    };
+  });
+  document.addEventListener('keydown', e => {
+    if (!hub.isConnected || e.key !== 'Escape' || e.defaultPrevented) return;
+    if (document.getElementById('tss-ctx')) {
+      e.preventDefault();
+      e.stopPropagation();
+      state._ctxMenuClose?.();
+      return;
+    }
+    if (document.querySelector('#tss-eq-overlay,#tss-stats-overlay,#tss-debug-overlay,#tss-debug-help-overlay')) return;
+    if (state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSidebar(e);
+    } else if (hub.dataset.view === 'settings') {
+      e.preventDefault();
+      e.stopPropagation();
+      setHubView('main', true, e);
+    }
+  });
 
   const hubHdr = document.getElementById('tss-hub-hdr');
   hubHdr.onmousedown = e => {
-    if (e.target.closest('button')) return;
+    if (e.button !== 0 || e.target.closest('button,input,select,textarea,a,[role="button"],[contenteditable="true"]')) return;
     e.preventDefault();
     const rect = hub.getBoundingClientRect();
     hub.style.left   = rect.left + 'px';
@@ -9445,42 +10693,37 @@ function updateHub() {
   const onDifferentPlaylist = active && isCollectionPage(location.href)
     && playlistBase(location.href) !== playlistBase(state.playlistUrl);
   const reshuffleTitle = onDifferentPlaylist
-    ? 'Load & re-shuffle this playlist'
-    : 'Re-shuffle upcoming tracks';
+    ? 'Load and reshuffle this playlist'
+    : 'Reshuffle upcoming tracks';
   for (const reshuffleBtn of [
     document.getElementById('tss-hub-reshuffle'),
   ]) {
     if (!reshuffleBtn) continue;
-    reshuffleBtn.dataset.loading = loading ? 'true' : 'false';
-    reshuffleBtn.disabled = loading;
-    reshuffleBtn.title = reshuffleTitle;
+    const loadingValue = loading ? 'true' : 'false';
+    if (reshuffleBtn.dataset.loading !== loadingValue) reshuffleBtn.dataset.loading = loadingValue;
+    if (reshuffleBtn.disabled !== loading) reshuffleBtn.disabled = loading;
+    if (reshuffleBtn.title !== reshuffleTitle) reshuffleBtn.title = reshuffleTitle;
   }
 
   const av = document.getElementById('tss-hub-active-view');
-  if (av) av.style.display = active ? '' : 'none';
+  const activeDisplay = active ? '' : 'none';
+  if (av && av.style.display !== activeDisplay) av.style.display = activeDisplay;
 
   const startBtn = document.getElementById('tss-hub-start');
-  const actions  = document.getElementById('tss-hub-actions');
   if (startBtn) {
-    startBtn.style.display = '';
-    startBtn.disabled = false;
-    if (loading) {
-      startBtn.textContent     = 'Cancel loading';
-      startBtn.dataset.active  = 'false';
-      startBtn.dataset.loading = 'true';
-    } else if (active) {
-      startBtn.textContent     = 'Stop Shuffle';
-      startBtn.dataset.active  = 'true';
-      startBtn.dataset.loading = 'false';
-    } else {
-      startBtn.textContent     = 'True Shuffle';
-      startBtn.dataset.active  = 'false';
-      startBtn.dataset.loading = 'false';
-    }
-    startBtn.setAttribute('aria-label', loading ? 'Cancel loading' : active ? 'Stop Shuffle' : 'Start True Shuffle');
+    if (startBtn.style.display !== '') startBtn.style.display = '';
+    if (startBtn.disabled) startBtn.disabled = false;
+    const text = loading ? 'Cancel loading' : active ? 'End shuffle session' : 'Start shuffle';
+    const activeValue = !loading && active ? 'true' : 'false';
+    const loadingValue = loading ? 'true' : 'false';
+    const label = text;
+    if (startBtn.textContent !== text) startBtn.textContent = text;
+    if (startBtn.dataset.active !== activeValue) startBtn.dataset.active = activeValue;
+    if (startBtn.dataset.loading !== loadingValue) startBtn.dataset.loading = loadingValue;
+    if (startBtn.getAttribute('aria-label') !== label) startBtn.setAttribute('aria-label', label);
   }
 
-  if (actions) actions.style.padding = '0 14px 14px';
+  syncHubView();
 
   const cb = document.getElementById('tss-hub-stop-after');
   if (cb && cb.checked !== state.stopAfterRound) cb.checked = state.stopAfterRound;
@@ -9497,14 +10740,29 @@ function updateHub() {
 
   const qi = document.getElementById('tss-hub-qico');
   if (qi) {
-    qi.dataset.open = state.sidebarOpen ? 'true' : 'false';
-    qi.title        = state.sidebarOpen ? 'close queue panel' : 'open queue panel';
+    const open = state.sidebarOpen ? 'true' : 'false';
+    const title = state.sidebarOpen ? 'Close queue' : 'Open queue';
+    if (qi.dataset.open !== open) qi.dataset.open = open;
+    if (qi.title !== title) qi.title = title;
+    if (qi.getAttribute('aria-expanded') !== open) qi.setAttribute('aria-expanded', open);
+    if (qi.getAttribute('aria-label') !== title) qi.setAttribute('aria-label', title);
+  }
+  const qpos = document.getElementById('tss-hub-qpos');
+  if (qpos) {
+    const total = Math.max(1, state.roundTotal || state.queue.length);
+    const inRound = Math.min(total, Math.max(1, state.roundPlayed + 1));
+    const text = active ? `${inRound} / ${total}` : '0 / 0';
+    if (qpos.textContent !== text) qpos.textContent = text;
   }
   syncSidebarToHub();
 
   if (!active) {
     const prog  = document.getElementById('tss-hub-prog');
-    if (prog) prog.style.width = '0%';
+    if (prog && prog.style.width !== '0%') prog.style.width = '0%';
+    const seekbar = document.getElementById('tss-hub-seekbar');
+    if (seekbar && seekbar.getAttribute('aria-valuenow') !== '0') seekbar.setAttribute('aria-valuenow', '0');
+    const sleepDisplay = document.getElementById('tss-hub-sleep-display');
+    if (sleepDisplay && !state.sleepTimer && sleepDisplay.textContent) sleepDisplay.textContent = '';
     if (state._lastWaveformKey) {
       state._lastWaveformKey = '';
       waveformRequest++;
@@ -9512,34 +10770,23 @@ function updateHub() {
     }
     const currentTime = document.getElementById('tss-hub-time-current');
     const remainingTime = document.getElementById('tss-hub-time-remaining');
-    if (currentTime) currentTime.textContent = '0:00';
-    if (remainingTime) remainingTime.textContent = '-0:00';
-    const bgimg = document.getElementById('tss-hub-bgimg');
-    if (bgimg) { bgimg.style.backgroundImage = ''; bgimg.style.opacity = '0'; }
-    if (state._lastAccentArtwork) {
-      state._lastAccentArtwork = '';
-      document.documentElement.style.setProperty('--tss-a',  '#ff5500');
-      document.documentElement.style.setProperty('--tss-ar', '255');
-      document.documentElement.style.setProperty('--tss-ag', '85');
-      document.documentElement.style.setProperty('--tss-ab', '0');
-    }
+    if (currentTime && currentTime.textContent !== '0:00') currentTime.textContent = '0:00';
+    if (remainingTime && remainingTime.textContent !== '-0:00') remainingTime.textContent = '-0:00';
     return;
   }
 
-  const pb = document.getElementById('tss-hub-play');
-  if (pb) pb.innerHTML = paused() ? SVG.play : SVG.pause;
+  refreshPlayBtn();
 
   if (state.suspended) {
     const tEl = document.getElementById('tss-hub-title');
     const aEl = document.getElementById('tss-hub-artist');
-    if (tEl) tEl.textContent = playerTitle() || '—';
-    if (aEl) aEl.textContent = '↩ not in queue';
+    const title = playerTitle() || '—';
+    if (tEl && tEl.textContent !== title) tEl.textContent = title;
+    if (aEl && aEl.textContent !== '↩ not in queue') aEl.textContent = '↩ not in queue';
     const art = document.getElementById('tss-hub-art');
     if (art && art.dataset.src) {
       delete art.dataset.src;
       art.innerHTML = SVG.note;
-      const bgimg = document.getElementById('tss-hub-bgimg');
-      if (bgimg) { bgimg.style.backgroundImage = ''; bgimg.style.opacity = '0'; }
     }
     return;
   }
@@ -9547,10 +10794,12 @@ function updateHub() {
   const m   = state.meta[state.queue?.[state.pos]];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');
-  if (tEl) tEl.textContent = playerTitle() || m?.title  || '—';
-  if (aEl) aEl.textContent = m?.artist || '—';
+  const title = playerTitle() || m?.title || '—';
+  const artist = m?.artist || '—';
+  if (tEl && tEl.textContent !== title) tEl.textContent = title;
+  if (aEl && aEl.textContent !== artist) aEl.textContent = artist;
 
-  const waveformKey = trackId(m) || m?.title || '';
+  const waveformKey = waveformTrackKey(m);
   if (waveformKey && state._lastWaveformKey !== waveformKey) {
     state._lastWaveformKey = waveformKey;
     renderWaveform();
@@ -9563,75 +10812,97 @@ function updateHub() {
       art.dataset.src = m.artwork;
       art.innerHTML   = '';
       const img = document.createElement('img');
+      img.alt = 'Current track artwork';
       img.src           = m.artwork;
       img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
       img.onerror       = () => { art.innerHTML = SVG.note; delete art.dataset.src; };
       art.appendChild(img);
-      const bgimg = document.getElementById('tss-hub-bgimg');
-      if (bgimg) { bgimg.style.backgroundImage = `url("${m.artwork}")`; bgimg.style.opacity = '1'; }
-
-      if (state._lastAccentArtwork !== m.artwork) {
-        state._lastAccentArtwork = m.artwork;
-        extractAccentColor(m.artwork, ([r, g, b]) => applyAccentColor(r, g, b));
-      }
     } else if (!m?.artwork && art.dataset.src) {
       delete art.dataset.src;
       art.innerHTML = SVG.note;
-      const bgimg = document.getElementById('tss-hub-bgimg');
-      if (bgimg) { bgimg.style.backgroundImage = ''; bgimg.style.opacity = '0'; }
     }
   }
 
-  updateProgressBar();
-
   const timing = playbackTiming();
+  updateProgressBar(timing);
   const currentTime = document.getElementById('tss-hub-time-current');
   const remainingTime = document.getElementById('tss-hub-time-remaining');
-  if (currentTime) currentTime.textContent = formatPlaybackClock(timing.current);
-  if (remainingTime) remainingTime.textContent = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
+  const currentText = formatPlaybackClock(timing.current);
+  const remainingText = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
+  if (currentTime && currentTime.textContent !== currentText) currentTime.textContent = currentText;
+  if (remainingTime && remainingTime.textContent !== remainingText) remainingTime.textContent = remainingText;
 
-  const nextTi = upcomingTrackIndex();
-  const nextM  = nextTi !== undefined ? state.meta[nextTi] : null;
-  const qpos   = document.getElementById('tss-hub-qpos');
-  const nextup = document.getElementById('tss-hub-nextup');
-  if (qpos) {
-    const total = Math.max(1, state.roundTotal || state.queue.length);
-    const inRound = Math.min(total, Math.max(1, state.roundPlayed + 1));
-    qpos.textContent = `${inRound} / ${total}`;
-  }
-  if (nextup) nextup.textContent = nextM ? nextM.title : '—';
 }
 
 
 function syncSidebarToHub() {
-  if (!state.sidebarOpen) return;
   const hub = document.getElementById('tss-hub');
   const sidebar = document.getElementById('tss-sidebar');
-  if (!hub || !sidebar) return;
-
-  const rect = hub.getBoundingClientRect();
-  const requestedWidth = Math.max(260, Math.min(620, state.sidebarWidth || 320));
+  if (!hub) return;
+  const space = document.getElementById('tss-hub-queue-space');
+  let rect = hub.getBoundingClientRect();
   const rightSpace = Math.max(0, window.innerWidth - rect.right - 12);
   const leftSpace = Math.max(0, rect.left - 12);
   const fitsRight = rightSpace >= 220 || rightSpace >= leftSpace;
   const available = fitsRight ? rightSpace : leftSpace;
-  const canDock = available >= 220;
-  const viewportWidth = Math.max(120, window.innerWidth - 24);
-  const width = canDock ? Math.min(requestedWidth, available) : Math.min(requestedWidth, viewportWidth);
-  const left = canDock
-    ? (fitsRight ? rect.right - 1 : rect.left - width + 1)
-    : Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
-  const requestedHeight = state.sidebarHeight > 0 ? state.sidebarHeight : rect.height;
-  const maxHeight = Math.max(120, rect.bottom - 12);
-  const height = Math.min(Math.max(Math.min(rect.height, maxHeight), requestedHeight), maxHeight);
-  const top = rect.bottom - height;
+  // Keep the narrow queue footprint stable until the outgoing panel is hidden.
+  const closingNarrow = !state.sidebarOpen && sidebar?.dataset.motion === 'exiting'
+    && sidebar.dataset.layout === 'narrow' && hub.dataset.view === 'main';
+  const narrow = closingNarrow || Boolean(state.sidebarOpen && sidebar && available < 220);
+  const queueView = narrow ? 'true' : 'false';
+  const layoutChanged = hub.dataset.queueView !== queueView;
+  if (layoutChanged) hub.dataset.queueView = queueView;
+  if (space && space.hidden !== !narrow) space.hidden = !narrow;
+  if (narrow && hub.dataset.view === 'settings') {
+    hub.dataset.view = 'main';
+    syncHubView();
+  }
+  if (layoutChanged) rect = hub.getBoundingClientRect();
+  const leftBound = Math.max(12, Math.min(rect.left, window.innerWidth - rect.width - 12));
+  const topBound = Math.max(12, Math.min(rect.top, window.innerHeight - rect.height - 12));
+  if (rect.width && rect.left !== leftBound) hub.style.left = `${leftBound}px`;
+  if (rect.height && rect.top !== topBound) {
+    hub.style.top = `${topBound}px`;
+    hub.style.bottom = 'auto';
+  }
+  if (rect.left !== leftBound || rect.top !== topBound) rect = hub.getBoundingClientRect();
+  if (!sidebar || !state.sidebarOpen) {
+    delete hub.dataset.sidebarSide;
+    return;
+  }
 
-  sidebar.style.width  = `${width}px`;
-  sidebar.style.left   = `${left}px`;
-  sidebar.style.top    = `${top}px`;
-  sidebar.style.height = `${height}px`;
-  sidebar.dataset.side = fitsRight ? 'right' : 'left';
-  hub.dataset.sidebarSide = fitsRight ? 'right' : 'left';
+  const layout = narrow ? 'narrow' : 'docked';
+  const enteringNarrow = sidebar.dataset.layout !== 'narrow' && narrow;
+  if (sidebar.dataset.layout !== layout) sidebar.dataset.layout = layout;
+  const requestedWidth = Math.max(260, Math.min(620, state.sidebarWidth || 320));
+  const width = narrow ? rect.width : Math.min(requestedWidth, available);
+  const left = narrow ? rect.left : fitsRight ? rect.right : rect.left - width;
+  const requestedHeight = state.sidebarHeight > 0 ? state.sidebarHeight : Math.max(320, rect.height);
+  const maxHeight = Math.max(120, rect.bottom - 12);
+  const height = narrow
+    ? Math.max(120, document.getElementById('tss-hub-queue-space')?.getBoundingClientRect().height || rect.height - 56)
+    : Math.min(Math.max(Math.min(rect.height, maxHeight), requestedHeight), maxHeight);
+  const top = rect.bottom - height;
+  if (sidebar.style.width !== `${width}px`) sidebar.style.width = `${width}px`;
+  if (sidebar.style.left !== `${left}px`) sidebar.style.left = `${left}px`;
+  if (sidebar.style.top !== `${top}px`) sidebar.style.top = `${top}px`;
+  if (sidebar.style.height !== `${height}px`) sidebar.style.height = `${height}px`;
+  const side = fitsRight ? 'right' : 'left';
+  if (sidebar.dataset.side !== side) sidebar.dataset.side = side;
+  // A taller queue unfolds upward from its bottom edge; otherwise it unfolds
+  // downward from its top. Horizontal attachment stays fixed beside the player.
+  const opensUp = !narrow && top < rect.top - 0.5;
+  const origin = `${narrow ? '50%' : side === 'right' ? '0px' : '100%'} ${opensUp ? '100%' : '0px'}`;
+  if (sidebar.style.transformOrigin !== origin) sidebar.style.transformOrigin = origin;
+  if (narrow) delete hub.dataset.sidebarSide;
+  else if (hub.dataset.sidebarSide !== side) hub.dataset.sidebarSide = side;
+  const close = document.getElementById('tss-sidebar-close');
+  if (close) {
+    const label = narrow ? 'Back to player' : 'Close queue';
+    if (close.textContent !== label) close.textContent = label;
+    if (close.getAttribute('aria-label') !== label) close.setAttribute('aria-label', label);
+    if (enteringNarrow) close.focus({ preventScroll: true });
+  }
 }
 
 function setupSidebarResize() {
@@ -9741,100 +11012,195 @@ function mkSidebar() {
   sidebar.id = 'tss-sidebar';
   sidebar.dataset.open = 'false';
   sidebar.dataset.side = 'right';
+  sidebar.hidden = true;
+  sidebar.inert = true;
+  sidebar.setAttribute('aria-hidden', 'true');
+  sidebar.setAttribute('role', 'region');
+  sidebar.setAttribute('aria-label', 'Queue and listening history');
   sidebar.style.cssText = `
     position:fixed; left:-9999px; top:12px;
     width:min(320px,calc(100vw - 24px)); height:380px;
-    background:rgba(9,9,9,0.99); border:1px solid rgba(195,176,142,0.18);
+    background:var(--tss-glass-surface,#080b12); border:1px solid var(--tss-glass-rim,rgba(183,199,232,.12));
     border-radius:0 16px 16px 0; overflow:hidden;
-    z-index:99997; display:flex; flex-direction:column;
-    transition:opacity 0.2s ease,transform 0.2s ease;
+    display:flex; flex-direction:column;
     font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
-    box-shadow:24px 28px 72px rgba(0,0,0,0.72);
-    -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px);
+    box-shadow:var(--tss-glass-shadow);
+    -webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);
   `;
 
   sidebar.innerHTML = `
     <button id="tss-sidebar-resize" class="tss-sidebar-resize" aria-label="Resize queue panel" title="Drag to resize · double-click to reset"></button>
     <button id="tss-sidebar-height-resize" class="tss-sidebar-height-resize" aria-label="Resize queue height" title="Drag upward for more tracks · double-click to reset"></button>
+    <div id="tss-sidebar-content">
     <div class="tss-side-head">
       <div class="tss-side-titlebar">
-        <span class="tss-side-title">Up next</span>
+        <span class="tss-side-title">Queue</span>
         <span style="flex:1;"></span>
-        <button id="tss-merge-btn" class="tss-side-action" title="add current page to queue">${SVG.plus}<span>Merge playlist</span></button>
+        <button id="tss-merge-btn" class="tss-side-action" type="button" title="Add current page to queue">${SVG.plus}<span>Merge playlist</span></button>
+        <button id="tss-sidebar-close" class="tss-side-action" type="button" aria-label="Close queue">Close queue</button>
       </div>
-      <div class="tss-side-tabs">
-        <button id="tss-tab-queue" class="tss-side-tab" data-active="true">Queue</button>
-        <button id="tss-tab-history" class="tss-side-tab" data-active="false">History</button>
+      <div class="tss-side-tabs" role="tablist" aria-label="Queue and history">
+        <button id="tss-tab-queue" class="tss-side-tab" type="button" role="tab" data-active="true" aria-selected="true" aria-controls="tss-sidebar-list">Queue</button>
+        <button id="tss-tab-history" class="tss-side-tab" type="button" role="tab" data-active="false" aria-selected="false" aria-controls="tss-sidebar-list" tabindex="-1">History</button>
         <span style="flex:1;"></span>
         <span id="tss-sidebar-count" style="color:rgba(255,255,255,.32);font-size:10px;font-variant-numeric:tabular-nums;padding-bottom:9px;"></span>
       </div>
       <div class="tss-side-searchwrap">
         <span class="tss-side-searchicon">${SVG.search}</span>
-        <input id="tss-search" placeholder="Search tracks" style="padding-left:33px !important;" />
+        <input id="tss-search" type="search" aria-label="Search queue and history" placeholder="Search tracks" style="padding-left:33px !important;" />
       </div>
     </div>
-    <div id="tss-sidebar-list" style="overflow-y:auto;flex:1;padding:6px 0;scrollbar-width:thin;scrollbar-color:#242424 transparent;"></div>
+    <div id="tss-sidebar-list" role="tabpanel" aria-labelledby="tss-tab-queue" style="overflow-y:auto;padding:6px 0;scrollbar-width:thin;"></div>
+    </div>
   `;
 
   document.body.appendChild(sidebar);
+  sidebar.addEventListener('pointerdown', () => { motionIsInstant.keyboardTarget = null; }, true);
+  sidebar.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') motionIsInstant.keyboardTarget = event.target;
+  }, true);
   setupSidebarResize();
+  document.getElementById('tss-sidebar-close').onclick = event => {
+    if (state.sidebarOpen) toggleSidebar(event);
+  };
+  sidebar.addEventListener('keydown', e => {
+    if (e.key !== 'Escape' || e.defaultPrevented || document.getElementById('tss-ctx')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (state.sidebarOpen) toggleSidebar(e);
+  });
 
   document.getElementById('tss-merge-btn').onclick  = () => mergeCurrentPage();
   document.getElementById('tss-search').oninput     = e => renderList(e.target.value);
   document.getElementById('tss-search').onclick     = e => e.stopPropagation();
 
-  document.getElementById('tss-tab-queue').onclick = () => {
-    state.sidebarTab = 'queue';
-    updateTabStyles();
-    renderList(document.getElementById('tss-search')?.value || '');
-  };
-  document.getElementById('tss-tab-history').onclick = () => {
-    state.sidebarTab = 'history';
-    updateTabStyles();
-    renderList(document.getElementById('tss-search')?.value || '');
-  };
+  ['queue', 'history'].forEach(tab => {
+    const button = document.getElementById(`tss-tab-${tab}`);
+    button.onclick = event => setSidebarTab(tab, event);
+    button.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 'queue' : event.key === 'End' ? 'history'
+        : tab === 'queue' ? 'history' : 'queue';
+      setSidebarTab(next, event);
+      document.getElementById(`tss-tab-${next}`)?.focus({ preventScroll: true });
+    };
+  });
   window.addEventListener('resize', syncSidebarToHub);
 }
 
-function updateTabStyles() {
-  const qBtn = document.getElementById('tss-tab-queue');
-  const hBtn = document.getElementById('tss-tab-history');
-  if (qBtn) {
-    const active = state.sidebarTab === 'queue';
-    qBtn.dataset.active       = active ? 'true' : 'false';
-    qBtn.style.background   = active ? 'rgba(255,255,255,0.06)' : 'transparent';
-    qBtn.style.color        = active ? '#f0f0f0' : '#464646';
-    qBtn.style.borderColor  = active ? 'rgba(255,255,255,0.12)' : 'transparent';
-  }
-  if (hBtn) {
-    const active = state.sidebarTab === 'history';
-    hBtn.dataset.active       = active ? 'true' : 'false';
-    hBtn.style.background   = active ? 'rgba(255,255,255,0.06)' : 'transparent';
-    hBtn.style.color        = active ? '#f0f0f0' : '#464646';
-    hBtn.style.borderColor  = active ? 'rgba(255,255,255,0.12)' : 'transparent';
-  }
+function setSidebarTab(tab, event = null) {
+  if (!['queue', 'history'].includes(tab) || state.sidebarTab === tab) return;
+  state.sidebarTab = tab;
+  updateTabStyles();
+  const list = document.getElementById('tss-sidebar-list');
+  if (!list) return;
+  if (list.contains?.(document.activeElement)) document.getElementById(`tss-tab-${tab}`)?.focus({ preventScroll: true });
+  const instant = motionIsInstant(event) || !state.sidebarOpen;
+  // Fade the mounted rows out before rendering the latest requested tab.
+  list._tssTabSwap = true;
+  animateSurface(list, false, {
+    instant, duration: 75, restart: true,
+    onFinish: () => {
+      list._tssTabSwap = false;
+      renderList(document.getElementById('tss-search')?.value || '');
+      animateSurface(list, true, { instant, duration: 95 });
+    },
+  });
 }
 
-function toggleSidebar() {
-  state.sidebarOpen = !state.sidebarOpen;
-  const s = document.getElementById('tss-sidebar');
-  if (s) {
-    s.dataset.open = state.sidebarOpen ? 'true' : 'false';
-    if (state.sidebarOpen) {
-      if (state._sidebarDirty) renderList();
-      syncSidebarToHub();
-    }
+function updateTabStyles() {
+  for (const tab of ['queue', 'history']) {
+    const button = document.getElementById(`tss-tab-${tab}`);
+    if (!button) continue;
+    const active = state.sidebarTab === tab;
+    button.dataset.active = String(active);
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
   }
-  if (!state.sidebarOpen) {
-    const hub = document.getElementById('tss-hub');
-    if (hub) delete hub.dataset.sidebarSide;
+  document.getElementById('tss-sidebar-list')?.setAttribute('aria-labelledby', `tss-tab-${state.sidebarTab}`);
+}
+
+function toggleSidebar(event = null) {
+  const instant = motionIsInstant(event);
+  state.sidebarOpen = !state.sidebarOpen;
+  const sidebar = document.getElementById('tss-sidebar');
+  const hub = document.getElementById('tss-hub');
+  const closedInNarrow = !state.sidebarOpen && sidebar?.dataset.layout === 'narrow';
+  if (sidebar) {
+    sidebar.dataset.open = String(state.sidebarOpen);
+    if (state.sidebarOpen) {
+      setHubView('main', false, { instant });
+      if (state._sidebarDirty || !sidebar.dataset.rendered) {
+        renderList();
+        sidebar.dataset.rendered = 'true';
+      }
+    }
+    // Layout must know the destination side/anchor before the first painted
+    // entry frame. Closure keeps the existing footprint until finish.
+    if (state.sidebarOpen) syncSidebarToHub();
+    animateSurface(sidebar, state.sidebarOpen, {
+      instant, kind: 'queue',
+      onFinish: () => {
+        syncSidebarToHub();
+        if (!state.sidebarOpen && closedInNarrow && hub?.dataset.view === 'main'
+          && document.activeElement === document.getElementById('tss-hub-settings')) {
+          document.getElementById('tss-hub-qico')?.focus({ preventScroll: true });
+        }
+      },
+    });
   }
   updateHub();
+  syncSidebarToHub();
+  if (state.sidebarOpen) {
+    document.getElementById('tss-sidebar-close')?.focus({ preventScroll: true });
+  } else {
+    const settings = hub?.dataset.view === 'settings';
+    const exitingNarrow = closedInNarrow && sidebar?.dataset.motion === 'exiting';
+    document.getElementById(settings || exitingNarrow ? 'tss-hub-settings' : 'tss-hub-qico')?.focus({ preventScroll: true });
+  }
 }
 
 
+function bindQueueRowActions(row, qi, ti, cur, past, filter) {
+  row.draggable = true;
+  row.ondragstart = e => {
+    state.dragSrc = qi;
+    e.dataTransfer.effectAllowed = 'move';
+    row.style.opacity = '0.35';
+  };
+  row.ondragend = () => { row.style.opacity = past ? '0.3' : '1'; };
+  row.ondragover = e => { e.preventDefault(); row.style.background = 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)'; };
+  row.ondragleave = () => { row.style.background = cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)' : 'transparent'; };
+  row.ondrop = e => {
+    e.preventDefault();
+    if (state.dragSrc === null || state.dragSrc === qi) return;
+    const src = state.dragSrc;
+    const [moved] = state.queue.splice(src, 1);
+    state.queue.splice(qi, 0, moved);
+    if (state.pos === src) state.pos = qi;
+    else if (src < state.pos && qi >= state.pos) state.pos--;
+    else if (src > state.pos && qi <= state.pos) state.pos++;
+    state.dragSrc = null;
+    refreshUpcomingCrossfadePreparation();
+    badges();
+    renderList(filter);
+  };
+  row.onclick = () => jumpTo(qi, ti);
+  row.oncontextmenu = e => showCtxMenu(e, qi, ti);
+}
+
+function bindPlayNextRowAction(row, index) {
+  row.oncontextmenu = e => {
+    e.preventDefault();
+    state.playNext.splice(index, 1);
+    refreshUpcomingCrossfadePreparation();
+    renderList();
+  };
+}
+
 function renderList(filter) {
-  if (!state.sidebarOpen) {
+  if (!state.sidebarOpen || document.getElementById('tss-sidebar-list')?._tssTabSwap) {
     state._sidebarDirty = true;
     return;
   }
@@ -9855,10 +11221,17 @@ function renderList(filter) {
   list.dataset.view = 'queue';
   list.dataset.filter = q;
 
-  list.innerHTML = '';
+  const children = [];
+  // Only currently mounted queue rows are candidates; no detached row cache.
+  const previousRows = new Map();
+  for (const row of list.children) {
+    if (Number.isInteger(row._tssQueueTi) && !previousRows.has(row._tssQueueTi)) {
+      previousRows.set(row._tssQueueTi, row);
+    }
+  }
 
   if (!state.active || !state.queue.length) {
-    list.innerHTML = `<div style="color:#363636;font-size:12px;padding:28px 18px;text-align:center;line-height:1.7;">start shuffle<br>to see the queue</div>`;
+    list.innerHTML = `<div style="color:#b1b8c2;font-size:12px;padding:28px 18px;text-align:center;line-height:1.7;">start shuffle<br>to see the queue</div>`;
     if (count) count.textContent = '';
     return;
   }
@@ -9871,34 +11244,29 @@ function renderList(filter) {
 
   if (state.suspended && !q) {
     const banner = document.createElement('div');
-    banner.style.cssText = 'padding:6px 14px;font-size:10px;color:var(--tss-a,#ff5500);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.06);border-bottom:1px solid #1a1a1a;';
+    banner.style.cssText = 'padding:6px 14px;font-size:10px;color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.06);border-bottom:1px solid rgba(255,255,255,.06);';
     banner.textContent = '↩ external track playing — queue will resume after';
-    list.appendChild(banner);
+    children.push(banner);
   }
 
   if (state.playNext.length && !q) {
     const header = document.createElement('div');
-    header.style.cssText = 'padding:7px 14px 3px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.07em;';
+    header.style.cssText = 'padding:7px 14px 3px;font-size:10px;color:#b1b8c2;text-transform:uppercase;letter-spacing:0.07em;';
     header.textContent = `play next (${state.playNext.length})`;
-    list.appendChild(header);
+    children.push(header);
 
     state.playNext.forEach((ti, i) => {
       const m   = state.meta[ti] || { title: '—', artist: '—', artwork: null };
       const row = mkRow(m, -1, ti, false, false);
       row.style.opacity    = '0.65';
       row.style.borderLeft = '2px solid #2e2e2e';
-      row.oncontextmenu = e => {
-        e.preventDefault();
-        state.playNext.splice(i, 1);
-        refreshUpcomingCrossfadePreparation();
-        renderList();
-      };
-      list.appendChild(row);
+      bindPlayNextRowAction(row, i);
+      children.push(row);
     });
 
     const divider = document.createElement('div');
-    divider.style.cssText = 'height:1px;background:#191919;margin:4px 0;';
-    list.appendChild(divider);
+    divider.style.cssText = 'height:1px;background:rgba(255,255,255,.06);margin:4px 0;';
+    children.push(divider);
   }
 
   state.queue.forEach((ti, qi) => {
@@ -9907,43 +11275,57 @@ function renderList(filter) {
 
     const cur  = qi === state.pos;
     const past = qi <  state.pos;
-    const row  = mkRow(m, qi, ti, cur, past);
+    // mkRow captures only current/past display state in its hover handlers.
+    // Queue-index/filter-dependent handlers below are rebound on every pass.
+    const previous = previousRows.get(ti);
+    const flags = (cur ? 1 : 0) | (past ? 2 : 0);
+    const text = previous?.children[2];
+    const image = previous?.children[1]?.querySelector('img');
+    const number = previous?.lastElementChild;
+    const numberMatches = cur
+      ? number?.childNodes.length === 1
+        && number.firstElementChild?.querySelector('path')?.getAttribute('d') === 'M3 2.5v11l10-5.5z'
+      : number?.textContent === String(state.stats.played + (qi - state.pos));
+    const reusable = previous && previous._tssQueueFlags === flags
+      && previous.children.length === 5
+      && text?.children[0]?.textContent === String(m.title ?? '')
+      && text?.children[1]?.textContent === String(m.artist ?? '')
+      && (image?.getAttribute('src') || '') === (m.artwork || '')
+      && previous.children[3]?.textContent === (cur ? 'playing' : '')
+      && previous.style.opacity === (past ? '0.3' : '1')
+      && numberMatches;
+    const row = reusable ? previous : mkRow(m, qi, ti, cur, past);
+    previousRows.delete(ti);
+    row._tssQueueTi = ti;
+    row._tssQueueFlags = flags;
 
-    row.draggable   = true;
-    row.ondragstart = e => {
-      state.dragSrc = qi;
-      e.dataTransfer.effectAllowed = 'move';
-      row.style.opacity = '0.35';
-    };
-    row.ondragend   = () => { row.style.opacity = past ? '0.3' : '1'; };
-    row.ondragover  = e => { e.preventDefault(); row.style.background = 'rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.07)'; };
-    row.ondragleave = () => { row.style.background = cur ? 'rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.07)' : 'transparent'; };
-    row.ondrop = e => {
-      e.preventDefault();
-      if (state.dragSrc === null || state.dragSrc === qi) return;
-      const src     = state.dragSrc;
-      const [moved] = state.queue.splice(src, 1);
-      state.queue.splice(qi, 0, moved);
-      if      (state.pos === src)                  state.pos = qi;
-      else if (src < state.pos && qi >= state.pos) state.pos--;
-      else if (src > state.pos && qi <= state.pos) state.pos++;
-      state.dragSrc = null;
-      refreshUpcomingCrossfadePreparation();
-      badges();
-      renderList(filter);
-    };
-
-    row.onclick       = () => jumpTo(qi, ti);
-    row.oncontextmenu = e => showCtxMenu(e, qi, ti);
-    list.appendChild(row);
+    bindQueueRowActions(row, qi, ti, cur, past, filter);
+    children.push(row);
   });
+  // Remove retired rows, retain surviving rows in place, and batch contiguous
+  // insertions/moves. Consuming the queue head need not detach every later row.
+  const wanted = new Set(children);
+  for (const row of Array.from(list.childNodes)) {
+    if (!wanted.has(row)) row.remove();
+  }
+  let cursor = list.firstChild;
+  const fragment = document.createDocumentFragment();
+  for (const row of children) {
+    if (row === cursor) {
+      if (fragment.childNodes.length) list.insertBefore(fragment, cursor);
+      cursor = cursor.nextSibling;
+    } else {
+      fragment.appendChild(row);
+    }
+  }
+  if (fragment.childNodes.length) list.insertBefore(fragment, cursor);
 
   // Background refreshes must not pull the reader back to the playing track.
   list.scrollTop = preserveScroll ? scrollTop : 0;
   if (!preserveScroll && !q) {
     let offset = state.playNext.length ? state.playNext.length + 2 : 0;
     if (state.suspended) offset++;
-    list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: motionIsInstant() ? 'instant' : 'smooth' });
   }
 
   refreshPlayBtn();
@@ -9955,11 +11337,11 @@ function renderHistory(filter = '') {
   if (!list) return;
   list.dataset.view = 'history';
 
-  list.innerHTML = '';
+  const fragment = document.createDocumentFragment();
   if (count) count.textContent = state.history.length ? `${state.history.length}` : '';
 
   if (!state.history.length) {
-    list.innerHTML = `<div style="color:#363636;font-size:12px;padding:28px 18px;text-align:center;line-height:1.7;">no history yet</div>`;
+    list.innerHTML = `<div style="color:#b1b8c2;font-size:12px;padding:28px 18px;text-align:center;line-height:1.7;">no history yet</div>`;
     return;
   }
 
@@ -9984,7 +11366,7 @@ function renderHistory(filter = '') {
     row.onclick = () => { queueNext(ti); };
 
     const artEl = document.createElement('div');
-    artEl.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:#1a1a1a;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#2c2c2c;';
+    artEl.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);';
     if (m.artwork) {
       const img = document.createElement('img');
       img.src           = m.artwork;
@@ -9996,22 +11378,24 @@ function renderHistory(filter = '') {
     }
 
     const num = document.createElement('div');
-    num.style.cssText = 'font-size:10px;color:#3e3e3e;font-weight:600;min-width:20px;text-align:center;flex-shrink:0;';
+    num.style.cssText = 'font-size:10px;color:#aeb5bf;font-weight:600;min-width:20px;text-align:center;flex-shrink:0;';
     num.textContent   = String(state.history.length - i);
 
     const txt = document.createElement('div');
     txt.style.cssText = 'overflow:hidden;flex:1;';
     txt.innerHTML = `
       <div style="font-size:12px;color:#b8b8b8;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">${esc(m.title)}</div>
-      <div style="font-size:11px;color:#4e4e4e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(m.artist)}</div>
+      <div style="font-size:11px;color:#b1b8c2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(m.artist)}</div>
     `;
 
     row.append(artEl, num, txt);
-    list.appendChild(row);
+    fragment.appendChild(row);
   });
 
   if (!shown) {
-    list.innerHTML = `<div style="color:#363636;font-size:12px;padding:28px 18px;text-align:center;">no results</div>`;
+    list.innerHTML = `<div style="color:#b1b8c2;font-size:12px;padding:28px 18px;text-align:center;">no results</div>`;
+  } else {
+    list.replaceChildren(fragment);
   }
 }
 
@@ -10021,8 +11405,8 @@ function mkRow(m, qi, ti, cur, past) {
   row.style.cssText = `
       display:flex; align-items:center; gap:9px; padding:7px 12px;
     cursor:pointer;
-    background:${cur ? 'rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),0.09)' : 'transparent'};
-    border-left:2px solid ${cur ? 'var(--tss-a,#ff5500)' : 'transparent'};
+    background:${cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.09)' : 'transparent'};
+    border-left:2px solid ${cur ? 'var(--tss-a,#aebaf3)' : 'transparent'};
     transition:background 0.12s;
     opacity:${past ? '0.3' : '1'};
     -webkit-user-select:none; user-select:none;
@@ -10031,7 +11415,7 @@ function mkRow(m, qi, ti, cur, past) {
   row.onmouseleave = () => { if (!cur) row.style.background = 'transparent'; };
 
   const art = document.createElement('div');
-  art.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:#1a1a1a;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#2c2c2c;box-shadow:0 5px 14px rgba(0,0,0,.28);';
+  art.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);box-shadow:0 5px 14px rgba(0,0,0,.28);';
   if (m.artwork) {
     const img = document.createElement('img');
     img.src           = m.artwork;
@@ -10043,7 +11427,7 @@ function mkRow(m, qi, ti, cur, past) {
   }
 
   const num = document.createElement('div');
-  num.style.cssText = `font-size:10px;color:${cur ? 'var(--tss-a,#ff5500)' : '#3e3e3e'};font-weight:${cur ? '700' : '600'};min-width:20px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center;`;
+  num.style.cssText = `font-size:10px;color:${cur ? 'var(--tss-a,#aebaf3)' : '#aeb5bf'};font-weight:${cur ? '700' : '600'};min-width:20px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center;`;
   const displayNum  = qi >= 0 ? state.stats.played + (qi - state.pos) : '↑';
   if (cur) num.innerHTML = SVG.play;
   else num.textContent = String(displayNum);
@@ -10052,7 +11436,7 @@ function mkRow(m, qi, ti, cur, past) {
   txt.style.cssText = 'overflow:hidden;flex:1;';
   txt.innerHTML = `
     <div style="font-size:12px;color:${cur ? '#f4f4f4' : '#c8c8c8'};font-weight:${cur ? '680' : '520'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.35;">${esc(m.title)}</div>
-    <div style="font-size:10px;color:rgba(255,255,255,.38);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;">${esc(m.artist)}</div>
+    <div style="font-size:11px;color:rgba(255,255,255,.72);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;">${esc(m.artist)}</div>
   `;
 
   const handle = document.createElement('span');
@@ -10063,9 +11447,9 @@ function mkRow(m, qi, ti, cur, past) {
   status.className = 'tss-queue-status';
   status.textContent = cur ? 'playing' : qi < 0 ? 'next' : '';
   status.style.cssText = cur
-    ? 'color:var(--tss-a,#ff5500);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.12);'
+    ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12);'
     : qi < 0
-      ? 'color:var(--tss-a,#ff5500);background:rgba(var(--tss-ar,255),var(--tss-ag,85),var(--tss-ab,0),.1);'
+      ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.1);'
       : 'display:none;';
 
   row.append(handle, art, txt, status, num);
@@ -10265,12 +11649,15 @@ function checkForNavigation() {
 function installNavigationTracking() {
   const history = pageWindow.history;
   for (const method of ['pushState', 'replaceState']) {
-    const original = history[method];
-    history[method] = function (...args) {
-      const result = Reflect.apply(original, this, args);
-      checkForNavigation();
-      return result;
-    };
+    try {
+      const original = history[method];
+      if (typeof original !== 'function') continue;
+      history[method] = function (...args) {
+        const result = Reflect.apply(original, this, args);
+        checkForNavigation();
+        return result;
+      };
+    } catch (_) {}
   }
 }
 
@@ -10289,8 +11676,15 @@ function scheduleLiveQueueSync(delay = 250) {
 
 function mutationChangesPlaylistTracks(records) {
   const selector = '.trackList__item, .soundList__item, li.sc-list-item';
-  return records.some(record => [...record.addedNodes, ...record.removedNodes].some(node =>
-    node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))));
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))) return true;
+    }
+    for (const node of record.removedNodes) {
+      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))) return true;
+    }
+  }
+  return false;
 }
 
 function mutationsAreTrueShuffleOnly(records) {
@@ -10306,10 +11700,10 @@ function scheduleLiveQueueSyncFromMutation(records) {
 }
 
 function initializePage() {
-  document.documentElement.style.setProperty('--tss-a', '#ff5500');
-  document.documentElement.style.setProperty('--tss-ar', '255');
-  document.documentElement.style.setProperty('--tss-ag', '85');
-  document.documentElement.style.setProperty('--tss-ab', '0');
+  document.documentElement.style.setProperty('--tss-a', '#aebaf3');
+  document.documentElement.style.setProperty('--tss-ar', '174');
+  document.documentElement.style.setProperty('--tss-ag', '186');
+  document.documentElement.style.setProperty('--tss-ab', '243');
 
   new MutationObserver(records => {
     if (mutationsAreTrueShuffleOnly(records)) return;

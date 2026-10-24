@@ -1,9 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const childProcess = require('node:child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
 const scriptPath = process.env.TSS_SCRIPT
@@ -29,6 +27,23 @@ function extractFunction(name) {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+
+function soundCloudDependencies(extra = {}) {
+  const dependencies = { URL, location: { origin: 'https://soundcloud.com' }, ...extra };
+  for (const name of ['soundCloudInteger', 'soundCloudHref', 'normalizeTrackUrl', 'soundCloudTrackMatches',
+    'trackId', 'trackCacheKey', 'indexTrackMeta', 'trackIdentityIndex', 'matchingTrackIndex', 'waveformTrackKey', 'getLink',
+    'soundCloudPermalinkConflicts', 'soundCloudLinkMatches', 'soundCloudPlayerMatches',
+    'soundCloudRowsByLink', 'matchingSoundCloudRow']) {
+    if (!source.includes(`function ${name}(`)) continue;
+    dependencies[name] = Function(...Object.keys(dependencies), `return (${extractFunction(name)})`)(...Object.values(dependencies));
+  }
+  return dependencies;
+}
+
+function extractedWithSoundCloud(name) {
+  const dependencies = soundCloudDependencies();
+  return Function(...Object.keys(dependencies), `return (${extractFunction(name)})`)(...Object.values(dependencies));
+}
 function queueTransitionDependencies(state) {
   const dependencies = { state };
   for (const name of ['finalizeLeavingCurrentTrack', 'recountRoundTotal']) {
@@ -72,24 +87,21 @@ function createBalancedRoundHarness() {
 function createTrackMetadataHarness(fetchTrack = async () => ({ ok: false })) {
   const syncTrackPlaybackAccess = Function(`return (${extractFunction('syncTrackPlaybackAccess')})`)();
   const metaFromSoundCloudTrack = Function(
-    'syncTrackPlaybackAccess', `return (${extractFunction('metaFromSoundCloudTrack')})`,
-  )(syncTrackPlaybackAccess);
+    'syncTrackPlaybackAccess', ...Object.keys(soundCloudDependencies()), `return (${extractFunction('metaFromSoundCloudTrack')})`,
+  )(syncTrackPlaybackAccess, ...Object.values(soundCloudDependencies()));
   const mergeTrackMeta = Function(`return (${extractFunction('mergeTrackMeta')})`)();
   const fetchSoundCloudResource = async (url, format = 'json') => {
     const response = await fetchTrack(url);
     return { ok: response.ok, status: response.status, data: response.ok ? await response[format]() : null };
   };
-  const normalizeTrackUrl = Function('URL', 'location', `return (${extractFunction('normalizeTrackUrl')})`)(
-    URL, { origin: 'https://soundcloud.com' },
-  );
   const resolveLiveTrackMeta = Function(
-    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource',
+    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource', ...Object.keys(soundCloudDependencies()),
     `return (${extractFunction('resolveLiveTrackMeta').replace(/^function /, 'async function ')})`,
-  )(metaFromSoundCloudTrack, mergeTrackMeta, async () => 'client-id', fetchSoundCloudResource);
+  )(metaFromSoundCloudTrack, mergeTrackMeta, async () => 'client-id', fetchSoundCloudResource, ...Object.values(soundCloudDependencies()));
   const resolvePlaylistSnapshotMetas = Function(
-    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'normalizeTrackUrl', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource', 'URL',
+    'metaFromSoundCloudTrack', 'mergeTrackMeta', 'discoverSoundCloudClientIdFromBundle', 'fetchSoundCloudResource', ...Object.keys(soundCloudDependencies()),
     `return (${extractFunction('resolvePlaylistSnapshotMetas').replace(/^function /, 'async function ')})`,
-  )(metaFromSoundCloudTrack, mergeTrackMeta, normalizeTrackUrl, async () => 'client-id', fetchSoundCloudResource, URL);
+  )(metaFromSoundCloudTrack, mergeTrackMeta, async () => 'client-id', fetchSoundCloudResource, ...Object.values(soundCloudDependencies()));
   return { metaFromSoundCloudTrack, resolveLiveTrackMeta, resolvePlaylistSnapshotMetas };
 }
 
@@ -119,7 +131,7 @@ test('DOM bylines retain complete contributor text, deduplicate names and only t
       return null;
     },
   };
-  const getArtistLink = Function(`return (${extractFunction('getArtistLink')})`)();
+  const getArtistLink = extractedWithSoundCloud('getArtistLink');
   const getMeta = Function(
     'artwork', 'getLink', 'getArtistLink', 'waveformUrl', 'soundCloudLikeButtonState', 'location',
     `return (${extractFunction('getMeta')})`,
@@ -186,7 +198,7 @@ test('playlist artist recovery batches only missing names and preserves richer D
 });
 
 test('only an explicit complete empty playlist is safe to reconcile as empty', () => {
-  const playlistSnapshotFromHtml = Function(`return (${extractFunction('playlistSnapshotFromHtml')})`)();
+  const playlistSnapshotFromHtml = extractedWithSoundCloud('playlistSnapshotFromHtml');
   const snapshot = data => playlistSnapshotFromHtml(`<script>window.__sc_hydration = ${JSON.stringify([
     { hydratable: 'playlist', data: { id: 44, kind: 'playlist', ...data } },
   ])};</script>`);
@@ -195,6 +207,316 @@ test('only an explicit complete empty playlist is safe to reconcile as empty', (
   assert.equal(snapshot({ track_count: 0 }), null);
   assert.equal(snapshot({ tracks: [], track_count: 3 }), null);
 });
+
+if (source.includes('function soundCloudInteger(')) {
+  test('playlist authority requires exact valid counts and every raw track ID', () => {
+    const parse = extractedWithSoundCloud('playlistSnapshotFromHtml');
+    const snapshot = data => parse(`<script>window.__sc_hydration = ${JSON.stringify([
+      { hydratable: 'playlist', data: { kind: 'playlist', ...data } },
+    ])};</script>`);
+    for (const count of [undefined, null, '', ' ', 1.5, -1, true, false, '1.5', '1e0', Number.MAX_SAFE_INTEGER + 1]) {
+      const result = snapshot({ tracks: [{ id: 7 }], track_count: count });
+      assert.deepEqual(result.tracks, [{ id: 7 }]);
+      assert.equal(result.complete, false, `count ${String(count)}`);
+      assert.equal(snapshot({ tracks: [], track_count: count }), null);
+    }
+    for (const id of [null, 0, '', ' ', true, false, -1, 1.5, '1e2', Number.MAX_SAFE_INTEGER + 1]) {
+      const result = snapshot({ tracks: [{ id: 7 }, { id }], track_count: 2 });
+      assert.deepEqual(result.tracks, [{ id: 7 }]);
+      assert.equal(result.complete, false, `ID ${String(id)}`);
+    }
+    assert.equal(snapshot({ tracks: [{ id: 7 }], track_count: 0 }).complete, false);
+    assert.equal(snapshot({ tracks: [{ id: 7 }], track_count: 2 }).complete, false);
+    assert.equal(snapshot({ tracks: [{ id: '7' }, { id: '7' }], track_count: '2' }).complete, true);
+    assert.equal(snapshot({ tracks: [], track_count: '0' }).complete, true);
+  });
+
+  test('hydration selects requested playlist identity across assignment whitespace', () => {
+    const parse = extractedWithSoundCloud('playlistSnapshotFromHtml');
+    const entry = (url, id) => ({ hydratable: 'playlist', data: {
+      kind: 'playlist', permalink_url: url, track_count: 1, tracks: [{ id }],
+    } });
+    const wanted = 'https://soundcloud.com/user/sets/wanted';
+    for (const assignment of ['=', ' = ', '\n=\t']) {
+      const html = `<script>window.__sc_hydration${assignment}${JSON.stringify([
+        entry('https://soundcloud.com/user/sets/other', 1), entry(wanted, 2),
+      ])} \n; \t</script >`;
+      assert.deepEqual(parse(html, `${wanted}/?in=user`).tracks, [{ id: 2 }]);
+      assert.equal(parse(html), null);
+      assert.equal(parse(html, 'https://soundcloud.com/user/sets/missing'), null);
+    }
+    const single = entries => `<script>window.__sc_hydration=${JSON.stringify(entries)};</script>`;
+    assert.equal(parse(single([entry('https://soundcloud.com/user/sets/other', 1)]), wanted), null);
+    assert.equal(parse(single([entry(undefined, 2)]), wanted).complete, true);
+    assert.equal(parse(single([entry(undefined, 1), entry(undefined, 2)]), wanted), null);
+  });
+
+  test('live enrichment rejects contradictory API identity without losing hydration', async () => {
+    const track = { id: 7, title: 'Hydrated', permalink_url: 'https://soundcloud.com/artist/expected', access: 'preview' };
+    for (const response of [
+      { ...track, id: 8, publisher_metadata: { artist: 'Wrong' }, access: 'playable' },
+      { ...track, id: null, permalink_url: 'https://soundcloud.com/artist/wrong', publisher_metadata: { artist: 'Wrong' } },
+    ]) {
+      const h = createTrackMetadataHarness(async () => ({ ok: true, json: async () => response }));
+      const result = await h.resolveLiveTrackMeta(track, 'playlist', 4);
+      assert.equal(result.soundcloudId, 7);
+      assert.equal(result.title, 'Hydrated');
+      assert.equal(result.link, track.permalink_url);
+      assert.equal(result.artist, '—');
+      assert.equal(result.requiresNativePlayback, true);
+    }
+  });
+
+  test('track and artist DOM links resolve relative forms and reject unsafe schemes', () => {
+    for (const name of ['getLink', 'getArtistLink']) {
+      const get = extractedWithSoundCloud(name);
+      for (const [href, expected] of [
+        ['/artist/track', 'https://soundcloud.com/artist/track'],
+        ['artist/track', 'https://soundcloud.com/artist/track'],
+        ['//soundcloud.com/artist/track', 'https://soundcloud.com/artist/track'],
+        ['https://example.com/artist', 'https://example.com/artist'],
+        ['javascript:alert(1)', null], ['data:text/plain,x', null], ['http://[', null], ['', null],
+      ]) assert.equal(get({ querySelector: () => ({ getAttribute: () => href }) }), expected);
+      assert.equal(get({ querySelector: () => null }), null);
+    }
+  });
+}
+
+if (source.includes('const WAVEFORM_CACHE_LIMIT =')) {
+  test('waveform cache bounds retention, serves hits, and reloads evicted tracks', async () => {
+    const declaration = source.match(/const WAVEFORM_CACHE_LIMIT\s*=\s*[^;]+;/);
+    assert.ok(declaration);
+    const limit = Function(`${declaration[0]} return WAVEFORM_CACHE_LIMIT;`)();
+    const waveformCache = new Map();
+    const rendered = [];
+    const requests = [];
+    const dependencies = {
+      ...soundCloudDependencies(),
+      state: { _playbackEpoch: 1, _playbackAbort: new AbortController() },
+      waveformCache, WAVEFORM_CACHE_LIMIT: limit,
+      DEFAULT_WAVE_HEIGHTS: Function(`${source.match(/const DEFAULT_WAVE_HEIGHTS\s*=\s*[^;]+;/)[0]} return DEFAULT_WAVE_HEIGHTS;`)(),
+      resolveWaveformUrl: Function(`return (${extractFunction('resolveWaveformUrl').replace(/^function /, 'async function ')})`)(),
+      fetchSoundCloudResource: async url => {
+        requests.push(url);
+        return { ok: true, data: { samples: [0, 1, 2, 3, 2, 1] } };
+      },
+      renderWaveform: heights => rendered.push(heights),
+      recordPlaybackDiagnostic: (_event, details) => { throw new Error(`unexpected waveform failure: ${details.errorName}`); },
+      playbackErrorName: extractedWithSoundCloud('playbackErrorName'),
+    };
+    dependencies.downsampleWaveform = Function('DEFAULT_WAVE_HEIGHTS',
+      `return (${extractFunction('downsampleWaveform')})`)(dependencies.DEFAULT_WAVE_HEIGHTS);
+    const load = Function(...Object.keys(dependencies),
+      `let waveformRequest = 0; return (${extractFunction('loadTrackWaveform').replace(/^function /, 'async function ')});`)(...Object.values(dependencies));
+    const meta = id => ({ link: `https://soundcloud.com/artist/track-${id}`, waveform: `https://wave.sndcdn.com/${id}.json` });
+    for (let id = 0; id <= limit; id++) await load(meta(id));
+    assert.equal(waveformCache.size, limit);
+    assert.equal(waveformCache.has(dependencies.trackId(meta(0))), false);
+    const currentKey = dependencies.trackId(meta(limit));
+    assert.equal(waveformCache.has(currentKey), true);
+    const count = requests.length;
+    const currentHeights = waveformCache.get(currentKey);
+    await load(meta(limit));
+    assert.equal(requests.length, count);
+    assert.equal(rendered.at(-1), currentHeights);
+    await load(meta(0));
+    assert.equal(requests.length, count + 1);
+    assert.equal(requests.at(-1), meta(0).waveform);
+    assert.equal(waveformCache.size, limit);
+    assert.equal(waveformCache.has(currentKey), true);
+    assert.equal(waveformCache.has(dependencies.trackId(meta(0))), true);
+  });
+
+  if (source.includes('function waveformTrackKey(')) {
+    test('waveforms distinguish known SoundCloud IDs sharing a permalink and restore each cached rendering', async () => {
+      const limit = Function(`${source.match(/const WAVEFORM_CACHE_LIMIT\s*=\s*[^;]+;/)[0]} return WAVEFORM_CACHE_LIMIT;`)();
+      const defaultHeights = Function(`${source.match(/const DEFAULT_WAVE_HEIGHTS\s*=\s*[^;]+;/)[0]} return DEFAULT_WAVE_HEIGHTS;`)();
+      const waveformCache = new Map();
+      const requests = [];
+      const heights = Array(defaultHeights.length).fill(null);
+      const bars = heights.map((_, index) => ({
+        style: { setProperty: (name, value) => {
+          assert.equal(name, '--h');
+          heights[index] = value;
+        } },
+      }));
+      const first = {
+        soundcloudId: 11, link: 'https://soundcloud.com/artist/shared-track',
+        waveform: 'https://wave.sndcdn.com/identity-11.json',
+      };
+      const second = { ...first, soundcloudId: 22, waveform: 'https://wave.sndcdn.com/identity-22.json' };
+      const dependencies = {
+        ...soundCloudDependencies(),
+        state: { _playbackEpoch: 1, _playbackAbort: new AbortController() },
+        waveformCache, WAVEFORM_CACHE_LIMIT: limit, DEFAULT_WAVE_HEIGHTS: defaultHeights,
+        resolveWaveformUrl: Function(`return (${extractFunction('resolveWaveformUrl').replace(/^function /, 'async function ')})`)(),
+        fetchSoundCloudResource: async url => {
+          requests.push(url);
+          assert.ok(url === first.waveform || url === second.waveform);
+          return { ok: true, data: { samples: url === first.waveform ? [0, 0, 0, 0] : [1, 1, 1, 1] } };
+        },
+        recordPlaybackDiagnostic: (_event, details) => { throw new Error(`unexpected waveform failure: ${details.errorName}`); },
+        playbackErrorName: extractedWithSoundCloud('playbackErrorName'),
+      };
+      dependencies.downsampleWaveform = Function('DEFAULT_WAVE_HEIGHTS',
+        `return (${extractFunction('downsampleWaveform')})`)(defaultHeights);
+      dependencies.renderWaveform = Function('document', 'DEFAULT_WAVE_HEIGHTS', 'updateProgressBar',
+        `return (${extractFunction('renderWaveform')})`)({
+        querySelectorAll: selector => {
+          assert.equal(selector, '#tss-wave-bars i');
+          return bars;
+        },
+      }, defaultHeights, () => {});
+      const load = Function(...Object.keys(dependencies),
+        `let waveformRequest = 0; return (${extractFunction('loadTrackWaveform').replace(/^function /, 'async function ')});`)(...Object.values(dependencies));
+
+      await load(first);
+      assert.deepEqual(heights, Array(defaultHeights.length).fill('18%'));
+      await load(second);
+      assert.deepEqual(requests, [first.waveform, second.waveform]);
+      assert.deepEqual(heights, Array(defaultHeights.length).fill('100%'));
+      await load(first);
+      assert.deepEqual(requests, [first.waveform, second.waveform], 'revisiting ID 11 must use its cached samples');
+      assert.deepEqual(heights, Array(defaultHeights.length).fill('18%'));
+      await load(second);
+      assert.deepEqual(requests, [first.waveform, second.waveform], 'revisiting ID 22 must use its cached samples');
+      assert.deepEqual(heights, Array(defaultHeights.length).fill('100%'));
+      assert.ok(waveformCache.size <= limit, 'identity-specific waveforms retain the cache bound');
+    });
+  }
+}
+
+if (source.includes('function soundCloudInteger(')) {
+  test('live sync upgrades a query-bearing DOM row without duplicating source membership', async () => {
+    const h = createLiveSyncHarness();
+    h.state.active = true;
+    h.state.playlistUrl = h.music;
+    const row = { marker: 'original row' };
+    h.state.meta = [{
+      title: 'DOM title', artist: 'Artist', link: 'https://soundcloud.com/artist/track-7?in=user/sets/music',
+      sourcePage: h.music,
+    }];
+    h.state.els = [row];
+    h.state.queue = [0];
+    h.state.pos = 0;
+    h.state.roundTotal = 1;
+    h.state._deckTrack = 0;
+    h.state._liveSyncSources.set(h.music, new Set([0]));
+    h.snapshots.set(h.music, h.snapshot([7]));
+    assert.equal(await h.sync({ force: true }), 0);
+    assert.equal(h.state.meta.length, 1);
+    assert.deepEqual(h.state.queue, [0]);
+    assert.equal(h.state.els[0], row);
+    assert.equal(h.state.meta[0].soundcloudId, 7);
+    assert.deepEqual([...h.state._liveSyncSources.get(h.music)], [0]);
+    assert.equal(h.state._deckTrack, 0);
+  });
+
+  for (const suffix of ['?in=user/sets/music', '']) {
+    for (const currentId of [11, 33]) {
+      test(`live sync separates conflicting known IDs at ${suffix ? 'query-bearing' : 'identical'} URLs with current track ${currentId}`, async () => {
+        const h = createLiveSyncHarness();
+        const metadata = createTrackMetadataHarness();
+        const link = 'https://soundcloud.com/artist/reused-permalink';
+        const oldTrack = {
+          id: 11, title: 'Original recording', permalink_url: `${link}${suffix}`,
+          user: { username: 'Original artist' }, access: 'preview', policy: 'SNIP',
+          streams: { hls_aac_160_url: 'https://cf-hls-media.sndcdn.com/original-11/playlist.m3u8' },
+          media: { transcodings: [{
+            url: 'https://api-v2.soundcloud.com/media/original-11/stream/hls',
+            format: { protocol: 'hls', mime_type: 'audio/mpeg' }, snipped: true,
+          }] },
+        };
+        const incomingTrack = {
+          id: 22, title: 'Replacement recording', permalink_url: link,
+          user: { username: 'Replacement artist' }, access: 'playable', policy: 'ALLOW',
+          streams: { hls_aac_160_url: 'https://cf-hls-media.sndcdn.com/replacement-22/playlist.m3u8' },
+          media: { transcodings: [{
+            url: 'https://api-v2.soundcloud.com/media/replacement-22/stream/hls',
+            format: { protocol: 'hls', mime_type: 'audio/mpeg' },
+          }] },
+        };
+        const original = metadata.metaFromSoundCloudTrack(oldTrack, h.music, 1);
+        const originalFields = {
+          soundcloudId: original.soundcloudId, title: original.title, artist: original.artist,
+          link: original.link, access: original.access, policy: original.policy,
+          requiresNativePlayback: original.requiresNativePlayback,
+          nativePlaybackReason: original.nativePlaybackReason,
+          hls_aac_160_url: original.hls_aac_160_url,
+          transcodings: original.transcodings.map(item => ({ ...item })),
+        };
+        const row = { meta: original };
+        h.state.active = true;
+        h.state.playlistUrl = h.music;
+        h.state.meta = [original, h.meta(33, h.music)];
+        h.state.els = [row, null];
+        const currentTi = h.state.meta.findIndex(meta => meta.soundcloudId === currentId);
+        h.state.queue = [currentTi, ...[0, 1].filter(ti => ti !== currentTi)];
+        h.state._deckTrack = currentTi;
+        h.state.roundTotal = 2;
+        h.state._liveSyncSources.set(h.music, new Set([0, 1]));
+        h.state._liveSyncSources.set(h.bumpers, new Set([0]));
+        h.resolveWith(metadata.resolveLiveTrackMeta);
+        h.snapshots.set(h.music, { complete: true, tracks: [incomingTrack, { id: 33 }] });
+        h.snapshots.set(h.bumpers, { complete: true, tracks: [oldTrack] });
+
+        const members = sourcePage => new Set([...h.state._liveSyncSources.get(sourcePage)]
+          .map(ti => h.state.meta[ti].soundcloudId));
+        const assertOriginalIdentity = () => {
+          for (const [key, value] of Object.entries(originalFields)) {
+            assert.deepEqual(original[key], value, `track 11 retains its own ${key}`);
+          }
+          assert.equal(h.state.meta.filter(meta => meta.soundcloudId === 11).length, 1);
+          assert.equal(h.state.meta[h.state._deckTrack].soundcloudId, currentId);
+          assert.equal(h.queueIds()[h.state.pos], currentId);
+        };
+
+        assert.equal(await h.sync({ force: true }), 1);
+        assertOriginalIdentity();
+        assert.equal(h.state.els[h.state.meta.indexOf(original)],
+          source.includes('function soundCloudLinkMatches(') ? null : row,
+          'ID-aware native binding clears the now-ambiguous permalink without altering either track');
+        assert.deepEqual(members(h.music), new Set([22, 33]));
+        assert.deepEqual(members(h.bumpers), new Set([11]));
+        assert.deepEqual(new Set(h.queueIds()), new Set([11, 22, 33]));
+        assert.equal(h.state.queue.length, 3);
+        const replacements = h.state.meta.filter(meta => meta.soundcloudId === 22);
+        assert.equal(replacements.length, 1);
+        const replacement = replacements[0];
+        assert.notEqual(replacement, original);
+        if (source.includes('function soundCloudLinkMatches(')) {
+          assert.equal(h.state.els[h.state.meta.indexOf(replacement)], null,
+            'the replacement cannot inherit the original identity’s URL-only native row');
+        }
+        assert.equal(replacement.title, incomingTrack.title);
+        assert.equal(replacement.artist, incomingTrack.user.username);
+        assert.equal(replacement.access, 'playable');
+        assert.equal(replacement.requiresNativePlayback, false);
+        assert.equal(replacement.nativePlaybackReason, undefined);
+        assert.equal(replacement.hls_aac_160_url, incomingTrack.streams.hls_aac_160_url);
+        assert.equal(replacement.transcodings.length, 1);
+        assert.equal(replacement.transcodings[0].url, incomingTrack.media.transcodings[0].url);
+
+        h.snapshots.set(h.bumpers, h.snapshot([]));
+        await h.sync({ force: true });
+        assertOriginalIdentity();
+        assert.deepEqual(members(h.bumpers), new Set());
+        assert.deepEqual(members(h.music), new Set([22, 33]));
+        assert.equal(original.removedFromPlaylist, true);
+        assert.deepEqual(new Set(h.queueIds()), new Set(currentId === 11 ? [11, 22, 33] : [22, 33]));
+        if (currentId !== 11) assert.equal(original.unavailable, true);
+
+        h.snapshots.set(h.music, h.snapshot([33]));
+        await h.sync({ force: true });
+        assertOriginalIdentity();
+        assert.deepEqual(members(h.music), new Set([33]));
+        assert.equal(replacement.removedFromPlaylist, true);
+        assert.equal(replacement.unavailable, true);
+        assert.deepEqual(new Set(h.queueIds()), new Set(currentId === 11 ? [11, 33] : [33]));
+      });
+    }
+  }
+}
 
 test('time parser supports normal, long and hour-long tracks', () => {
   assert.equal(parseTimeText('2:54'), 174);
@@ -363,10 +685,15 @@ test('liked-song grid cards join the existing collection pipeline', () => {
       return [];
     },
   };
+  const collectionDependencies = {
+    ...soundCloudDependencies(),
+    getLink: element => element === card ? '/artist/track' : null,
+  };
   const currentPageTrackElements = Function(
-    'document', 'isLikedTracksPage', 'getLink', 'normalizeTrackUrl',
+    'document', 'isLikedTracksPage', 'getMeta', ...Object.keys(collectionDependencies),
     `return (${extractFunction('currentPageTrackElements')})`,
-  )(document, () => true, element => element === card ? '/artist/track' : null, value => value);
+  )(document, () => true, element => ({ link: element === card ? '/artist/track' : null }),
+    ...Object.values(collectionDependencies));
 
   assert.deepEqual(currentPageTrackElements(), [legacy, card]);
 });
@@ -647,8 +974,8 @@ function createWatcherHarness() {
     getItem(key) { return storage.get(key) || null; },
     removeItem(key) { storage.delete(key); },
   };
-  const saveQueueSessionCache = Function('state', 'sessionStorage', 'trackId', 'Date',
-    `return (${extractFunction('saveQueueSessionCache')})`)(state, sessionStorage, trackId, { now: () => now });
+  const saveQueueSessionCache = Function('state', 'sessionStorage', 'Date', ...Object.keys(soundCloudDependencies()),
+    `return (${extractFunction('saveQueueSessionCache')})`)(state, sessionStorage, { now: () => now }, ...Object.values(soundCloudDependencies()));
 
   const nativePlaybackAllowed = Function(
     'state', `return (${extractFunction('nativePlaybackAllowed')})`,
@@ -812,12 +1139,12 @@ test('a suspended external end consumes and caches the source queue exactly once
 
 test('restoring a consumed suspended queue does not reinsert played tracks into the round', () => {
   const remapCachedQueue = Function(
-    'trackId', 'fisherYates', 'spaceDuplicateTitles',
+    'fisherYates', 'spaceDuplicateTitles', ...Object.keys(soundCloudDependencies()),
     `return (${extractFunction('remapCachedQueue')})`,
   )(
-    meta => meta?.link || '',
     items => items.slice().reverse(),
     spaceDuplicateTitles,
+    ...Object.values(soundCloudDependencies()),
   );
   const restored = remapCachedQueue({
     queue: [1, 2],
@@ -846,12 +1173,12 @@ test('restoring a consumed suspended queue does not reinsert played tracks into 
 
 test('cached queue spacing never moves tracks across a nonzero current position', () => {
   const remapCachedQueue = Function(
-    'trackId', 'fisherYates', 'spaceDuplicateTitles',
+    'fisherYates', 'spaceDuplicateTitles', ...Object.keys(soundCloudDependencies()),
     `return (${extractFunction('remapCachedQueue')})`,
   )(
-    meta => meta?.link || '',
     items => items.slice(),
     spaceDuplicateTitles,
+    ...Object.values(soundCloudDependencies()),
   );
   const meta = [
     { link: 'a-1', title: 'A' },
@@ -1060,7 +1387,11 @@ test('checked stop-after-round leaves the queue exhausted', () => {
 test('closed sidebar defers queue DOM rebuilds until it is opened', () => {
 
   const state = { sidebarOpen: false, _sidebarDirty: true };
-  const sidebar = { dataset: {} };
+  const sidebar = {
+    dataset: {}, hidden: true, attributes: {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+  };
   const hub = { dataset: {} };
   const document = {
     getElementById(id) {
@@ -1070,30 +1401,31 @@ test('closed sidebar defers queue DOM rebuilds until it is opened', () => {
     },
   };
   let renders = 0;
-  let syncs = 0;
   let hubUpdates = 0;
   const toggleSidebar = Function(
-    'state', 'document', 'renderList', 'syncSidebarToHub', 'updateHub',
-    `return (${extractFunction('toggleSidebar')})`,
+    'state', 'document', 'renderList', 'syncSidebarToHub', 'updateHub', 'window',
+    `${['motionIsInstant', 'animateSurface', 'syncSettingsTabs', 'setSettingsTab',
+      'syncHubView', 'setHubView', 'setHubMini', 'setSidebarTab', 'updateTabStyles']
+      .filter(name => source.includes(`function ${name}(`)).map(extractFunction).join('\n')}
+    return (${extractFunction('toggleSidebar')})`,
   )(
     state,
     document,
     () => { renders++; state._sidebarDirty = false; },
-    () => { syncs++; },
+    () => {},
     () => { hubUpdates++; },
+    {},
   );
 
   toggleSidebar();
   assert.equal(state.sidebarOpen, true);
   assert.equal(sidebar.dataset.open, 'true');
   assert.equal(renders, 1);
-  assert.equal(syncs, 1);
 
   toggleSidebar();
   assert.equal(state.sidebarOpen, false);
   assert.equal(sidebar.dataset.open, 'false');
   assert.equal(renders, 1);
-  assert.equal(syncs, 1);
   assert.equal(hubUpdates, 2);
 });
 
@@ -1467,14 +1799,17 @@ test('PiP visual sync repaints Better Feed waveform and time labels from the liv
   };
   const syncBetterFeedPipWindow = Function(
     'state', 'pageWindow', 'documentPipApi', 'betterFeedPipActive', 'playbackTiming',
-    'formatPlaybackClock', 'trackId', 'waveformCache', 'DEFAULT_WAVE_HEIGHTS',
+    'formatPlaybackClock', 'waveformCache', 'DEFAULT_WAVE_HEIGHTS',
+    'getComputedStyle', 'document', ...Object.keys(soundCloudDependencies()),
     `return (${extractFunction('syncBetterFeedPipWindow')})`,
   )(
     state, pageWindow, () => pageWindow.documentPictureInPicture,
     () => true, () => ({ current: 90, duration: 180 }),
     seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`,
-    meta => meta.link, new Map([['https://soundcloud.com/test/live', [25, 50, 75, 100]]]),
+    new Map([['https://soundcloud.com/test/live', [25, 50, 75, 100]]]),
     [50, 50, 50, 50],
+    () => ({ getPropertyValue: () => '#a6b6ea' }), { documentElement: {} },
+    ...Object.values(soundCloudDependencies()),
   );
 
   assert.equal(syncBetterFeedPipWindow(), true);
@@ -1483,9 +1818,13 @@ test('PiP visual sync repaints Better Feed waveform and time labels from the liv
   assert.equal(canvas.width, 300);
   assert.equal(canvas.height, 30);
   const bars = fills.filter(call => call[0] === 'fill');
-  assert.ok(bars.some(call => call[1] === '#f50' && call[2] < 150));
-  assert.ok(bars.some(call => call[1] === '#777' && call[2] >= 150));
-  assert.equal(bars.filter(call => call[1] === '#f50').length, 50);
+  const played = bars.filter(call => call[2] < 150);
+  const upcoming = bars.filter(call => call[2] >= 150);
+  assert.equal(played.length, 50);
+  assert.equal(upcoming.length, 50);
+  assert.equal(new Set(played.map(call => call[1])).size, 1);
+  assert.equal(new Set(upcoming.map(call => call[1])).size, 1);
+  assert.notEqual(played[0][1], upcoming[0][1]);
 });
 
 test('native True Shuffle PiP mirrors the active deck and upcoming queue item', () => {
@@ -1499,7 +1838,8 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
       hidden: false,
       src: '',
       attributes: {},
-      setAttribute(name, entry) { this.attributes[name] = entry; },
+      getAttribute(name) { return this.attributes[name] ?? null; },
+      setAttribute(name, entry) { this.attributes[name] = String(entry); },
     };
     nodes.set(id, value);
     return value;
@@ -1512,12 +1852,26 @@ test('native True Shuffle PiP mirrors the active deck and upcoming queue item', 
     'tss-pip-next-artwork', 'tss-pip-next-fallback', 'tss-pip-next-settings', 'tss-pip-crossfade',
     'tss-pip-crossfade-value', 'tss-pip-auto-level', 'tss-pip-processing', 'tss-pip-waveform',
   ].forEach(node);
+  const pipProperties = {};
   const pipDocument = {
     title: 'True Shuffle',
-    documentElement: { style: { setProperty() {} } },
+    documentElement: {
+      dataset: {},
+      style: {
+        getPropertyValue: name => pipProperties[name] ?? '',
+        setProperty(name, value) { pipProperties[name] = String(value); },
+        removeProperty(name) {
+          const value = pipProperties[name] ?? '';
+          delete pipProperties[name];
+          return value;
+        },
+      },
+    },
     getElementById: id => nodes.get(id) || null,
   };
   const state = {
+    active: true,
+    suspended: false,
     _ownPipWindow: { closed: false, document: pipDocument },
     _deckTrack: 0,
     queue: [0, 1],
@@ -1650,30 +2004,88 @@ test('PiP artwork toggle preserves compact, full-picture and focus layouts', () 
 
 test('PiP marquee activates only when the full title overflows its viewport', () => {
   const properties = {};
+  const independentScrolling = source.includes('function setScrollLongTitles(');
+  const state = { reduceVisualEffects: false, scrollLongTitles: true };
+  const stage = { dataset: { view: 'player' } };
+  const pipDocument = {
+    getElementById: id => id === 'tss-pip-stage' ? stage : null,
+  };
   const viewport = {
     clientWidth: 120,
+    ownerDocument: pipDocument,
     dataset: {},
     attributes: {},
+    getAttribute(name) { return this.attributes[name] ?? null; },
     setAttribute(name, value) { this.attributes[name] = value; },
   };
   const text = {
     textContent: 'A deliberately long track title',
     scrollWidth: 260,
-    style: { setProperty(name, value) { properties[name] = value; } },
+    style: {
+      getPropertyValue: name => properties[name] ?? '',
+      setProperty(name, value) { properties[name] = String(value); },
+    },
   };
   const syncOwnPipMarquee = Function(
+    'state',
     `return (${extractFunction('syncOwnPipMarquee')})`,
-  )();
+  )(state);
 
   assert.equal(syncOwnPipMarquee(viewport, text), true);
   assert.equal(viewport.dataset.overflow, 'true');
   assert.equal(viewport.attributes['aria-label'], text.textContent);
-  assert.equal(properties['--tss-pip-marquee-distance'], '-140px');
-  assert.match(source, /@media\(prefers-reduced-motion:reduce\)[^{]*\{[^}]*\.tss-pip-title-text/);
+  if (independentScrolling) {
+    assert.equal(properties['--tss-pip-marquee-distance'], '-140px');
+    assert.equal(properties['--tss-pip-marquee-duration'], '12.8s');
+  }
 
   text.scrollWidth = 118;
   assert.equal(syncOwnPipMarquee(viewport, text), false);
   assert.equal(viewport.dataset.overflow, 'false');
+
+  if (source.includes('function setReducedVisualEffects(')) {
+    text.scrollWidth = 260;
+    stage.dataset.view = 'queue';
+    assert.equal(syncOwnPipMarquee(viewport, text), false);
+    assert.equal(viewport.dataset.overflow, 'false');
+
+    stage.dataset.view = 'player';
+    assert.equal(syncOwnPipMarquee(viewport, text), true);
+    assert.equal(viewport.dataset.overflow, 'true');
+
+    if (independentScrolling) {
+      for (const reduced of [false, true]) {
+        for (const scrolling of [false, true]) {
+          state.reduceVisualEffects = reduced;
+          state.scrollLongTitles = scrolling;
+          assert.equal(syncOwnPipMarquee(viewport, text), scrolling,
+            `scrolling=${scrolling} must be independent of reduced effects=${reduced}`);
+          assert.equal(viewport.dataset.overflow, String(scrolling));
+        }
+      }
+    } else {
+      state.reduceVisualEffects = true;
+      assert.equal(syncOwnPipMarquee(viewport, text), false);
+      assert.equal(viewport.dataset.overflow, 'false');
+
+      state.reduceVisualEffects = false;
+      assert.equal(syncOwnPipMarquee(viewport, text), true);
+      assert.equal(viewport.dataset.overflow, 'true');
+    }
+
+    viewport.clientWidth = 0;
+    assert.equal(syncOwnPipMarquee(viewport, text), false);
+    assert.equal(viewport.dataset.overflow, 'false');
+
+    viewport.clientWidth = 120;
+    text.scrollWidth = 122;
+    assert.equal(syncOwnPipMarquee(viewport, text), false, 'a two-pixel rounding difference is not overflow');
+    text.scrollWidth = 123;
+    assert.equal(syncOwnPipMarquee(viewport, text), true);
+    stage.dataset.view = 'queue';
+    assert.equal(syncOwnPipMarquee(viewport, text), false);
+    assert.equal(viewport.attributes['aria-label'], text.textContent, 'the complete title remains accessible');
+  }
 });
 
 test('native PiP queue puts play-next requests directly after the current track', () => {
@@ -1877,17 +2289,48 @@ test('PiP like state follows SoundCloud selected and aria states', () => {
   assert.equal(soundCloudLikeButtonState(button(false, 'Unlike')), true);
 });
 
-test('PiP like control uses the native authenticated SoundCloud button', () => {
-  const finder = extractFunction('findSoundCloudLikeButton');
-  const toggleLike = extractFunction('toggleCurrentTrackLike');
-  const syncPip = extractFunction('syncOwnPipWindow');
-  assert.match(finder, /\.playbackSoundBadge__like/);
-  assert.match(finder, /bound\.querySelector\('\.sc-button-like'\)/);
-  assert.match(toggleLike, /button\.click\(\)/);
-  assert.match(toggleLike, /state\._likeBusy/);
-  assert.match(syncPip, /like\.setAttribute\('aria-pressed'/);
-  assert.match(syncPip, /SVG\.heartFilled/);
-});
+if (source.includes('function boundSoundCloudRow(')) {
+  test('Like rejects a recycled attached row and rebinds only the expected track', async () => {
+    let wrongClicks = 0;
+    let rightClicks = 0;
+    let liked = false;
+    const wrongButton = { click() { wrongClicks++; } };
+    const rightButton = {
+      click() { rightClicks++; liked = !liked; },
+      classList: { contains: () => liked },
+      getAttribute: () => null,
+    };
+    const row = (href, button) => ({
+      href,
+      querySelector(selector) {
+        return selector === '.sc-button-like' ? button : { getAttribute: () => this.href };
+      },
+    });
+    const recycled = row('/artist/wrong', wrongButton);
+    const correct = row('/artist/expected?in=user/sets/list', rightButton);
+    let links = [];
+    const state = { meta: [{ link: 'https://soundcloud.com/artist/expected' }], els: [recycled], queue: [0], pos: 0 };
+    const dependencies = {
+      ...soundCloudDependencies({ state,
+        document: { body: { contains: () => true }, querySelector: () => null, querySelectorAll: () => links } }), state,
+      location: { href: 'https://soundcloud.com/user/sets/list' },
+      document: { body: { contains: () => true }, querySelector: () => null, querySelectorAll: () => links },
+      wait: async () => {}, syncOwnPipWindow: () => {}, showMergeToast: () => {},
+    };
+    for (const name of ['getLink', 'soundCloudLikeButtonState', 'boundSoundCloudRow', 'findSoundCloudLikeButton', 'currentTrackLikeState', 'toggleCurrentTrackLike']) {
+      dependencies[name] = Function(...Object.keys(dependencies),
+        `return (${extractFunction(name).replace(/^function toggleCurrentTrackLike/, 'async function toggleCurrentTrackLike')})`)(...Object.values(dependencies));
+    }
+    assert.equal(await dependencies.toggleCurrentTrackLike(), false);
+    assert.equal(wrongClicks, 0);
+    links = [{ href: 'https://soundcloud.com/artist/expected', closest: () => correct }];
+    assert.equal(await dependencies.toggleCurrentTrackLike(), true);
+    assert.equal(state.els[0], correct);
+    assert.equal(rightClicks, 1);
+    assert.equal(wrongClicks, 0);
+    assert.equal(state.meta[0].liked, true);
+  });
+}
 
 
 test('native playback pause never toggles the transport or touches True Shuffle decks', () => {
@@ -1972,6 +2415,10 @@ function createNativePlaybackHarness(overrides = {}) {
   const state = {
     active: false, loading: false, suspended: false, busy: false,
     queue: [7], pos: 0, _decks: [ownDeck], _nativeTrack: null,
+    meta: Array.from({ length: 8 }, (_, index) => ({
+      link: `https://soundcloud.com/artist/track-${index}`,
+    })),
+    els: [],
     _nativePlaybackGuardInstalled: false, _nativeGuardButtonAction: false,
     _playbackEpoch: 0, _playbackAbort: new AbortController(), _userPaused: false,
     ...overrides,
@@ -1999,12 +2446,14 @@ function createNativePlaybackHarness(overrides = {}) {
       stopImmediatePropagation() { this.stopped = true; },
     };
   }
+  const nativeBadge = { href: 'https://soundcloud.com/artist/track-7' };
   const document = {
     addEventListener(type, handler) { listeners[type] = handler; },
-    querySelector: () => button,
-    querySelectorAll: () => [ownDeck, nativeAudio],
+    querySelector: selector => selector === '.playbackSoundBadge__titleLink' ? nativeBadge : button,
+    querySelectorAll: selector => selector === 'audio' ? [ownDeck, nativeAudio] : [],
   };
   const dependencies = {
+    ...soundCloudDependencies({ state, document }),
     state, document,
     queueMicrotask: fn => microtasks.push(fn),
     setTimeout: fn => timers.push(fn),
@@ -2127,6 +2576,7 @@ test('True Shuffle transport retries custom playback but cannot start idle nativ
     refreshPlayBtn: () => {},
     runPlaybackOperation: async (_label, operation) => operation(() => true),
     paused: () => harness.nativeAudio.paused,
+    showMergeToast: () => {},
   });
   dependencies.pause = Function(
     ...Object.keys(dependencies), `return (${extractFunction('pause')})`,
@@ -2159,57 +2609,10 @@ test('True Shuffle transport retries custom playback but cannot start idle nativ
 });
 
 
-test('build copies the canonical userscript byte-for-byte without using legacy modules', () => {
-  const root = path.resolve(__dirname, '..');
-  const buildSource = fs.readFileSync(path.join(root, 'build.py'), 'utf8');
-  assert.doesNotMatch(buildSource, /src[/\\\\]|FILES\s*=|HEADER\s*=|FOOTER\s*=/);
-  assert.match(buildSource, /SOURCE\s*=\s*ROOT \/ "SC Trueshuffle\.js"/);
-
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tss-build-'));
-  const output = path.join(tempDir, 'SC Trueshuffle.user.js');
-  try {
-    const result = childProcess.spawnSync(
-      process.env.PYTHON || 'python',
-      [path.join(root, 'build.py'), '--output', output],
-      { cwd: root, encoding: 'utf8' },
-    );
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.deepEqual(fs.readFileSync(output), fs.readFileSync(scriptPath));
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test('diagnostic build has distinct metadata and preserves production instrumentation', () => {
-  const root = path.resolve(__dirname, '..');
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tss-diagnostic-build-'));
-  const output = path.join(tempDir, 'SC Trueshuffle Diagnostic.user.js');
-  try {
-    const result = childProcess.spawnSync(
-      process.env.PYTHON || 'python',
-      [path.join(root, 'build.py'), '--diagnostic', '--output', output],
-      { cwd: root, encoding: 'utf8' },
-    );
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    const canonical = fs.readFileSync(path.join(root, 'SC Trueshuffle.js'), 'utf8');
-    const expected = canonical
-      .replace('// @name         SoundCloud True Shuffle',
-        '// @name         SoundCloud True Shuffle (Temporary Diagnostic)')
-      .replace('// @version      6.2.5', '// @version      6.2.6')
-      .replace('// @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.',
-        '// @description  Temporary diagnostic copy; disable the stable script while diagnosing playback.');
-    assert.equal(fs.readFileSync(output, 'utf8'), expected);
-    assert.match(expected, /@match\s+https:\/\/soundcloud\.com\/\*/);
-    assert.match(expected, /@version\s+6\.2\.6/);
-    assert.match(expected, /const DIAGNOSTIC_BUILD = true;/);
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-});
 
 
 test('playlist hydration parser exposes the complete stable track id list', () => {
-  const playlistSnapshotFromHtml = Function(`return (${extractFunction('playlistSnapshotFromHtml')})`)();
+  const playlistSnapshotFromHtml = extractedWithSoundCloud('playlistSnapshotFromHtml');
   const payload = [
     { hydratable: 'user', data: { id: 9 } },
     { hydratable: 'playlist', data: {
@@ -2244,22 +2647,31 @@ test('live tracks are inserted only into the unplayed part of the round', () => 
   assert.ok(queue.indexOf(5) > 1);
 });
 
+function metadataRow(meta) {
+  const href = meta.link;
+  return {
+    meta,
+    querySelector(selector) {
+      return selector === '.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary'
+        ? { href, getAttribute: () => href } : null;
+    },
+  };
+}
+
 function createPlaylistCollectionHarness(resolveSnapshotMetas) {
-  const normalizeTrackUrl = Function('URL', 'location', `return (${extractFunction('normalizeTrackUrl')})`)(
-    URL, { origin: 'https://soundcloud.com' },
-  );
+  const dependencies = soundCloudDependencies();
   const mergeTrackMeta = Function(`return (${extractFunction('mergeTrackMeta')})`)();
   return Function(
-    'getMeta', 'fetchLivePlaylistSnapshot', 'resolvePlaylistSnapshotMetas', 'normalizeTrackUrl', 'mergeTrackMeta',
+    'getMeta', 'fetchLivePlaylistSnapshot', 'resolvePlaylistSnapshotMetas', 'mergeTrackMeta', ...Object.keys(dependencies),
     `return (${extractFunction('completePlaylistCollection').replace(/^function /, 'async function ')})`,
-  )(el => el.meta, async () => null, resolveSnapshotMetas, normalizeTrackUrl, mergeTrackMeta);
+  )(el => el.meta, async () => null, resolveSnapshotMetas, mergeTrackMeta, ...Object.values(dependencies));
 }
 
 test('complete playlist collection fills tracks SoundCloud did not render in the DOM', async () => {
   const pageUrl = 'https://soundcloud.com/user/sets/list';
-  const firstEl = { meta: {
+  const firstEl = metadataRow({
     title: 'First', artist: 'A', link: 'https://soundcloud.com/a/first', sourcePage: pageUrl,
-  } };
+  });
   const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
     firstEl.meta,
     { title: 'Second', artist: 'B', link: 'https://soundcloud.com/b/second', sourcePage: pageUrl },
@@ -2280,7 +2692,7 @@ test('complete playlist identities replace unmatched DOM rows while preserving r
     { meta: { title: 'Second', artist: 'Beta, Guest', link: 'https://soundcloud.com/b/second?in=user/sets/list', liked: false, artwork: 'dom-art' } },
     { meta: { title: 'First', artist: '—', link: 'https://soundcloud.com/a/first/', artistLink: null, waveform: null } },
     { meta: { title: 'Unmatched', artist: '—', link: 'https://soundcloud.com/c/unmatched' } },
-  ];
+  ].map(row => metadataRow(row.meta));
   const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
     { title: 'First API title', artist: 'Alpha', link: 'https://soundcloud.com/a/first', artistLink: 'https://soundcloud.com/a', waveform: 'first-wave' },
     { title: 'Second API title', artist: 'Beta', link: 'https://soundcloud.com/b/second', liked: true, artwork: 'api-art' },
@@ -2302,7 +2714,7 @@ test('complete playlist identities replace unmatched DOM rows while preserving r
 
 test('partially resolved playlists retain rendered tracks and recovered names without claiming completion', async () => {
   const pageUrl = 'https://soundcloud.com/user/sets/list';
-  const pageEls = [{ meta: { title: 'First', artist: '—', link: 'https://soundcloud.com/a/first' } }];
+  const pageEls = [metadataRow({ title: 'First', artist: '—', link: 'https://soundcloud.com/a/first' })];
   const completePlaylistCollection = createPlaylistCollectionHarness(async () => [
     { title: 'First', artist: 'Alpha', link: 'https://soundcloud.com/a/first' },
   ]);
@@ -2345,15 +2757,18 @@ test('live queue application preserves current playback and updates the round on
     els: [{}, {}],
   };
   const trackId = Function(`return (${extractFunction('trackId')})`)();
+  const identityDependencies = soundCloudDependencies({ state });
   const applyLiveQueueTracks = Function(
     'state', 'trackId', 'getMeta', 'insertTracksRandomlyAfterCurrent', 'fisherYates',
     'refreshUpcomingCrossfadePreparation', 'badges', 'renderList', 'updateHub', 'showMergeToast',
+    ...Object.keys(identityDependencies),
     `return (${extractFunction('applyLiveQueueTracks')})`,
   )(
     state, trackId, () => ({}),
     (queue, pos, indices) => queue.splice(pos + 1, 0, ...indices),
     items => items.slice(),
     () => {}, () => {}, () => {}, () => {}, () => {},
+    ...Object.values(identityDependencies),
   );
   const added = applyLiveQueueTracks([
     { soundcloudId: 20, title: 'New A', artist: 'C', link: 'https://soundcloud.com/c/new-a', sourcePage: 'playlist' },
@@ -2377,6 +2792,7 @@ function createLiveSyncHarness() {
     roundPlayed: 0, roundTotal: 0, priority: {}, skipCounts: {}, roundStarts: {},
     _liveSyncSources: new Map(), _liveSyncInFlight: false, _liveSyncLastCheck: 0,
     _liveSyncTimer: null, _deckTrack: null, _nativeTrack: null,
+    _streamCache: new Map(),
     _playbackEpoch: 0, _playbackAbort: new AbortController(), _collectionEpoch: 0, _userPaused: false,
   };
   const location = { href: music };
@@ -2394,6 +2810,7 @@ function createLiveSyncHarness() {
   const snapshot = (ids, complete = true) => ({ complete, tracks: ids.map(id => ({ id })) });
   const document = { getElementById: () => null, querySelectorAll: () => [], removeEventListener: () => {} };
   const dependencies = {
+    ...soundCloudDependencies({ state, document }),
     state, location, document, playlistBase, syncTasks,
     AbortController,
     currentPageTrackElements: () => [],
@@ -2412,7 +2829,7 @@ function createLiveSyncHarness() {
     },
     resolveLiveTrackMeta: async (track, sourcePage) => resolver
       ? resolver(track, sourcePage) : meta(track.id, sourcePage),
-    loadTracks: async () => (collections.get(playlistBase(location.href)) || []).map(item => ({ meta: { ...item } })),
+    loadTracks: async () => (collections.get(playlistBase(location.href)) || []).map(item => metadataRow({ ...item })),
     completePlaylistCollection: async (sourcePage, els, snapshotPromise) => {
       await snapshotPromise;
       return { els, meta: els.map(el => el.meta), complete: true };

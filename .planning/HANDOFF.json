@@ -1,0 +1,203 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-10-24",
+  "context": "release",
+  "phase": null,
+  "phase_name": "Öffentlicher Cutover 6.3.0 verifiziert — bereit für autorisierten assetlosen GitHub-Release",
+  "phase_dir": null,
+  "plan": null,
+  "task": null,
+  "historical_total_tasks": 5,
+  "status": "verified_ready_to_ship",
+  "artifact": "dist/SC Trueshuffle.user.js",
+  "release": {
+    "version": "6.3.0",
+    "canonical_source": "SC Trueshuffle.js",
+    "promoted_from": "verified UI 6.2.9.19",
+    "repository": "mrketa/soundcloud-true-shuffle",
+    "branch": "main",
+    "planned_tag": "v6.3.0",
+    "github_push_authorized": true,
+    "github_release_authorized": true,
+    "uploaded_release_assets": [],
+    "uploaded_release_assets_allowed": false,
+    "automatic_source_archives": "GitHub-generated, not uploaded attachments",
+    "publication_status": "not_yet_recorded",
+    "release_url": null,
+    "final_verification": {
+      "reported_by": "Main release run",
+      "syntax_canonical_public_diagnostic": "passed",
+      "node": {
+        "canonical_default": {"passed": 164, "skipped": 0, "failed": 0},
+        "public_dist": {"passed": 164, "skipped": 0, "failed": 0},
+        "diagnostic_dist": {"passed": 164, "skipped": 0, "failed": 0},
+        "private_ui_19_comparison": {"passed": 164, "skipped": 0, "failed": 0},
+        "abox_private_9_comparison": {"passed": 133, "skipped": 9, "failed": 0}
+      },
+      "default_build_byte_identical_to_canonical": true,
+      "public_code_body_byte_identical_to_verified_ui_19": true,
+      "public_diagnostic_metadata_version": "6.3.0",
+      "public_diagnostic_verbose_flags": [false, true],
+      "public_sha256": "1fe179307575d7fa30b469ddb6f3129470641097d4d9f84894e1a2a450e8879e",
+      "chrome_built_public": {
+        "real_local_wav_graph_pause_resume": "passed",
+        "independent_scroll_with_reduce_on": "passed",
+        "dark_native_document_pip": "passed",
+        "fault_report_characters": 718,
+        "native_clipboard_exact": true,
+        "same_deck_context_kept_playing": true,
+        "browser_errors": 0
+      },
+      "firefox_158_built_public": {
+        "ui_pip_marquee": "passed",
+        "fault_report_characters": 484,
+        "native_clipboard_exact": true,
+        "browser_errors": 0
+      },
+      "all_fixtures_cleaned": true,
+      "limits": "No authenticated SoundCloud, userscript-manager, current Abox-VM or Safari certification."
+    },
+    "greasyfork_publication_in_scope": false,
+    "greasyfork_version_sync_claimed": false,
+    "install_url_after_push": "https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js",
+    "production": {
+      "diagnostic_build": false,
+      "transition_diagnostics": true,
+      "fault_only_header_report": true,
+      "short_report_max_characters": 1800,
+      "optional_full_report": true,
+      "persistent_logs_or_telemetry": false
+    },
+    "build": {
+      "default": "Verbatim copy of canonical source to dist/SC Trueshuffle.user.js",
+      "diagnostic": "Standalone Temporary Diagnostic identity and description; same canonical version; DIAGNOSTIC_BUILD=true"
+    },
+    "tests": {
+      "default_command": "node --test tests/*.test.js",
+      "default_source": "SC Trueshuffle.js",
+      "private_expectation_flags_required": false,
+      "explicit_artifact_override": "TSS_SCRIPT",
+      "expectations": "Metadata-version release contracts: half-duration budget from 6.2.6; immediate prefetch from 6.2.7"
+    },
+    "preserved_private_artifacts": [
+      "dist/SC Trueshuffle UI Backup 6.2.9.user.js",
+      "dist/SC Trueshuffle HLS Pre-release 6.2.9.user.js"
+    ],
+    "limits": "Current built-public Chrome/Firefox fixtures, historical UI .19 evidence and separate private-6.2.9 feedback do not certify public 6.3.0 on Abox VM, authenticated SoundCloud, userscript managers, Safari or the full browser/manager matrix.",
+    "execution_owner": "Main release run; this documentation assignment runs no builds/tests/lint/format/git/publication."
+  },
+  "historical_completed_tasks": [
+    {
+      "id": 1,
+      "name": "Firefox-Scheduling-Ursache lokal reproduziert und Berichte gesichert",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": 2,
+      "name": "Private 6.2.9 mit paarweisen Rampen und monotoner Zeitkompensation implementiert",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": 3,
+      "name": "PCM-/HLS-Smokes, Regressionen und Review abgeschlossen",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": 4,
+      "name": "Antworttext für Abox formuliert",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": 5,
+      "name": "Positive VM-Rückmeldung zu privater 6.2.9 laut Nutzer dokumentiert",
+      "status": "done",
+      "commit": null
+    }
+  ],
+  "historical_remaining_tasks": [],
+  "blockers": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Öffentliche 6.3.0 aus geprüfter UI .19 übernehmen; private Originale erhalten.",
+      "rationale": "Nutzer hat den öffentlichen Cutover, GitHub-Push und Release ohne hochgeladene Assets ausdrücklich autorisiert. Frühere Trennung von stabiler 6.2.5 ohne Migrationsauftrag ist historische Autorisierungslage."
+    },
+    {
+      "decision": "Cancelable paired linear ramps statt nativer Kurvenevents.",
+      "rationale": "Aktive native Kurven lassen sich im getesteten Firefox nicht zuverlässig durch neue Automation ersetzen."
+    },
+    {
+      "decision": "Reserve innerhalb des bestehenden Overlap-Fensters.",
+      "rationale": "Keine Verlängerung des Übergangs oder Verbrauch zusätzlichen Bumper-Budgets; aktive Rampe wird entsprechend kürzer."
+    }
+  ],
+  "blocking_constraints": [
+    {
+      "description": "AudioContext.currentTime kann innerhalb eines Firefox-JS-Tasks trotz langer Arbeit konstant bleiben. +15 ms im alten Report war kein Nachweis rechtzeitiger Übergabe.",
+      "severity": "blocking",
+      "mitigation": "Neue Wall-Dauer und monotone Schätzung getrennt vom rohen Audiozeit-Sample interpretieren; keine Render-Zustellgarantie behaupten."
+    },
+    {
+      "description": "setValueCurveAtTime mit nachfolgender Automation kann in Firefox trotz cancelScheduledValues(0) NotSupportedError auslösen.",
+      "severity": "blocking",
+      "mitigation": "Vorhandene paarweise lineare Rampen erhalten; keine native Kurven-Abkürzung ohne neuen Nachweis."
+    }
+  ],
+  "historical_private_verification": {
+    "syntaxPassed": true,
+    "privateRunnerResults": 131,
+    "standardRunnerResults": 129,
+    "failures": 0,
+    "reviewFindings": 0,
+    "pcm": {
+      "casesPerBuild": 18,
+      "baselineDiscontinuities": 8,
+      "candidateDiscontinuities": 0
+    },
+    "hls": "Beide Bumper-Übergänge in allen Profilen; Pause/Fortsetzen und Stop/Deck-Wiederverwendung bestanden.",
+    "limits": "Historische lokale Fix-Verifikation: Firefox158 Windows und synthetische lokale Medien, kein physisches Audio-Loopback oder direkter Assistentennachweis auf Abox Ubuntu-VM. Neue Nutzerrückmeldung separat unter tester_feedback.",
+    "rerunDuringHandoff": false
+  },
+  "tester_feedback": {
+    "recordedAt": "2026-10-23T20:01:41+02:00",
+    "source": "Neue Nutzerrückmeldung: Abox sagte, dass 6.2.9 das Problem mit den Audioartefakten auf seiner VM behoben hat.",
+    "artifact": "dist/SC Trueshuffle HLS Pre-release 6.2.9.user.js",
+    "result": "reported_fixed_on_abox_vm",
+    "directAssistantObservation": false,
+    "newRawReportAttached": false,
+    "newPcmCapture": false,
+    "limits": "Testdatum, Dauer und konkrete Szenarien nicht genannt. Keine universelle Garantie; keine Zertifizierung von UI .19 oder öffentlicher 6.3.0, keine neue Firefox-/Safari-/Browsermatrix-Validierung. Bestehende unabhängige UI-Prüflücken bleiben bestehen."
+  },
+  "required_reading": [
+    ".continue-here.md",
+    "HANDOFF.md",
+    ".planning/debug/abox-vm-crossfade-fix-verification-2026-10-22.json"
+  ],
+  "evidence_files": [
+    ".planning/debug/abox-vm-crossfade-reports-2026-10-21.json",
+    ".planning/debug/abox-vm-crossfade-experiments-2026-10-22.json",
+    ".planning/debug/abox-vm-crossfade-fix-verification-2026-10-22.json"
+  ],
+  "background_processes": "Eigene Smoke-Prozesse/Browser/Server wurden beendet, generierte Medien und Runner entfernt; keine laufenden Dienste voraussetzen.",
+  "uncommitted_files": null,
+  "git_state": "GitHub-Push und assetloser Release autorisiert, aber Abschluss noch nicht dokumentiert. Keine Git-Mutationen in dieser Dokumentationsarbeit; tatsächliche Ergebnisse ergänzt der Hauptlauf.",
+  "known_implementation_files": [
+    "SC Trueshuffle.js",
+    "build.py",
+    "README.md",
+    "dist/SC Trueshuffle HLS Pre-release 6.2.9.user.js",
+    "tests/transition-diagnostics.test.js",
+    "tests/low-spec-playback.test.js",
+    "tests/clock-recovery.test.js",
+    "tests/crossfade-prototype.test.js",
+    "CHANGELOG.md",
+    "HANDOFF.md",
+    ".continue-here.md"
+  ],
+  "next_action": "Konsolidierte öffentliche Release-Verifikation abgeschlossen. Hauptlauf führt jetzt autorisierten GitHub-Push und Release v6.3.0 ohne hochgeladene Assets aus; anschließend tatsächliche Veröffentlichung und Release-URL dokumentieren. Greasy Fork ist nicht Teil dieses Veröffentlichungsauftrags. Kein offener Audiofix oder externes Feedback-Warten zu Abox' ursprünglicher privater 6.2.9.",
+  "context_notes": "Kanonische öffentliche Quelle ist jetzt 6.3.0 aus geprüfter UI 6.2.9.19; öffentliche Identität wiederhergestellt. UI-Backup .19 und originale Abox-private 6.2.9 bleiben unverändert. Frühere 6.2.5-/keine-Migration-/alte-Builder-Aussagen und Flag-Befehle sind historische Belege, nicht aktive Anweisungen. Abox bestätigte laut Nutzer den ursprünglichen privaten Audiofix, getrennt von lokalen PCM-/HLS-/UI-Fixtures und ohne neuen Rohbericht. build.py kopiert die aktuelle kanonische Quelle und darf keine private Originaldatei überschreiben."
+}

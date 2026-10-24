@@ -24,8 +24,8 @@ def diagnostic_source(source_bytes):
             b"// @name         SoundCloud True Shuffle (Temporary Diagnostic)",
         ),
         (
-            b"// @version      6.2.5",
-            b"// @version      6.2.6",
+            b"const DIAGNOSTIC_BUILD = false;",
+            b"const DIAGNOSTIC_BUILD = true;",
         ),
         (
             b"// @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.",

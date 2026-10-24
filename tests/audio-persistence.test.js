@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(process.env.TSS_SCRIPT || path.resolve(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+const installedVersion = source.match(/^\/\/\s*@version\s+(\S+)/m)?.[1];
+const compactReports = source.includes('function compactPlaybackReport(');
 
 function extractFunction(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -21,6 +23,15 @@ function extractFunction(name) {
 }
 
 const plain = value => JSON.parse(JSON.stringify(value));
+function dialogSnapshot(overlay) {
+  if (compactReports) {
+    const details = overlay.querySelector('#tss-debug-details');
+    details.open = true;
+    details.ontoggle();
+    return JSON.parse(overlay.querySelector('#tss-debug-full-report').textContent);
+  }
+  return JSON.parse(overlay.querySelector('#tss-debug-report').textContent);
+}
 const tests = [];
 const test = (name, run) => tests.push({ name, run });
 
@@ -84,11 +95,11 @@ function harness({ stored = {}, deniedRead = false, deniedWrite = false, gm = nu
   }
   const makeElement = tag => {
     const element = {
-      tagName: tag.toUpperCase(), dataset: {}, style: { setProperty() {} }, children: [],
+      tagName: tag.toUpperCase(), dataset: {}, style: { setProperty() {} }, children: [], isConnected: true,
       src: '', currentSrc: '', currentTime: 0, duration: 240, readyState: 2,
       paused: true, ended: false, volume: 0.1, textContent: '', value: '',
       appendChild(child) { this.children.push(child); if (child.id) elements.set(child.id, child); },
-      remove() { this.removed = true; elements.delete(this.id); },
+      remove() { this.removed = true; this.isConnected = false; elements.delete(this.id); },
       querySelector(selector) {
         if (!this.queries) this.queries = new Map();
         if (!this.queries.has(selector)) this.queries.set(selector, makeElement('div'));
@@ -158,8 +169,14 @@ function harness({ stored = {}, deniedRead = false, deniedWrite = false, gm = nu
     'playbackDiagnosticPageKind', 'playbackDiagnosticEnvironment',
     'playbackDiagnosticCapabilities', 'diagnosticDeckStreamKind',
   ];
+  diagnosticSupport.push(...['playbackDiagnosticContext', 'capturePlaybackDiagnosticIncident', 'compactPlaybackReport']
+    .filter(name => source.includes(`function ${name}(`)));
+  const preparationSupport = [
+    'crossfadePreparationMatches', 'runCrossfadeDeckPreparation', 'destroyCrossfadePreflight',
+    'recordTransitionDiagnostic', 'observeTransitionMedia', 'observeTransitionHls', 'hlsDiagnosticCode',
+  ].filter(name => source.includes(`function ${name}(`));
   const load = names => vm.runInContext(
-    [...new Set([...diagnosticSupport, ...names])].map(extractFunction).join('\n'),
+    [...new Set([...diagnosticSupport, ...preparationSupport, ...names])].map(extractFunction).join('\n'),
     sandbox,
   );
   const graphFunctions = ['ensureCrossfadeDecks', 'retireAudioGraph', 'ensureAutoLevelAudioGraph', 'syncDeckProcessingRouting',
@@ -425,7 +442,12 @@ test('legacy diagnostic records are purged without loading or rewriting them', a
   h.sandbox.showPlaybackDiagnostics();
   const overlay = h.elements.get('tss-debug-overlay');
   await overlay.querySelector('#tss-debug-copy').onclick({ currentTarget: overlay.querySelector('#tss-debug-copy') });
-  assert.deepEqual(JSON.parse(h.sandbox.copiedReport).diagnostics, []);
+  if (compactReports) {
+    assert.equal(h.sandbox.copiedReport, overlay.querySelector('#tss-debug-report').textContent);
+    assert.ok(h.sandbox.copiedReport.length <= 1800);
+    assert.match(h.sandbox.copiedReport, /Latest fault: none recorded/);
+    assert.deepEqual(dialogSnapshot(overlay).diagnostics, []);
+  } else assert.deepEqual(JSON.parse(h.sandbox.copiedReport).diagnostics, []);
   overlay.querySelector('#tss-debug-close').onclick();
 
   h.sandbox.recordPlaybackDiagnostic('recovery-failed', { reason: 'media-error' });
@@ -458,13 +480,13 @@ test('Copy report survives dispatch cleanup while clipboard access settles or re
     event.currentTarget = null; // Real DOM clears currentTarget when synchronous dispatch finishes.
     settle();
     await pending;
-    assert.deepEqual(JSON.parse(submitted), JSON.parse(report));
+    assert.equal(submitted, report);
     assert.equal(h.elements.get('tss-debug-overlay'), overlay, 'the report remains available after either clipboard outcome');
     assert.equal(overlay.querySelector('#tss-debug-report').textContent, report);
   }
 });
 
-test('only current page faults expose a report, with Clear allowing a later genuine fault', () => {
+test('only current page faults mark the report as a warning, with Clear allowing a later genuine fault', () => {
   const mount = stored => {
     const h = harness({ stored });
     h.load(['recordPlaybackDiagnostic', 'updatePlaybackDiagnosticButton',
@@ -479,42 +501,43 @@ test('only current page faults expose a report, with Clear allowing a later genu
   const { h, button } = mount({
     tss_playback_diagnostics: JSON.stringify([{ at: '2026-01-01T00:00:00.000Z', event: 'recovery-failed' }]),
   });
-  assert.equal(button.hidden, true);
+  assert.equal(button.hidden, compactReports || !h.state._transitionDiagnostics);
   assert.equal(button.dataset.status, 'none');
 
   h.sandbox.recordPlaybackDiagnostic('custom-start-retry', { attempt: 1 });
-  assert.equal(button.hidden, true, 'a recoverable retry does not mark playback as failed');
+  assert.equal(button.hidden, compactReports || !h.state._transitionDiagnostics, 'a recoverable retry must not mark a fault');
   assert.equal(button.dataset.status, 'none');
   h.sandbox.recordPlaybackDiagnostic('custom-start-exhausted', { attempted: 3 });
   assert.equal(button.hidden, false);
   assert.equal(button.dataset.status, 'current');
   button.onclick();
   const overlay = h.elements.get('tss-debug-overlay');
-  const report = JSON.parse(overlay.querySelector('#tss-debug-report').textContent);
+  const report = dialogSnapshot(overlay);
   assert.deepEqual(report.diagnostics.map(entry => entry.event), ['custom-start-retry', 'custom-start-exhausted']);
   assert.equal(report.diagnostics.at(-1).attempted, 3);
   assert.equal(h.storage.has('tss_playback_diagnostics'), false);
   assert.equal(h.storageCalls.some(call => call.key === 'tss_playback_diagnostics' && call.operation === 'set'), false);
 
   const reloaded = mount(Object.fromEntries(h.storage));
-  assert.equal(reloaded.button.hidden, true, 'reloading never restores a previous page warning');
+  assert.equal(reloaded.button.hidden, compactReports || !reloaded.h.state._transitionDiagnostics, 'reloading must not restore a previous page warning');
   assert.equal(reloaded.button.dataset.status, 'none');
   reloaded.h.sandbox.showPlaybackDiagnostics();
-  const freshReport = JSON.parse(reloaded.h.elements.get('tss-debug-overlay').querySelector('#tss-debug-report').textContent);
+  const freshReport = dialogSnapshot(reloaded.h.elements.get('tss-debug-overlay'));
   assert.deepEqual(freshReport.diagnostics, []);
 
   overlay.querySelector('#tss-debug-clear').onclick();
   assert.equal(h.elements.has('tss-debug-overlay'), false);
   assert.deepEqual(plain(h.sandbox.playbackDiagnosticSnapshot().diagnostics), []);
-  assert.equal(button.hidden, true);
+  assert.equal(button.hidden, compactReports || !h.state._transitionDiagnostics);
+  if (compactReports) assert.equal(h.state._playbackDiagnosticIncident, null);
   assert.equal(button.dataset.status, 'none');
   h.sandbox.recordPlaybackDiagnostic('custom-start-retry', { attempt: 1 });
-  assert.equal(button.hidden, true, 'Clear does not turn a subsequent retry into a fault');
+  assert.equal(button.hidden, compactReports || !h.state._transitionDiagnostics, 'Clear must not turn a subsequent retry into a fault');
   h.sandbox.recordPlaybackDiagnostic('recovery-failed', { reason: 'media-error' });
   assert.equal(button.hidden, false);
   assert.equal(button.dataset.status, 'current');
   button.onclick();
-  const nextReport = JSON.parse(h.elements.get('tss-debug-overlay').querySelector('#tss-debug-report').textContent);
+  const nextReport = dialogSnapshot(h.elements.get('tss-debug-overlay'));
   assert.deepEqual(nextReport.diagnostics.map(entry => entry.event), ['custom-start-retry', 'recovery-failed']);
   assert.equal(nextReport.diagnostics.at(-1).reason, 'media-error');
   assert.equal(h.storageCalls.some(call => call.key === 'tss_playback_diagnostics' && call.operation === 'set'), false);
@@ -612,7 +635,7 @@ test('playback report identifies browser capabilities without account paths or t
     version: '1.7.3', Events: { ERROR: 'hlsError' }, isSupported: () => true,
   });
   h.sandbox.GM_info = {
-    scriptHandler: 'Tampermonkey', scriptHandlerVersion: '5.5.1', script: { version: '6.2.5' },
+    scriptHandler: 'Tampermonkey', scriptHandlerVersion: '5.5.1', script: { version: installedVersion },
   };
   h.load(['hlsJsConstructor', 'playbackDiagnosticSnapshot']);
 
@@ -622,9 +645,10 @@ test('playback report identifies browser capabilities without account paths or t
   assert.equal(report.schemaVersion, 2);
   assert.equal(report.reason, 'manual');
   assert.equal(report.pageKind, 'playlist');
+  assert.equal(report.scriptVersion, installedVersion);
   assert.deepEqual(plain(report.environment), {
     browser: 'chromium', browserMajorVersion: 138, platform: 'windows',
-    manager: 'tampermonkey', managerVersion: '5.5.1', scriptVersion: '6.2.5',
+    manager: 'tampermonkey', managerVersion: '5.5.1', scriptVersion: installedVersion,
     visible: true, focused: false, onLine: true,
   });
   assert.equal(report.capabilities.hlsLibraryVersion, '1.7.3');
@@ -640,6 +664,82 @@ test('playback report identifies browser capabilities without account paths or t
     assert.equal(serialized.includes(sensitive), false);
   }
 });
+
+if (source.includes('function soundCloudInteger(')) {
+  test('disposed cached volume models fall through to usable slider and native audio volume', () => {
+    for (const failure of ['getVolume', 'getMuted', 'setVolumeAndMuted',
+      'missing-getVolume', 'missing-getMuted', 'missing-setVolumeAndMuted']) {
+      const h = harness();
+      h.load(['normalizeSoundCloudVolume', 'soundCloudVolumeModel', 'soundCloudVolumeSlider',
+        'soundCloudVolume', 'setSoundCloudVolume', 'initializePlaybackVolume']);
+      let sliderLevel = 0.72;
+      let dragging = false;
+      const slider = {
+        getAttribute: name => name === 'aria-valuenow' ? String(sliderLevel * 100) : '100',
+        querySelector: () => null,
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 20, height: 100 }),
+        dispatchEvent(event) { if (event.type === 'mousedown') dragging = true; },
+      };
+      h.sandbox.MouseEvent = class { constructor(type, options) { this.type = type; Object.assign(this, options); } };
+      h.sandbox.document.querySelector = () => slider;
+      h.sandbox.document.dispatchEvent = event => {
+        if (dragging && event.type === 'mousemove') sliderLevel = 1 - (event.clientY - 4) / 100;
+        if (event.type === 'mouseup') dragging = false;
+      };
+      const model = {
+        getVolume: () => 0.31, getMuted: () => false, setVolumeAndMuted() {},
+      };
+      if (failure.startsWith('missing-')) delete model[failure.slice('missing-'.length)];
+      else model[failure] = () => { throw new Error('disposed volume model'); };
+      h.state._soundCloudVolumeModel = model;
+      if (failure !== 'setVolumeAndMuted') {
+        assert.equal(h.sandbox.soundCloudVolume(), 0.72);
+        assert.equal(h.state._soundCloudVolumeModel, null);
+        assert.equal(h.sandbox.setSoundCloudVolume(0.42), true);
+        assert.ok(Math.abs(sliderLevel - 0.42) < 1e-12);
+      } else {
+        assert.equal(h.sandbox.setSoundCloudVolume(0.42), true);
+        assert.ok(Math.abs(sliderLevel - 0.42) < 1e-12);
+        assert.equal(h.state._soundCloudVolumeModel, null);
+      }
+      h.sandbox.document.querySelector = () => null;
+      h.sandbox.document.querySelectorAll = () => [{ dataset: {}, currentSrc: 'native.mp3', volume: 0.58 }];
+      assert.equal(h.sandbox.soundCloudVolume(), 0.58);
+      assert.equal(h.sandbox.initializePlaybackVolume(), true);
+      assert.equal(h.state.playbackVolume, 0.58);
+      const decks = h.sandbox.ensureCrossfadeDecks();
+      assert.equal(decks.length, 2, 'volume fallback does not prevent custom deck initialization');
+      assert.equal(h.sandbox.ensureAutoLevelAudioGraph(), true);
+      for (const graph of h.state._deckAudioGraphs) {
+        assert.equal(reaches(graph.source, h.state._audioContext.destination), true);
+      }
+    }
+  });
+
+  test('valid cached volume model remains authoritative without consulting DOM fallback', () => {
+    const h = harness();
+    h.load(['normalizeSoundCloudVolume', 'soundCloudVolumeModel', 'soundCloudVolumeSlider',
+      'soundCloudVolume', 'setSoundCloudVolume', 'initializePlaybackVolume']);
+    let level = 0.37;
+    let muted = false;
+    const model = {
+      getVolume: () => level, getMuted: () => muted,
+      setVolumeAndMuted(value) { level = value.volume; muted = value.muted; },
+    };
+    h.state._soundCloudVolumeModel = model;
+    h.sandbox.document.querySelector = () => { throw new Error('unexpected slider access'); };
+    h.sandbox.document.querySelectorAll = () => { throw new Error('unexpected native audio access'); };
+    assert.equal(h.sandbox.initializePlaybackVolume(), true);
+    assert.equal(h.state.playbackVolume, 0.37);
+    assert.equal(h.sandbox.setSoundCloudVolume(0), true);
+    assert.equal(h.sandbox.soundCloudVolume(), 0);
+    assert.equal(muted, true);
+    assert.equal(h.sandbox.setSoundCloudVolume(0.63), true);
+    assert.equal(h.sandbox.soundCloudVolume(), 0.63);
+    assert.equal(muted, false);
+    assert.equal(h.state._soundCloudVolumeModel, model);
+  });
+}
 
 test('invalid Auto Level cache entries cannot suppress learning and loaded cache is bounded', () => {
   const entries = Object.fromEntries(Array.from({ length: 305 }, (_, index) =>

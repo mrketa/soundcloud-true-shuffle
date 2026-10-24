@@ -9,6 +9,12 @@ const test = require('node:test');
 const source = fs.readFileSync(process.env.TSS_SCRIPT
   ? path.resolve(process.env.TSS_SCRIPT)
   : path.resolve(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+const releaseVersion = source.match(/^\/\/\s*@version\s+(\d+)\.(\d+)\.(\d+)(?=[.\s+-]|$)/m);
+assert.ok(releaseVersion, 'userscript must declare a numeric release version');
+const [major, minor, patch] = releaseVersion.slice(1).map(Number);
+// Half-duration fade budgets are a release contract from 6.2.6 onward.
+const expectSplitFade = major > 6
+  || (major === 6 && (minor > 2 || (minor === 2 && patch >= 6)));
 
 function extractFunction(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -233,7 +239,11 @@ function createHarness(options = {}) {
   const names = [
     'withDeadline', 'invalidatePlaybackSession', 'waitForDeck', 'playDeckWithDeadline',
     'resumeAudioGraph', 'suspendAudioGraph', 'cancelCrossfadeForRecovery', 'recoverCurrentDeckStream',
-    'pause', 'toggle', 'crossfadeGains', 'setAudioParamImmediately', 'scheduleAudioParamCurve',
+    'pause', 'toggle', 'crossfadeGains', 'setAudioParamImmediately',
+    ...(source.includes('function schedulePairedCrossfade(')
+      ? ['crossfadeAutomationPlan', 'schedulePairedCrossfade']
+      : ['scheduleAudioParamCurve']),
+    ...(source.includes('function crossfadeAutomationTiming(') ? ['crossfadeAutomationTiming'] : []),
     'waitForCrossfadeSchedule', 'settleScheduledCrossfade', 'animateDeckCrossfadeFallback', 'animateDeckCrossfade',
     'mkWorker', 'nativePlaybackAllowed', 'startWatcher', 'playbackErrorName', 'diagnosticDeckStreamKind',
   ];
@@ -309,7 +319,8 @@ for (const scenario of [
   });
 }
 
-test('automatic fade uses the six-second incoming-track preparation reserve', async () => {
+test(expectSplitFade ? 'automatic fade gives a ten-second incoming track its full five-second half budget'
+  : 'automatic fade uses the six-second incoming-track preparation reserve', async () => {
   const makeReady = current => {
     const h = createHarness({
       current, crossfadeSeconds: 5, incomingDuration: 10, upcomingReady: true,
@@ -319,9 +330,14 @@ test('automatic fade uses the six-second incoming-track preparation reserve', as
     return h;
   };
 
+  const beforeFive = makeReady(174.99);
+  await beforeFive.clock.advance(50);
+  assert.equal(beforeFive.counts.next, 0, 'automatic fading must not precede the configured boundary');
+  beforeFive.state._watcherCleanup?.();
+
   const atFive = makeReady(175);
   await atFive.clock.advance(50);
-  assert.equal(atFive.counts.next, 0);
+  assert.equal(atFive.counts.next, expectSplitFade ? 1 : 0);
   atFive.state._watcherCleanup?.();
 
   const atFour = makeReady(176);
@@ -331,21 +347,51 @@ test('automatic fade uses the six-second incoming-track preparation reserve', as
 });
 
 for (const incomingDuration of [6, 5]) {
-  test(`short incoming ${incomingDuration}s track skips automatic fade and advances at EOF`, async () => {
+  test(expectSplitFade
+    ? `short incoming ${incomingDuration}s track starts automatic fade at its half-duration boundary`
+    : `short incoming ${incomingDuration}s track skips automatic fade and advances at EOF`, async () => {
     const h = createHarness({
-      current: 179, crossfadeSeconds: 5, incomingDuration, upcomingReady: true,
+      current: expectSplitFade ? 180 - incomingDuration / 2 - 0.01 : 179,
+      crossfadeSeconds: 5, incomingDuration, upcomingReady: true,
     });
     h.context.startWatcher();
     h.workers[0].fail();
     await h.clock.advance(50);
     assert.equal(h.counts.next, 0);
 
-    h.decks[0].ended = true;
-    await h.clock.advance(50);
-    assert.equal(h.counts.next, 1);
-    assert.equal(h.state._crossfadePending, false);
+    if (expectSplitFade) {
+      h.decks[0].currentTime = 180 - incomingDuration / 2;
+      await h.clock.advance(50);
+      assert.equal(h.counts.next, 1, 'half the incoming duration is available for its entry fade');
+    } else {
+      h.decks[0].ended = true;
+      await h.clock.advance(50);
+      assert.equal(h.counts.next, 1);
+      assert.equal(h.state._crossfadePending, false);
+    }
     h.state._watcherCleanup?.();
   });
+}
+
+if (expectSplitFade) {
+  for (const incomingDuration of [0.49, 0.5]) {
+    test(`incoming ${incomingDuration}s track respects the quarter-second minimum half-fade budget`, async () => {
+      const h = createHarness({ current: 179.7, crossfadeSeconds: 5, incomingDuration, upcomingReady: true });
+      h.context.startWatcher();
+      h.workers[0].fail();
+      await h.clock.advance(50);
+      assert.equal(h.counts.next, 0);
+      h.decks[0].currentTime = 179.75;
+      await h.clock.advance(50);
+      assert.equal(h.counts.next, incomingDuration === 0.5 ? 1 : 0);
+      if (incomingDuration < 0.5) {
+        h.decks[0].ended = true;
+        await h.clock.advance(50);
+        assert.equal(h.counts.next, 1, 'an ineligible tiny fade must still advance at natural EOF');
+      }
+      h.state._watcherCleanup?.();
+    });
+  }
 }
 
 test('unknown and metadata-only incoming durations preserve configured automatic fade', async () => {

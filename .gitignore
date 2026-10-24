@@ -1,0 +1,15 @@
+# Installed local agent tooling and machine-specific permissions
+/.agents/skills/ui-ux-pro-max/
+/.claude/skills/ui-ux-pro-max/
+/.claude/settings.local.json
+/.claude/worktrees/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+
+# Local agent transcripts and original third-party tester report
+/.planning/debug/.library-queue-state-agent-error.log
+/.planning/debug/.library-queue-state-agent-output.log
+/.planning/debug/.library-queue-state-agent-prompt.md
+/.planning/debug/abox-vm-crossfade-reports-2026-10-21.json

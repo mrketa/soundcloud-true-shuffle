@@ -10,6 +10,12 @@ const scriptPath = process.env.TSS_SCRIPT
     ? path.resolve(process.argv[2])
   : path.resolve(__dirname, '..', 'SC Trueshuffle.js');
 const source = fs.readFileSync(scriptPath, 'utf8');
+const releaseVersion = source.match(/^\/\/\s*@version\s+(\d+)\.(\d+)\.(\d+)(?=[.\s+-]|$)/m);
+assert.ok(releaseVersion, 'userscript must declare a numeric release version');
+const [major, minor, patch] = releaseVersion.slice(1).map(Number);
+// Immediate standby preparation is a release contract from 6.2.7 onward.
+const expectImmediatePrefetch = major > 6
+  || (major === 6 && (minor > 2 || (minor === 2 && patch >= 7)));
 
 function extractFunction(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -22,6 +28,16 @@ function extractFunction(name) {
   }
   throw new Error(`could not extract function ${name}`);
 }
+const preparationHelpers = source.includes('function crossfadePreparationMatches(')
+  ? `${extractFunction('crossfadePreparationMatches')};
+${extractFunction('runCrossfadeDeckPreparation').replace(/^function /, 'async function ')};
+${extractFunction('upcomingCrossfadeDeckReady')};`
+  : '';
+const preflightHelpers = source.includes('function preflightCrossfadeHls(')
+  ? `${extractFunction('destroyCrossfadePreflight')};
+${extractFunction('preflightCrossfadeHls')};`
+  : 'function destroyCrossfadePreflight() {}\nfunction preflightCrossfadeHls() {}';
+
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -151,19 +167,24 @@ test('waveform progress updates only bars that crossed the playhead', () => {
   assert.doesNotMatch(update, /bars\.forEach/);
 });
 
-test('crossfade control state updates its slider, labels and selected profile together', () => {
+test('crossfade controls synchronize duration, manual transitions and selected profile', () => {
   const syncSource = extractFunction('syncCrossfadeControls');
   const values = {};
   const elements = {
     'tss-crossfade-card': { dataset: {} },
-    'tss-hub-crossfade': { value: '0', style: { setProperty: (key, value) => { values[key] = value; } } },
-    'tss-crossfade-summary-seconds': { textContent: '' },
-    'tss-crossfade-seconds': { textContent: '' },
+    'tss-hub-crossfade': {
+      value: '0',
+      style: {
+        getPropertyValue: key => values[key] ?? '',
+        setProperty: (key, value) => { values[key] = String(value); },
+      },
+    },
     'tss-crossfade-manual': { checked: false },
   };
   const buttons = ['smooth', 'clean', 'dj'].map(curve => ({
     dataset: { curve },
     attributes: {},
+    getAttribute(key) { return this.attributes[key] ?? null; },
     setAttribute(key, value) { this.attributes[key] = value; },
   }));
   const state = { crossfadeSeconds: 7, crossfadeCurve: 'clean', crossfadeManual: true };
@@ -171,21 +192,38 @@ test('crossfade control state updates its slider, labels and selected profile to
     getElementById: id => elements[id] || null,
     querySelectorAll: selector => selector === '.tss-crossfade-mode' ? buttons : [],
   };
-  Function('state', 'document', `${syncSource}; syncCrossfadeControls();`)(state, document);
+  const sync = Function('state', 'document', `${syncSource}; return syncCrossfadeControls;`)(state, document);
+  sync();
   assert.equal(elements['tss-crossfade-card'].dataset.enabled, 'true');
   assert.equal(elements['tss-hub-crossfade'].value, '7');
-  assert.equal(elements['tss-crossfade-summary-seconds'].textContent, '7 sec');
-  assert.equal(elements['tss-crossfade-seconds'].textContent, '7 sec');
-  assert.equal(values['--tss-crossfade-fill'], `${(7 / 12) * 100}%`);
   assert.equal(buttons.find(button => button.dataset.curve === 'clean').dataset.active, 'true');
   assert.equal(elements['tss-crossfade-manual'].checked, true);
+
+  state.crossfadeSeconds = 0;
+  state.crossfadeCurve = 'smooth';
+  state.crossfadeManual = false;
+  sync();
+  assert.equal(elements['tss-crossfade-card'].dataset.enabled, 'false');
+  assert.equal(elements['tss-hub-crossfade'].value, '0');
+  assert.equal(elements['tss-crossfade-manual'].checked, false);
+  for (const button of buttons) {
+    const selected = button.dataset.curve === 'smooth' ? 'true' : 'false';
+    assert.equal(button.dataset.active, selected);
+    assert.equal(button.getAttribute('aria-pressed'), selected);
+  }
 });
 
 test('master volume is continuous, persistent and synchronized outside crossfade settings', () => {
   const syncSource = extractFunction('syncPlaybackVolumeControls');
   const fills = {};
   const elements = {
-    'tss-hub-volume': { value: '0', style: { setProperty: (key, value) => { fills[key] = value; } } },
+    'tss-hub-volume': {
+      value: '0',
+      style: {
+        getPropertyValue: key => fills[key] ?? '',
+        setProperty: (key, value) => { fills[key] = String(value); },
+      },
+    },
     'tss-hub-volume-value': { textContent: '' },
   };
   const state = { playbackVolume: 0.137 };
@@ -224,7 +262,7 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
     'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
     'waitForDeck', 'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl',
     'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
-    `return (${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')})`,
+    `${preparationHelpers}; return (${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')})`,
   )(
     state,
     () => state._decks,
@@ -264,7 +302,7 @@ test('delayed deck preparation cannot overwrite a newer request for the same dec
   assert.equal(standby.loadCalls, 1);
 });
 
-test('stream candidates warm during an incoming fade and are reused for the following track', async () => {
+test('stream candidates warm during the fade and feed the following track preparation', async () => {
   const makeAudio = (src, paused) => ({
     src, currentSrc: src, readyState: src ? 2 : 0, volume: 0, paused, ended: false,
     currentTime: 0, duration: 30, loadCalls: 0,
@@ -276,7 +314,7 @@ test('stream candidates warm during an incoming fade and are reused for the foll
   const incoming = makeAudio('', true);
   const request = { operationId: 1 };
   const state = {
-    active: true, _playbackEpoch: 3, _playbackRequest: request, _playbackAbort: new AbortController(),
+    active: true, busy: true, _playbackEpoch: 3, _playbackRequest: request, _playbackAbort: new AbortController(),
     _userPaused: false, _crossfading: false, _deckTrack: 0, _deckIndex: 0, _crossfadeToken: 0,
     crossfadeSeconds: 5, autoLevel: false, eqEnabled: false, safetyClipper: false,
     _audioContext: null, _audioGraphFailed: false, _diagnosticBuild: false,
@@ -301,11 +339,14 @@ test('stream candidates warm during an incoming fade and are reused for the foll
   const functions = Function(
     'state', 'ensureCrossfadeDecks', 'ensureAutoLevelAudioGraph', 'resolveCrossfadeStreams',
     'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
-    'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl', 'loadStreamOnDeck',
-    'playbackErrorName', 'recordPlaybackDiagnostic', 'setCrossfadeStatus', 'currentDeckAudio',
+    'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl', 'hlsJsConstructor', 'loadStreamOnDeck',
+    'playbackErrorName', 'recordPlaybackDiagnostic',
+    'setCrossfadeStatus', 'currentDeckAudio',
     'pauseSoundCloudTransport', 'pauseSoundCloud', 'resumeAudioGraph', 'playDeckWithDeadline',
     'installBetterFeedPipBridge', 'animateDeckCrossfade', 'trackPlayed', 'clearTimeout', 'setTimeout',
-    `${extractFunction('upcomingTrackIndex')};
+    `${preflightHelpers};
+     ${extractFunction('upcomingTrackIndex')};
+     ${preparationHelpers};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('warmUpcomingCrossfadeStreams')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
@@ -338,7 +379,7 @@ test('stream candidates warm during an incoming fade and are reused for the foll
       state._deckGains[index] = 0;
     },
     () => {}, () => {}, async () => true,
-    value => String(value || ''), () => false, () => false, loadReadyDeck,
+    value => String(value || ''), () => false, () => false, () => null, loadReadyDeck,
     error => String(error?.name || 'UnknownError'), () => {},
     status => { state.crossfadeStatus = status; },
     () => state._decks[state._deckIndex],
@@ -365,12 +406,17 @@ test('stream candidates warm during an incoming fade and are reused for the foll
 
   finishFade(true);
   assert.equal(await playback, true);
-  assert.equal(timers.length, 2);
-  timers[0]();
-  await Promise.resolve();
+  if (expectImmediatePrefetch) {
+    assert.equal(timers.length, 1);
+    assert.ok(functions.lastPrefetch());
+    assert.equal(state.crossfadeStatus, 'loading');
+  } else {
+    assert.equal(timers.length, 2);
+    timers[0]();
+    await Promise.resolve();
+  }
   assert.equal(lookups.length, 2);
   assert.equal(outgoing.loadCalls, 0);
-
   resolveFollowing(['following-stream']);
   assert.equal(await functions.lastPrefetch(), outgoing);
   assert.equal(outgoing.src, 'following-stream');
@@ -402,7 +448,9 @@ test('invalidated crossfade warmup cannot install stale URLs and resolves the ne
     'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
     'normalizeTrackUrl', 'deckIsPreviewLimited', 'currentDeckAudio', 'setCrossfadeStatus',
     'isHlsStreamUrl', 'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
-    `${extractFunction('upcomingTrackIndex')};
+    `${preflightHelpers};
+     ${extractFunction('upcomingTrackIndex')};
+     ${preparationHelpers};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('warmUpcomingCrossfadeStreams')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
@@ -468,7 +516,9 @@ test('failed speculative stream warmup falls back to normal stream resolution', 
     'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume', 'waitForDeck',
     'normalizeTrackUrl', 'deckIsPreviewLimited', 'isHlsStreamUrl', 'loadStreamOnDeck',
     'playbackErrorName', 'recordPlaybackDiagnostic', 'setCrossfadeStatus',
-    `${extractFunction('upcomingTrackIndex')};
+    `${preflightHelpers};
+     ${extractFunction('upcomingTrackIndex')};
+     ${preparationHelpers};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('warmUpcomingCrossfadeStreams')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
@@ -539,7 +589,9 @@ test('play-next and reorder invalidation prepare the authoritative standby track
     'resolveCrossfadeStreams', 'resetDeck', 'applyCachedAutoLevel', 'syncCrossfadeVolume',
     'waitForDeck', 'normalizeTrackUrl', 'deckIsPreviewLimited', 'currentDeckAudio', 'setCrossfadeStatus',
     'isHlsStreamUrl', 'loadStreamOnDeck', 'playbackErrorName', 'recordPlaybackDiagnostic',
-    `${extractFunction('upcomingTrackIndex')};
+    `${preflightHelpers};
+     ${extractFunction('upcomingTrackIndex')};
+     ${preparationHelpers};
      ${extractFunction('prepareCrossfadeDeck').replace(/^function /, 'async function ')};
      ${extractFunction('prefetchUpcomingCrossfadeTrack').replace(/^function /, 'async function ')};
      ${extractFunction('refreshUpcomingCrossfadePreparation')};
@@ -735,7 +787,8 @@ test('background worker resolves paused or frozen Firefox crossfades', () => {
 test('crossfade gain automation follows the audio clock instead of the render loop', () => {
   const curveSource = extractFunction('crossfadeGains');
   const scheduledSource = extractFunction('scheduledCrossfadeGain');
-  const scheduleSource = extractFunction('scheduleAudioParamCurve');
+  const paired = source.includes('function schedulePairedCrossfade(');
+  const scheduleSource = extractFunction(paired ? 'schedulePairedCrossfade' : 'scheduleAudioParamCurve');
   const state = {
     _audioContext: { currentTime: 5 },
     _crossfadeSchedule: {
@@ -756,11 +809,20 @@ test('crossfade gain automation follows the audio clock instead of the render lo
     setValueAtTime: (value, time) => calls.push(['set', value, time]),
     linearRampToValueAtTime: (value, time) => calls.push(['ramp', value, time]),
   };
-  Function('param', 'values', `${scheduleSource}; scheduleAudioParamCurve(param, values, 2, 8);`)(param, new Float32Array([1, 0.5, 0]));
-  assert.deepEqual(calls.map(call => call[0]), ['cancel', 'set', 'ramp', 'ramp']);
-  assert.equal(calls[0][1], 0);
-  assert.deepEqual(calls[2], ['ramp', 0.5, 6]);
-  assert.deepEqual(calls[3], ['ramp', 0, 10]);
+  if (paired) {
+    const incomingCalls = [];
+    const incoming = {
+      cancelScheduledValues: value => incomingCalls.push(['cancel', value]),
+      setValueAtTime: (value, time) => incomingCalls.push(['set', value, time]),
+      linearRampToValueAtTime: (value, time) => incomingCalls.push(['ramp', value, time]),
+    };
+    Function('param', 'incoming', `${scheduleSource};
+      schedulePairedCrossfade(param, incoming, {times:[0,.5,1],outgoing:[1,.5,0],incoming:[0,.5,1]},2,8);`)(param, incoming);
+    assert.deepEqual(incomingCalls, [['cancel', 0], ['set', 0, 2], ['ramp', 0.5, 6], ['ramp', 1, 10]]);
+  } else {
+    Function('param', 'values', `${scheduleSource}; scheduleAudioParamCurve(param, values, 2, 8);`)(param, new Float32Array([1, 0.5, 0]));
+  }
+  assert.deepEqual(calls, [['cancel', 0], ['set', 1, 2], ['ramp', 0.5, 6], ['ramp', 0, 10]]);
 });
 
 test('Firefox crossfade cleanup clears active automation before setting gain', () => {

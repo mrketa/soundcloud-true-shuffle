@@ -4,6 +4,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(process.env.TSS_SCRIPT || path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+const hardenedSoundCloud = source.includes('function soundCloudInteger(');
+
+function hydrationHtml(snapshot) {
+  if (typeof snapshot === 'string') return snapshot;
+  return `<script>window.__sc_hydration = ${JSON.stringify([{
+    hydratable: 'playlist',
+    data: { kind: 'playlist', track_count: snapshot.tracks.length, tracks: snapshot.tracks },
+  }])};</script>`;
+}
 
 function extract(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -91,9 +100,8 @@ function createHarness() {
       const key = String(url).split('?')[0];
       const snapshot = snapshots.get(key);
       if (snapshot instanceof Error) throw snapshot;
-      return { ok: Boolean(snapshot), status: snapshot ? 200 : 404, text: async () => JSON.stringify(await snapshot) };
+      return { ok: Boolean(snapshot), status: snapshot ? 200 : 404, text: async () => hydrationHtml(await snapshot) };
     },
-    playlistSnapshotFromHtml: html => JSON.parse(html),
     discoverSoundCloudClientIdFromBundle: async () => '',
     getMeta: el => ({ ...el.meta }), getLink: el => el.meta?.link || '',
     isLikedTracksPage: () => false,
@@ -132,6 +140,11 @@ function createHarness() {
     syncCrossfadeVolume: () => {}, processAutoLevel: () => {}, next: async () => {},
   };
   const names = [
+    ...(hardenedSoundCloud ? ['soundCloudInteger', 'soundCloudTrackMatches'] : []),
+    ...['trackCacheKey', 'indexTrackMeta', 'trackIdentityIndex', 'matchingTrackIndex', 'soundCloudPermalinkConflicts',
+      'soundCloudLinkMatches', 'soundCloudRowsByLink', 'matchingSoundCloudRow']
+      .filter(name => source.includes(`function ${name}(`)),
+    'playlistSnapshotFromHtml',
     'withDeadline', 'fetchSoundCloudResource', 'invalidatePlaybackSession', 'runPlaybackOperation',
     'normalizeTrackUrl', 'trackId', 'trackAvailable', 'syncTrackPlaybackAccess', 'metaFromSoundCloudTrack',
     'mergeTrackMeta', 'fetchLivePlaylistSnapshot', 'resolveLiveTrackMeta', 'resolvePlaylistSnapshotMetas',
@@ -160,6 +173,11 @@ function createHarness() {
     },
     rows(url, rows) { pages.set(url, rows); },
     setSnapshot(url, ids) { snapshots.set(url, { complete: true, tracks: ids.map(track) }); },
+    setHydration(url, data) {
+      snapshots.set(url, `<script>window.__sc_hydration = ${JSON.stringify(
+        data.map(entry => ({ hydratable: 'playlist', data: { kind: 'playlist', ...entry } })),
+      )};</script>`);
+    },
     deferWait(hook) { waitHook = hook; }, deferPlay(hook) { playHook = hook; }, network(hook) { networkHook = hook; },
     async flush() { for (let i = 0; i < 100; i++) await Promise.resolve(); },
     async flushSync() { while (pendingSync.length) await Promise.all(pendingSync.splice(0)); },
@@ -182,6 +200,102 @@ function createHarness() {
 
 const tests = [];
 const test = (name, operation) => tests.push({ name, operation });
+
+if (hardenedSoundCloud) {
+  test('untrusted hydration cannot replace DOM or remove queued source members', async () => {
+    const cases = [
+      tracks => ({ tracks }),
+      ...[null, '', true, -1, 0.5, '9007199254740992', 0].map(track_count => tracks => ({ track_count, tracks })),
+      ...[null, true, 0, '1e2'].map(id => tracks => ({ track_count: 2, tracks: [...tracks, { id }] })),
+      tracks => ({ track_count: 1, tracks, permalink_url: 'https://soundcloud.com/user/sets/other' }),
+      () => ({ track_count: null, tracks: [] }),
+    ];
+    for (const makeData of cases) {
+      const h = createHarness(); h.page(h.a, [1, 2, 3]);
+      await h.start(); await h.flushSync();
+      const rows = [2, 3].map(id => ({ meta: h.meta(id) }));
+      h.setHydration(h.a, [makeData([{
+        id: 2, title: 'Track 2', permalink_url: h.meta(2).link,
+        publisher_metadata: { artist: 'Artist 2' },
+      }])]);
+      const collected = await h.completePlaylistCollection(h.a, rows);
+      assert.equal(collected.complete, false);
+      assert.deepEqual(collected.els, rows);
+      assert.deepEqual(collected.meta.map(meta => meta.soundcloudId), [2, 3]);
+      await h.sync({ force: true });
+      assert.deepEqual(h.queueIds(), [1, 2, 3]);
+      assert.equal(h.state._liveSyncSources.get(h.a).size, 3);
+      assert.equal(h.state.meta.some(meta => meta.removedFromPlaylist), false);
+    }
+  });
+
+  test('ambiguous hydration is nonauthoritative and valid empty removes only its own source', async () => {
+    const h = createHarness(); h.page(h.a, [1, 2]); h.page(h.b, [2, 3]);
+    await h.start(); await h.flushSync();
+    h.location.href = h.b; await h.mergeCurrentPage(); await h.flushSync();
+    const mergedQueue = h.queueIds();
+    assert.equal(mergedQueue[0], 1);
+    assert.deepEqual([...mergedQueue].sort((a, b) => a - b), [1, 2, 3]);
+    const rows = [1, 2].map(id => ({ meta: h.meta(id, h.a) }));
+    h.setHydration(h.a, [{ track_count: 0, tracks: [] }, { track_count: 0, tracks: [] }]);
+    const uncertain = await h.completePlaylistCollection(h.a, rows);
+    assert.equal(uncertain.complete, false);
+    assert.deepEqual(uncertain.els, rows);
+    await h.sync({ force: true });
+    assert.deepEqual(h.queueIds(), mergedQueue);
+    h.setHydration(h.a, [{ permalink_url: h.a, track_count: '0', tracks: [] }]);
+    const empty = await h.completePlaylistCollection(h.a, rows);
+    assert.equal(empty.complete, true);
+    assert.deepEqual(empty.meta, []);
+    await h.sync({ force: true });
+    assert.equal(h.state._liveSyncSources.get(h.a).size, 0);
+    assert.deepEqual(h.queueIds(), mergedQueue);
+    assert.equal(h.state.meta[0].removedFromPlaylist, true);
+    h.consumeCurrentQueueTrack();
+    assert.deepEqual(h.queueIds(), mergedQueue.slice(1));
+    assert.equal(h.trackAvailable(1), true);
+  });
+
+  test('canonical hydration preserves row identity, source membership and consumed history', async () => {
+    const h = createHarness(); h.page(h.a, [1, 2]);
+    const row = { meta: { ...h.meta(1), soundcloudId: null, link: `${h.meta(1).link}?in=user/sets/a#play` } };
+    h.rows(h.a, [row, { meta: h.meta(2) }]);
+    await h.start(); await h.flushSync();
+    assert.equal(h.state.els[0], row);
+    assert.equal(h.state.meta[0].soundcloudId, 1);
+    assert.deepEqual(h.queueIds(), [1, 2]);
+    assert.deepEqual([...h.state._liveSyncSources.get(h.a)], [0, 1]);
+    h.consumeCurrentQueueTrack(); h.state._deckTrack = h.state.queue[h.state.pos];
+    await h.sync({ force: true });
+    assert.equal(h.state.meta.length, 2);
+    assert.deepEqual(h.queueIds(), [2]);
+    assert.deepEqual(h.state.history, [0]);
+    assert.equal(h.state.meta[0].removedFromPlaylist, undefined);
+  });
+
+  test('locked History preserves writable interception and URL poll invalidation', async () => {
+    for (const locked of ['pushState', 'replaceState']) {
+      const h = createHarness(); h.page(h.a, [1]); h.page(h.b, [2]);
+      Object.defineProperty(h.history, locked, { value: h.history[locked], writable: false });
+      h.installNavigationTracking();
+      const writable = locked === 'pushState' ? 'replaceState' : 'pushState';
+      const waiting = deferred();
+      h.deferWait(ms => ms === 900 ? waiting.promise : Promise.resolve());
+      const starting = h.start(); await h.flush();
+      const firstEpoch = h.state._routeEpoch || 0;
+      h.history[writable](null, '', h.b);
+      assert.ok(h.state._routeEpoch > firstEpoch);
+      h.history[locked](null, '', h.a);
+      assert.equal(h.checkForNavigation(), true);
+      assert.ok(h.state._routeEpoch > firstEpoch + 1);
+      waiting.resolve(); await starting; await h.flush();
+      assert.equal(h.state.active, false);
+      assert.equal(h.state.loading, false);
+      assert.deepEqual(h.state.meta, []);
+      assert.equal(h.checkForNavigation(), false);
+    }
+  });
+}
 
 test('complete playlist authority deduplicates DOM identities and replaces unrelated rows', async () => {
   for (const ids of [[1, 1], [1, 9]]) {
@@ -220,7 +334,7 @@ test('one stalled source does not permanently latch live sync or discard a healt
   h.location.href = h.b; await h.mergeCurrentPage(); await h.flushSync();
   h.setSnapshot(h.b, [2, 3]);
   h.network(url => String(url).startsWith(h.a) ? new Promise(() => {}) : Promise.resolve({
-    ok: true, status: 200, text: async () => JSON.stringify(h.snapshots.get(h.b)),
+    ok: true, status: 200, text: async () => hydrationHtml(h.snapshots.get(h.b)),
   }));
   const syncing = h.sync({ force: true });
   await h.flush(); await h.advance(10_001); await syncing;
@@ -437,7 +551,7 @@ test('Back consumes a historical Play Next request without duplicate playback or
 test('restored totals equal consumed plus surviving scheduled tracks across additions and removals', () => {
   const h = createHarness();
   const cache = { queue: [1, 2], pos: 0, history: [0], playNext: [], priority: {},
-    metaKeys: [1, 2, 3].map(id => h.meta(id).link), roundPlayed: 1, roundTotal: 3 };
+    metaKeys: [1, 2, 3].map(id => h.trackCacheKey ? h.trackCacheKey(h.meta(id)) : h.meta(id).link), roundPlayed: 1, roundTotal: 3 };
   const added = h.remapCachedQueue(cache, [1, 2, 3, 4].map(id => h.meta(id)));
   assert.equal(added.roundTotal, 4);
   const removed = h.remapCachedQueue(cache, [1, 2].map(id => h.meta(id)));
@@ -452,6 +566,92 @@ test('merging shared tracks preserves a coherent primary source and playlist pos
   assert.equal(shared.sourcePage, h.a);
   assert.equal(shared.playlistPosition, 1);
 });
+
+if (hardenedSoundCloud) {
+  test('cache restore preserves shared-permalink IDs across current, upcoming, Play Next, history and sources', () => {
+    for (const obsoleteKeys of [false, true]) {
+      const h = createHarness();
+      const shared = 'https://soundcloud.com/artist/shared';
+      const meta = [11, 22, 33, 44].map(id => h.meta(id, id === 44 ? h.b : h.a));
+      meta[0].link = shared;
+      meta[1].link = shared;
+      Object.assign(h.state, {
+        meta, queue: [2, 0, 1], pos: 1, playNext: [1, 3], history: [2, 1, 0],
+        priority: { 0: 3, 1: 1 }, playlistUrl: h.a, roundPlayed: 1, roundTotal: 4,
+        _liveSyncSources: new Map([[h.a, new Set([0, 1, 2])], [h.b, new Set([1, 3])]]),
+      });
+      assert.equal(h.saveQueueSessionCache(), true);
+      const cache = JSON.parse(h.storage.get('tss_queue_cache'));
+      if (!obsoleteKeys) assert.notEqual(cache.metaKeys[0], cache.metaKeys[1], 'serialization retains both IDs');
+      else cache.metaKeys = cache.meta.map(item => item.link);
+      const restored = h.restoreQueueSessionCache(cache, {
+        meta: [meta[1], meta[0], meta[2]], els: [null, null, null], complete: true,
+      }, h.a);
+      assert.ok(restored);
+      const ids = indices => indices.map(ti => h.state.meta[ti].soundcloudId);
+      assert.deepEqual(ids(restored.queue), [33, 11, 22]);
+      assert.equal(h.state.meta[restored.queue[restored.pos]].soundcloudId, 11);
+      assert.deepEqual(ids(restored.playNext), [22, 44]);
+      assert.deepEqual(ids(restored.history), [33, 22, 11]);
+      assert.deepEqual(restored.priority, { 0: 3, 1: 1 });
+      assert.equal(restored.roundTotal, 4);
+      assert.deepEqual(ids([...h.state._liveSyncSources.get(h.a)]), [22, 11, 33]);
+      assert.deepEqual(ids([...h.state._liveSyncSources.get(h.b)]), [22, 44]);
+      const reversed = cache.meta.slice().reverse();
+      const remapped = h.remapCachedQueue(cache, reversed);
+      const remappedIds = indices => indices.map(ti => reversed[ti].soundcloudId);
+      assert.deepEqual(remappedIds(remapped.queue), [33, 11, 22]);
+      assert.deepEqual(remappedIds(remapped.playNext), [22, 44]);
+      assert.deepEqual(remappedIds(remapped.history), [33, 22, 11]);
+      assert.equal(remapped.priority[reversed.findIndex(item => item.soundcloudId === 11)], 3);
+      assert.equal(remapped.priority[reversed.findIndex(item => item.soundcloudId === 22)], 1);
+    }
+  });
+
+  test('restoring ID-less cached metadata promotes unique identities without rescheduling or duplicating tracks', () => {
+    const h = createHarness();
+    const meta = [11, 22].map(id => h.meta(id));
+    const cachedMeta = meta.map(({ soundcloudId, ...item }) => item);
+    const cache = {
+      meta: cachedMeta, metaKeys: cachedMeta.map(item => item.link),
+      queue: [0, 1], pos: 1, playNext: [0], history: [0], priority: { 1: 3 },
+      sources: [[h.a, [0, 1]]], roundPlayed: 1,
+    };
+    const restored = h.restoreQueueSessionCache(cache, {
+      meta: meta.slice().reverse(), els: [null, null], complete: true,
+    }, h.a);
+    assert.deepEqual(restored.queue.map(ti => h.state.meta[ti].soundcloudId), [11, 22]);
+    assert.equal(restored.pos, 1);
+    assert.deepEqual(restored.history.map(ti => h.state.meta[ti].soundcloudId), [11]);
+    assert.deepEqual(restored.playNext.map(ti => h.state.meta[ti].soundcloudId), [11]);
+    assert.equal(restored.priority[1], 3);
+  });
+
+  test('complete collection and merging retain distinct IDs at one permalink without native row guesses', async () => {
+    const h = createHarness();
+    const shared = 'https://soundcloud.com/artist/shared';
+    const meta = [11, 22].map(id => ({ ...h.meta(id), link: shared }));
+    const snapshot = { complete: true, tracks: meta.map(item => ({
+      id: item.soundcloudId, title: item.title, permalink_url: shared,
+      publisher_metadata: { artist: item.artist },
+    })) };
+    const rows = meta.map(item => ({ meta: item }));
+    const collection = await h.completePlaylistCollection(h.a, rows, Promise.resolve(snapshot));
+    assert.equal(collection.complete, true);
+    assert.deepEqual(collection.meta.map(item => item.soundcloudId), [11, 22]);
+    assert.deepEqual(collection.meta.map(item => item.title), ['Track 11', 'Track 22']);
+    assert.deepEqual(collection.els, [null, null], 'URL-only rows cannot bind either conflicting ID');
+    Object.assign(h.state, { active: true, meta: [meta[0]], els: [rows[0]], queue: [0], playlistUrl: h.a });
+    h.rows(h.a, rows);
+    h.snapshots.set(h.a, snapshot);
+    await h.mergeCurrentPage();
+    await h.flushSync();
+    assert.deepEqual(h.state.meta.map(item => item.soundcloudId), [11, 22]);
+    assert.deepEqual(new Set(h.queueIds()), new Set([11, 22]));
+    assert.deepEqual(h.state.els, [null, null], 'merging also clears an old now-ambiguous native binding');
+    assert.deepEqual(new Set([...h.state._liveSyncSources.get(h.a)].map(ti => h.state.meta[ti].soundcloudId)), new Set([11, 22]));
+  });
+}
 
 (async () => {
   for (const { name, operation } of tests) {

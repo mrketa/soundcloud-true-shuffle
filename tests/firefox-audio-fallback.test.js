@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
+const source = fs.readFileSync(process.env.TSS_SCRIPT || path.join(__dirname, '..', 'SC Trueshuffle.js'), 'utf8');
 
 function extractFunction(name) {
   const marker = `function ${name}(`;
@@ -16,6 +16,14 @@ function extractFunction(name) {
   }
   throw new Error(`unterminated function ${name}`);
 }
+function extractedHelpers(names, dependencies) {
+  const functions = names.map(name => {
+    const body = extractFunction(name);
+    return source.includes(`async function ${name}(`) ? `async ${body}` : body;
+  }).join('\n');
+  return Function(...Object.keys(dependencies), `${functions}\nreturn { ${names.join(', ')} };`)(...Object.values(dependencies));
+}
+const hardenedNative = source.includes('function boundSoundCloudRow(');
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -132,7 +140,9 @@ test('SoundCloud access metadata distinguishes previews from entitled streams', 
 function createNativeFallbackHarness() {
   const nativeAudio = {
     tagName: 'AUDIO', dataset: {}, paused: false, currentSrc: 'entitled-stream',
-    pause() { this.paused = true; },
+    ended: false, playCalls: 0, pauseCalls: 0,
+    play() { this.playCalls++; throw new Error('native media.play is forbidden'); },
+    pause() { this.pauseCalls++; this.paused = true; },
   };
   const wanted = 'https://soundcloud.com/artist/premium';
   const state = {
@@ -156,26 +166,40 @@ function createNativeFallbackHarness() {
       }
     },
   };
-  const row = { scrollIntoView() {}, dispatchEvent() {}, querySelector: () => button };
+  const row = {
+    scrollIntoView() {}, dispatchEvent() {},
+    querySelector: selector => selector === '.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary'
+      ? { href: harness.rowLink, getAttribute: () => harness.rowLink } : button,
+  };
   state.els = [row];
   const transport = {
+    pauseCalls: 0,
     get title() { return transportPaused ? 'Play current track' : 'Pause current track'; },
     getAttribute() { return this.title; },
-    click() { transportPaused = !transportPaused; nativeAudio.paused = transportPaused; },
+    click() {
+      transportPaused = !transportPaused;
+      if (transportPaused) this.pauseCalls++;
+      nativeAudio.paused = transportPaused;
+    },
   };
   const harness = {
-    state, nativeAudio, button, wanted,
+    state, nativeAudio, transport, button, wanted, row, rowLink: wanted,
+    attachedRows: new Set([row]), replacementRows: [],
+    transportPresent: true, audioPresent: true,
     currentLink: 'https://soundcloud.com/artist/previous',
     onWait: async () => {},
   };
   const document = {
-    body: { contains: value => value === row },
+    body: { contains: value => harness.attachedRows.has(value) },
     querySelector: selector => selector === '.playControls__play'
-      ? transport : { href: harness.currentLink },
-    querySelectorAll: selector => selector === 'audio' ? [nativeAudio] : [],
+      ? (harness.transportPresent ? transport : null) : { href: harness.currentLink },
+    querySelectorAll: selector => selector === 'audio'
+      ? (harness.audioPresent ? [nativeAudio] : [])
+      : selector === 'a[href]' ? harness.replacementRows.map(row => row.link) : [],
   };
   const dependencies = {
-    state, document, nativePlaybackAllowed,
+    state, document, nativePlaybackAllowed, URL, AbortController, window: {},
+    location: { href: 'https://soundcloud.com/user/sets/list' }, syncOwnPipWindow() {},
     MouseEvent: function MouseEvent() {},
     wait: () => harness.onWait(),
     stopCrossfadeDecks: () => { state._nativeTrack = null; },
@@ -187,7 +211,8 @@ function createNativeFallbackHarness() {
     showMergeToast: () => {}, setTimeout: () => 1, refreshPlayBtn: () => {},
     updateProgressBar: () => {}, updateHub: () => {},
     withDeadline: operation => operation(),
-    normalizeTrackUrl: value => String(value || ''),
+    normalizeTrackUrl: value => String(value || '').split(/[?#]/)[0].replace(/\/$/, '').toLowerCase(),
+    currentDeckAudio: () => null,
     playbackErrorName: error => {
       const name = typeof error?.name === 'string' ? error.name : '';
       return /^(?:AbortError|TimeoutError|NotAllowedError|NotSupportedError|NotReadableError|InvalidStateError|SecurityError|NetworkError|EncodingError|OperationError|QuotaExceededError|UnknownError|Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|DataError|IndexSizeError|NotFoundError|InvalidAccessError|InvalidModificationError|ConstraintError|NoModificationAllowedError|InvalidCharacterError|OverconstrainedError)$/.test(name)
@@ -195,17 +220,22 @@ function createNativeFallbackHarness() {
     },
     recordPlaybackDiagnostic: () => {},
   };
-  for (const name of ['isTrueShuffleAudio', 'soundCloudPaused', 'pauseSoundCloud', 'pauseSoundCloudTransport']) {
-    dependencies[name] = Function(
-      ...Object.keys(dependencies), `return (${extractFunction(name)})`,
-    )(...Object.values(dependencies));
-  }
-  harness.play = Function(
-    ...Object.keys(dependencies),
-    `return (${extractFunction('playWithSoundCloudSession').replace(/^function /, 'async function ')})`,
-  )(...Object.values(dependencies));
+  const names = ['isTrueShuffleAudio', 'soundCloudPaused', 'pauseSoundCloud', 'pauseSoundCloudTransport',
+    'paused', 'pause', 'toggle', 'playWithSoundCloudSession'];
+  if (hardenedNative) names.push('soundCloudHref', 'getLink', 'boundSoundCloudRow', 'findSoundCloudLikeButton', 'motionIsInstant');
+  names.push(...['soundCloudInteger', 'soundCloudPermalinkConflicts', 'soundCloudLinkMatches', 'soundCloudPlayerMatches',
+    'toggleCurrentTrackLike', 'currentTrackLikeState', 'soundCloudLikeButtonState']
+    .filter(name => source.includes(`function ${name}(`)));
+  const helpers = extractedHelpers(names, dependencies);
+  harness.play = helpers.playWithSoundCloudSession;
   harness.nativePlaybackAllowed = nativePlaybackAllowed;
-  harness.soundCloudPaused = dependencies.soundCloudPaused;
+  harness.soundCloudPaused = helpers.soundCloudPaused;
+  harness.paused = helpers.paused;
+  harness.pause = helpers.pause;
+  harness.toggle = helpers.toggle;
+  if (hardenedNative) harness.findLikeButton = helpers.findSoundCloudLikeButton;
+  harness.toggleLike = helpers.toggleCurrentTrackLike;
+  if (hardenedNative) harness.boundRow = helpers.boundSoundCloudRow;
   return harness;
 }
 
@@ -267,17 +297,16 @@ test('late fallback completion cannot pause a newer successful native request', 
 });
 
 test('Firefox stream candidates prefer MPEG and continue after a failed endpoint', async () => {
-  const resolverSource = extractFunction('resolveProgressiveStreams');
   const calls = [];
   const fetch = async endpoint => {
     calls.push(String(endpoint));
     if (calls.length === 1) return { ok: false, status: 500 };
     return { ok: true, status: 200, data: { url: 'https://media.example/working' } };
   };
-  const resolveProgressiveStreams = Function(
-    'fetchSoundCloudResource',
-    `return (${resolverSource.replace(/^function /, 'async function ')})`,
-  )(fetch);
+  const { resolveProgressiveStreams } = extractedHelpers(
+    ['resolveProgressiveStreams', 'playbackErrorName'],
+    { fetchSoundCloudResource: fetch, URL, recordPlaybackDiagnostic() {} },
+  );
   const track = {
     track_authorization: 'track-token',
     media: {
@@ -307,13 +336,212 @@ test('authorization recovery excludes the rejected SoundCloud client ID', () => 
     ],
   };
   const discover = Function(
-    'state', 'performance',
+    'state', 'performance', 'URL',
     `return (${extractFunction('discoverSoundCloudClientId')})`,
-  )(state, performance);
+  )(state, performance, URL);
 
   assert.equal(discover(new Set(['rejected-client'])), 'fresh-client');
   assert.equal(state._clientId, 'fresh-client');
 });
+
+if (hardenedNative) {
+  test('shared-permalink identities cannot authorize native start or Like through URL-only rows', async () => {
+    const h = createNativeFallbackHarness();
+    h.state.meta[0].soundcloudId = 11;
+    h.state.meta.push({ ...h.state.meta[0], soundcloudId: 22 });
+    h.currentLink = h.wanted;
+    assert.strictEqual(h.boundRow(0), null);
+    assert.strictEqual(h.findLikeButton(0), null);
+    assert.equal(await h.toggleLike(), false);
+    assert.equal(await h.play(0), false);
+    assert.equal(h.button.clickCalls, 0, 'neither Like nor native start clicks an ambiguous row');
+    assert.equal(h.state.stats.played, 0);
+    assert.equal(h.nativePlaybackAllowed(), false);
+  });
+
+  test('a conflict discovered across native waits prevents clicks and wrong-identity acknowledgement', async () => {
+    for (const phase of ['before click', 'acknowledgement']) {
+      const h = createNativeFallbackHarness();
+      h.state.meta[0].soundcloudId = 11;
+      let waits = 0;
+      h.onWait = async () => {
+        waits++;
+        if (waits === (phase === 'before click' ? 1 : 2)) {
+          h.state.meta.push({ ...h.state.meta[0], soundcloudId: 22 });
+          h.currentLink = h.wanted;
+        }
+      };
+      assert.equal(await h.play(0), false);
+      assert.equal(h.button.clickCalls, phase === 'before click' ? 0 : 1);
+      assert.equal(h.state.stats.played, 0, 'shared URL is never acknowledged as the requested ID');
+      assert.strictEqual(h.state._nativeTrack, null);
+      assert.equal(h.nativeAudio.paused, true, 'current failed owner stops native output');
+    }
+  });
+
+  test('native resume rejects an ambiguous badge while a unique known identity retains native playback', async () => {
+    const h = createNativeFallbackHarness();
+    h.state.meta[0].soundcloudId = 11;
+    h.onWait = async () => { h.currentLink = h.wanted; };
+    assert.equal(await h.play(0), true, 'a unique ID still supports established URL-only native binding');
+    assert.strictEqual(h.boundRow(0), h.row);
+    h.pause();
+    h.state.meta.push({ ...h.state.meta[0], soundcloudId: 22 });
+    let resumeClicks = 0;
+    const click = h.transport.click;
+    h.transport.click = function () { resumeClicks++; return click.call(this); };
+    assert.equal(await h.toggle(), false);
+    assert.equal(resumeClicks, 0);
+    assert.equal(h.nativeAudio.paused, true);
+    assert.equal(h.state._userPaused, true);
+    assert.equal(h.state.stats.played, 1, 'rejected resume adds no new play acknowledgement');
+  });
+
+  test('native start retains cleanup ownership when a real Like lookup rebinds its row during an await', async () => {
+    for (const phase of ['before click', 'unacknowledged poll']) {
+      for (const invalidation of ['detached', 'recycled']) {
+        const h = createNativeFallbackHarness();
+        const owner = {
+          epoch: h.state._playbackEpoch,
+          request: h.state._playbackRequest,
+          meta: h.state.meta[0],
+        };
+        let release;
+        let reached;
+        const pending = new Promise(resolve => { release = resolve; });
+        const waiting = new Promise(resolve => { reached = resolve; });
+        let waits = 0;
+        h.onWait = async () => {
+          waits++;
+          if (waits === (phase === 'before click' ? 1 : 2)) {
+            reached();
+            await pending;
+          }
+        };
+        const operation = h.play(0);
+        await waiting;
+        assert.equal(h.state._nativeTrack, 0);
+        assert.equal(h.button.clickCalls, phase === 'before click' ? 0 : 1);
+
+        if (invalidation === 'detached') h.attachedRows.delete(h.row);
+        else h.rowLink = 'https://soundcloud.com/other/recycled-track';
+        const replacementButton = {
+          clickCalls: 0,
+          click() { this.clickCalls++; },
+        };
+        const likeButton = { click() { throw new Error('Like lookup must not click'); } };
+        const replacement = {
+          querySelector(selector) {
+            if (selector === '.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary') return this.link;
+            return selector === '.sc-button-like' ? likeButton : replacementButton;
+          },
+        };
+        replacement.link = {
+          href: h.wanted,
+          getAttribute: () => h.wanted,
+          closest: () => replacement,
+        };
+        h.attachedRows.add(replacement);
+        h.replacementRows.push(replacement);
+        assert.strictEqual(h.findLikeButton(0), likeButton, 'real lookup finds the replacement track row');
+        assert.strictEqual(h.state.els[0], replacement, 'boundSoundCloudRow actually updates the shared binding');
+        assert.equal(h.state._playbackEpoch, owner.epoch);
+        assert.equal(h.state._playbackRequest, owner.request);
+        assert.strictEqual(h.state.meta[0], owner.meta);
+
+        // Model native output becoming active while the operation is suspended,
+        // without directly invoking native media.play().
+        h.nativeAudio.paused = false;
+        const stopsBeforeRelease = h.nativeAudio.pauseCalls + h.transport.pauseCalls;
+        release();
+        assert.equal(await operation, false, `${phase}/${invalidation}: current owner rejects unavailable playback`);
+        assert.strictEqual(h.state._nativeTrack, null, 'row replacement cannot strand native authorization');
+        assert.equal(h.nativePlaybackAllowed(), false);
+        assert.equal(h.nativeAudio.paused, true);
+        assert.ok(h.nativeAudio.pauseCalls + h.transport.pauseCalls > stopsBeforeRelease,
+          'current owner actively stops native output through transport or media');
+        assert.equal(h.button.clickCalls, phase === 'before click' ? 0 : 1, 'captured invalid row is never clicked after replacement');
+        assert.equal(replacementButton.clickCalls, 0, 'concurrent rebind cannot redirect the pending click');
+        assert.equal(h.nativeAudio.playCalls, 0);
+        assert.equal(h.state.stats.played, 0);
+      }
+    }
+  });
+
+  test('a recycled attached native row is never clicked, including recycling across the pre-click await', async () => {
+    for (const afterWait of [false, true]) {
+      const h = createNativeFallbackHarness();
+      if (afterWait) h.onWait = async () => { h.rowLink = 'https://soundcloud.com/other/track'; };
+      else h.rowLink = 'https://soundcloud.com/other/track';
+      assert.equal(await h.play(0), false);
+      assert.equal(h.button.clickCalls, 0);
+      assert.equal(h.state.stats.played, 0);
+      assert.equal(h.nativePlaybackAllowed(), false);
+    }
+  });
+
+  test('an exact native badge without transport or active audio is not a playback acknowledgement', async () => {
+    for (const audioPresent of [false, true]) {
+      const h = createNativeFallbackHarness();
+      h.transportPresent = false;
+      h.audioPresent = audioPresent;
+      h.onWait = async () => {
+        h.currentLink = h.wanted;
+        h.nativeAudio.paused = true;
+      };
+      assert.equal(await h.play(0), false);
+      assert.equal(h.state.stats.played, 0);
+      assert.equal(h.nativePlaybackAllowed(), false);
+      assert.equal(h.paused(), true);
+    }
+  });
+
+  test('authorized active native audio remains pausable after transport removal and cannot resume by direct play', async () => {
+    const h = createNativeFallbackHarness();
+    h.onWait = async () => { h.currentLink = h.wanted; };
+    assert.equal(await h.play(0), true);
+    h.transportPresent = false;
+    assert.equal(h.paused(), false);
+    await h.toggle();
+    assert.equal(h.nativeAudio.paused, true);
+    assert.equal(h.state._userPaused, true);
+    assert.equal(await h.toggle(), false);
+    assert.equal(h.state._userPaused, true);
+    assert.equal(h.nativePlaybackAllowed(), false);
+    assert.equal(h.nativeAudio.playCalls, 0);
+  });
+
+  test('client discovery ignores unrelated resources and preserves API and rejected-ID bundle paths', async () => {
+    const state = { _clientId: '' };
+    const resources = [
+      { name: 'https://api.soundcloud.com/tracks?client_id=api-client' },
+      { name: 'https://api-v2.soundcloud.com/resolve?client_id=rejected-client' },
+      { name: 'https://api-v2.soundcloud.com.evil.example/x?client_id=wrong-client' },
+      { name: 'https://other.example/?client_id=unrelated-client' },
+      { name: 'https://other.example/?url=https://api.soundcloud.com/?client_id=nested-client' },
+    ];
+    const bundleId = 'valid_bundle_client_123456';
+    const helpers = extractedHelpers(
+      ['discoverSoundCloudClientId', 'discoverSoundCloudClientIdFromBundle', 'playbackErrorName'],
+      {
+        state, URL, DOMException, performance: { getEntriesByType: () => resources },
+        document: { scripts: [{ src: 'https://a-v2.sndcdn.com/assets/app.js' }] },
+        fetchSoundCloudResource: async () => ({
+          ok: true, data: `client_id:"rejected_bundle_123456789";client_id:"${bundleId}"`,
+        }),
+        recordPlaybackDiagnostic() {},
+      },
+    );
+    const rejected = new Set(['rejected-client', 'rejected_bundle_123456789']);
+    assert.equal(helpers.discoverSoundCloudClientId(rejected), 'api-client');
+    state._clientId = '';
+    resources.splice(0, 2);
+    assert.equal(helpers.discoverSoundCloudClientId(rejected), '');
+    assert.equal(state._clientId, '');
+    assert.equal(await helpers.discoverSoundCloudClientIdFromBundle(rejected), bundleId);
+    assert.equal(state._clientId, bundleId);
+  });
+}
 
 test('waveform hydration requires exact track identity and never reuses a title match', () => {
   const resolver = extractFunction('hydrationWaveformUrl');
