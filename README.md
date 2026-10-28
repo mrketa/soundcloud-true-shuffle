@@ -1,124 +1,131 @@
-<div align="center">
+# SoundCloud True Shuffle
 
-<img src="https://img.shields.io/badge/SoundCloud-True%20Shuffle-ff5500?style=for-the-badge&logo=soundcloud&logoColor=white" alt="SoundCloud True Shuffle">
+[![Version 6.3.0](https://img.shields.io/badge/version-6.3.0-ff5500)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Install userscript](https://img.shields.io/badge/userscript-install-ff5500)](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)
 
-<br/>
-<br/>
+A userscript for SoundCloud with collection-wide shuffle, a floating player, an editable queue and audio controls.
 
-> **SoundCloud's shuffle is broken. This fixes it.**
+**[Install from GitHub](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)** · [Install from Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) · [Release notes](CHANGELOG.md) · [Report an issue](https://github.com/mrketa/soundcloud-true-shuffle/issues)
 
-<br/>
+![True Shuffle queue with demo tracks](screenshots/6.3.0/03-queue.png)
 
-![Version](https://img.shields.io/badge/version-6.3.0-ff5500?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
-![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-install-brightgreen?style=flat-square&logo=tampermonkey)
-![Works in background](https://img.shields.io/badge/background%20tab-✓-ff5500?style=flat-square)
-
-</div>
-
----
-
-## The problem
-
-SoundCloud's built-in shuffle only randomizes the **first ~20 tracks** that happen to be loaded on the page. If your playlist has 100+ songs, you'll hear the same ones over and over. On top of that, the player breaks when the tab is in the background — so if you're gaming or doing anything else, it just stops.
-
-## What this does
-
-- **Loads your entire playlist** before doing anything — no tracks get skipped
-- **Fisher-Yates shuffle** — genuinely random, not fake random
-- **Background playback supervision** — worker heartbeat, timer fallback and audio-clock stall recovery
-- **Round-based shuffle** — every track plays once before a fresh round is generated
-- **Modern floating player** — artwork, real waveform, queue, history, stats and sleep timer
-- **Two-deck audio engine** — progressive and AAC HLS playback in True Shuffle's own decks; previews and HLS/MSE startup failures use exact-track SoundCloud fallback
-- **DJ-style crossfade** — adjustable duration and Smooth, Clean or DJ transition curves
-- **5-band equalizer** — built-in presets, a visual editor and persistent custom presets
-- **Auto Level** — evens out large volume differences between tracks and remembers learned levels
-- Works on playlists, likes, tracks, reposts and the SoundCloud Feed
+*Version 6.3.0 interface shown with demo data, not a live SoundCloud listening session.*
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/get-it/) where available for your browser. For Safari, use Tampermonkey.
-2. Click **[Install the canonical GitHub build](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)**. This link follows the current public build on `main`.
-3. Confirm installation, disable any other True Shuffle copies, then reload SoundCloud.
+1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/get-it/), where available for your browser. Safari users can use Tampermonkey.
+2. Open the **[canonical GitHub userscript](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)** and confirm installation in your userscript manager. [Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) is an alternative installation channel.
+3. **Disable any other True Shuffle copies**, including diagnostic copies, then reload SoundCloud.
 
-[Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) also serves **6.3.0**, as reported by the maintainer. It remains a separately managed installation/feedback channel; this report was not independently checked against its live source.
+The GitHub link points to the public build on `main`. Choose one installation channel rather than enabling both copies.
 
-**[Release v6.3.0](https://github.com/mrketa/soundcloud-true-shuffle/releases/tag/v6.3.0)** was published on **2026-10-24 at 02:49:21 UTC** from commit [`c7474d9`](https://github.com/mrketa/soundcloud-true-shuffle/commit/c7474d9ce308d529204bde6f6b018365b18f1050). It is public, neither draft nor prerelease. It was originally created without attachments; the current GitHub API shows one subsequently added asset, **[SC.Trueshuffle.user.js](https://github.com/mrketa/soundcloud-true-shuffle/releases/download/v6.3.0/SC.Trueshuffle.user.js)** (564892 bytes). GitHub's automatic source archives are separate. The fixed **[v6.3.0 userscript](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/v6.3.0/dist/SC%20Trueshuffle.user.js)** also remains available.
+## What it does
 
-> Designed for current mainstream browsers, not just Firefox. See browser support below for manager availability and capability differences.
+- **Collection-wide shuffle:** collects available tracks from playlists, likes, profile tracks, reposts and the Feed before shuffling with Fisher–Yates. New rounds continue when the current round finishes.
+- **Queue control:** search and reorder upcoming tracks, use Play Next, review listening history, and merge playlists into the session. Merged sources are checked for new tracks.
+- **Floating player:** artwork, waveform, volume and playback controls, with picture-in-picture options where supported.
+- **Audio tools:** a two-deck player, adjustable crossfade with Smooth, Clean and DJ profiles, a five-band equalizer with saved custom presets, and Auto Level to reduce volume differences between tracks.
+- **Session controls:** a sleep timer, Stop after this round, and an explicit End shuffle session action.
+- **Playback supervision:** background scheduling and bounded stall recovery, subject to browser and operating-system limits.
 
-## Usage
+Track availability still depends on SoundCloud, your account and network conditions. Collection loading cannot make unavailable tracks playable.
 
-Navigate to a supported SoundCloud playlist, library page or Feed. The floating **True Shuffle** player appears in the lower-left corner.
+## Use it
 
-- Click **Start shuffle** to load every available track and begin a shuffled round.
-- The native SoundCloud player stays paused, including on playlist open/reload and after ending a session. Only an explicitly selected True Shuffle native fallback may play through it; True Shuffle's own audio decks are unaffected.
-- Use **Cancel loading** to abandon a stalled load. During playback, open **Settings → Session → End shuffle session** to stop; session controls remain usable while work is pending.
-- Click **Reshuffle**, directly beside **Queue**, to reshuffle upcoming tracks without reloading the page.
-- Open **Queue** to search, reorder, merge playlists or view listening history. **Merge playlist** and **Close queue / Back to player** share its compact title row.
-- Merged playlists keep updating automatically: new tracks from each source enter the upcoming queue once, without interrupting the current track.
-- Restoring a cached queue preserves merged sources, history and Play Next requests.
-- Adjust the master output level in the player. Open the header's **Settings** gear for **Audio / Session / Info** tabs; the back arrow returns to playback.
-- **Audio:** choose crossfade duration, Smooth/Clean/DJ profile and **Fade manual skips**; toggle **Auto Level** or **Open equalizer** for presets and a custom five-band curve. Custom EQ presets use userscript storage.
-- **Session:** set a sleep timer, enable **Stop after this round**, or end the shuffle session.
-- **Info:** view listening statistics and set **Reduce visual effects** or **Scroll long titles**.
+1. Open a supported collection page on SoundCloud. Find the floating **True Shuffle** player in the lower-left corner.
+2. Select **Start shuffle** and let the collection load. Use **Cancel loading** if you want to abandon it.
+3. Open **Queue** to manage upcoming tracks or merge another playlist. **Reshuffle**, beside Queue, reshuffles upcoming tracks without reloading the page.
+4. Open the header's **Settings** gear to adjust playback or end the session.
 
-**Reduce visual effects** is a manual, locally saved preference, off by default. It replaces the main glass with dense charcoal and removes owned blur and nonessential motion; it does not change audio quality, crossfade automation, deck count or HLS buffers, and it does not automatically detect weak hardware. **Scroll long titles** is saved separately and on by default: overflowing PiP player titles can scroll with reduced effects on, or remain still with effects off. Queue/short titles stay still. The system's reduced-motion preference always prevents the title animation. Blocked storage can prevent either preference from surviving reload.
+True Shuffle normally pauses SoundCloud's native player and uses its own audio decks. Certain tracks can fall back to SoundCloud's native playback; crossfade and audio processing are unavailable in that mode.
 
-## Playback recovery and reports
+### Settings
 
-Network requests, response bodies and audio startup have deadlines. Playback operations release their controls after failure; stale callbacks cannot overwrite a newer session. Frozen playback has a bounded recovery budget, and failed or closed audio contexts are rebuilt with fresh audio elements.
+| Tab | Controls |
+| --- | --- |
+| **Audio** | Crossfade duration and profile, Fade manual skips, Auto Level, and Open equalizer |
+| **Session** | Sleep timer, Stop after this round, and End shuffle session |
+| **Info** | Listening statistics, Reduce visual effects, and Scroll long titles |
 
-If playback stalls, use **Cancel loading** or **Settings → Session → End shuffle session**, then start True Shuffle again. A classified playback fault reveals a **red exclamation mark next to PiP** in the player header, including after ending the session. Ordinary transition observations do not reveal it; audible clicks or silence without a classified fault do not automatically reveal it either. Click it, then choose **Copy report** for readable, privacy-filtered text capped at **1,800 characters**. **Full technical details (optional)** offers sanitized JSON through the separate **Copy full report** action; opening it does not change the short copy. If clipboard access is blocked, the dialog explains manual Ctrl+C/Cmd+C copying and selects the text where supported. Reports exist only in memory: reloading or closing the page discards them, and previously saved diagnostic data is removed on initialization. **Clear** removes the current report and hides the fault indicator until another fault.
+**Reduce visual effects** is a manual appearance preference, not an audio-quality or hardware-detection mode. **Scroll long titles** is independent; the system's reduced-motion preference also prevents title animation. Preferences and custom EQ presets are stored locally where browser storage is available. Blocked storage can prevent settings from surviving a reload.
 
-Choose **How to report** in the report dialog for a separate short tutorial. Copy the report before reloading, then use its direct link to [Greasy Fork feedback](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback). Sign in if needed and start a new discussion with the report, the steps you took, and what happened instead of the expected result. Feedback is public. Reports contain the browser family/major version, OS family, userscript manager/version, page category, playback state, numeric indices, and sanitized request/media/audio diagnostics. They exclude track titles, account names, page paths, media or stream URLs, query strings, credentials, and exception text. Nothing is sent automatically; review the report yourself before posting.
+<details>
+<summary>More screenshots — version 6.3.0, demo data</summary>
 
-The production script keeps lightweight transition observations active by default (`_transitionDiagnostics=true`) while verbose diagnostic tracing is off (`DIAGNOSTIC_BUILD=false`). It uses the bounded 80-event in-memory ring and retains the latest fault's context and nearby events across Stop/ring rollover; no persistent logs or telemetry are added. For a standalone support install, run `python build.py --diagnostic`: it writes `dist/SC Trueshuffle Diagnostic.user.js`, named **SoundCloud True Shuffle (Temporary Diagnostic)**, with the **same canonical version, 6.3.0**, and verbose tracing explicitly enabled (`DIAGNOSTIC_BUILD=true`). Disable every other True Shuffle copy before enabling it; the distinct name does not isolate shared preferences.
+### Mini-player
 
-Reports capture candidate outcomes, request status/timing, stream protocol/quality, HLS/MSE milestones, media readiness/play results, audio-context/graph state, prefetch, crossfade, recovery, and native fallback. URLs, titles, account/page paths, credentials, and full exception messages are not recorded. The report stays local until you choose **Copy report**.
+![Mini-player with demo track](screenshots/6.3.0/01-mini-player.png)
 
-SoundCloud deprecated progressive HTTP streams in favor of AAC HLS after 2025. True Shuffle resolves the signed HLS manifest and plays it through the existing two-deck player with its crossfade and audio processing; pinned hls.js 1.7.3 supplies MSE playback. Native SoundCloud fallback is limited to previews or HLS/MSE startup failures, where crossfade and audio processing are unavailable. See [SoundCloud's streaming migration](https://developers.soundcloud.com/blog/api-streaming-urls/).
-Unavailable browser storage does not prevent playback or volume changes. Custom EQ presets that could not be saved show an unsaved state rather than falsely acknowledging persistence.
+### Settings
 
-## How it works
+![Audio settings with demo data](screenshots/6.3.0/02-settings.png)
 
+### Listening statistics
+
+![Listening statistics with demo data](screenshots/6.3.0/04-listening-stats.png)
+
+### Equalizer
+
+![Five-band equalizer with demo data](screenshots/6.3.0/05-equalizer.png)
+
+</details>
+
+## Browser targets and limitations
+
+The compatibility targets are current Chrome, Edge, Brave, Opera, Firefox and Safari with a suitable userscript manager. These are targets, **not certification that every browser and manager combination has been tested**.
+
+- Chromium browsers and Firefox can use Tampermonkey or Violentmonkey where supported; Safari can use Tampermonkey. Manager availability and injection permissions vary.
+- Picture-in-picture uses a separate document window where available, otherwise video PiP or an in-page mini-player. Controls and window behavior differ between modes.
+- AAC HLS playback depends on browser media capabilities and the declared userscript dependency, hls.js. Previews and HLS/MSE startup failures may use native SoundCloud playback instead.
+- Background recovery cannot prevent browser tab suspension, operating-system sleep, network interruptions or SoundCloud changes from interrupting playback.
+- The script integrates with SoundCloud's web interface; site changes can affect collection loading and playback.
+
+## Privacy and feedback
+
+Settings, queue caches and learned audio levels use local browser/userscript storage. Playback makes requests to SoundCloud and its media services; the userscript manager also loads the declared [hls.js dependency](https://www.jsdelivr.com/package/npm/hls.js). The script does not automatically upload diagnostic reports or send analytics telemetry.
+
+If playback stalls, try **Cancel loading** or **Settings → Session → End shuffle session**, then start a new session. A classified playback fault can reveal a **red exclamation mark next to PiP** in the header. Open it and choose **Copy report**; optional full technical details have a separate copy action. Copy the report before reloading.
+
+Reports include browser/manager information and sanitized playback diagnostics. They exclude track titles, account names, page paths, stream URLs, credentials and full exception text. **Review anything you post:** GitHub issues and Greasy Fork feedback are public.
+
+For bugs or suggestions, open a [GitHub issue](https://github.com/mrketa/soundcloud-true-shuffle/issues) or [Greasy Fork discussion](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle/feedback). Include:
+
+- Browser and userscript manager versions, plus the True Shuffle version.
+- The page type, steps to reproduce, and expected versus actual behavior.
+- A copied diagnostic report if available; a report is not required to describe a problem.
+
+## Development
+
+Requirements: **Python 3** for the build and **Node.js** with the built-in `node:test` runner for regression tests.
+
+```sh
+python build.py
+node --test tests/*.test.js
 ```
-1. Scroll to bottom of page repeatedly until all tracks are loaded
-2. Collect all track elements
-3. Fisher-Yates shuffle → build a queue
-4. Resolve the selected track and play it through True Shuffle's two-deck audio engine
-5. Apply output level, Auto Level, equalizer and optional crossfade
-6. Coordinate track changes with a supervised worker and the audio clock
-7. Recover stalled custom playback; acknowledge the exact requested track in SoundCloud-session fallback
-8. When the round is exhausted → generate a new balanced round
+
+The standard build copies [`SC Trueshuffle.js`](SC%20Trueshuffle.js) **verbatim** to [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js). Edit the canonical source, then regenerate the public build. The tests target that source by default; `TSS_SCRIPT` can select another script artifact explicitly. Automated tests do not replace real SoundCloud/browser integration checks.
+
+### Optional diagnostic build
+
+```sh
+python build.py --diagnostic
 ```
 
-## Browser support
+This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifact named **SoundCloud True Shuffle (Temporary Diagnostic)**. It keeps version 6.3.0 and enables verbose diagnostic tracing. Install it locally only when needed, **disable every other True Shuffle copy**, and reload SoundCloud. Its distinct name does not isolate shared preferences. Disable it before returning to the stable script.
 
-Compatibility targets are current Chrome, Edge, Brave, Opera, Firefox and Safari:
+### Repository layout
 
-| Browser family | Userscript manager |
-|----------------|--------------------|
-| Chromium: Chrome, Edge, Brave, Opera | Tampermonkey or Violentmonkey, where supported by the browser/manager version |
-| Firefox | Tampermonkey or Violentmonkey |
-| Safari | Tampermonkey |
-
-Optional features use capability checks rather than browser-name gating. PiP uses a separate document window where available, otherwise video PiP or an in-page mini-player; these modes do not provide identical controls or window behavior. Owned document/inline PiP surfaces stay opaque near-black regardless of the effects preference. CSS cannot change native OS window chrome, and native video PiP cannot blur the surrounding desktop. Worker failures fall back to a timer, but browser or operating-system suspension can still interrupt background work. Page-script integrations also depend on the manager's injection mode and site policy.
-
-These are compatibility targets, not a claim that every browser/manager combination has been runtime-tested. Public 6.3.0 passed syntax checks and **164 tests, zero skips and zero failures** for each of canonical source, public distribution and diagnostic distribution. The standard build was byte-identical to canonical source, and its code body matched the verified UI .19 revision.
-
-Actual built-public Chrome fixtures exercised real local WAV playback through the audio graph, pause/resume, independent title scrolling with reduced effects on, dark native Document PiP and exact native-clipboard copying of a 718-character fault report without replacing the playing deck/context. Firefox 158 fixtures exercised the built-public UI, PiP marquee and exact native-clipboard copying of a 484-character fault report. Both completed without browser errors; fixtures were cleaned. These controlled checks are not authenticated SoundCloud playback, userscript-manager integration, Abox-VM or Safari certification.
-
-## Build and regression commands
-
-`python build.py` copies the canonical `SC Trueshuffle.js` verbatim to `dist/SC Trueshuffle.user.js`. Never target an archived private or UI-backup file with `--output`; those are preserved comparison artifacts, not build destinations. The diagnostic command above changes the standalone identity and verbose flag, not the version.
-
-`node --test tests/*.test.js` targets the current canonical source without private expectation flags. `TSS_SCRIPT` remains an explicit source/artifact override. Fade-policy and immediate-prefetch expectations use the selected script's metadata-version release contracts: half-duration budgeting from 6.2.6 and immediate prefetch from 6.2.7.
-
-## Release notes
-
-GitHub release descriptions contain only a concise, user-facing changelog in English. Keep installation instructions, test/build reports, attachment notes and internal workflow details in project documentation, not in the release description.
+| Path | Purpose |
+| --- | --- |
+| [`SC Trueshuffle.js`](SC%20Trueshuffle.js) | Canonical userscript source |
+| [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js) | Public installable build |
+| [`build.py`](build.py) | Standard and diagnostic build commands |
+| [`tests/`](tests/) | Node.js regression tests |
+| [`screenshots/6.3.0/`](screenshots/6.3.0/) | Interface screenshots using demo data |
+| [`CHANGELOG.md`](CHANGELOG.md) | User-facing release notes |
+| [`LICENSE`](LICENSE) | MIT license |
 
 ## License
 
-MIT
+[MIT](LICENSE).

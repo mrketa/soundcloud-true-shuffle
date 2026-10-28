@@ -1,15 +1,28 @@
-# Installed local agent tooling and machine-specific permissions
-/.agents/skills/ui-ux-pro-max/
-/.claude/skills/ui-ux-pro-max/
-/.claude/settings.local.json
-/.claude/worktrees/
+# Local tooling, planning and handoff notes
+/.agents/
+/.claude/
+/.planning/
+/.continue-here.md
+/HANDOFF.md
+/GreasyFork-*.md
+
+# Historical implementations and design experiments (kept locally)
+/src/
+/mockups/
+/soundcloud-true-shuffle.user.js
+/old working.js
+/SC Trueshuffle.redesign.js
+/SC Trueshuffle.v*-*.js
+
+# Only the canonical installable build is published
+/dist/*
+!/dist/SC Trueshuffle.user.js
 
 # Python bytecode
-**/__pycache__/
-**/*.pyc
+__pycache__/
+*.py[cod]
 
-# Local agent transcripts and original third-party tester report
-/.planning/debug/.library-queue-state-agent-error.log
-/.planning/debug/.library-queue-state-agent-output.log
-/.planning/debug/.library-queue-state-agent-prompt.md
-/.planning/debug/abox-vm-crossfade-reports-2026-10-21.json
+# Local editor and operating-system files
+/.vscode/
+.DS_Store
+Thumbs.db
