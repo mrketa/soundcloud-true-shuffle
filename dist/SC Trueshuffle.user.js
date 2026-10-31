@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.3.0
+// @version      6.3.1
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
@@ -9,6 +9,8 @@
 // @license      MIT
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      api.github.com
 // @grant        unsafeWindow
 // @sandbox      raw
 // @run-at       document-start
@@ -28,7 +30,6 @@ const PLAYBACK_DIAGNOSTIC_FAULTS = new Set([
   'recovery-exhausted', 'recovery-failed', 'playback-operation-failed',
   'custom-start-exhausted', 'custom-start-candidate-failed', 'hls-playback-failed',
   'audio-graph-failed', 'audio-context-resume-failed', 'audio-context-suspend-failed',
-  'native-fallback-unavailable', 'native-track-not-acknowledged', 'native-start-failed',
   'prefetch-failed', 'stop-cleanup-failed',
 ]);
 
@@ -45,9 +46,281 @@ const safeStorage = {
   },
 };
 
+// Backup-only release notice. No page fetch: userscript-manager transport avoids
+// SoundCloud's CSP/CORS, and failed attempts still consume the daily allowance.
+const UPDATE_NOTICE_KEY = 'tss_update_notice_backup_v1';
+const UPDATE_NOTICE_DAY = 24 * 60 * 60 * 1000;
+const UPDATE_NOTICE_TIMEOUT = 10000;
+const updateNoticeState = {
+  cache: null, cacheCheckedAt: 0, lastAttempt: 0, lastAttention: 0,
+  acknowledged: '', inFlight: null, attentionShown: false, media: null,
+  closeChooser: null,
+};
+
+function parseUpdateVersion(value) {
+  if (typeof value !== 'string' || !/^v?\d+\.\d+\.\d+(?:\.\d+)?$/.test(value) || value.length > 64) return null;
+  const parts = value.replace(/^v/, '').split('.').map(Number);
+  if (parts.some(part => !Number.isSafeInteger(part))) return null;
+  if (parts.length === 3) parts.push(0);
+  return parts;
+}
+
+function compareUpdateVersions(left, right) {
+  const a = parseUpdateVersion(left), b = parseUpdateVersion(right);
+  if (!a || !b) return null;
+  for (let i = 0; i < 4; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+function validateUpdateRelease(value) {
+  if (!value || value.draft !== false || value.prerelease !== false || !parseUpdateVersion(value.tag_name)) return null;
+  // Cache only validated release identity; provider destinations stay fixed.
+  return { tag_name: value.tag_name, draft: false, prerelease: false };
+}
+
+function loadUpdateNotice() {
+  try {
+    const stored = typeof GM_getValue === 'function' ? GM_getValue(UPDATE_NOTICE_KEY, null) : null;
+    if (!stored || typeof stored !== 'object') return;
+    const cached = validateUpdateRelease(stored.cache);
+    const cacheCheckedAt = Number.isFinite(stored.cacheCheckedAt) && stored.cacheCheckedAt > 0
+      ? stored.cacheCheckedAt : 0;
+    if (cached && (!updateNoticeState.cache || cacheCheckedAt > updateNoticeState.cacheCheckedAt)) {
+      updateNoticeState.cache = cached;
+      updateNoticeState.cacheCheckedAt = cacheCheckedAt;
+    }
+    for (const key of ['lastAttempt', 'lastAttention']) {
+      if (Number.isFinite(stored[key]) && stored[key] > updateNoticeState[key]) updateNoticeState[key] = stored[key];
+    }
+    if (parseUpdateVersion(stored.acknowledged) && (!parseUpdateVersion(updateNoticeState.acknowledged)
+        || compareUpdateVersions(stored.acknowledged, updateNoticeState.acknowledged) === 1)) {
+      updateNoticeState.acknowledged = stored.acknowledged;
+    }
+  } catch (_) {}
+}
+
+function saveUpdateNotice() {
+  // Another tab may have checked or acknowledged a release since this mount.
+  // Merge fresh GM state before writing so stale tabs cannot roll it backwards.
+  loadUpdateNotice();
+  try {
+    if (typeof GM_setValue === 'function') GM_setValue(UPDATE_NOTICE_KEY, {
+      cache: updateNoticeState.cache, cacheCheckedAt: updateNoticeState.cacheCheckedAt,
+      lastAttempt: updateNoticeState.lastAttempt,
+      lastAttention: updateNoticeState.lastAttention, acknowledged: updateNoticeState.acknowledged,
+    });
+  } catch (_) {}
+}
+
+function installedUpdateVersion() {
+  try {
+    const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : null;
+    // Unknown or prerelease installs are deliberately not compared to stable.
+    return parseUpdateVersion(version) ? version : null;
+  } catch (_) { return null; }
+}
+
+function checkUpdateRelease() {
+  loadUpdateNotice();
+  if (updateNoticeState.inFlight) return updateNoticeState.inFlight;
+  const now = Date.now();
+  if (!installedUpdateVersion() || typeof GM_xmlhttpRequest !== 'function'
+      || (updateNoticeState.lastAttempt && now - updateNoticeState.lastAttempt < UPDATE_NOTICE_DAY)) {
+    return Promise.resolve(updateNoticeState.cache);
+  }
+  updateNoticeState.lastAttempt = now;
+  saveUpdateNotice();
+  updateNoticeState.inFlight = new Promise(resolve => {
+    let settled = false, request = null;
+    const finish = release => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      loadUpdateNotice();
+      // Request-start order wins, even when the authoritative release moves backwards.
+      // On equal timestamps keep the known result rather than guessing which request is newer.
+      if (release && (!updateNoticeState.cache || now > updateNoticeState.cacheCheckedAt)) {
+        updateNoticeState.cache = release;
+        updateNoticeState.cacheCheckedAt = now;
+        saveUpdateNotice();
+      }
+      resolve(updateNoticeState.cache);
+    };
+    const deadline = setTimeout(() => {
+      finish(null);
+      try { request?.abort(); } catch (_) {}
+    }, UPDATE_NOTICE_TIMEOUT);
+    try {
+      request = GM_xmlhttpRequest({
+        method: 'GET',
+        url: 'https://api.github.com/repos/mrketa/soundcloud-true-shuffle/releases/latest',
+        headers: { Accept: 'application/vnd.github+json' },
+        anonymous: true, timeout: UPDATE_NOTICE_TIMEOUT,
+        onload(response) {
+          let release = null;
+          try {
+            if (response.status === 200) release = validateUpdateRelease(JSON.parse(response.responseText));
+          } catch (_) {}
+          finish(release);
+        },
+        onerror: () => finish(null), ontimeout: () => finish(null), onabort: () => finish(null),
+      });
+    } catch (_) { finish(null); }
+  }).finally(() => { updateNoticeState.inFlight = null; });
+  return updateNoticeState.inFlight;
+}
+
+function settleUpdateAttention(documentLike = document) {
+  documentLike.querySelectorAll('.tss-deck-brand[data-update-attention]').forEach(brand => {
+    brand.removeAttribute('data-update-attention');
+  });
+}
+
+function showUpdateProviderChooser(hub, trigger) {
+  if (updateNoticeState.closeChooser) {
+    updateNoticeState.closeChooser();
+    return;
+  }
+  const release = updateNoticeState.cache;
+  if (!hub.isConnected || !release || !hub.querySelector('.tss-deck-brand')?.dataset.update) return;
+  const popup = document.createElement('div');
+  popup.id = 'tss-update-providers';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-labelledby', 'tss-update-providers-title');
+  popup.innerHTML = `
+    <div class="tss-update-providers-heading"><span id="tss-update-providers-title">Choose update source</span><button type="button" aria-label="Close update sources">×</button></div>
+    <a class="tss-update-provider-primary" href="https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle" target="_blank" rel="noopener noreferrer">Greasy Fork</a>
+    <a class="tss-update-provider-github" href="https://github.com/mrketa/soundcloud-true-shuffle/releases/latest" target="_blank" rel="noopener noreferrer">GitHub release</a>
+  `;
+  document.body.appendChild(popup);
+  trigger.setAttribute('aria-expanded', 'true');
+  const anchor = trigger.getBoundingClientRect();
+  const bounds = popup.getBoundingClientRect();
+  const margin = 8;
+  const viewportWidth = document.documentElement.clientWidth;
+  const viewportHeight = document.documentElement.clientHeight;
+  popup.style.left = `${Math.max(margin, Math.min(anchor.left, viewportWidth - bounds.width - margin))}px`;
+  const top = anchor.top >= bounds.height + margin * 2 ? anchor.top - bounds.height - margin : anchor.bottom + margin;
+  popup.style.top = `${Math.max(margin, Math.min(top, viewportHeight - bounds.height - margin))}px`;
+
+  const close = (restoreFocus = false) => {
+    document.removeEventListener('pointerdown', dismiss, true);
+    document.removeEventListener('focusin', dismiss, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('resize', onViewportChange);
+    window.removeEventListener('scroll', onViewportChange, true);
+    window.removeEventListener('popstate', onViewportChange);
+    window.removeEventListener('hashchange', onViewportChange);
+    observer.disconnect();
+    popup.remove();
+    trigger.setAttribute('aria-expanded', 'false');
+    if (updateNoticeState.closeChooser === close) updateNoticeState.closeChooser = null;
+    if (restoreFocus && trigger.isConnected) trigger.focus({ preventScroll: true });
+  };
+  const dismiss = event => {
+    if (!popup.contains(event.target) && !trigger.contains(event.target)) close();
+  };
+  const onKeyDown = event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    close(true);
+  };
+  const onViewportChange = event => {
+    if (event.type === 'scroll' && event.target instanceof Node && popup.contains(event.target)) return;
+    close();
+  };
+  const observer = new MutationObserver(() => {
+    if (!hub.isConnected || !trigger.isConnected || !popup.isConnected) close();
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+  updateNoticeState.closeChooser = close;
+  popup.querySelector('button').addEventListener('click', () => close(true));
+  // Keep popup interactions away from page-level playback and shortcut handlers.
+  for (const type of ['pointerdown', 'mousedown', 'click', 'dblclick', 'auxclick', 'keydown', 'keyup']) {
+    popup.addEventListener(type, event => event.stopPropagation());
+  }
+  document.addEventListener('pointerdown', dismiss, true);
+  document.addEventListener('focusin', dismiss, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('scroll', onViewportChange, true);
+  window.addEventListener('popstate', onViewportChange);
+  window.addEventListener('hashchange', onViewportChange);
+  popup.querySelector('a').focus({ preventScroll: true });
+}
+
+function renderUpdateNotice(hub) {
+  if (!hub.isConnected) return;
+  loadUpdateNotice();
+  const brand = hub.querySelector('.tss-deck-brand');
+  const trigger = hub.querySelector('.tss-update-trigger');
+  const label = hub.querySelector('.tss-deck-label');
+  const release = updateNoticeState.cache;
+  const installed = installedUpdateVersion();
+  const newer = release && installed && compareUpdateVersions(release.tag_name, installed) === 1;
+  if (!newer) {
+    brand.removeAttribute('data-update');
+    brand.removeAttribute('data-update-attention');
+    label.removeAttribute('aria-hidden');
+    updateNoticeState.closeChooser?.();
+    trigger.setAttribute('aria-hidden', 'true');
+    trigger.tabIndex = -1;
+    return;
+  }
+  const alreadyVisible = brand.dataset.update === release.tag_name;
+  trigger.title = `Installed ${installed}; available ${release.tag_name}. Choose update source`;
+  trigger.setAttribute('aria-label', `Update available: installed ${installed}, available ${release.tag_name}. Choose update source`);
+  trigger.removeAttribute('aria-hidden');
+  trigger.tabIndex = 0;
+  label.setAttribute('aria-hidden', 'true');
+  brand.dataset.update = release.tag_name;
+  if (alreadyVisible) return;
+  const now = Date.now();
+  const acknowledged = compareUpdateVersions(updateNoticeState.acknowledged, release.tag_name);
+  const reduced = state.reduceVisualEffects || updateNoticeState.media?.matches;
+  if (!reduced && !document.hidden && !updateNoticeState.attentionShown
+      && acknowledged !== 0 && acknowledged !== 1
+      && (!updateNoticeState.lastAttention || now - updateNoticeState.lastAttention >= UPDATE_NOTICE_DAY)) {
+    updateNoticeState.attentionShown = true;
+    updateNoticeState.lastAttention = now;
+    saveUpdateNotice();
+    brand.dataset.updateAttention = 'true';
+  }
+}
+
+function mountUpdateNotice(hub) {
+  updateNoticeState.closeChooser?.();
+  loadUpdateNotice();
+  if (!updateNoticeState.media && typeof window.matchMedia === 'function') {
+    updateNoticeState.media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    updateNoticeState.media.addEventListener('change', event => {
+      if (event.matches) settleUpdateAttention();
+    });
+  }
+  const trigger = hub.querySelector('.tss-update-trigger');
+  trigger.addEventListener('click', event => {
+    event.stopPropagation();
+    const version = hub.querySelector('.tss-deck-brand').dataset.update;
+    if (parseUpdateVersion(version)) {
+      updateNoticeState.acknowledged = version;
+      saveUpdateNotice();
+    }
+    settleUpdateAttention();
+    showUpdateProviderChooser(hub, trigger);
+  });
+  hub.addEventListener('animationend', event => {
+    if (event.animationName === 'tss-update-glow') settleUpdateAttention();
+  });
+  renderUpdateNotice(hub);
+  void checkUpdateRelease().then(() => renderUpdateNotice(hub));
+}
+
 const DIAGNOSTIC_NUMBER_FIELDS = new Set([
   'schemaVersion', 'attemptId', 'operationId', 'playbackEpoch', 'collectionEpoch',
-  'trackIndex', 'deckTrack', 'nativeTrackIndex',
+  'trackIndex', 'deckTrack',
   'attempt', 'attempted', 'priorFailedCandidates', 'precedingFailedCandidates',
   'queuePosition', 'queueLength', 'deckIndex', 'outgoingIndex', 'incomingIndex', 'index',
   'deckCount', 'deckGain', 'mixGain', 'autoGain', 'elapsedMs', 'durationMs', 'duration', 'position', 'resumedAt',
@@ -65,7 +338,7 @@ const DIAGNOSTIC_NUMBER_FIELDS = new Set([
   'hlsNonFatalErrorCount', 'hlsFatalErrorCount', 'hlsLevelCount', 'hlsCurrentLevel',
   'hlsBandwidthEstimate', 'hlsBufferedFragmentCount', 'hlsMediaAttachedElapsedMs',
   'hlsManifestParsedElapsedMs', 'hlsFirstFragmentBufferedElapsedMs', 'mediaWaitElapsedMs',
-  'playElapsedMs', 'pollCount', 'nativePollCount', 'pollLimit', 'maxPolls', 'attempts',
+  'playElapsedMs', 'attempts',
   'recoveryAttempts', 'elapsed', 'timeoutMs', 'waitMs', 'remainingMs', 'bufferedAhead',
   'playbackRate', 'browserMajorVersion', 'monotonicMs', 'previousToken', 'incomingDuration',
   'sampledSchedulingLeadMs', 'schedulingSubmissionMs', 'estimatedSchedulingLeadMs',
@@ -81,26 +354,25 @@ const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
   'hlsManifestParsed', 'hlsFirstFragmentBuffered', 'hlsReady', 'hlsMseSupported', 'mseSupported',
   'mediaSourceAvailable', 'nativeHlsSupported', 'audioContextAvailable',
   'sourceNodeConnected', 'graphFailed', 'audioGraphFailed', 'playFulfilled', 'ready',
-  'userPaused', 'visible', 'focused', 'onLine', 'buttonFound', 'clickIssued',
-  'acknowledged', 'hasCurrentSrc', 'sourceBound', 'fallbackAvailable', 'automatic',
+  'userPaused', 'visible', 'focused', 'onLine',
+  'hasCurrentSrc', 'sourceBound', 'fallbackAvailable', 'automatic',
   'crossfadeManual', 'diagnosticsEnabled', 'graphAvailable', 'recoveredSchedule', 'incomingPaused',
-  'outgoingPaused', 'nativeAudioFound', 'playerMatched', 'elementFound', 'elementAttached',
-  'trackElementPresent', 'playButtonFound', 'playClickIssued', 'nativeAcknowledged', 'nativeTransportPaused',
+  'outgoingPaused',
   'bufferedDataAvailable',
   'autoLevel', 'eqEnabled', 'safetyClipper', 'foreground', 'detached', 'fatal', 'transitionDiagnosticsEnabled',
   'progressAlreadyAtSchedule',
 ]);
 const DIAGNOSTIC_STRING_FIELDS = new Set([
   'event', 'operation', 'stage', 'failureStage', 'failureReason', 'reason',
-  'streamSource', 'clientIdSource', 'mediaWaitOutcome', 'nativeOutcome',
-  'nativeFallbackReason', 'hlsMode', 'hlsErrorType', 'hlsErrorDetail',
+  'streamSource', 'clientIdSource', 'mediaWaitOutcome', 'customPlaybackReason',
+  'hlsMode', 'hlsErrorType', 'hlsErrorDetail',
   'hlsLastErrorType', 'hlsLastErrorDetail', 'errorName', 'error', 'contextState',
   'contextStateBefore', 'contextStateAfter', 'audioContextState', 'crossfadeStatus',
   'crossfadeCurve', 'startedVia', 'pageKind', 'streamKind', 'streamQuality',
   'qualityClass', 'streamProtocol', 'browser', 'platform', 'manager',
   'managerVersion', 'scriptVersion', 'hlsLibraryVersion', 'graphPhase', 'graphReason',
   'phase', 'outcome', 'result', 'recoveryOutcome', 'recoveryReason', 'stateName',
-  'sourceKind', 'errorType', 'errorDetail', 'nativeReason', 'nativeAction',
+  'sourceKind', 'errorType', 'errorDetail',
   'hlsStage', 'audioGraphPhase', 'audioGraphReason', 'requestStage', 'crossfadeOutcome',
   'crossfadeMode',
 ]);
@@ -277,10 +549,13 @@ async function fetchSoundCloudResource(url, format = 'json', options = {}) {
 }
 
 function invalidatePlaybackSession() {
+  state._pipTrackMenuClose?.();
+  state.dragSrc = null;
   state._playbackEpoch++;
   state._collectionEpoch++;
   state._playbackAbort.abort();
   state._playbackAbort = new AbortController();
+  state._pendingPlaybackResume = null;
   return state._playbackEpoch;
 }
 
@@ -334,6 +609,7 @@ const state = {
   _playbackAbort: new AbortController(),
   _collectionEpoch: 0,
   _userPaused: false,
+  _pendingPlaybackResume: null,
   lastTitle:    '',
   lastProgress: 0,
   sidebarOpen:  false,
@@ -356,6 +632,7 @@ const state = {
   playlistUrl:  '',
   _savedStats:  null,
   _lifetimeBase: null,
+  _lifetimePending: null,
   _lastWaveformKey: '',
   _waveformBars: null,
   _lastWaveformPlayed: 0,
@@ -401,8 +678,7 @@ const state = {
   _crossfadeToken: 0,
   _deckIndex: -1,
   _deckTrack: null,
-  _nativeTrack: null,
-  _nativeSessionNoticeShown: false,
+  _pendingPlaybackTrack: null,
   _decks: [],
   _deckHlsPlayers: [null, null],
   _deckHlsFailed: [false, false],
@@ -412,6 +688,7 @@ const state = {
   _crossfadePrefetchToken: 0,
   _deckGains: [0, 0],
   _audioContext: null,
+  _audioGraphSuspension: null,
   _audioGraphFailed: false,
   _audioMaster: null,
   _audioClipper: null,
@@ -426,6 +703,7 @@ const state = {
   })(),
   _autoLevelCacheTimer: null,
   _streamCache: new Map(),
+  _widevineCapability: null,
   _clientId: '',
   _lastSoundCloudVolume: null,
   _soundCloudVolumeModel: null,
@@ -658,36 +936,12 @@ function buildBalancedRound(indices, previousTi = null) {
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
 function playerTitle() {
-  if (state._deckTrack !== null && state.meta[state._deckTrack]) {
-    return state.meta[state._deckTrack].title || '';
-  }
-  for (const s of ['.playbackSoundBadge__titleLink', '.playbackSoundBadge a[title]', '.playerTrackName']) {
-    const el = document.querySelector(s);
-    if (!el) continue;
-    const t = (el.getAttribute('title') || el.textContent)
-      .trim()
-      .replace(/^current\s+track:\s*/i, '');
-    if (t) return t;
-  }
-  return '';
+  return Number.isInteger(state._deckTrack) ? state.meta[state._deckTrack]?.title || '' : '';
 }
 
-function parseTimeText(text) {
-  const match = String(text || '').trim().match(/(?:^|[^\d:])(\d+(?::\d+){1,2})$/);
-  if (!match) return 0;
-  const parts = match[1].split(':').map(Number);
-  if (parts.length < 2 || parts.length > 3 || parts.some(n => !Number.isFinite(n))) return 0;
-  return parts.reduce((seconds, part) => seconds * 60 + part, 0);
-}
 
 function activeAudio() {
-  const deck = currentDeckAudio();
-  if (deck) return deck;
-  const audios = [...document.querySelectorAll('audio')];
-  return audios.find(a => !a.paused && a.currentSrc)
-      || audios.find(a => a.currentSrc)
-      || audios[0]
-      || null;
+  return currentDeckAudio();
 }
 
 function playbackTiming() {
@@ -701,14 +955,7 @@ function playbackTiming() {
     };
   }
 
-  const passed = document.querySelector('.playbackTimeline__timePassed');
-  const total  = document.querySelector('.playbackTimeline__duration');
-  return {
-    current:  passed ? parseTimeText(passed.textContent) : 0,
-    duration: total  ? parseTimeText(total.textContent)  : 0,
-    ended:    false,
-    source:   'dom',
-  };
+  return { current: 0, duration: 0, ended: false, source: 'none' };
 }
 
 function progress() {
@@ -732,15 +979,7 @@ function formatPlaybackClock(seconds) {
 
 function paused() {
   const deck = currentDeckAudio();
-  if (deck) return deck.paused;
-  let nativeAudioFound = false;
-  for (const audio of document.querySelectorAll('audio')) {
-    if (isTrueShuffleAudio(audio) || !audio.currentSrc) continue;
-    nativeAudioFound = true;
-    if (!audio.paused) return false;
-  }
-  if (nativeAudioFound) return true;
-  return soundCloudPaused() !== false;
+  return !deck || deck.paused || deck.ended;
 }
 
 function soundCloudPaused() {
@@ -782,22 +1021,66 @@ function pauseSoundCloudTransport() {
   }
 }
 
-function nativePlaybackAllowed() {
-  return Boolean(state.active && !state.suspended && !state._userPaused
-    && Number.isInteger(state._nativeTrack) && state.queue[state.pos] === state._nativeTrack);
-}
 
 function installNativePlaybackGuard() {
   if (state._nativePlaybackGuardInstalled) return;
   state._nativePlaybackGuardInstalled = true;
 
+  // Detached native players never reach document's capture listener. Guard the
+  // page's actual play boundary, exporting callbacks before crossing Firefox's Xray.
+  try {
+    const host = typeof pageWindow !== 'undefined' ? pageWindow
+      : (typeof window !== 'undefined' ? window : null);
+    const realm = host?.wrappedJSObject || host;
+    const prototype = realm?.HTMLMediaElement?.prototype;
+    const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'play');
+    const canExport = typeof exportFunction === 'function';
+    const sameRealm = typeof window !== 'undefined' && realm === window;
+    if (typeof descriptor?.value === 'function' && (canExport || sameRealm)) {
+      const originalPlay = descriptor.value;
+      const pausedGetter = Object.getOwnPropertyDescriptor(prototype, 'paused')?.get;
+      const PromiseConstructor = realm.Promise || Promise;
+      const ExceptionConstructor = realm.DOMException
+        || (typeof DOMException !== 'undefined' ? DOMException : null);
+      const observed = new WeakSet();
+      const exportCallback = callback => canExport ? exportFunction(callback, realm) : callback;
+      const stopObservedAudio = exportCallback(function (event) {
+        const audio = event.currentTarget;
+        if (isTrueShuffleAudio(audio)) return;
+        try { audio.pause(); } catch (_) {}
+      });
+      const guardedPlay = exportCallback(function (...args) {
+        let foreignAudio = false;
+        try {
+          // The native getter validates media across realms and rejects forged receivers.
+          const mediaReceiver = pausedGetter
+            ? (Reflect.apply(pausedGetter, this, []), true)
+            : Object.prototype.isPrototypeOf.call(prototype, this);
+          if (mediaReceiver && this.tagName === 'AUDIO') foreignAudio = !isTrueShuffleAudio(this);
+        } catch (_) {}
+        if (!foreignAudio) return Reflect.apply(originalPlay, this, args);
+        if (!observed.has(this) && typeof this.addEventListener === 'function') {
+          try {
+            this.addEventListener('play', stopObservedAudio, true);
+            observed.add(this);
+          } catch (_) {}
+        }
+        try { this.pause(); } catch (_) {}
+        const error = ExceptionConstructor
+          ? new ExceptionConstructor('Native SoundCloud audio is disabled by True Shuffle.', 'AbortError')
+          : Object.assign(new Error('Native SoundCloud audio is disabled by True Shuffle.'), { name: 'AbortError' });
+        return PromiseConstructor.reject(error);
+      });
+      Object.defineProperty(prototype, 'play', { ...descriptor, value: guardedPlay });
+    }
+  } catch (_) {}
+
   document.addEventListener('click', event => {
     const button = event.target?.closest?.('.playControls__play');
-    if (!button || state._nativeGuardButtonAction || nativePlaybackAllowed()) return;
+    if (!button || state._nativeGuardButtonAction) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     queueMicrotask(() => {
-      if (nativePlaybackAllowed()) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     });
@@ -805,12 +1088,10 @@ function installNativePlaybackGuard() {
 
   document.addEventListener('play', event => {
     const audio = event.target;
-    if (audio?.tagName !== 'AUDIO' || isTrueShuffleAudio(audio) || nativePlaybackAllowed()) return;
-    // Native autoplay is blocked even before True Shuffle starts. Only an
-    // explicitly selected native fallback may use SoundCloud's player.
+    if (audio?.tagName !== 'AUDIO' || isTrueShuffleAudio(audio)) return;
+    // True Shuffle owns audio output, including before a session is started.
     try { audio.pause(); } catch (_) {}
     queueMicrotask(() => {
-      if (nativePlaybackAllowed()) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     });
@@ -820,19 +1101,97 @@ function installNativePlaybackGuard() {
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
-      if (!nativePlaybackAllowed()) {
-        pauseSoundCloudTransport();
-        pauseSoundCloud();
-      }
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
     }, delay);
   });
 }
 
+function playbackResumeCurrent(resume) {
+  return Boolean(resume && state._pendingPlaybackResume === resume
+    && state.active && state._playbackEpoch === resume.epoch && !resume.signal.aborted
+    && (state._crossfadePauseGeneration || 0) === resume.pauseGeneration
+    && resume.identities.every(({ audio, index, token, track }) => state._decks[index] === audio
+      && state._deckPrepareTokens[index] === token && state._deckTracks[index] === track));
+}
+
+function pauseCrossfadeSchedule() {
+  const schedule = state._crossfadeSchedule;
+  const context = state._audioContext;
+  if (!schedule || !context || schedule.token !== state._crossfadeToken || Number.isFinite(schedule.pausedAt)) return;
+  const now = Number(context.currentTime) || 0;
+  schedule.pausedAt = now;
+  schedule.pausedMediaTimes = [schedule.outgoingIndex, schedule.incomingIndex].map(index => {
+    const time = Number(state._decks[index]?.currentTime);
+    return Number.isFinite(time) && time >= 0 ? time : null;
+  });
+  const progress = Math.max(0, Math.min(1, (now - schedule.startTime) / schedule.duration));
+  const [outgoingGain, incomingGain] = crossfadeGains(progress, schedule.curve);
+  setAudioParamImmediately(state._deckAudioGraphs[schedule.outgoingIndex]?.mixGain.gain, outgoingGain, now);
+  setAudioParamImmediately(state._deckAudioGraphs[schedule.incomingIndex]?.mixGain.gain, incomingGain, now);
+}
+
+function resumeCrossfadeSchedule() {
+  const schedule = state._crossfadeSchedule;
+  const context = state._audioContext;
+  if (!schedule || !context || schedule.token !== state._crossfadeToken || !Number.isFinite(schedule.pausedAt)) return;
+  const now = Number(context.currentTime) || 0;
+  const progress = Math.max(0, Math.min(1, (schedule.pausedAt - schedule.startTime) / schedule.duration));
+  const delay = Math.max(0, now - schedule.pausedAt);
+  schedule.startTime += delay;
+  schedule.endTime += delay;
+  const startTime = Math.max(now, schedule.startTime);
+  const frozenRemaining = Math.max(0, schedule.endTime - startTime);
+  let spent = 0;
+  let mediaRemaining = Infinity;
+  [schedule.outgoingIndex, schedule.incomingIndex].forEach((index, position) => {
+    const audio = state._decks[index];
+    const time = Number(audio?.currentTime);
+    const validTime = Number.isFinite(time) && time >= 0;
+    const pausedTime = schedule.pausedMediaTimes?.[position];
+    if (validTime && Number.isFinite(pausedTime)) spent = Math.max(spent, time - pausedTime);
+    if (Number.isFinite(audio?.duration)) {
+      const limit = position === 0 ? audio.duration : audio.duration / 2;
+      mediaRemaining = Math.min(mediaRemaining, validTime ? Math.max(0, limit - time) : 0);
+    }
+  });
+  // A running graph alone consumes nothing, but either advancing deck spends
+  // the shared overlap. Backward seeks never replenish the frozen budget.
+  const remaining = Math.max(0, Math.min(frozenRemaining - spent, mediaRemaining));
+  if (remaining < frozenRemaining) {
+    // Compress the rest of the curve, not its held starting gains. Keep the
+    // schedule's progress mapping consistent for subsequent pauses/recovery.
+    schedule.duration = progress < 1 && remaining > 0 ? remaining / (1 - progress) : schedule.duration;
+    schedule.startTime = startTime - progress * schedule.duration;
+    schedule.endTime = startTime + remaining;
+  }
+  schedule.lastClockValue = now;
+  schedule.lastClockAdvanceAt = Date.now();
+  schedule.lastIncomingTime = Number(state._decks[schedule.incomingIndex]?.currentTime) || 0;
+  schedule.lastIncomingAdvanceAt = Date.now();
+  const plan = crossfadeAutomationPlan(schedule.curve);
+  delete schedule.pausedMediaTimes;
+  if (progress > 0) {
+    const [outgoingGain, incomingGain] = crossfadeGains(progress, schedule.curve);
+    const first = plan.times.findIndex(time => time > progress);
+    const times = first < 0 ? [] : plan.times.slice(first);
+    plan.times = [0, ...times.map(time => (time - progress) / (1 - progress))];
+    plan.outgoing = [outgoingGain, ...(first < 0 ? [] : plan.outgoing.slice(first))];
+    plan.incoming = [incomingGain, ...(first < 0 ? [] : plan.incoming.slice(first))];
+  }
+  schedulePairedCrossfade(state._deckAudioGraphs[schedule.outgoingIndex].mixGain.gain,
+    state._deckAudioGraphs[schedule.incomingIndex].mixGain.gain, plan, startTime, remaining);
+  delete schedule.pausedAt;
+}
+
 function pause() {
   state._userPaused = true;
+  state._pendingPlaybackResume = null;
+  if (state._playbackRequest) state._playbackRequest.nextRequested = null;
   state._crossfadePauseGeneration = (state._crossfadePauseGeneration || 0) + 1;
   if (state._crossfading) state._crossfadePausedByUser = true;
   if (state._crossfadeSchedule?.incomingClockObservation) delete state._crossfadeSchedule.incomingClockObservation;
+  pauseCrossfadeSchedule();
   const deck = currentDeckAudio();
   if (deck) {
     state._decks.forEach(audio => {
@@ -841,6 +1200,7 @@ function pause() {
     if (state._crossfading) void suspendAudioGraph(state._playbackAbort.signal);
     return;
   }
+  pauseSoundCloudTransport();
   pauseSoundCloud();
 }
 
@@ -851,6 +1211,16 @@ async function toggle() {
   const deck = currentDeckAudio();
   const pending = state._pendingPlaybackTrack;
   const pendingCurrent = pending?.epoch === epoch;
+  if (state._pendingPlaybackResume) {
+    pause();
+    refreshPlayBtn();
+    return;
+  }
+  if (deck && !deck.paused && !deck.ended && !state._userPaused) {
+    pause();
+    refreshPlayBtn();
+    return;
+  }
   const retryGraph = Number.isInteger(state._deckTrack)
     && (state._userPaused || !deck || deck.paused)
     && (state._audioGraphFailed || state._audioContext?.state === 'closed');
@@ -890,8 +1260,11 @@ async function toggle() {
       refreshPlayBtn();
       return;
     }
-    state._userPaused = false;
-    state._crossfadePausedByUser = false;
+    // Keep pause authoritative until BOTH graph and media startup have accepted
+    // this particular Play. A second click cancels it rather than duplicating it.
+    state._userPaused = true;
+    if (state._crossfading) state._crossfadePausedByUser = true;
+    pauseCrossfadeSchedule();
     const decks = state._crossfading
       ? state._decks.filter((audio, index) => audio && state._deckTracks[index] !== null)
       : [deck];
@@ -899,48 +1272,28 @@ async function toggle() {
       const index = state._decks.indexOf(audio);
       return { audio, index, token: state._deckPrepareTokens[index], track: state._deckTracks[index] };
     });
-    const isCurrent = () => state.active && state._playbackEpoch === epoch
-      && !signal.aborted && !state._userPaused
-      && identities.every(({ audio, index, token, track }) => state._decks[index] === audio
-        && state._deckPrepareTokens[index] === token && state._deckTracks[index] === track);
+    const intent = { epoch, signal, identities, pauseGeneration: state._crossfadePauseGeneration || 0 };
+    state._pendingPlaybackResume = intent;
+    const isCurrent = () => playbackResumeCurrent(intent);
+    let accepted = false;
     try {
-      if (!await resumeAudioGraph(signal) || !isCurrent()) return;
-      await Promise.all(identities.map(({ audio, index }) =>
-        playDeckWithDeadline(audio, index, signal, isCurrent)));
-      if (!isCurrent()) return;
+      if (!await resumeAudioGraph(signal, null, intent) || !isCurrent()) return;
+      const played = await Promise.all(identities.map(({ audio, index }) =>
+        playDeckWithDeadline(audio, index, signal, isCurrent, null, intent)));
+      if (!isCurrent() || played.some(result => result !== true)) return;
+      resumeCrossfadeSchedule();
+      state._userPaused = false;
+      state._crossfadePausedByUser = false;
+      accepted = true;
     } catch (_) {
       if (!isCurrent()) return;
     } finally {
+      if (state._pendingPlaybackResume === intent) {
+        if (accepted) state._pendingPlaybackResume = null;
+        else pause();
+      }
       if (state._playbackEpoch === epoch) refreshPlayBtn();
     }
-    return;
-  }
-  if (!state.suspended && Number.isInteger(state._nativeTrack)
-      && state.queue[state.pos] === state._nativeTrack) {
-    if (!paused()) {
-      pause();
-    } else {
-      const meta = state.meta[state._nativeTrack];
-      const playerMatched = soundCloudPlayerMatches(meta);
-      const button = document.querySelector('.playControls__play');
-      if (!button || soundCloudPaused() !== true || !playerMatched) {
-        showMergeToast('SoundCloud playback is unavailable until this track is visible');
-        refreshPlayBtn();
-        return false;
-      }
-      const userPaused = state._userPaused;
-      state._nativeGuardButtonAction = true;
-      state._userPaused = false;
-      try {
-        button.click();
-      } catch (error) {
-        state._userPaused = userPaused;
-        throw error;
-      } finally {
-        state._nativeGuardButtonAction = false;
-      }
-    }
-    setTimeout(() => { if (state._playbackEpoch === epoch) refreshPlayBtn(); }, 150);
     return;
   }
   const ti = state.queue[state.pos];
@@ -956,18 +1309,10 @@ function seekTo(ratio) {
     const time = ratio === 0 ? 0 : deck.duration * ratio;
     state._deckSeekRequest = { epoch: state._playbackEpoch, audio: deck, time };
     deck.currentTime = time;
+    void state._watcherTick?.();
     updateProgressBar();
     return;
   }
-  const bar = document.querySelector('.playControls .playbackTimeline__progressWrapper');
-  if (!bar) return;
-  const rect = bar.getBoundingClientRect();
-  const x    = rect.left + rect.width * ratio;
-  const y    = rect.top  + rect.height / 2;
-  const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-  bar.dispatchEvent(new MouseEvent('mousedown', opts));
-  bar.dispatchEvent(new MouseEvent('mousemove', opts));
-  bar.dispatchEvent(new MouseEvent('mouseup',   opts));
 }
 
 function refreshPlayBtn() {
@@ -1040,8 +1385,11 @@ function getLink(el) {
 function waveformUrl(el) {
   const direct = el.querySelector('[data-waveform-url]')?.getAttribute('data-waveform-url');
   if (direct) return direct;
+  if (el._tssWaveformUrl !== undefined) return el._tssWaveformUrl;
   const match = el.outerHTML.match(/https?:\/\/wave\.sndcdn\.com\/[^"'\s<>)]+/i);
-  return match ? match[0].replace(/&amp;/g, '&') : null;
+  const url = match ? match[0].replace(/&amp;/g, '&') : null;
+  if (url) el._tssWaveformUrl = url;
+  return url;
 }
 
 function getArtistLink(el) {
@@ -1164,16 +1512,19 @@ function syncTrackPlaybackAccess(meta, track) {
     || transcodings.some(item => item?.snipped === true
       || item?.is_snipped === true
       || /(?:^|[\/_-])preview(?:[\/_-]|$)/i.test(String(item?.url || '')));
+  const accessRestricted = access === 'blocked' || policy === 'BLOCK';
 
   if (Number.isFinite(durationMs) && durationMs > 0) meta.durationMs = durationMs;
   if (access) meta.access = access;
   if (policy) meta.policy = policy;
-  if (access || policy || preview) {
-    meta.requiresNativePlayback = preview;
-    if (preview) meta.nativePlaybackReason = 'preview-only';
-    else if (meta.nativePlaybackReason === 'preview-only') delete meta.nativePlaybackReason;
+  if (preview || accessRestricted) {
+    meta.customPlaybackUnavailable = true;
+    meta.customPlaybackReason = accessRestricted ? 'access-restricted' : 'preview-only';
+  } else if ((access || policy) && ['preview-only', 'preview-limited', 'access-restricted'].includes(meta.customPlaybackReason)) {
+    delete meta.customPlaybackUnavailable;
+    delete meta.customPlaybackReason;
   }
-  return preview;
+  return preview || accessRestricted;
 }
 
 function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
@@ -1318,10 +1669,10 @@ function recordTransitionDiagnostic(event, details = {}) {
 
 function observeTransitionMedia(audio, index) {
   if (!state._transitionDiagnostics || audio._tssTransitionMedia) return;
-  const observation = { waiting: -Infinity, stalled: -Infinity, playing: -Infinity, token: null };
+  const observation = { waiting: -Infinity, stalled: -Infinity, playing: -Infinity, token: null, listeners: [] };
   audio._tssTransitionMedia = observation;
   for (const type of ['waiting', 'stalled', 'playing']) {
-    audio.addEventListener(type, () => {
+    const listener = () => {
       if (!state._transitionDiagnostics || state._decks[index] !== audio || !audio.currentSrc) return;
       const now = performance.now();
       const token = state._deckPrepareTokens[index];
@@ -1336,7 +1687,9 @@ function observeTransitionMedia(audio, index) {
         readyState: audio.readyState, networkState: audio.networkState,
         currentTime: audio.currentTime, paused: audio.paused,
       });
-    });
+    };
+    observation.listeners.push([type, listener]);
+    audio.addEventListener(type, listener);
   }
 }
 
@@ -1432,7 +1785,7 @@ function playbackDiagnosticEnvironment() {
   const manager = rawManager.includes('tampermonkey') ? 'tampermonkey'
     : (rawManager.includes('violentmonkey') ? 'violentmonkey'
       : (rawManager.includes('greasemonkey') ? 'greasemonkey' : (rawManager ? 'other' : 'unknown')));
-  const managerVersion = safeDiagnosticVersion(managerInfo?.scriptHandlerVersion || '');
+  const managerVersion = safeDiagnosticVersion(managerInfo?.scriptHandlerVersion || managerInfo?.version || '');
   const scriptVersion = safeDiagnosticVersion(managerInfo?.script?.version || '');
   const doc = typeof document !== 'undefined' ? document : null;
   return {
@@ -1542,8 +1895,7 @@ function createCustomStartTrace(trackIndex) {
     errorName: '',
     audioGraphPhase: '',
     audioGraphReason: '',
-    nativeOutcome: 'not-attempted',
-    nativeFallbackReason: '',
+    customPlaybackReason: '',
   };
 }
 
@@ -1622,8 +1974,7 @@ function customStartDiagnosticDetails(trace, outcome = 'failed') {
     errorName: trace.errorName,
     audioGraphPhase: trace.audioGraphPhase,
     audioGraphReason: trace.audioGraphReason,
-    nativeOutcome: trace.nativeOutcome,
-    nativeFallbackReason: trace.nativeFallbackReason,
+    customPlaybackReason: trace.customPlaybackReason,
     audioFeatures: {
       autoLevel: Boolean(state.autoLevel),
       eqEnabled: Boolean(state.eqEnabled),
@@ -1663,10 +2014,7 @@ function playbackDiagnosticContext() {
       queueLength: state.queue?.length || 0,
       deckIndex: state._deckIndex,
       deckTrack: state._deckTrack,
-      nativeTrackIndex: Number.isInteger(state._nativeTrack) ? state._nativeTrack : null,
-      nativeFallbackReason: Number.isInteger(state._nativeTrack)
-        ? state.meta?.[state._nativeTrack]?.nativePlaybackReason || 'native-player'
-        : null,
+      customPlaybackReason: state.meta?.[state.queue?.[state.pos]]?.customPlaybackReason || null,
       streamKind: activeDeck ? diagnosticDeckStreamKind(activeDeck, state._deckIndex) : 'none',
       retryPending: Boolean(state._customPlaybackRetryTimer),
       diagnosticsEnabled: Boolean(state._diagnosticBuild),
@@ -1799,7 +2147,7 @@ function compactPlaybackReport(snapshot) {
   append(fault ? `Latest fault: ${fault.event} at ${fault.at || 'unknown'}` : 'Latest fault: none recorded');
   if (fault) {
     const identity = [];
-    for (const [label, key] of [['stage', 'failureStage'], ['reason', 'failureReason'], ['reason', 'reason'], ['error', 'errorName']]) {
+    for (const [label, key] of [['stage', 'failureStage'], ['reason', 'failureReason'], ['reason', 'reason'], ['phase', 'phase'], ['error', 'errorName']]) {
       if (fault[key] && !(label === 'reason' && identity.some(item => item.startsWith('reason=')))) identity.push(`${label}=${fault[key]}`);
     }
     if (identity.length) append(`Fault: ${identity.join('; ')}`);
@@ -1863,14 +2211,20 @@ function compactPlaybackReport(snapshot) {
     const relevant = [];
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index];
-      if (!/^(?:recovery-|crossfade-|custom-start-|hls-|audio-|native-|playback-|fade-|transition-|preparation-|media-(?:waiting|stalled))/.test(entry.event || '')) continue;
+      if (!/^(?:recovery-|crossfade-|custom-start-|hls-|audio-|playback-|fade-|transition-|preparation-|media-(?:waiting|stalled))/.test(entry.event || '')) continue;
       const detail = entry.failureReason || entry.reason || entry.recoveryOutcome || entry.outcome || entry.errorName || entry.errorDetail || '';
-      const key = `${entry.event}|${detail}|${entry.status ?? ''}`;
+      const key = `${entry.event}|${detail}|${entry.status ?? ''}|${entry.event === 'audio-graph-failed' ? entry.phase || '' : ''}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const delta = Number.isFinite(faultTime) ? Math.round(Date.parse(entry.at) - faultTime) : null;
       let line = `${delta === null ? entry.at : `${delta >= 0 ? '+' : ''}${delta}ms`}: ${entry.event}`;
       if (detail) line += ` ${detail}`;
+      if (entry.event === 'audio-graph-failed') {
+        if (entry.phase) line += ` phase=${entry.phase}`;
+        if (typeof entry.deckIndex === 'number') line += ` deck=${number(entry.deckIndex)}`;
+        if (typeof entry.sourceBound === 'boolean') line += ` published=${flag(entry.sourceBound)}`;
+        if (entry.contextState) line += ` context=${entry.contextState}`;
+      }
       if (typeof entry.status === 'number') line += ` HTTP=${number(entry.status)}`;
       if (typeof entry.elapsedMs === 'number') line += ` elapsed=${number(entry.elapsedMs)}ms`;
       relevant.unshift(line);
@@ -2120,7 +2474,10 @@ function hydrationWaveformUrl(meta) {
 
 async function resolveWaveformUrl(meta, options = {}) {
   const direct = meta?.waveform || hydrationWaveformUrl(meta);
-  if (direct) return direct;
+  if (direct) {
+    if (meta && !meta.waveform) meta.waveform = direct;
+    return direct;
+  }
   const wantedUrl = normalizeTrackUrl(meta?.link);
   if (!wantedUrl) return null;
   const isCurrent = options.isCurrent || (() => !options.signal?.aborted);
@@ -2241,23 +2598,37 @@ function loadLifetimeStats() {
   } catch (_) { return sanitizeLifetimeStats(null); }
 }
 
+function carryLifetimeStats() {
+  const base = sanitizeLifetimeStats(state._lifetimeBase);
+  const current = sanitizeLifetimeStats(state.stats);
+  const pending = sanitizeLifetimeStats(state._lifetimePending);
+  pending.played += Math.max(0, current.played - base.played);
+  pending.elapsed += Math.max(0, current.elapsed - base.elapsed);
+  for (const [key, count] of Object.entries(current.playCounts)) {
+    const delta = count - (base.playCounts[key] || 0);
+    if (delta > 0) pending.playCounts[key] = (pending.playCounts[key] || 0) + delta;
+  }
+  // Once carried, collection-local baselines may change without losing an unsaved delta.
+  state._lifetimePending = pending;
+  state._lifetimeBase = current;
+}
+
 function saveLifetimeStats() {
   try {
-    const lt   = loadLifetimeStats();
-    const base = sanitizeLifetimeStats(state._lifetimeBase);
-    const current = sanitizeLifetimeStats(state.stats);
+    carryLifetimeStats();
+    const lt = loadLifetimeStats();
+    const pending = state._lifetimePending;
     const merged = {
-      played:     lt.played + Math.max(0, current.played - base.played),
-      elapsed:    lt.elapsed + Math.max(0, current.elapsed - base.elapsed),
+      played: lt.played + pending.played,
+      elapsed: lt.elapsed + pending.elapsed,
       playCounts: { ...lt.playCounts },
-      _ts:        Date.now(),
+      _ts: Date.now(),
     };
-    for (const [k, v] of Object.entries(current.playCounts)) {
-      const delta = v - (base.playCounts?.[k] || 0);
-      if (delta > 0) merged.playCounts[k] = (merged.playCounts[k] || 0) + delta;
+    for (const [key, count] of Object.entries(pending.playCounts)) {
+      merged.playCounts[key] = (merged.playCounts[key] || 0) + count;
     }
     if (!safeStorage.setItem(LIFETIME_KEY, JSON.stringify(merged))) return false;
-    state._lifetimeBase = current;
+    state._lifetimePending = null;
     return true;
   } catch (_) { return false; }
 }
@@ -2302,6 +2673,7 @@ function timedSleepRemaining(timer, now = Date.now()) {
 }
 
 function updateSleepDisplay(now = Date.now()) {
+  syncSleepSelectors();
   const el = document.getElementById('tss-hub-sleep-display');
   if (!el) return;
   const t = state.sleepTimer;
@@ -2322,6 +2694,17 @@ function currentDeckAudio() {
   return state._decks[state._deckIndex] || null;
 }
 
+function currentPlaybackTrackIndex() {
+  if (Number.isInteger(state._deckTrack)) return state._deckTrack;
+  return currentPendingPlaybackTrack() ? undefined : state.queue[state.pos];
+}
+
+function retainedPlaybackTrackIndex() {
+  const pending = currentPendingPlaybackTrack();
+  return pending && Number.isInteger(state._deckTrack) && state._deckTrack !== pending.ti
+    ? state._deckTrack : undefined;
+}
+
 function sleepTimerValue() {
   const timer = state.sleepTimer;
   if (!timer) return 'off';
@@ -2330,6 +2713,17 @@ function sleepTimerValue() {
   if (minutes <= 15) return 't15';
   if (minutes <= 30) return 't30';
   return 't60';
+}
+
+function syncSleepSelectors() {
+  const value = sleepTimerValue();
+  for (const doc of [document, state._ownPipWindow?.document]) {
+    if (!doc) continue;
+    for (const id of ['tss-hub-sleep', 'tss-pip-sleep']) {
+      const select = doc.getElementById(id);
+      if (select && select.value !== value) select.value = value;
+    }
+  }
 }
 
 function setSleepTimer(value, now = Date.now()) {
@@ -2343,10 +2737,10 @@ function setSleepTimer(value, now = Date.now()) {
   updateSleepDisplay(now);
 }
 
-// Better SoundCloud Feed's PiP reads scPlayer, not Media Session. Expose the
-// private deck while active; otherwise delegate to SoundCloud unchanged.
+// Better SoundCloud Feed's PiP reads scPlayer, not Media Session. An active
+// True Shuffle session owns these controls even while its deck is unavailable.
 function betterFeedPipActive() {
-  return state.active && Number.isInteger(state._deckTrack) && Boolean(currentDeckAudio());
+  return state.active && !state._nativeGuardButtonAction;
 }
 
 function betterFeedPipSound() {
@@ -2572,8 +2966,11 @@ function drawOwnPipWaveform(canvas, meta, current, duration, accent) {
 
 function ownPipQueueOrder() {
   const upcoming = state.queue.slice(state.pos);
-  if (!upcoming.length) return [];
-  const current = upcoming.shift();
+  const retained = retainedPlaybackTrackIndex();
+  if (!upcoming.length) return retained === undefined ? [] : [retained];
+  const current = retained === undefined ? upcoming.shift() : retained;
+  const currentDuplicate = retained === undefined ? -1 : upcoming.indexOf(current);
+  if (currentDuplicate !== -1) upcoming.splice(currentDuplicate, 1);
   const pending = [];
   const seen = new Set();
   for (const ti of state.playNext) {
@@ -2586,7 +2983,8 @@ function ownPipQueueOrder() {
   return [current, ...pending, ...upcoming];
 }
 
-function renderOwnPipQueue(pipDocument, currentTi) {
+function renderOwnPipQueue(pipDocument) {
+  const currentTi = currentPlaybackTrackIndex();
   const list = pipDocument.getElementById('tss-pip-queue-list');
   const count = pipDocument.getElementById('tss-pip-queue-count');
   if (!list || !count) return;
@@ -2602,8 +3000,17 @@ function renderOwnPipQueue(pipDocument, currentTi) {
   const countText = `${order.length} ${tab === 'history' ? 'played' : `track${order.length === 1 ? '' : 's'}`}`;
   if (count.textContent !== countText) count.textContent = countText;
   const priorityKey = order.map(ti => state.priority[ti] ?? 1).join(',');
-  const key = `${tab}|${query}|${currentTi}|${order.join(',')}|${priorityKey}|${state.roundPlayed}|${state.roundTotal}`;
-  if (list.dataset.key === key) return;
+  const key = `${state._collectionEpoch}|${tab}|${query}|${currentTi}|${order.join(',')}|${priorityKey}|${state.roundPlayed}|${state.roundTotal}`;
+  const metadata = list._tssQueueMetadata;
+  if (list.dataset.key === key && metadata?.length === order.length && order.every((ti, index) => {
+    const meta = state.meta[ti], previous = metadata[index];
+    return previous.meta === meta && previous.title === meta.title
+      && previous.artist === meta.artist && previous.artwork === meta.artwork;
+  })) return;
+  list._tssQueueMetadata = order.map(ti => {
+    const meta = state.meta[ti];
+    return { meta, title: meta.title, artist: meta.artist, artwork: meta.artwork };
+  });
   list.dataset.key = key;
   list.textContent = '';
 
@@ -2689,7 +3096,10 @@ function renderOwnPipQueue(pipDocument, currentTi) {
 
 function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
   state._pipTrackMenuClose?.();
-  const meta = state.meta[ti] || {};
+  const meta = state.meta[ti];
+  if (!meta) return;
+  const epoch = state._playbackEpoch;
+  const collectionEpoch = state._collectionEpoch;
   const menu = pipDocument.createElement('div');
   menu.id = 'tss-pip-track-menu';
   menu.className = 'tss-pip-track-menu';
@@ -2734,23 +3144,32 @@ function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
     if (state._pipTrackMenuClose === close) state._pipTrackMenuClose = null;
   };
   state._pipTrackMenuClose = close;
+  const isCurrent = () => {
+    if (state._playbackEpoch === epoch && state._collectionEpoch === collectionEpoch && state.meta[ti] === meta) return true;
+    close();
+    return false;
+  };
   menu.querySelector('.tss-pip-menu-title button').onclick = close;
   menu.querySelector('[data-action="play"]').onclick = () => {
+    if (!isCurrent()) return;
     close();
     void jumpTo(state.queue.indexOf(ti), ti);
   };
   menu.querySelector('[data-action="next"]').onclick = () => {
+    if (!isCurrent()) return;
     queueNext(ti);
     close();
-    renderOwnPipQueue(pipDocument, currentTi);
+    renderOwnPipQueue(pipDocument);
   };
   menu.querySelector('[data-action="remove"]').onclick = () => {
+    if (!isCurrent()) return;
     removeTrackFromUpcoming(ti);
     close();
-    renderOwnPipQueue(pipDocument, currentTi);
+    renderOwnPipQueue(pipDocument);
   };
   menu.querySelectorAll('[data-priority]').forEach(button => {
     button.onclick = () => {
+      if (!isCurrent()) return;
       state.priority[ti] = Number(button.dataset.priority);
       menu.querySelectorAll('[data-priority]').forEach(option => option.setAttribute('aria-pressed', option === button ? 'true' : 'false'));
       const list = pipDocument.getElementById('tss-pip-queue-list');
@@ -2861,7 +3280,9 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
   };
   const eqPreset = menu.querySelector('#tss-pip-eq-preset');
   eqPreset.onchange = () => {
-    const values = EQ_PRESETS[eqPreset.value] || state.customEqPresets[eqPreset.value];
+    const name = eqPreset.value;
+    const values = Object.prototype.hasOwnProperty.call(EQ_PRESETS, name) ? EQ_PRESETS[name]
+      : Object.prototype.hasOwnProperty.call(state.customEqPresets, name) ? state.customEqPresets[name] : null;
     if (!Array.isArray(values) || !ensureAutoLevelAudioGraph()) return;
     state.eqBands = values.slice(0, 5).map(value => Math.max(-12, Math.min(12, Number(value) || 0)));
     state.eqPreset = eqPreset.value;
@@ -3264,18 +3685,18 @@ function syncOwnPipWindow() {
   const processingHidden = state.crossfadeSeconds <= 0 && !state.autoLevel;
   if (processing && processing.hidden !== processingHidden) processing.hidden = processingHidden;
   if (pipState) {
-    const status = state.suspended ? 'external playback'
+    const status = state.suspended ? (currentDeckAudio() && !paused() ? 'next unavailable' : 'custom playback unavailable')
       : state.loading ? 'loading'
       : state._crossfading ? 'mixing'
       : state.busy ? 'switching'
       : state.crossfadeStatus === 'loading' ? 'loading next'
-      : state.crossfadeStatus === 'fallback' ? 'fallback'
+      : state.crossfadeStatus === 'fallback' ? 'custom retry'
       : '';
     if (pipState.textContent !== status) pipState.textContent = status;
     if (pipState.hidden !== !status) pipState.hidden = !status;
   }
 
-  if (pipDocument.getElementById('tss-pip-stage')?.dataset.view === 'queue') renderOwnPipQueue(pipDocument, currentTi);
+  if (pipDocument.getElementById('tss-pip-stage')?.dataset.view === 'queue') renderOwnPipQueue(pipDocument);
 
   drawOwnPipWaveform(
     pipDocument.getElementById('tss-pip-waveform'),
@@ -3697,6 +4118,8 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-sound-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.07)}.tss-pip-sound-head>div{display:flex;flex-direction:column;gap:2px}.tss-pip-sound-head span{font-size:11px;font-weight:720}.tss-pip-sound-head small{color:rgba(255,255,255,.3);font-size:8px}.tss-pip-sound-head button,.tss-pip-mini-icon{display:flex;align-items:center;justify-content:center;border:0;background:transparent;color:rgba(255,255,255,.45);cursor:pointer}.tss-pip-sound-head button{width:26px;height:26px;border-radius:6px}.tss-pip-sound-head button:hover,.tss-pip-mini-icon:hover{background:rgba(255,255,255,.07);color:#fff}
     .tss-pip-setting-row{display:flex;align-items:center;gap:9px;padding:11px 0}.tss-pip-mini-icon{width:28px;height:28px;border-radius:7px}.tss-pip-setting-row output,.tss-pip-setting-label output{color:rgba(255,255,255,.4);font-size:8px;font-variant-numeric:tabular-nums}.tss-pip-setting-row output{width:30px;text-align:right}
     .tss-pip-sound-menu input[type="range"]{--fill:0%;width:100%;height:3px;margin:0;appearance:none;border:0;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--fill),rgba(114,130,165,.18) var(--fill));box-shadow:inset 0 1px 2px rgba(3,4,10,.3);cursor:pointer}.tss-pip-sound-menu input[type="range"]::-webkit-slider-thumb{width:12px;height:12px;appearance:none;border:2px solid #fff;border-radius:50%;background:var(--accent);box-shadow:0 2px 7px rgba(0,0,0,.5)}.tss-pip-sound-menu input[type="range"]::-moz-range-thumb{width:9px;height:9px;border:2px solid #fff;border-radius:50%;background:var(--accent)}
+    .tss-pip-sound-menu input[type="range"]::-moz-range-track{height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18);box-shadow:inset 0 1px 2px rgba(3,4,10,.3)}
+    .tss-pip-sound-menu input[type="range"]::-moz-range-progress{height:3px;border-radius:3px;background:var(--accent)}
     .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.78);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(0,0,0,.04)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[aria-pressed="true"]{background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:#fff}
     .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:var(--pip-glass-inset);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:rgba(255,255,255,.78);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 3px rgba(0,0,0,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.78);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
     .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.78);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#101113}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
@@ -3763,7 +4186,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
         </div>
       </section>
       </div>
-      <section id="tss-pip-queue-view" class="tss-pip-view" data-tab="queue" aria-hidden="true">
+      <section id="tss-pip-queue-view" class="tss-pip-view" data-tab="queue" aria-hidden="true" inert>
         <div class="tss-pip-queue-head"><span class="tss-pip-kicker">Queue</span><span id="tss-pip-queue-count" class="tss-pip-queue-count">0 tracks</span></div>
         <div class="tss-pip-queue-tools">
           <div class="tss-pip-tabs" role="tablist" aria-label="Queue view"><button id="tss-pip-tab-queue" class="tss-pip-tab" type="button" role="tab" aria-selected="true">Queue</button><button id="tss-pip-tab-history" class="tss-pip-tab" type="button" role="tab" aria-selected="false">History</button></div>
@@ -3809,7 +4232,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     if (showQueue) {
       const list = pipDocument.getElementById('tss-pip-queue-list');
       if (list) delete list.dataset.key;
-      renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+      renderOwnPipQueue(pipDocument);
     }
     syncOwnPipMarquee(pipDocument.getElementById('tss-pip-title'), pipDocument.getElementById('tss-pip-title-text'));
   };
@@ -3820,14 +4243,14 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     pipDocument.getElementById('tss-pip-tab-history').setAttribute('aria-selected', tab === 'history' ? 'true' : 'false');
     const list = pipDocument.getElementById('tss-pip-queue-list');
     if (list) delete list.dataset.key;
-    renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+    renderOwnPipQueue(pipDocument);
   };
   pipDocument.getElementById('tss-pip-tab-queue').onclick = () => setPipQueueTab('queue');
   pipDocument.getElementById('tss-pip-tab-history').onclick = () => setPipQueueTab('history');
   pipDocument.getElementById('tss-pip-queue-search').oninput = () => {
     const list = pipDocument.getElementById('tss-pip-queue-list');
     if (list) delete list.dataset.key;
-    renderOwnPipQueue(pipDocument, Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+    renderOwnPipQueue(pipDocument);
   };
   pipDocument.getElementById('tss-pip-play').onclick = () => { void toggle(); };
   pipDocument.getElementById('tss-pip-prev').onclick = () => { void prevTrack(); };
@@ -3912,7 +4335,9 @@ function installBetterFeedPipBridge() {
     if (!Number.isFinite(amountMs)) return;
     const base = relative ? (Number(deck.currentTime) || 0) : 0;
     const duration = Number.isFinite(deck.duration) && deck.duration > 0 ? deck.duration : Infinity;
-    deck.currentTime = Math.max(0, Math.min(duration, base + amountMs / 1000));
+    const time = Math.max(0, Math.min(duration, base + amountMs / 1000));
+    state._deckSeekRequest = { epoch: state._playbackEpoch, audio: deck, time };
+    deck.currentTime = time;
     updateProgressBar();
     updateHub();
   };
@@ -3927,7 +4352,7 @@ function installBetterFeedPipBridge() {
       ? null
       : callOriginal('getCurrentQueueItem', args);
     patched.isPlaying = (...args) => betterFeedPipActive()
-      ? !currentDeckAudio().paused
+      ? !paused()
       : callOriginal('isPlaying', args);
     patched.toggleCurrent = (...args) => {
       if (!betterFeedPipActive()) return callOriginal('toggleCurrent', args);
@@ -3973,6 +4398,60 @@ function installBetterFeedPipBridge() {
   return true;
 }
 
+function createCrossfadeDeckAudio(index) {
+  const audio = document.createElement('audio');
+  audio.id = `tss-crossfade-deck-${index + 1}`;
+  audio.preload = 'auto';
+  audio.playsInline = true;
+  audio.crossOrigin = 'anonymous';
+  audio.dataset.tssCrossfadeDeck = String(index);
+  audio.style.display = 'none';
+  document.body.appendChild(audio);
+  if (state._transitionDiagnostics) observeTransitionMedia(audio, index);
+  return audio;
+}
+
+function replaceCrossfadeDeckAudio(audio, index, deferAudioGraph = false) {
+  if (state._decks[index] !== audio) return null;
+  resetDeck(audio, index);
+  const graph = state._deckAudioGraphs[index];
+  if (graph) {
+    try { graph.source?.disconnect(); } catch (_) {}
+    graph.source = null;
+    graph.sourceAudio = null;
+    delete graph.routedEq;
+    delete graph.routedAutoLevel;
+  }
+  if (audio._tssTransitionMedia?.listeners) {
+    for (const [type, listener] of audio._tssTransitionMedia.listeners) {
+      try { audio.removeEventListener(type, listener); } catch (_) {}
+    }
+    audio._tssTransitionMedia = null;
+  }
+  try { audio.srcObject = null; } catch (_) {}
+  try { audio.remove(); } catch (_) {}
+  const replacement = createCrossfadeDeckAudio(index);
+  replacement._tssDeferAudioGraph = deferAudioGraph;
+  replacement._tssFirefoxDrm = deferAudioGraph;
+  state._decks[index] = replacement;
+  const record = state._deckPreparations?.[index];
+  if (record?.audio === audio) record.audio = replacement;
+  if (state._deckSeekRequest?.audio === audio) state._deckSeekRequest.audio = replacement;
+  return replacement;
+}
+
+function resetDeckForStream(audio, index, drmContext = null) {
+  // Gecko rejects setMediaKeys (even null) on an element captured by WebAudio.
+  // A new protected load, and the first plain load after one, need fresh media.
+  const firefoxDrm = drmContext?.keySystem === 'com.widevine.alpha'
+    && typeof navigator !== 'undefined' && /Firefox\//i.test(navigator.userAgent || '');
+  if (firefoxDrm || audio._tssFirefoxDrm) {
+    return replaceCrossfadeDeckAudio(audio, index, firefoxDrm);
+  }
+  resetDeck(audio, index);
+  return audio;
+}
+
 function ensureCrossfadeDecks() {
   if (state._decks.length === 2 && state._decks.every(Boolean)) {
     state._deckHlsPlayers ||= [null, null];
@@ -3980,18 +4459,7 @@ function ensureCrossfadeDecks() {
     state._deckHlsFailed ||= [false, false];
     return state._decks;
   }
-  state._decks = [0, 1].map(index => {
-    const audio = document.createElement('audio');
-    audio.id = `tss-crossfade-deck-${index + 1}`;
-    audio.preload = 'auto';
-    audio.playsInline = true;
-    audio.crossOrigin = 'anonymous';
-    audio.dataset.tssCrossfadeDeck = String(index);
-    audio.style.display = 'none';
-    document.body.appendChild(audio);
-    if (state._transitionDiagnostics) observeTransitionMedia(audio, index);
-    return audio;
-  });
+  state._decks = [0, 1].map(createCrossfadeDeckAudio);
   state._deckHlsPlayers = [null, null];
   state._deckHlsFailed = [false, false];
   state._deckTracks = [null, null];
@@ -4094,9 +4562,14 @@ function syncEqualizer() {
   const now = state._audioContext?.currentTime || 0;
   state._deckAudioGraphs.forEach((graph, deckIndex) => {
     if (!graph?.eqFilters) return;
+    graph.appliedEqGains ||= [];
     graph.eqFilters.forEach((filter, index) => {
       const value = state.eqEnabled ? state.eqBands[index] : 0;
-      filter.gain.setTargetAtTime(value, now, 0.025);
+      if (graph.appliedEqGains[index] !== value) {
+        filter.gain.cancelScheduledValues?.(0);
+        filter.gain.setTargetAtTime(value, now, 0.025);
+        graph.appliedEqGains[index] = value;
+      }
     });
     const ti = state._deckTracks[deckIndex];
     if (Number.isInteger(ti) && graph.trackKey !== autoLevelTrackKey(ti)) {
@@ -4209,7 +4682,7 @@ function ensureAutoLevelAudioGraph() {
         mixGain.gain.value = state._deckGains[index] || 0;
         mixGain.connect(master);
         return {
-          source: null, eqFilters, analyser, autoGain, mixGain,
+          source: null, sourceAudio: null, eqFilters, analyser, autoGain, mixGain,
           buffer: new Float32Array(analyser.fftSize),
           smoothedRms: 0, peakRms: 0, measuredPeak: 0, currentGain: 1,
           samples: 0, settled: false, trackKey: '',
@@ -4222,13 +4695,16 @@ function ensureAutoLevelAudioGraph() {
       state._audioClipper = clipper;
       state._deckAudioGraphs = graphs;
       published = true;
-      phase = 'bind-media-element-source';
-      decks.forEach((audio, index) => {
-        failedDeckIndex = index;
-        graphs[index].source = context.createMediaElementSource(audio);
-        audio.volume = 1;
-      });
     }
+    phase = 'bind-media-element-source';
+    decks.forEach((audio, index) => {
+      failedDeckIndex = index;
+      const graph = state._deckAudioGraphs[index];
+      if (audio._tssDeferAudioGraph || graph.source) return;
+      graph.source = context.createMediaElementSource(audio);
+      graph.sourceAudio = audio;
+      audio.volume = 1;
+    });
     phase = 'apply-processing-routing';
     syncEqualizer();
     if (context.state === 'suspended' && !state._userPaused) void resumeAudioGraph();
@@ -4238,7 +4714,7 @@ function ensureAutoLevelAudioGraph() {
         contextState: context.state,
         sampleRate: Number(context.sampleRate) || 0,
         deckCount: decks.length,
-        sourceNodeConnected: true,
+        sourceNodeConnected: state._deckAudioGraphs.every(graph => Boolean(graph?.source)),
       });
     }
     return true;
@@ -4261,7 +4737,7 @@ function ensureAutoLevelAudioGraph() {
 
 function syncDeckProcessingRouting() {
   state._deckAudioGraphs.forEach(graph => {
-    if (!graph) return;
+    if (!graph?.source) return;
     // Each new graph starts unrouted; EQ band targets are applied separately.
     if (graph.routedEq === state.eqEnabled && graph.routedAutoLevel === state.autoLevel) return;
     for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain]) {
@@ -4308,8 +4784,10 @@ function syncSafetyClipper() {
   } catch (_) {}
 }
 
-async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosticTrace = null) {
+async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosticTrace = null, resumeIntent = null) {
   const context = state._audioContext;
+  const isCurrent = () => !signal?.aborted && state._audioContext === context
+    && (resumeIntent ? playbackResumeCurrent(resumeIntent) : !state._userPaused);
   const fail = (reason, error = null, contextStateBefore = context?.state || 'missing') => {
     const errorName = error ? playbackErrorName(error) : '';
     if (diagnosticTrace) {
@@ -4319,7 +4797,7 @@ async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosti
       diagnosticTrace.audioGraphReason = reason;
       if (errorName) diagnosticTrace.errorName = errorName;
     }
-    if (!signal?.aborted && !state._userPaused) {
+    if (isCurrent()) {
       recordPlaybackDiagnostic('audio-context-resume-failed', {
         attemptId: diagnosticTrace?.attemptId,
         reason,
@@ -4331,8 +4809,21 @@ async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosti
     }
     return false;
   };
-  if (signal?.aborted || state._userPaused) return false;
+  if (!isCurrent()) return false;
   if (state._audioGraphFailed) return fail('graph-marked-failed');
+  const suspension = state._audioGraphSuspension;
+  if (suspension?.context === context) {
+    try {
+      // The physical suspension outlives cancellation of the session that requested it.
+      await withDeadline(() => suspension.promise, 5000, signal);
+    } catch (error) {
+      if (!isCurrent()) return false;
+      if (state._audioContext === context) state._audioGraphFailed = true;
+      return fail(error?.name === 'TimeoutError' ? 'resume-timeout' : 'resume-rejected', error);
+    }
+    if (!isCurrent()) return false;
+    if (state._audioGraphFailed) return fail('graph-marked-failed');
+  }
   if (!context || context.state === 'running') return true;
   if (context.state === 'closed') return fail('context-closed');
   const contextStateBefore = context.state;
@@ -4343,9 +4834,19 @@ async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosti
     diagnosticTrace.audioGraphPhase = 'resume';
   }
   try {
-    await withDeadline(() => context.resume(), 5000, signal);
-    const current = !signal?.aborted && state._audioContext === context;
-    if (!current || state._userPaused) return false;
+    await withDeadline(() => {
+      const resuming = context.resume();
+      Promise.resolve(resuming).then(() => {
+        // A browser resume cannot be aborted. Reapply the latest Pause/Stop
+        // if that physical resume finishes after its intent was cancelled.
+        if (state._audioContext === context && state._userPaused
+            && !playbackResumeCurrent(state._pendingPlaybackResume)) {
+          void suspendAudioGraph(state._playbackAbort?.signal);
+        }
+      }, () => {});
+      return resuming;
+    }, 5000, signal);
+    if (!isCurrent()) return false;
     if (context.state !== 'running') {
       state._audioGraphFailed = true;
       return fail('context-not-running', null, contextStateBefore);
@@ -4364,7 +4865,7 @@ async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosti
     });
     return true;
   } catch (error) {
-    if (signal?.aborted || state._userPaused) return false;
+    if (!isCurrent()) return false;
     if (state._audioContext === context) state._audioGraphFailed = true;
     const reason = error?.name === 'TimeoutError' ? 'resume-timeout' : 'resume-rejected';
     return fail(reason, error, contextStateBefore);
@@ -4390,7 +4891,16 @@ async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
   const contextStateBefore = context.state;
   const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
   try {
-    await withDeadline(() => context.suspend(), 5000, signal);
+    let suspension = state._audioGraphSuspension;
+    if (!suspension || suspension.context !== context) {
+      suspension = { context, promise: Promise.resolve(context.suspend()) };
+      state._audioGraphSuspension = suspension;
+      const clearSuspension = () => {
+        if (state._audioGraphSuspension === suspension) state._audioGraphSuspension = null;
+      };
+      suspension.promise.then(clearSuspension, clearSuspension);
+    }
+    await withDeadline(() => suspension.promise, 5000, signal);
     const current = !signal?.aborted && state._audioContext === context;
     if (!current) return false;
     if (context.state !== 'suspended') {
@@ -4430,7 +4940,7 @@ function applyCachedAutoLevel(index, ti) {
     ? calculateAutoLevelGain(cachedRms, cachedPeak, state.playbackVolume)
     : 1;
   graph.autoGainMaster = hasCachedMeasurement ? state.playbackVolume : null;
-  graph.autoGain.gain.setValueAtTime(graph.currentGain, state._audioContext.currentTime);
+  setAudioParamImmediately(graph.autoGain.gain, graph.currentGain, state._audioContext.currentTime);
   graph.appliedAutoGain = graph.currentGain;
 }
 
@@ -4442,7 +4952,8 @@ function processAutoLevel() {
 
   state._deckAudioGraphs.forEach((graph, index) => {
     const audio = state._decks[index];
-    if (!graph || !audio || audio.paused || !audio.currentSrc || state._deckGains[index] <= 0.001) return;
+    if (!graph?.source || !audio || audio._tssDeferAudioGraph || audio.paused
+        || !audio.currentSrc || state._deckGains[index] <= 0.001) return;
     if (graph.settled) return;
     graph.analyser.getFloatTimeDomainData(graph.buffer);
     let sum = 0;
@@ -4467,6 +4978,7 @@ function processAutoLevel() {
       state.playbackVolume,
     );
     graph.autoGainMaster = state.playbackVolume;
+    graph.autoGain.gain.cancelScheduledValues?.(0);
     graph.autoGain.gain.setTargetAtTime(
       graph.currentGain,
       state._audioContext.currentTime,
@@ -4508,17 +5020,20 @@ function soundCloudVolumeModel() {
   const registry = pageWindow.webpackJsonp;
   if (!registry || typeof registry.push !== 'function') return null;
 
-  let webpackRequire = null;
-  try {
-    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const moduleId = `tss-volume-module-${stamp}`;
-    registry.push([
-      [`tss-volume-chunk-${stamp}`],
-      { [moduleId]: (module, exports, requireFn) => { webpackRequire = requireFn; } },
-      [[moduleId]],
-    ]);
-  } catch (_) {
-    return null;
+  let webpackRequire = state._soundCloudWebpackRequire || null;
+  if (!webpackRequire?.c) {
+    try {
+      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const moduleId = `tss-volume-module-${stamp}`;
+      registry.push([
+        [`tss-volume-chunk-${stamp}`],
+        { [moduleId]: (module, exports, requireFn) => { webpackRequire = requireFn; } },
+        [[moduleId]],
+      ]);
+      if (webpackRequire?.c) state._soundCloudWebpackRequire = webpackRequire;
+    } catch (_) {
+      return null;
+    }
   }
   if (!webpackRequire?.c) return null;
 
@@ -4647,6 +5162,7 @@ function syncCrossfadeVolume() {
     !Number.isFinite(state._appliedMasterGain)
     || Math.abs(state._appliedMasterGain - master) > 0.0001
   )) {
+    state._audioMaster.gain.cancelScheduledValues?.(0);
     state._audioMaster.gain.setTargetAtTime(master, state._audioContext.currentTime, 0.015);
     state._appliedMasterGain = master;
   }
@@ -4683,6 +5199,7 @@ function syncCrossfadeVolume() {
       const targetAutoGain = state.autoLevel ? graph.currentGain : 1;
       if (!Number.isFinite(graph.appliedAutoGain)
           || Math.abs(graph.appliedAutoGain - targetAutoGain) > 0.0001) {
+        graph.autoGain.gain.cancelScheduledValues?.(0);
         graph.autoGain.gain.setTargetAtTime(targetAutoGain, state._audioContext.currentTime, 0.08);
         graph.appliedAutoGain = targetAutoGain;
       }
@@ -5029,6 +5546,93 @@ function directHlsStreamUrls(track) {
   ].filter(isHlsManifestUrl);
 }
 
+// DRM transcodings are not ordinary HLS. Only normal Widevine CTR playback
+// is supported here; FairPlay/CBC and unknown DRM stay fail-closed.
+function soundCloudHlsEncryption(transcoding) {
+  const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '').toLowerCase();
+  const description = `${protocol} ${transcoding?.url || ''}`.toLowerCase();
+  if (/cbc-encrypted|fairplay/.test(description)) return 'unsupported';
+  if (protocol === 'ctr-encrypted-hls' || (!protocol && /ctr-encrypted-hls/.test(description))) return 'widevine';
+  // SoundCloud's legacy encrypted-hls protocol uses HLS AES-128, not EME.
+  if (protocol === 'encrypted-hls') return 'plain';
+  if (/encrypted|widevine|playready|cenc|cbcs/.test(description)) return 'unsupported';
+  if (protocol && protocol !== 'hls' && protocol !== 'progressive') return 'unsupported';
+  return 'plain';
+}
+
+async function soundCloudWidevineSupported(options = {}) {
+  const checkCurrent = () => {
+    if (options.signal?.aborted || (options.isCurrent && !options.isCurrent())) {
+      throw new DOMException('Playback canceled', 'AbortError');
+    }
+  };
+  checkCurrent();
+  if (typeof state._widevineCapability === 'boolean') return state._widevineCapability;
+  const navigatorObject = pageWindow?.navigator || globalThis.navigator;
+  if (typeof navigatorObject?.requestMediaKeySystemAccess !== 'function') {
+    state._widevineCapability = false;
+    return false;
+  }
+  try {
+    await withDeadline(() => navigatorObject.requestMediaKeySystemAccess('com.widevine.alpha', [{
+      initDataTypes: ['cenc'],
+      audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+      distinctiveIdentifier: 'optional',
+      persistentState: 'not-allowed',
+      sessionTypes: ['temporary'],
+    }]), 5000, options.signal);
+    checkCurrent();
+    state._widevineCapability = true;
+    return true;
+  } catch (error) {
+    checkCurrent();
+    if (error?.name !== 'NotSupportedError') throw error;
+    state._widevineCapability = false;
+    return false;
+  }
+}
+
+function cachedStreamDrmContext(meta, streamUrl) {
+  const cached = state._streamCache.get(normalizeTrackUrl(meta?.link));
+  const context = cached?.drmContexts?.get(streamUrl);
+  if (!context) return null;
+  const expectedId = soundCloudInteger(meta?.soundcloudId ?? meta?.id, 1);
+  const actualId = soundCloudInteger(cached.soundcloudId, 1);
+  if (Date.now() - cached.ts >= 30 * 60 * 1000 || !cached.urls?.includes(streamUrl)
+      || (expectedId !== null && actualId !== expectedId)) {
+    throw new DOMException('DRM context unavailable', 'NotSupportedError');
+  }
+  return context;
+}
+
+function soundCloudHlsConfig(drmContext = null, options = {}) {
+  const config = { enableWorker: true, lowLatencyMode: false, backBufferLength: 30 };
+  if (!drmContext) return config;
+  if (drmContext.keySystem !== 'com.widevine.alpha'
+      || typeof drmContext.licenseAuthToken !== 'string' || !drmContext.licenseAuthToken.trim()) {
+    throw new DOMException('DRM authorization unavailable', 'NotSupportedError');
+  }
+  const licenseUrl = 'https://license.media-streaming.soundcloud.cloud/playback/widevine';
+  config.emeEnabled = true;
+  config.drmSystems = { 'com.widevine.alpha': { licenseUrl } };
+  config.licenseXhrSetup = (xhr, url, _keyContext, challenge) => {
+    if (options.signal?.aborted || (options.isCurrent && !options.isCurrent())) {
+      throw new DOMException('Playback canceled', 'AbortError');
+    }
+    const endpoint = new URL(url);
+    const allowed = new URL(licenseUrl);
+    if (endpoint.origin !== allowed.origin || endpoint.pathname !== allowed.pathname
+        || endpoint.username || endpoint.password || endpoint.hash) {
+      throw new DOMException('Unsupported license endpoint', 'SecurityError');
+    }
+    endpoint.searchParams.set('license_token', drmContext.licenseAuthToken);
+    xhr.open('POST', endpoint.href, true);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    return challenge;
+  };
+  return config;
+}
+
 async function resolveHlsStreamUrls(track, clientId, options = {}) {
   const urls = directHlsStreamUrls(track);
   if (urls.length) return { urls, authFailed: false };
@@ -5036,9 +5640,15 @@ async function resolveHlsStreamUrls(track, clientId, options = {}) {
     ? track.media.transcodings
     : (Array.isArray(track?.transcodings) ? track.transcodings : []);
   const candidates = [];
+  let drmFailureReason = '';
   for (const transcoding of transcodings) {
     const protocol = String(transcoding?.format?.protocol || transcoding?.protocol || '').toLowerCase();
     if (!transcoding?.url || (!protocol.includes('hls') && !isHlsStreamUrl(transcoding.url))) continue;
+    const encryption = soundCloudHlsEncryption(transcoding);
+    if (encryption === 'unsupported') {
+      drmFailureReason = 'drm-unsupported';
+      continue;
+    }
     try {
       const endpoint = new URL(transcoding.url);
       endpoint.searchParams.set('client_id', clientId);
@@ -5047,12 +5657,33 @@ async function resolveHlsStreamUrls(track, clientId, options = {}) {
       const quality = `${transcoding.preset || ''} ${transcoding.quality || ''} ${endpoint.pathname}`.toLowerCase();
       const priority = /aac[_-]?160|160k/.test(quality) ? 0
         : (/aac[_-]?96|96k/.test(quality) ? 1 : 2);
-      candidates.push({ url: endpoint, priority });
+      candidates.push({ url: endpoint, priority, encryption });
     } catch (_) {}
   }
-  candidates.sort((a, b) => a.priority - b.priority);
+  if (candidates.length) drmFailureReason = '';
+  candidates.sort((a, b) => Number(a.encryption === 'widevine') - Number(b.encryption === 'widevine')
+    || a.priority - b.priority);
   let authFailed = false;
+  const drmContexts = new Map();
+  let widevineSupported;
   for (const candidate of candidates) {
+    // Do not probe a CDM when a usable plain stream is already available.
+    if (candidate.encryption === 'widevine') {
+      if (urls.length && !drmContexts.size) break;
+      if (widevineSupported === undefined) {
+        try {
+          widevineSupported = await soundCloudWidevineSupported(options);
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          drmFailureReason = error?.name === 'TimeoutError' ? 'drm-capability-timeout' : 'drm-capability-error';
+          break;
+        }
+      }
+      if (!widevineSupported) {
+        drmFailureReason = 'drm-widevine-unavailable';
+        break;
+      }
+    }
     try {
       const response = await fetchSoundCloudResource(candidate.url, 'json', {
         ...options, diagnosticStage: 'hls-stream',
@@ -5061,18 +5692,27 @@ async function resolveHlsStreamUrls(track, clientId, options = {}) {
       if (response.status === 401 || response.status === 403) authFailed = true;
       if (!response.ok) continue;
       const data = response.data;
+      if (candidate.encryption === 'widevine'
+          && (typeof data?.licenseAuthToken !== 'string' || !data.licenseAuthToken.trim())) {
+        drmFailureReason = 'drm-token-unavailable';
+        continue;
+      }
       const resolvedUrls = typeof data === 'string' ? [data] : [
         data?.url, data?.hls_aac_160_url, data?.hls_aac_96_url,
       ];
       for (const url of resolvedUrls) {
-        if (isHlsManifestUrl(url) && !urls.includes(url)) urls.push(url);
+        if (!isHlsManifestUrl(url) || urls.includes(url)) continue;
+        urls.push(url);
+        if (candidate.encryption === 'widevine') {
+          drmContexts.set(url, { keySystem: 'com.widevine.alpha', licenseAuthToken: data.licenseAuthToken });
+        }
       }
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
       recordPlaybackDiagnostic('hls-endpoint-failed', { error: playbackErrorName(error) });
     }
   }
-  return { urls, authFailed };
+  return { urls, authFailed, drmContexts, drmFailureReason };
 }
 
 function hlsDiagnosticCode(value) {
@@ -5097,8 +5737,19 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     }
     return { supported: false, ready: false, player: null, source: '' };
   }
+  if (signal?.aborted || !isCurrent()) {
+    return { supported: true, ready: false, player: null, source: audio.src, failed: true };
+  }
   let player;
-  const preflight = options.preflight?.streamUrl === streamUrl
+  const playbackEpoch = state._playbackEpoch;
+  // Hls 1.7.3 snapshots CDMCleanupPromise in its constructor. A detached
+  // encrypted controller predates this physical deck's reset, so recreate it
+  // after destroy() rather than racing that deck's outstanding CDM cleanup.
+  if (options.drmContext && options.preflight && !options.preflight.adopted) {
+    try { options.preflight.player?.destroy?.(); } catch (_) {}
+    options.preflight.failed = true;
+  }
+  const preflight = !options.drmContext && options.preflight?.streamUrl === streamUrl
     && !options.preflight.failed && !options.preflight.adopted ? options.preflight : null;
   if (preflight?.player) {
     player = preflight.player;
@@ -5106,8 +5757,20 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     preflight.onError = null;
   } else {
     try {
-      player = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
+      player = new HlsCtor(soundCloudHlsConfig(options.drmContext, {
+        // A prepared deck may be promoted/reused under a new preparation token.
+        // License renewals belong to the physical player, not that old request.
+        isCurrent: () => state._deckHlsPlayers?.[index] === player
+          && state._decks[index] === audio && state._playbackEpoch === playbackEpoch,
+      }));
     } catch (error) {
+      if (options.drmContext && error?.name === 'NotSupportedError') {
+        if (diagnosticTrace) {
+          diagnosticTrace.stage = 'drm-capability';
+          diagnosticTrace.reason = 'drm-token-unavailable';
+        }
+        return { supported: true, ready: false, player: null, source: audio.src, failed: true };
+      }
       if (diagnosticTrace) {
         diagnosticTrace.stage = 'hls-mse';
         diagnosticTrace.reason = 'hls-initialization-error';
@@ -5131,7 +5794,11 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
   }
   const waitController = new AbortController();
   const abortWait = () => { if (!waitController.signal.aborted) waitController.abort(); };
-  signal?.addEventListener('abort', abortWait, { once: true });
+  const abortPreparation = () => {
+    abortWait();
+    if (state._deckHlsPlayers[index] === player) resetDeck(audio, index);
+  };
+  signal?.addEventListener('abort', abortPreparation, { once: true });
   let fatalError = null;
   const hlsStartedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
   const hlsElapsedMs = () => typeof performance !== 'undefined'
@@ -5139,7 +5806,7 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
   let readinessSettled = false;
   let reportedFatal = false;
   const onHlsError = (_event, data) => {
-    if (!data || state._deckHlsPlayers[index] !== player) return;
+    if (!data || state._deckHlsPlayers[index] !== player || state._decks[index] !== audio) return;
     const errorType = hlsDiagnosticCode(data.type);
     const errorDetail = hlsDiagnosticCode(data.details);
     const status = Number(data.response?.code) || null;
@@ -5148,6 +5815,7 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
       diagnosticTrace.hlsLastErrorType = errorType;
       diagnosticTrace.hlsLastErrorDetail = errorDetail;
       if (status !== null) diagnosticTrace.hlsStatus = status;
+      if (data.error) diagnosticTrace.errorName = playbackErrorName(data.error);
       if (data.fatal) {
         diagnosticTrace.hlsFatalErrorCount = (Number(diagnosticTrace.hlsFatalErrorCount) || 0) + 1;
         diagnosticTrace.hlsErrorType = errorType;
@@ -5172,6 +5840,7 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
           reason: 'fatal-hls-error',
           errorType,
           errorDetail,
+          errorName: data.error ? playbackErrorName(data.error) : '',
           status,
           hlsLibraryVersion: safeDiagnosticVersion(HlsCtor.version || ''),
           hlsLevelCount: Array.isArray(player.levels) ? player.levels.length : 0,
@@ -5259,6 +5928,7 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
           reason: 'fatal-hls-error',
           errorType: hlsDiagnosticCode(fatalError.type),
           errorDetail: hlsDiagnosticCode(fatalError.details),
+          errorName: fatalError.error ? playbackErrorName(fatalError.error) : '',
           status: Number(fatalError.response?.code) || null,
           hlsLibraryVersion: safeDiagnosticVersion(player.version || ''),
           hlsLevelCount: Array.isArray(player.levels) ? player.levels.length : 0,
@@ -5291,37 +5961,67 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     }
     return { supported: true, ready: false, player, source: audio.src, failed: true };
   } finally {
-    signal?.removeEventListener('abort', abortWait);
+    signal?.removeEventListener('abort', abortPreparation);
   }
 }
 
 async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options = {}) {
   audio.preload = 'auto';
+  let loaded;
   if (isHlsStreamUrl(streamUrl)) {
-    return prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options);
+    loaded = await prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurrent, diagnosticTrace, options);
+  } else {
+    audio.src = streamUrl;
+    const source = audio.src;
+    audio.load();
+    const ready = await waitForDeck(audio, timeout, signal, isCurrent, diagnosticTrace);
+    loaded = { supported: true, ready, player: null, source, failed: !ready };
   }
-  audio.src = streamUrl;
-  const source = audio.src;
-  audio.load();
-  const ready = await waitForDeck(audio, timeout, signal, isCurrent, diagnosticTrace);
-  return { supported: true, ready, player: null, source, failed: !ready };
+  if (!loaded.ready) return loaded;
+  const current = !signal?.aborted && isCurrent() && state._decks[index] === audio
+    && (loaded.player ? state._deckHlsPlayers[index] === loaded.player : audio.src === loaded.source);
+  if (!current || (audio._tssDeferAudioGraph && !audio.mediaKeys)) {
+    loaded.ready = false;
+    loaded.failed = true;
+    return loaded;
+  }
+  // Media readiness follows the authorized EME association. Only this current
+  // physical load may release Gecko's capture barrier, before play or handoff.
+  audio._tssDeferAudioGraph = false;
+  if (!state._deckAudioGraphs[index]?.source
+      && (state._audioContext || state.autoLevel || state.eqEnabled
+        || state.safetyClipper || state.crossfadeSeconds > 0)) {
+    if (!ensureAutoLevelAudioGraph() || state._decks[index] !== audio
+        || state._deckAudioGraphs[index]?.sourceAudio !== audio) {
+      loaded.ready = false;
+      loaded.failed = true;
+    }
+  }
+  return loaded;
 }
 
 function hydrationTrackForPlayback(meta) {
   const roots = pageWindow.__sc_hydration;
   if (!Array.isArray(roots)) return null;
-  const seen = new WeakSet();
-  const stack = [...roots];
-  while (stack.length) {
-    const value = stack.pop();
-    if (!value || typeof value !== 'object' || seen.has(value)) continue;
-    seen.add(value);
-    if (soundCloudTrackMatches(meta, value) && Array.isArray(value.media?.transcodings)) return value;
-    for (const child of Object.values(value)) {
-      if (child && typeof child === 'object') stack.push(child);
+  let candidates = state._hydrationTrackCandidates?.get?.(roots);
+  if (!candidates) {
+    candidates = [];
+    const seen = new WeakSet();
+    const stack = [...roots];
+    while (stack.length) {
+      const value = stack.pop();
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      if (Array.isArray(value.media?.transcodings)) candidates.push(value);
+      for (const child of Object.values(value)) {
+        if (child && typeof child === 'object') stack.push(child);
+      }
+    }
+    if (typeof WeakMap === 'function') {
+      (state._hydrationTrackCandidates ||= new WeakMap()).set(roots, candidates);
     }
   }
-  return null;
+  return candidates.find(value => soundCloudTrackMatches(meta, value)) || null;
 }
 
 async function fetchPlaybackTrack(url, options = {}) {
@@ -5367,7 +6067,7 @@ async function resolveCrossfadeStreams(meta, options = {}) {
   let cached = state._streamCache.get(key);
   const expectedId = soundCloudInteger(meta.soundcloudId, 1);
   const cachedId = soundCloudInteger(cached?.soundcloudId, 1);
-  if (cached && expectedId !== null && cachedId !== null && expectedId !== cachedId) {
+  if (cached && expectedId !== null && expectedId !== cachedId) {
     state._streamCache.delete(key);
     cached = null;
   }
@@ -5390,6 +6090,7 @@ async function resolveCrossfadeStreams(meta, options = {}) {
   let trackMetadataFound = false;
   let hlsAvailable = false;
   let progressiveMetadataAvailable = false;
+  let drmFailureReason = '';
   // After two resource-history candidates, inspect current bundles rather than
   // repeatedly cycling expired IDs from our own failed resource requests.
   for (let credentialAttempt = 0; credentialAttempt < 8; credentialAttempt++) {
@@ -5415,8 +6116,8 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       if (syncTrackPlaybackAccess(meta, track)) {
         if (diagnosticTrace) {
           diagnosticTrace.stage = 'access-classification';
-          diagnosticTrace.reason = 'native-preview-required';
-          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+          diagnosticTrace.reason = 'custom-playback-unavailable';
+          diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
         }
         return [];
       }
@@ -5452,24 +6153,37 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       checkCurrent();
       authFailed = authFailed || result.authFailed;
       let urls = result.urls;
+      let drmContexts;
       if (!urls.length && hlsCandidateCount) {
         const hlsResult = await resolveHlsStreamUrls(track, clientId, requestOptions);
         checkCurrent();
         authFailed = authFailed || hlsResult.authFailed;
         urls = hlsResult.urls;
+        drmContexts = hlsResult.drmContexts;
+        drmFailureReason = hlsResult.drmFailureReason || '';
+        if (!urls.length && ['drm-unsupported', 'drm-widevine-unavailable'].includes(drmFailureReason)
+            && !directHlsUrls.length && !progressiveMetadataAvailable
+            && transcodings.every(item => soundCloudHlsEncryption(item) !== 'plain')) {
+          meta.customPlaybackUnavailable = true;
+          meta.customPlaybackReason = drmFailureReason;
+        }
         if (urls.length && diagnosticTrace) {
           diagnosticTrace.hlsStreamUrls += urls.length;
           diagnosticTrace.hlsMode = 'mse';
           diagnosticTrace.reason = 'hls-mse-candidate';
         } else if (!urls.length && diagnosticTrace) {
           diagnosticTrace.stage = 'stream-classification';
-          diagnosticTrace.reason = 'hls-url-unavailable';
+          diagnosticTrace.reason = drmFailureReason || 'hls-url-unavailable';
         }
       }
       if (urls.length) {
+        if (!soundCloudTrackMatches(meta, track)) return [];
+        if ((source === 'track-api' || source === 'url-resolve') && typeof WeakSet === 'function') {
+          (state._staleEmbeddedTracks ||= new WeakSet()).add(meta);
+        }
         state._streamCache.delete(key);
         state._streamCache.set(key, {
-          urls, ts: Date.now(),
+          urls, ts: Date.now(), ...(drmContexts?.size ? { drmContexts } : {}),
           soundcloudId: soundCloudInteger(track.id, 1) ?? soundCloudInteger(track.soundcloudId, 1)
             ?? soundCloudInteger(meta.soundcloudId, 1),
         });
@@ -5477,16 +6191,27 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       }
       return urls;
     };
-    const hydrated = hydrationTrackForPlayback(meta);
-    const embedded = hydrated || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null);
+    // A failed signed stream must refresh its metadata/authorization too,
+    // not resolve another URL from the same stale page snapshot.
+    const skipEmbedded = Boolean(options.forceRefresh || state._staleEmbeddedTracks?.has?.(meta));
+    const hydrated = skipEmbedded ? null : hydrationTrackForPlayback(meta);
+    const embedded = skipEmbedded ? null
+      : (hydrated || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null));
     let urls = await resolveTrack(embedded, hydrated ? 'hydration' : (embedded ? 'track-metadata' : 'none'));
     checkCurrent();
     if (urls.length) return urls;
-    if (meta.requiresNativePlayback) {
+    const embeddedHadTrackAuth = Boolean(embedded?.track_authorization || embedded?.trackAuthorization);
+    const embeddedAuthFailed = Boolean(embedded && authFailed);
+    const embeddedMetadataFound = Boolean(embedded && trackMetadataFound);
+    if (embedded && embeddedHadTrackAuth) {
+      authFailed = false;
+      trackMetadataFound = false;
+    }
+    if (meta.customPlaybackUnavailable) {
       if (diagnosticTrace) {
         diagnosticTrace.stage = 'stream-classification';
-        diagnosticTrace.reason = 'native-fallback-required';
-        diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+        diagnosticTrace.reason = 'custom-playback-unavailable';
+        diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
       }
       return [];
     }
@@ -5502,11 +6227,11 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       urls = await resolveTrack(result.track, 'track-api');
       checkCurrent();
       if (urls.length) return urls;
-      if (meta.requiresNativePlayback) {
+      if (meta.customPlaybackUnavailable) {
         if (diagnosticTrace) {
           diagnosticTrace.stage = 'stream-classification';
-          diagnosticTrace.reason = 'native-fallback-required';
-          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+          diagnosticTrace.reason = 'custom-playback-unavailable';
+          diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
         }
         return [];
       }
@@ -5522,13 +6247,17 @@ async function resolveCrossfadeStreams(meta, options = {}) {
     urls = await resolveTrack(resolved.track, 'url-resolve');
     checkCurrent();
     if (urls.length) return urls;
-    if (meta.requiresNativePlayback) {
+    if (meta.customPlaybackUnavailable) {
       if (diagnosticTrace) {
         diagnosticTrace.stage = 'stream-classification';
-        diagnosticTrace.reason = 'native-fallback-required';
-        diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+        diagnosticTrace.reason = 'custom-playback-unavailable';
+        diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
       }
       return [];
+    }
+    if (!trackMetadataFound && embeddedMetadataFound) {
+      trackMetadataFound = true;
+      authFailed = authFailed || embeddedAuthFailed;
     }
     if (!authFailed) {
       if (diagnosticTrace) {
@@ -5536,6 +6265,7 @@ async function resolveCrossfadeStreams(meta, options = {}) {
         if (statuses.includes(429)) diagnosticTrace.reason = 'http-rate-limited';
         else if (statuses.some(status => status >= 500 && status <= 599)) diagnosticTrace.reason = 'http-server-error';
         else if (diagnosticTrace.requests.some(request => request.errorName)) diagnosticTrace.reason = 'request-error';
+        else if (drmFailureReason) diagnosticTrace.reason = drmFailureReason;
         else if (hlsAvailable) diagnosticTrace.reason = 'hls-url-unavailable';
         else if (progressiveMetadataAvailable) diagnosticTrace.reason = 'progressive-url-unavailable';
         else diagnosticTrace.reason = trackMetadataFound ? 'unsupported-stream-protocol' : 'track-not-found';
@@ -5552,7 +6282,7 @@ async function resolveCrossfadeStreams(meta, options = {}) {
 
 
 function resetDeck(audio, index) {
-  if (!audio) return;
+  if (!audio || (Number.isInteger(index) && state._decks[index] !== audio)) return;
   const schedule = state._crossfadeSchedule;
   if (schedule && (schedule.incomingIndex === index || schedule.outgoingIndex === index)) delete schedule.incomingClockObservation;
   if (state._transitionDiagnostics) recordTransitionDiagnostic('deck-reset', {
@@ -5566,6 +6296,7 @@ function resetDeck(audio, index) {
   if (Number.isInteger(index) && state._deckHlsPlayers?.[index]) {
     const hls = state._deckHlsPlayers[index];
     state._deckHlsPlayers[index] = null;
+    // Hls owns license XHR/session teardown and serializes the next CDM binding.
     safely(() => hls.destroy());
   }
   safely(() => audio.pause());
@@ -5596,7 +6327,7 @@ function resetDeck(audio, index) {
 
 
 function deckIsPreviewLimited(meta, audio) {
-  if (meta?.requiresNativePlayback) return true;
+  if (meta?.customPlaybackUnavailable) return true;
   const expected = Number(meta?.durationMs) / 1000;
   const actual = Number(audio?.duration);
   return Number.isFinite(expected) && expected >= 60
@@ -5619,7 +6350,6 @@ function stopCrossfadeDecks() {
   state._decks.forEach((audio, index) => resetDeck(audio, index));
   state._deckIndex = -1;
   state._deckTrack = null;
-  state._nativeTrack = null;
   setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'armed' : 'off');
 }
 
@@ -5715,7 +6445,7 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
       return null;
     }
   }
-  const audio = ensureCrossfadeDecks()[index];
+  let audio = ensureCrossfadeDecks()[index];
   const meta = state.meta[ti];
   if (!audio || !meta) {
     if (diagnosticTrace) {
@@ -5788,12 +6518,13 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
       diagnosticTrace.stage = 'deck-readiness';
       diagnosticTrace.reason = 'loading-media';
     }
-    let hlsCandidatesFailed = false;
     for (let candidateIndex = 0; candidateIndex < streamUrls.length; candidateIndex++) {
       const streamUrl = streamUrls[candidateIndex];
       if (!requestIsCurrent()) return null;
       if (diagnosticTrace) diagnosticTrace.mediaCandidateOrdinal = candidateIndex + 1;
-      resetDeck(audio, index);
+      const drmContext = cachedStreamDrmContext(meta, streamUrl);
+      audio = resetDeckForStream(audio, index, drmContext);
+      if (!audio || !requestIsCurrent()) return null;
       const hlsStream = isHlsStreamUrl(streamUrl);
       if (diagnosticTrace) {
         diagnosticTrace.streamKind = hlsStream ? 'hls-mse' : 'progressive';
@@ -5810,32 +6541,40 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
         ? warmup.preflight : null;
       const loaded = await loadStreamOnDeck(
         audio, index, streamUrl, options.timeout || 5000,
-        controller.signal, requestIsCurrent, diagnosticTrace, { preflight },
+        controller.signal, requestIsCurrent, diagnosticTrace,
+        { preflight, drmContext },
       );
-      if (preflight && loaded.player === preflight.player) {
-        preflight.adopted = true;
+      if (preflight && (loaded.player === preflight.player || preflight.failed)) {
+        if (loaded.player === preflight.player) preflight.adopted = true;
         warmup.preflight = null;
       }
       const sourceIsCurrent = loaded.player
-        ? state._deckHlsPlayers[index] === loaded.player
+        ? state._deckHlsPlayers?.[index] === loaded.player
         : audio.src === loaded.source;
-      if (!requestIsCurrent() || !sourceIsCurrent || state._deckTracks[index] !== ti) return null;
+      if (!sourceIsCurrent && loaded.player) {
+        try { loaded.player.destroy(); } catch (_) {}
+      }
+      if (!requestIsCurrent() || !sourceIsCurrent || state._deckTracks[index] !== ti) {
+        if (sourceIsCurrent && state._deckPrepareTokens[index] === requestToken && state._decks[index] === audio) {
+          resetDeck(audio, index);
+        }
+        return null;
+      }
       if (!loaded.supported) {
-        meta.requiresNativePlayback = true;
-        meta.nativePlaybackReason = 'hls-mse-unavailable';
-        if (diagnosticTrace) diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason;
+        meta.customPlaybackUnavailable = true;
+        meta.customPlaybackReason = 'hls-mse-unavailable';
+        if (diagnosticTrace) diagnosticTrace.customPlaybackReason = meta.customPlaybackReason;
         resetDeck(audio, index);
         return null;
       }
       const ready = loaded.ready;
-      if (!ready && hlsStream) hlsCandidatesFailed = true;
       if (ready) {
         if (!deckIsPreviewLimited(meta, audio)) {
           if (diagnosticTrace) diagnosticTrace.reason = 'media-ready';
           return audio;
         }
-        meta.requiresNativePlayback = true;
-        meta.nativePlaybackReason = 'preview-limited';
+        meta.customPlaybackUnavailable = true;
+        meta.customPlaybackReason = 'preview-limited';
         if (diagnosticTrace) {
           diagnosticTrace.stage = 'stream-classification';
           diagnosticTrace.reason = 'preview-limited';
@@ -5845,7 +6584,8 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
         return null;
       }
       if (diagnosticTrace) {
-        if (hlsStream && !['hls-fatal-error', 'hls-initialization-error'].includes(diagnosticTrace.reason)) {
+        if (hlsStream && !diagnosticTrace.reason?.startsWith('drm-')
+            && !['hls-fatal-error', 'hls-initialization-error'].includes(diagnosticTrace.reason)) {
           diagnosticTrace.stage = 'hls-readiness';
           diagnosticTrace.reason = diagnosticTrace.mediaWaitOutcome === 'error'
             ? 'hls-media-error' : 'hls-readiness-timeout';
@@ -5856,17 +6596,19 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
         }
       }
     }
-    if (!requestIsCurrent()) return null;
-    if (hlsCandidatesFailed && options.forceRefresh) {
-      meta.requiresNativePlayback = true;
-      meta.nativePlaybackReason = 'hls-custom-playback-failed';
-      if (diagnosticTrace) diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason;
+    if (!requestIsCurrent()) {
+      if (state._deckPrepareTokens[index] === requestToken && state._decks[index] === audio) resetDeck(audio, index);
+      return null;
     }
+    if (typeof WeakSet === 'function') (state._staleEmbeddedTracks ||= new WeakSet()).add(meta);
     state._streamCache.delete(normalizeTrackUrl(meta.link));
     resetDeck(audio, index);
     return null;
   } catch (error) {
-    if (!requestIsCurrent() || error?.name === 'AbortError') return null;
+    if (!requestIsCurrent() || error?.name === 'AbortError') {
+      if (state._deckPrepareTokens[index] === requestToken && state._decks[index] === audio) resetDeck(audio, index);
+      return null;
+    }
     if (diagnosticTrace) {
       diagnosticTrace.stage = 'deck-preparation';
       diagnosticTrace.reason = 'preparation-error';
@@ -5898,7 +6640,7 @@ function cancelCrossfadeForRecovery(activeIndex) {
   setCrossfadeStatus(state.crossfadeSeconds > 0 ? 'loading' : 'off');
 }
 
-async function recoverCurrentDeckStream(audio, position, reason = 'unknown', attempt = 1) {
+async function recoverCurrentDeckStream(audio, position, reason = 'unknown', attempt = 1, recoveryOwner = null) {
   const index = state._decks.indexOf(audio);
   const ti = index >= 0 ? state._deckTracks[index] : null;
   const meta = state.meta[ti];
@@ -5967,25 +6709,26 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
       let loaded = null;
       for (const streamUrl of streamUrls) {
         if (!isCurrent()) return null;
-        audio.pause();
-        const previousHls = state._deckHlsPlayers?.[index];
-        if (previousHls) {
-          state._deckHlsPlayers[index] = null;
-          previousHls.destroy();
-        }
-        audio.removeAttribute('src');
-        audio.load();
+        const previousAudio = audio;
+        const drmContext = cachedStreamDrmContext(meta, streamUrl);
+        audio = resetDeckForStream(audio, index, drmContext);
+        if (!audio) return null;
+        if (recoveryOwner?.deck === previousAudio) recoveryOwner.deck = audio;
+        state._deckTracks[index] = ti;
+        state._deckGains[index] = 1;
+        applyCachedAutoLevel(index, ti);
         if (diagnosticTrace) {
           diagnosticTrace.streamKind = isHlsStreamUrl(streamUrl) ? 'hls-mse' : 'progressive';
           diagnosticTrace.streamQuality = diagnosticStreamQuality(streamUrl);
         }
         const candidate = await loadStreamOnDeck(
           audio, index, streamUrl, 8000, signal, isCurrent, diagnosticTrace,
+          { drmContext },
         );
         if (!isCurrent()) return null;
         if (!candidate.supported) {
-          meta.requiresNativePlayback = true;
-          meta.nativePlaybackReason = 'hls-mse-unavailable';
+          meta.customPlaybackUnavailable = true;
+          meta.customPlaybackReason = 'hls-mse-unavailable';
           recordPlaybackDiagnostic('hls-playback-failed', {
             attemptId: diagnosticTrace?.attemptId,
             trackIndex: ti,
@@ -6012,6 +6755,7 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
       const resumeTime = latestSeek !== initialSeek && latestSeek?.epoch === epoch
         && latestSeek.audio === audio ? latestSeek.time : savedTime;
       audio.currentTime = Math.min(Number.isFinite(duration) ? Math.max(0, duration - 0.1) : resumeTime, resumeTime);
+      syncCrossfadeVolume();
       const graphReady = await resumeAudioGraph(signal, diagnosticTrace);
       if (!isCurrent()) return null;
       if (!graphReady) return finish(false, 'audio-context-resume-failed');
@@ -6739,7 +7483,8 @@ function destroyCrossfadePreflight(record) {
 }
 
 function preflightCrossfadeHls(record, streamUrls) {
-  if (!record || record.preflight || record.controller.signal.aborted) return;
+  if (!record || record.preflight || record.controller.signal.aborted
+      || (record.isCurrent && !record.isCurrent())) return;
   const streamUrl = streamUrls.find(isHlsStreamUrl);
   if (!streamUrl) return;
   const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
@@ -6755,7 +7500,15 @@ function preflightCrossfadeHls(record, streamUrls) {
   if (!supported) return;
   let player;
   try {
-    player = new HlsCtor({ enableWorker: true, lowLatencyMode: false, startFragPrefetch: true });
+    const drmContext = cachedStreamDrmContext(record.meta, streamUrl);
+    if (drmContext) return;
+    player = new HlsCtor({
+      ...soundCloudHlsConfig(drmContext, {
+        signal: record.controller.signal,
+        isCurrent: () => !record.isCurrent || record.isCurrent(),
+      }),
+      startFragPrefetch: true,
+    });
     const preflight = {
       player, streamUrl, failed: false, adopted: false,
       events: HlsCtor.Events, onError: null,
@@ -6888,6 +7641,7 @@ async function prefetchUpcomingCrossfadeTrack() {
     });
   }
   if (state.crossfadeSeconds > 0) setCrossfadeStatus(audio ? 'ready' : 'fallback');
+  if (audio) void state._watcherTick?.();
   return audio;
 }
 
@@ -6900,8 +7654,35 @@ function upcomingCrossfadeDeckReady() {
     && audio.readyState >= 2 && !state._deckHlsFailed?.[standby]);
 }
 
+function currentPendingPlaybackTrack() {
+  const pending = state._pendingPlaybackTrack;
+  return pending?.epoch === state._playbackEpoch && pending.ti === state.queue[state.pos]
+    ? pending : null;
+}
+
+function promotePendingPlayNext() {
+  const ti = state.playNext.find(trackAvailable)
+    ?? state.queue.find((queuedTi, index) => index >= state.pos && trackAvailable(queuedTi));
+  if (ti === undefined) return undefined;
+  state.playNext = state.playNext.filter(pendingTi => pendingTi !== ti);
+  if (ti === state.queue[state.pos]) {
+    recountRoundTotal();
+    return ti;
+  }
+  const index = state.queue.indexOf(ti);
+  if (index !== -1) {
+    state.queue.splice(index, 1);
+    if (index < state.pos) state.pos--;
+  }
+  state.queue.splice(state.pos, 0, ti);
+  recountRoundTotal();
+  return ti;
+}
+
 function upcomingTrackIndex() {
-  return state.playNext.length ? state.playNext[0] : state.queue[state.pos + 1];
+  if (state.playNext.length) return state.playNext[0];
+  const pending = currentPendingPlaybackTrack();
+  return pending && state._deckTrack !== pending.ti ? pending.ti : state.queue[state.pos + 1];
 }
 
 function refreshUpcomingCrossfadePreparation() {
@@ -6942,7 +7723,7 @@ async function runPlaybackOperation(label, operation) {
   const epoch = state._playbackEpoch;
   state._diagnosticOperationSequence = (Number(state._diagnosticOperationSequence) || 0) + 1;
   const operationId = state._diagnosticOperationSequence;
-  const request = { operationId };
+  const request = { operationId, pending: true, nextRequested: null };
   const startedAt = state._diagnosticBuild && typeof performance !== 'undefined' ? performance.now() : 0;
   state._playbackRequest = request;
   state.busy = true;
@@ -6973,6 +7754,7 @@ async function runPlaybackOperation(label, operation) {
     }
     return false;
   } finally {
+    request.pending = false;
     if (isCurrent()) {
       if (state._diagnosticBuild) {
         recordPlaybackDiagnostic('playback-operation-finished', {
@@ -6990,15 +7772,29 @@ async function runPlaybackOperation(label, operation) {
       try { updateHub(); } catch (error) {
         recordPlaybackDiagnostic('playback-ui-failed', { operationId, operation: label, errorName: playbackErrorName(error) });
       }
+      const nextIntent = request.nextRequested;
+      if (nextIntent && !state._userPaused) {
+        queueMicrotask(() => {
+          if (request.nextRequested !== nextIntent) return;
+          request.nextRequested = null;
+          if (isCurrent() && !state.busy && !state._userPaused
+              && state._deckTrack === nextIntent.ti && state.meta[nextIntent.ti] === nextIntent.meta) {
+            void next();
+          }
+        });
+      } else {
+        request.nextRequested = null;
+      }
     }
   }
 }
 
-async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticTrace = null) {
+async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticTrace = null, resumeIntent = null) {
   const source = audio.src;
   const preparation = state._deckPrepareTokens[index];
   const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
-  if (!isCurrent() || signal?.aborted || state._userPaused) return null;
+  const pauseBlocksPlay = () => resumeIntent ? !playbackResumeCurrent(resumeIntent) : state._userPaused;
+  if (!isCurrent() || signal?.aborted || pauseBlocksPlay()) return null;
   const playTokens = state._deckPlayTokens || (state._deckPlayTokens = []);
   const playToken = (playTokens[index] || 0) + 1;
   playTokens[index] = playToken;
@@ -7012,7 +7808,7 @@ async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticT
       const playing = audio.play();
       Promise.resolve(playing).then(() => {
         const eligibleSource = !audio.src || (state._deckPrepareTokens[index] === preparation && audio.src === source);
-        if ((abandoned || !isCurrent() || state._userPaused)
+        if ((abandoned || !isCurrent() || pauseBlocksPlay())
             && state._deckPlayTokens[index] === playToken
             && state._decks[index] === audio && eligibleSource) {
           try { audio.pause(); } catch (error) {
@@ -7022,7 +7818,7 @@ async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticT
       }, () => {});
       return playing;
     }, 5000, signal);
-    if (!isCurrent() || state._userPaused) return null;
+    if (!isCurrent() || pauseBlocksPlay()) return null;
     if (diagnosticTrace) {
       diagnosticTrace.reason = 'play-fulfilled';
       diagnosticTrace.playElapsedMs = typeof performance !== 'undefined'
@@ -7044,7 +7840,7 @@ async function playDeckWithDeadline(audio, index, signal, isCurrent, diagnosticT
       // Abort pending media startup without discarding the recovery owner.
       try { audio.pause(); audio.load(); } catch (_) {}
     }
-    if (!owned || signal?.aborted || state._userPaused) return null;
+    if (!owned || signal?.aborted || pauseBlocksPlay()) return null;
     throw error;
   }
 }
@@ -7067,11 +7863,11 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
       remainingMs: observedOutgoing ? (observedOutgoing.duration - observedOutgoing.currentTime) * 1000 : 0,
     });
   }
-  if (meta?.requiresNativePlayback) {
+  if (meta?.customPlaybackUnavailable) {
     if (diagnosticTrace) {
-      diagnosticTrace.stage = 'native-fallback';
-      diagnosticTrace.reason = 'native-fallback-required';
-      diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+      diagnosticTrace.stage = meta.customPlaybackReason?.startsWith('drm-') ? 'drm-capability' : 'access-classification';
+      diagnosticTrace.reason = 'custom-playback-unavailable';
+      diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
     }
     return false;
   }
@@ -7089,6 +7885,10 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   }
   const outgoing = currentDeckAudio();
   const outgoingIndex = state._deckIndex;
+  const outgoingTrack = state._deckTrack;
+  const outgoingMeta = state.meta[outgoingTrack];
+  const outgoingToken = state._deckPrepareTokens[outgoingIndex];
+  const outgoingSource = outgoing?.src;
   const incomingIndex = outgoingIndex === 0 ? 1 : 0;
   if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
   let incoming = null;
@@ -7107,11 +7907,11 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
     if (!isCurrent()) return null;
     if (state._userPaused) return deferPaused();
     if (!incoming) {
-      if (meta.requiresNativePlayback) {
+      if (meta.customPlaybackUnavailable) {
         if (diagnosticTrace) {
-          diagnosticTrace.stage = 'native-fallback';
-          diagnosticTrace.reason = 'native-fallback-required';
-          diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
+          diagnosticTrace.stage = meta.customPlaybackReason?.startsWith('drm-') ? 'drm-capability' : 'access-classification';
+          diagnosticTrace.reason = 'custom-playback-unavailable';
+          diagnosticTrace.customPlaybackReason = meta.customPlaybackReason || 'preview-only';
         }
         return false;
       }
@@ -7123,8 +7923,11 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
       && state._deckPrepareTokens[incomingIndex] === preparedToken
       && state._deckTracks[incomingIndex] === ti && incoming.src === source;
     if (!ownsIncoming()) return null;
+    // A seek can silence an unpaused element. Do not hold the ready incoming
+    // deck at zero gain while pretending that source can supply the fade-out.
     canMix = Boolean(outgoing && state._decks[outgoingIndex] === outgoing
-      && !outgoing.paused && !outgoing.ended && requestedFade > 0);
+      && !outgoing.paused && !outgoing.ended && !outgoing.seeking
+      && outgoing.readyState >= 2 && requestedFade > 0);
     incoming.currentTime = 0;
     state._deckGains[incomingIndex] = canMix ? 0 : 1;
     syncCrossfadeVolume();
@@ -7183,14 +7986,40 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   }
   state._deckIndex = incomingIndex;
   state._deckTrack = ti;
-  state._nativeTrack = null;
   installBetterFeedPipBridge();
   if (canMix) {
     warmUpcomingCrossfadeStreams();
     const mixed = await animateDeckCrossfade(outgoing, incoming, requestedFade, token, diagnosticTrace, incomingBaselineTime);
-    if (!ownsIncoming() || state._crossfadeToken !== token) return null;
-    if (state._userPaused) return deferPaused();
+    const cleanupFailedWarmup = () => {
+      destroyCrossfadePreflight(state._crossfadeStreamWarmup);
+      state._crossfadeStreamWarmup?.controller?.abort();
+      state._crossfadeStreamWarmup = null;
+    };
+    if (!ownsIncoming() || state._crossfadeToken !== token) { cleanupFailedWarmup(); return null; }
+    if (state._userPaused) { cleanupFailedWarmup(); return deferPaused(); }
     if (mixed !== true) {
+      cleanupFailedWarmup();
+      // A failed overlap must not strand the old deck behind a silent incoming
+      // owner. Never revive it after Stop or a newer request/preparation.
+      if (ownsIncoming() && state._crossfadeToken === token) {
+        const retainOutgoing = outgoing && !outgoing.ended
+          && state._decks[outgoingIndex] === outgoing
+          && state._deckPrepareTokens[outgoingIndex] === outgoingToken
+          && state._deckTracks[outgoingIndex] === outgoingTrack
+          && state.meta[outgoingTrack] === outgoingMeta && outgoing.src === outgoingSource;
+        resetDeck(incoming, incomingIndex);
+        state._deckIndex = retainOutgoing ? outgoingIndex : -1;
+        state._deckTrack = retainOutgoing ? outgoingTrack : null;
+        if (retainOutgoing) {
+          state._deckGains[outgoingIndex] = 1;
+          const graph = state._deckAudioGraphs[outgoingIndex];
+          if (graph && state._audioContext) {
+            setAudioParamImmediately(graph.mixGain.gain, 1, state._audioContext.currentTime);
+            graph.appliedMixGain = 1;
+          }
+          syncCrossfadeVolume();
+        }
+      }
       return mixed === false ? false : null;
     }
   }
@@ -7395,152 +8224,6 @@ function trackAvailable(ti) {
   return Boolean(meta && !meta.unavailable && (meta.sourcePage || state.els[ti]));
 }
 
-async function playWithSoundCloudSession(ti, countPlay = true, diagnosticTrace = null) {
-  const epoch = state._playbackEpoch;
-  const request = state._playbackRequest;
-  const signal = state._playbackAbort?.signal;
-  const meta = state.meta[ti];
-  const el = boundSoundCloudRow(ti);
-  const isCurrent = () => state.active && epoch === state._playbackEpoch && state._playbackRequest === request
-    && state.meta[ti] === meta && !signal?.aborted;
-  if (!isCurrent()) return null;
-  if (!meta?.requiresNativePlayback) return false;
-  if (!el || !document.body.contains(el)) {
-    recordPlaybackDiagnostic('native-fallback-unavailable', {
-      attemptId: diagnosticTrace?.attemptId,
-      trackIndex: ti,
-      reason: el ? 'track-element-detached' : 'track-element-missing',
-      elementFound: Boolean(el),
-      elementAttached: Boolean(el && document.body.contains(el)),
-    });
-    return false;
-  }
-  if (state._userPaused) return null;
-  stopCrossfadeDecks();
-  pauseSoundCloudTransport();
-  pauseSoundCloud();
-  state.suspended = false;
-  let started = false;
-  let buttonFound = false;
-  let clickIssued = false;
-  let nativeAudioFound = false;
-  let playerMatched = false;
-  let nativeTransportPaused = null;
-  let pollCount = 0;
-  state._nativeTrack = ti;
-  recordPlaybackDiagnostic('native-fallback-started', {
-    attemptId: diagnosticTrace?.attemptId,
-    trackIndex: ti,
-    reason: meta.nativePlaybackReason || 'preview-only',
-    elementFound: true,
-    elementAttached: true,
-    pollLimit: 20,
-  });
-  try {
-    el.scrollIntoView({ block: 'center', behavior: motionIsInstant() ? 'instant' : 'smooth' });
-    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    await withDeadline(() => wait(80), 1000, signal);
-    if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
-    if (!document.body.contains(el) || !soundCloudLinkMatches(meta, getLink(el))) return false;
-    const button = el.querySelector(
-      'button.sc-button-play, .playButton, button[title*="Play"], .trackItem__coverArt, .sound__coverArt',
-    ) || el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
-    buttonFound = Boolean(button);
-    if (!buttonFound) {
-      recordPlaybackDiagnostic('native-fallback-unavailable', {
-        attemptId: diagnosticTrace?.attemptId,
-        trackIndex: ti,
-        reason: 'play-button-missing',
-        elementFound: true,
-        elementAttached: true,
-        buttonFound: false,
-        clickIssued: false,
-      });
-      return false;
-    }
-    button.click();
-    clickIssued = true;
-    recordPlaybackDiagnostic('native-fallback-command-issued', {
-      attemptId: diagnosticTrace?.attemptId,
-      trackIndex: ti,
-      reason: meta.nativePlaybackReason || 'preview-only',
-      buttonFound,
-      clickIssued,
-      pollLimit: 20,
-    });
-    for (let attempt = 0; attempt < 20; attempt++) {
-      pollCount = attempt + 1;
-      await withDeadline(() => wait(150), 1000, signal);
-      if (!isCurrent() || state._nativeTrack !== ti || state._userPaused) return null;
-      const nativeAudio = [...document.querySelectorAll('audio')]
-        .find(audio => !isTrueShuffleAudio(audio) && !audio.paused && audio.currentSrc);
-      nativeAudioFound = Boolean(nativeAudio);
-      playerMatched = soundCloudPlayerMatches(meta);
-      nativeTransportPaused = soundCloudPaused();
-      if (playerMatched && (nativeAudioFound || nativeTransportPaused === false)) {
-        started = true;
-        break;
-      }
-    }
-    if (!started) {
-      recordPlaybackDiagnostic('native-track-not-acknowledged', {
-        attemptId: diagnosticTrace?.attemptId,
-        trackIndex: ti,
-        reason: meta.nativePlaybackReason || 'preview-only',
-        buttonFound,
-        clickIssued,
-        pollCount,
-        playerMatched,
-        nativeAudioFound,
-        nativeTransportPaused,
-      });
-      return false;
-    }
-    state._pendingPlaybackTrack = null;
-    state.lastTitle = meta.title || playerTitle();
-    state.lastProgress = 0;
-    state.suspended = false;
-    if (countPlay) trackPlayed(ti);
-    recordPlaybackDiagnostic('native-fallback-succeeded', {
-      attemptId: diagnosticTrace?.attemptId,
-      trackIndex: ti,
-      reason: meta.nativePlaybackReason || 'preview-only',
-      buttonFound,
-      clickIssued,
-      pollCount,
-      playerMatched,
-      nativeAudioFound,
-      nativeTransportPaused,
-    });
-    if (!state._nativeSessionNoticeShown) {
-      state._nativeSessionNoticeShown = true;
-      showMergeToast('SoundCloud playback for this track; True Shuffle crossfade and audio processing are paused');
-    }
-    setTimeout(() => {
-      if (isCurrent()) { refreshPlayBtn(); updateProgressBar(); updateHub(); }
-    }, 80);
-    return true;
-  } catch (error) {
-    if (!isCurrent() || state._nativeTrack !== ti || signal?.aborted) return null;
-    recordPlaybackDiagnostic('native-start-failed', {
-      attemptId: diagnosticTrace?.attemptId,
-      trackIndex: ti,
-      errorName: playbackErrorName(error),
-      reason: meta.nativePlaybackReason || 'preview-only',
-      buttonFound,
-      clickIssued,
-      pollCount,
-    });
-    return false;
-  } finally {
-    if (isCurrent() && state._nativeTrack === ti && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
-    if (isCurrent() && state._nativeTrack === ti && !started) {
-      state._nativeTrack = null;
-      pauseSoundCloudTransport();
-      pauseSoundCloud();
-    }
-  }
-}
 
 
 async function playAt(idx, countPlay = true, attemptedCustomTracks = null, priorFailedCandidates = 0) {
@@ -7550,10 +8233,10 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null, prior
   const isCurrent = () => state.active && epoch === state._playbackEpoch
     && state._playbackRequest === request && state.meta[idx] === meta;
   if (!isCurrent() || !meta || !trackAvailable(idx)) return null;
-  if (state._userPaused) {
-    state._pendingPlaybackTrack = { ti: idx, countPlay, epoch };
-    return null;
-  }
+  state._pendingPlaybackTrack = { ti: idx, countPlay, epoch };
+  if (state._userPaused) return null;
+  clearTimeout(state._customPlaybackRetryTimer);
+  state._customPlaybackRetryTimer = null;
   const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(idx) : null;
   priorFailedCandidates = Math.max(0, Number(priorFailedCandidates) || 0);
   const requestedFade = currentDeckAudio()
@@ -7585,46 +8268,6 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null, prior
     }
     return true;
   }
-  stopCrossfadeDecks();
-  setCrossfadeStatus('fallback');
-  if (meta.requiresNativePlayback) {
-    if (diagnosticTrace) {
-      diagnosticTrace.stage = 'native-fallback';
-      diagnosticTrace.reason = 'native-start-pending';
-      diagnosticTrace.nativeFallbackReason = meta.nativePlaybackReason || 'preview-only';
-    }
-    const native = await playWithSoundCloudSession(idx, countPlay, diagnosticTrace);
-    if (!isCurrent() || state._userPaused || native === null) return null;
-    if (native) {
-      if (diagnosticTrace) diagnosticTrace.nativeOutcome = 'started';
-      if (state._diagnosticBuild) {
-        const precedingFailedCandidates = priorFailedCandidates + (attemptedCustomTracks?.size || 0);
-        recordPlaybackDiagnostic('custom-start-succeeded', {
-          ...(customStartDiagnosticDetails(diagnosticTrace, 'started') || {}),
-          trackIndex: idx,
-          deckIndex: state._deckIndex,
-          startedVia: 'native-fallback',
-          outcome: 'started',
-          nativeFallbackReason: meta.nativePlaybackReason || 'preview-only',
-          precedingFailedCandidates,
-        });
-        if (precedingFailedCandidates) {
-          recordPlaybackDiagnostic('custom-start-recovered', {
-            attemptId: diagnosticTrace?.attemptId,
-            trackIndex: idx,
-            startedVia: 'native-fallback',
-            precedingFailedCandidates,
-          });
-        }
-      }
-      return true;
-    }
-    if (diagnosticTrace) {
-      diagnosticTrace.stage = 'native-fallback';
-      diagnosticTrace.reason = 'native-start-failed';
-      diagnosticTrace.nativeOutcome = 'not-acknowledged';
-    }
-  }
   const attempted = attemptedCustomTracks || new Set();
   attempted.add(idx);
   const currentQueueIndex = state.queue.indexOf(idx, state.pos);
@@ -7648,9 +8291,21 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null, prior
       details,
     );
   } else {
-    recordPlaybackDiagnostic('custom-start-exhausted', { trackIndex: idx, attempted: attempted.size });
+    recordPlaybackDiagnostic(
+      replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
+      { trackIndex: idx, attempted: attempted.size },
+    );
   }
-  if (replacement !== undefined) return playAt(replacement, countPlay, attempted, priorFailedCandidates);
+  if (replacement !== undefined) {
+    const replacementIndex = state.queue.indexOf(replacement, state.pos);
+    if (replacementIndex > state.pos) {
+      state.queue.splice(replacementIndex, 1);
+      state.queue.splice(state.pos, 0, replacement);
+    }
+    return playAt(replacement, countPlay, attempted, priorFailedCandidates);
+  }
+  state._pendingPlaybackTrack = { ti: state.queue[state.pos], countPlay, epoch };
+  setCrossfadeStatus('fallback');
   state.suspended = true;
   showMergeToast('Custom playback unavailable — retrying shortly');
   updateHub();
@@ -7707,10 +8362,29 @@ async function playAt(idx, countPlay = true, attemptedCustomTracks = null, prior
 }
 
 async function next(fromWatcher = false) {
-  if (!state.active || state.busy || (fromWatcher && state._userPaused)) return;
+  if (!state.active || (fromWatcher && state._userPaused)) return;
+  if (state.busy) {
+    if (!fromWatcher && state._playbackRequest?.pending) {
+      const ti = currentPendingPlaybackTrack()?.ti
+        ?? (Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos]);
+      const meta = state.meta[ti];
+      state._playbackRequest.nextRequested = Number.isInteger(ti) && meta ? { ti, meta } : null;
+    }
+    return;
+  }
+  const pending = currentPendingPlaybackTrack();
+  if (fromWatcher && pending && state._customPlaybackRetryTimer) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
   if (!fromWatcher) state._userPaused = false;
   return runPlaybackOperation('next', async isCurrent => {
+    if (pending) {
+      const ti = promotePendingPlayNext();
+      if (ti === undefined) { state.suspended = true; return false; }
+      state.suspended = false;
+      const played = await playAt(ti, pending.countPlay);
+      if (isCurrent()) { badges(); renderList(); }
+      return played;
+    }
     const isQuickSkip = !fromWatcher && state.manualAction && state.lastProgress < 0.15;
     if (!state.queue.some(trackAvailable)) {
       state.suspended = true;
@@ -7790,7 +8464,7 @@ function moveSelectedTrackToCurrent(ti) {
   const current = state.queue[state.pos];
   if (current === ti) return false;
 
-  if (current !== undefined) {
+  if (current !== undefined && !currentPendingPlaybackTrack()) {
     state.history.push(current);
     if (state.history.length > 100) state.history.shift();
     state.queue.splice(state.pos, 1);
@@ -7851,12 +8525,8 @@ function removeTrackFromUpcoming(ti) {
   if (!removedPlayNext && qi === -1) return false;
 
   state.playNext = remainingPlayNext;
-  if (qi !== -1) {
-    state.queue.splice(qi, 1);
-    state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
-  } else if (removedPlayNext && state.history.includes(ti)) {
-    state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
-  }
+  if (qi !== -1) state.queue.splice(qi, 1);
+  recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   if (qi !== -1) badges();
   renderList();
@@ -7866,8 +8536,8 @@ function removeTrackFromUpcoming(ti) {
 function removeFromQueue(qi) {
   if (qi === state.pos) return;
   state.queue.splice(qi, 1);
-  if (qi >= state.pos) state.roundTotal = Math.max(state.roundPlayed + 1, state.roundTotal - 1);
   if (qi < state.pos) state.pos--;
+  recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   badges();
   renderList();
@@ -8121,6 +8791,7 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
     reviveRemovedQueueTrack(ti);
     const el = matchingSoundCloudRow(meta, rows, identities);
     if (el || soundCloudPermalinkConflicts(meta, identities)) state.els[ti] = el;
+    else if (state.els[ti]?.nodeType === 1 && !document.body.contains(state.els[ti])) state.els[ti] = null;
   });
 
   recountRoundTotal();
@@ -8178,6 +8849,13 @@ async function syncLiveQueue(options) {
         if (meta) resolved.set(id, meta);
       }
     }
+    const unchanged = !options.force && resolved.size === 0 && updates.length > 0
+      && updates.every(({ sourcePage, snapshot }) => {
+        const signature = `${Boolean(snapshot.complete)}:${snapshot.tracks.map(track => Number(track.id)).join(',')}`;
+        return state._liveSyncSignatures?.get?.(sourcePage) === signature
+          && snapshot.tracks.every(track => knownIds.has(Number(track.id)));
+      });
+    if (unchanged) return 0;
 
     const pageSource = playlistBase(location.href);
     const pageEls = sources.has(pageSource)
@@ -8223,6 +8901,14 @@ async function syncLiveQueue(options) {
     for (const { sourcePage, snapshot } of updates) {
       removed += reconcileLivePlaylistSnapshot(snapshot, sourcePage, sourcePage === pageSource ? pageEls : []);
     }
+    const signatures = state._liveSyncSignatures || (state._liveSyncSignatures = new Map());
+    for (const { sourcePage, snapshot } of updates) {
+      if (snapshot.tracks.every(track => existingById.has(Number(track.id)))) {
+        signatures.set(sourcePage, `${Boolean(snapshot.complete)}:${snapshot.tracks.map(track => Number(track.id)).join(',')}`);
+      } else {
+        signatures.delete(sourcePage);
+      }
+    }
     if (removed) {
       refreshUpcomingCrossfadePreparation();
       updateHub();
@@ -8241,6 +8927,7 @@ async function syncLiveQueue(options) {
 function resetLiveQueueSync() {
   if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
   state._liveSyncSources = new Map();
+  state._liveSyncSignatures = new Map();
   state._liveSyncInFlight = false;
   state._liveSyncLastCheck = 0;
   state._liveSyncTimer = null;
@@ -8480,7 +9167,22 @@ function saveQueueSessionCache() {
 
 function restoreQueueSessionCache(cache, collection, pageUrl) {
   if (!Array.isArray(cache.meta) || !Array.isArray(cache.sources)) return remapCachedQueue(cache, state.meta);
-  const meta = cache.meta.map(item => ({ ...item }));
+  const meta = cache.meta.map(item => {
+    const restored = { ...item };
+    const legacyReason = restored.nativePlaybackReason;
+    const reason = restored.customPlaybackReason || legacyReason;
+    const capabilityUnavailable = restored.customPlaybackUnavailable || restored.requiresNativePlayback;
+    delete restored.requiresNativePlayback;
+    delete restored.nativePlaybackReason;
+    if (capabilityUnavailable && ['preview-only', 'preview-limited', 'access-restricted', 'hls-mse-unavailable'].includes(reason)) {
+      restored.customPlaybackUnavailable = true;
+      restored.customPlaybackReason = reason;
+    } else {
+      delete restored.customPlaybackUnavailable;
+      delete restored.customPlaybackReason;
+    }
+    return restored;
+  });
   const identities = trackIdentityIndex(meta);
   const els = meta.map(() => null);
   const pageMembers = new Set();
@@ -8590,8 +9292,17 @@ async function start() {
     state.manualAction = false;
     state.playlistUrl = pageUrl;
     const previous = state._savedStats;
-    state.stats = previous && Date.now() - (previous._ts || 0) < 600_000
-      ? { ...previous } : { played: 0, playCounts: {}, elapsed: 0 };
+    if (previous && Date.now() - (previous._ts || 0) < 600_000) {
+      const counts = new Map(previous._trackCounts || []);
+      const playCounts = {};
+      state.meta.forEach((meta, ti) => {
+        const count = counts.get(trackCacheKey(meta));
+        if (count > 0) playCounts[ti] = count;
+      });
+      state.stats = { played: previous.played, elapsed: previous.elapsed, playCounts };
+    } else {
+      state.stats = { played: 0, playCounts: {}, elapsed: 0 };
+    }
     state._savedStats = null;
     state._lifetimeBase = { played: state.stats.played, elapsed: state.stats.elapsed, playCounts: { ...state.stats.playCounts } };
     await runPlaybackOperation('start', () => {
@@ -8653,7 +9364,11 @@ function stop() {
     state._workerInterval = null;
   }
   safely(() => document.querySelectorAll('.tss-badge').forEach(b => b.remove()));
-  state._savedStats = { ...state.stats, _ts: Date.now() };
+  state._savedStats = {
+    ...state.stats, playCounts: { ...state.stats.playCounts }, _ts: Date.now(),
+    _trackCounts: Object.entries(state.stats.playCounts).map(([ti, count]) => [trackCacheKey(state.meta[ti]), count])
+      .filter(([key]) => key !== null),
+  };
   safely(saveLifetimeStats);
   safely(updateHub);
 }
@@ -8674,10 +9389,7 @@ function startWatcher() {
     && state._watcherToken === watcherToken;
 
   state.lastTitle = playerTitle();
-  let lastTitle  = state.lastTitle;
-  let titleTicks = 0;
   let nearEnd    = false;
-  let lastRemaining = Infinity;
   let endpointTicks = 0;
   let uiTicks = 0;
   let lastDiagnosticTick = state._transitionDiagnostics ? performance.now() : 0;
@@ -8707,7 +9419,6 @@ function startWatcher() {
 
   const resetEndGuard = async () => {
     if (!watcherIsCurrent()) return;
-    lastTitle = playerTitle();
     endpointTicks = 0;
     if (!state.active) { nearEnd = false; return; }
     for (let i = 0; i < 10; i++) {
@@ -8718,26 +9429,15 @@ function startWatcher() {
     nearEnd = false;
   };
 
-  const returnToQueuePage = (consumeCurrent = false) => {
-    if (!watcherIsCurrent()) return;
-    if (consumeCurrent) consumeCurrentQueueTrack();
-
-    cleanup();
-    saveQueueSessionCache();
-
-    state.active    = false;
-    state.busy      = false;
-    state.suspended = false;
-
-    const a = document.createElement('a');
-    a.href = state.playlistUrl;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { if (a.parentNode) a.remove(); }, 2000);
-  };
 
   const advanceAtNaturalEnd = async () => {
     if (!watcherIsCurrent() || state._userPaused || state.busy || nearEnd) return;
+    if (currentPendingPlaybackTrack() && state._customPlaybackRetryTimer) {
+      state.suspended = true;
+      refreshPlayBtn();
+      updateHub();
+      return;
+    }
     nearEnd = true;
     if (state._transitionDiagnostics) recordTransitionDiagnostic('natural-end', {
       trackIndex: state._deckTrack, deckIndex: state._deckIndex,
@@ -8746,25 +9446,14 @@ function startWatcher() {
     });
 
     try {
-      if (state.suspended) {
-        if (state.els.some(e => e && document.body.contains(e))) {
-          state.suspended = false;
-          await next(true);
-        } else {
-          returnToQueuePage(true);
-          return;
-        }
-      } else {
-        await next(true);
-      }
+      await next(true);
     } finally {
       if (watcherIsCurrent()) await resetEndGuard();
     }
   };
 
   const onMediaEnded = e => {
-    if (e.target?.tagName !== 'AUDIO') return;
-    if (Number.isInteger(state._deckTrack) && e.target !== currentDeckAudio()) return;
+    if (e.target?.tagName !== 'AUDIO' || e.target !== currentDeckAudio()) return;
     void advanceAtNaturalEnd();
   };
   state._endedHandler = onMediaEnded;
@@ -8822,7 +9511,7 @@ function startWatcher() {
 
     if (state.busy) return;
 
-    const title  = playerTitle();
+    const pending = currentPendingPlaybackTrack();
     const timing = playbackTiming();
     const p      = timing.duration ? timing.current / timing.duration : 0;
 
@@ -8835,9 +9524,11 @@ function startWatcher() {
       ? Math.max(0, timing.duration - timing.current)
       : Infinity;
     const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
+    const fadeDeck = currentDeckAudio();
     const automaticFadeEligible = configuredFadeSeconds > 0
       && Number.isInteger(state._deckTrack)
       && !state._crossfading
+      && !pending
       && !nearEnd
       && !state._userPaused
       && !paused()
@@ -8845,7 +9536,9 @@ function startWatcher() {
       && !(state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)
       && timing.current > 0
       && remainingSeconds > 0.05
-      && remainingSeconds <= configuredFadeSeconds;
+      && remainingSeconds <= configuredFadeSeconds
+      && !fadeDeck?.seeking
+      && (fadeDeck?.readyState ?? 0) >= 2;
     let standbyReady = false;
     let effectiveFadeSeconds = configuredFadeSeconds;
     if (automaticFadeEligible) {
@@ -8906,7 +9599,7 @@ function startWatcher() {
       || (!deckStall.retryPending && Math.abs(timing.current - deckStall.current) >= 0.05);
     if (progressed) resetDeckStall(deck, timing.current, stallNow);
     const stallEligible = Boolean(deck && timing.source === 'audio'
-      && !state._userPaused && !state.loading && !state.suspended
+      && !pending && !state._userPaused && !state.loading && !state.suspended
       && !state.manualAction && !nearEnd && !deck.ended
       && (Number(deck.playbackRate) || 1) > 0
       && (deckStall.retryPending || (!deck.paused && !deck.seeking)));
@@ -8949,16 +9642,16 @@ function startWatcher() {
         owner.recoveryAttempts++;
         owner.recovering = true;
         if (!owner.retryPending) owner.position = timing.current;
-        const recovery = recoverCurrentDeckStream(deck, owner.position, stallKind, owner.recoveryAttempts);
+        const recovery = recoverCurrentDeckStream(deck, owner.position, stallKind, owner.recoveryAttempts, owner);
         owner.preparation = state._deckPrepareTokens[index];
         const finishRecovery = recovered => {
-          if (!watcherIsCurrent() || deckStall !== owner || currentDeckAudio() !== deck
+          if (!watcherIsCurrent() || deckStall !== owner || currentDeckAudio() !== owner.deck
               || state._deckPrepareTokens[index] !== owner.preparation
               || state._deckTrack !== owner.track || state.meta[owner.track] !== owner.meta
               || state._playbackRequest !== owner.foreground) return;
           owner.recovering = false;
           owner.retryPending = recovered !== true;
-          owner.current = Number(deck.currentTime) || 0;
+          owner.current = Number(owner.deck.currentTime) || 0;
           owner.observedAt = Date.now();
           owner.stalledSince = owner.observedAt;
           if (recovered === true) owner.position = owner.current;
@@ -8968,7 +9661,7 @@ function startWatcher() {
       }
     }
 
-    // SoundCloud can park at the endpoint without firing ended. Two paused
+    // A custom deck can park at the endpoint without firing ended. Two paused
     // endpoint polls distinguish this from a seek near the end.
     const parkedAtEnd = timing.duration > 0
       && !state._userPaused && !deck?.seeking
@@ -8979,59 +9672,22 @@ function startWatcher() {
       return;
     }
     endpointTicks = 0;
-    const queuedDeckActive = Number.isInteger(state._deckTrack)
-      && state.queue[state.pos] === state._deckTrack;
-    const queuedNativeActive = nativePlaybackAllowed();
-    const queuedPlaybackActive = queuedDeckActive || queuedNativeActive;
-    if (state.suspended && queuedPlaybackActive) state.suspended = false;
-
-
-    if (state.suspended) {
-      if (title && title !== lastTitle) lastTitle = title;
-      titleTicks = 0;
-      lastRemaining = timing.duration ? Math.max(0, timing.duration - timing.current) : Infinity;
-      state.lastProgress = p;
-      return;
-    }
-
-    if (title && lastTitle && title !== lastTitle) {
-      // Deck and intentional native-session changes are internal queue
-      // transitions, not external SoundCloud playback.
-      if (queuedPlaybackActive) {
-        titleTicks = 0;
-        lastTitle = title;
-        state.lastTitle = title;
+    if (!pending && Number.isInteger(state._deckTrack) && currentDeckAudio()) {
+      if (state.lastTitle !== playerTitle()) {
+        state.lastTitle = playerTitle();
         state.manualAction = false;
-        return;
       }
-      const naturalEndTitleChange = lastRemaining <= 5 || state.lastProgress >= 0.999;
-      if (!state.manualAction && naturalEndTitleChange) {
-        titleTicks = 0;
-        lastTitle = title;
-        pauseSoundCloud();
-        await advanceAtNaturalEnd();
-        return;
-      }
-      if (++titleTicks >= 2) {
-        titleTicks = 0;
-        nearEnd    = false;
-        lastTitle  = title;
-        if (state.manualAction) {
-          state.manualAction = false;
-        } else {
-          state.suspended = true;
-          updateHub();
-        }
-      }
-      return;
     }
-    titleTicks = 0;
-
     if (state.lastProgress > 0.5 && p < 0.1) nearEnd = false;
     state.lastProgress = p;
-    lastRemaining = timing.duration ? Math.max(0, timing.duration - timing.current) : Infinity;
-    if (title) lastTitle = title;
   };
+  state._watcherTick = tick;
+
+  const onMediaSeek = event => {
+    if (event.target?.tagName === 'AUDIO' && event.target === currentDeckAudio()) void tick();
+  };
+  const seekEvents = ['seeking', 'seeked', 'canplay', 'playing'];
+  for (const type of seekEvents) document.addEventListener(type, onMediaSeek, true);
 
   let worker = null;
   let fallbackInterval = null;
@@ -9052,8 +9708,10 @@ function startWatcher() {
       if (state._workerInterval === fallbackInterval) state._workerInterval = null;
     }
     document.removeEventListener('ended', onMediaEnded, true);
+    for (const type of seekEvents) document.removeEventListener(type, onMediaSeek, true);
     if (state._endedHandler === onMediaEnded) state._endedHandler = null;
     if (state._watcherToken === watcherToken) state._watcherToken++;
+    if (state._watcherTick === tick) state._watcherTick = null;
     if (state._watcherCleanup === cleanup) state._watcherCleanup = null;
   };
   state._watcherCleanup = cleanup;
@@ -9099,17 +9757,22 @@ function startWatcher() {
 
 function badges() {
   const stale = new Set(document.querySelectorAll('.tss-badge'));
+  const currentTi = currentPlaybackTrackIndex();
+  const retainedTi = retainedPlaybackTrackIndex();
 
-  state.queue.forEach((ti, qi) => {
+  const annotate = (ti, qi) => {
     const el = state.els[ti];
-    if (!el || !document.body.contains(el)) return;
+    if (!el || !document.body.contains(el)) {
+      if (el && el.nodeType === 1 && state.meta[ti]?.sourcePage) state.els[ti] = null;
+      return;
+    }
     const existing = el.querySelector('.tss-badge');
     // Duplicate queue entries can refer to the same mounted SoundCloud row.
     if (existing && !stale.has(existing)) return;
     const title = el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary');
     if (!title) return;
 
-    const cur = qi === state.pos;
+    const cur = ti === currentTi;
     const badge = existing || document.createElement('span');
     const className = `tss-badge${cur ? ' tss-badge-cur' : ''}`;
     const n = state.stats.played + (qi - state.pos);
@@ -9120,7 +9783,9 @@ function badges() {
     if (badge.parentNode !== title.parentNode || badge.nextSibling !== title) {
       title.parentNode.insertBefore(badge, title);
     }
-  });
+  };
+  if (retainedTi !== undefined) annotate(retainedTi, state.pos);
+  state.queue.forEach(annotate);
   stale.forEach(badge => badge.remove());
 }
 
@@ -9310,6 +9975,7 @@ function showStats() {
     state._playTimeRemainderMs = 0;
     state._savedStats  = null;
     state._lifetimeBase = { played: 0, elapsed: 0, playCounts: {} };
+    state._lifetimePending = null;
     try { safeStorage.removeItem(LIFETIME_KEY); } catch (_) {}
     renderStats();
   };
@@ -9539,14 +10205,16 @@ function showEqualizer() {
     if (event.target.closest('#tss-eq-save-open')) {
       saveRow.dataset.open = 'true';
       saveError.textContent = '';
-      saveName.value = state.customEqPresets[state.eqPreset] ? state.eqPreset : '';
+      saveName.value = Object.prototype.hasOwnProperty.call(state.customEqPresets, state.eqPreset) ? state.eqPreset : '';
       saveName.focus();
       saveName.select();
       return;
     }
     const button = event.target.closest('.tss-eq-preset');
     if (!button || !ensureAutoLevelAudioGraph()) return;
-    const values = EQ_PRESETS[button.dataset.preset] || state.customEqPresets[button.dataset.preset];
+    const name = button.dataset.preset;
+    const values = Object.prototype.hasOwnProperty.call(EQ_PRESETS, name) ? EQ_PRESETS[name]
+      : Object.prototype.hasOwnProperty.call(state.customEqPresets, name) ? state.customEqPresets[name] : null;
     if (!values) return;
     state.eqBands = values.slice();
     state.eqPreset = button.dataset.preset;
@@ -9663,6 +10331,7 @@ function applyVisualEffects(documentLike = document) {
   const attribute = 'data-tss-reduce-visual-effects';
   if (state.reduceVisualEffects) {
     if (root.getAttribute(attribute) !== 'true') root.setAttribute(attribute, 'true');
+    settleUpdateAttention(documentLike);
     // Settle owned finite motion through its real cleanup/render callback.
     for (const element of documentLike.querySelectorAll('[data-surface-open]')) {
       const animation = element._tssMotion;
@@ -9910,7 +10579,7 @@ function mkHub() {
     const s = document.createElement('style');
     s.id = 'tss-hub-style';
     s.textContent = `
-      #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast {
+      #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
         --tss-a:#aebaf3;--tss-ar:174;--tss-ag:186;--tss-ab:243;
         --tss-glass-base:rgba(9,10,12,.98);
         --tss-glass-surface:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%),var(--tss-glass-base);
@@ -9920,18 +10589,18 @@ function mkHub() {
         --tss-glass-shadow:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12),0 20px 54px rgba(0,0,0,.38);
       }
       @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
-        #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast {
+        #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
           --tss-glass-base:rgba(9,10,12,.54);
           --tss-glass-filter:blur(20px);
         }
       }
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) {
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) {
         --tss-glass-base:rgba(9,10,12,.98);--tss-glass-filter:none;
       }
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay),
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay) *,
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) *::before,
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast) *::after {
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay),
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay) *,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::before,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::after {
         transition:none!important;animation:none!important;scroll-behavior:auto!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;
       }
       :root[data-tss-reduce-visual-effects="true"] .tss-hub-btn:active { transform:none!important; }
@@ -10115,7 +10784,7 @@ function mkHub() {
       .tss-hub-navigation .tss-hub-btn-icon svg { width:16px !important;height:16px !important; }
       #tss-hub-settings[aria-expanded="false"] .tss-settings-back-icon,
       #tss-hub-settings[aria-expanded="true"] .tss-settings-gear-icon { display:none; }
-      .tss-deck-brand { display:flex;align-items:center;gap:8px;min-width:0; }
+      .tss-deck-brand { display:flex;align-items:center;min-width:0;flex:1; }
       .tss-deck-brandmark { display:flex;align-items:center;color:rgba(255,255,255,.8); }
       .tss-deck-brandmark svg { width:17px;height:17px; }
       .tss-hub-text-button { gap:7px;min-height:32px;padding:0 9px;border-radius:7px;background:rgba(255,255,255,.055);color:rgba(255,255,255,.88);font:600 11px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
@@ -10127,6 +10796,31 @@ function mkHub() {
         color:rgba(255,255,255,0.9);font-size:11px;font-weight:650;
         letter-spacing:0.015em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
       }
+      .tss-deck-brand-slot { display:grid;align-items:center;width:167px;max-width:100%;min-width:0;min-height:32px; }
+      .tss-deck-brand-slot > * { grid-area:1/1; }
+      .tss-deck-brand-original { display:flex;align-items:center;gap:8px;min-width:0; }
+      #tss-hub .tss-update-trigger { box-sizing:border-box;display:block;justify-self:start;min-width:0;min-height:30px;max-width:calc(100% - 8px);margin-left:8px;padding:0;border:0;border-radius:0;background:none;color:#d7ddff;font:700 12px/1 -apple-system,'Segoe UI',system-ui,sans-serif;text-align:left;white-space:nowrap;cursor:pointer;visibility:hidden;opacity:0;transform:translateY(100%); }
+      #tss-hub .tss-update-trigger:hover { color:#eef0ff; }
+      #tss-hub .tss-update-trigger:focus-visible { outline:2px solid #bfc7ff;outline-offset:2px; }
+      .tss-deck-brand[data-update] .tss-deck-brand-original { visibility:hidden;opacity:0;transform:translateY(-100%);pointer-events:none; }
+      #tss-hub .tss-deck-brand[data-update] .tss-update-trigger { visibility:visible;opacity:1;transform:translateY(0); }
+      .tss-deck-brand[data-update-attention] .tss-deck-brand-slot { animation:tss-update-clip 600ms linear; }
+      .tss-deck-brand[data-update-attention] .tss-deck-brand-original { visibility:visible;animation:tss-update-title-out 600ms cubic-bezier(.23,1,.32,1); }
+      #tss-hub .tss-deck-brand[data-update-attention] .tss-update-trigger { animation:tss-update-trigger-in 600ms cubic-bezier(.23,1,.32,1),tss-update-glow 2s ease-in-out 600ms 3; }
+      @keyframes tss-update-title-out { from { opacity:1;transform:translateY(0); } to { opacity:0;transform:translateY(-100%); } }
+      @keyframes tss-update-trigger-in { from { opacity:0;transform:translateY(100%); } to { opacity:1;transform:translateY(0); } }
+      @keyframes tss-update-glow { 0%,100% { text-shadow:none; } 50% { text-shadow:0 0 8px rgba(191,199,255,.65); } }
+      @keyframes tss-update-clip { from,to { clip-path:inset(0); } }
+      @media (prefers-reduced-motion:reduce) {
+        #tss-hub .tss-update-trigger { animation:none!important;text-shadow:none!important; }
+      }
+      #tss-update-providers { position:fixed;z-index:100010;box-sizing:border-box;width:238px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:10px;background:var(--tss-glass-surface,#080b12);color:#eef0fa;border:1px solid var(--tss-glass-rim,rgba(255,255,255,.12));border-radius:12px;box-shadow:var(--tss-glass-shadow);-webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);font:500 12px/1.4 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      .tss-update-providers-heading { display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;font-weight:650; }
+      .tss-update-providers-heading button { display:grid;place-items:center;flex-shrink:0;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:#c5cadb;font:22px/1 sans-serif;cursor:pointer; }
+      #tss-update-providers a { display:block;padding:10px 12px;border-radius:7px;color:#d5dcff;text-decoration:none; }
+      #tss-update-providers .tss-update-provider-primary { margin-bottom:4px;background:rgba(174,186,243,.15);font-weight:650; }
+      #tss-update-providers a:hover,.tss-update-providers-heading button:hover { background:rgba(174,186,243,.23); }
+      #tss-update-providers :focus-visible { outline:2px solid #bfc7ff;outline-offset:1px; }
       .tss-deck-track {
         display:grid;grid-template-columns:78px minmax(0,1fr);gap:13px;
         align-items:center;padding:5px 14px 12px;
@@ -10159,6 +10853,9 @@ function mkHub() {
       #tss-hub-volume { width:100%;height:18px;margin:0;appearance:none;background:transparent;cursor:pointer; }
       #tss-hub-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-volume-fill,10%),rgba(114,130,165,.18) var(--tss-volume-fill,10%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
       #tss-hub-volume::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-volume::-moz-range-track { height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18);box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
+      #tss-hub-volume::-moz-range-progress { height:3px;border-radius:3px;background:var(--tss-a,#aebaf3); }
+      #tss-hub-volume::-moz-range-thumb { box-sizing:border-box;width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
       #tss-hub-volume:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
       #tss-hub-volume-value { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums; }
       #tss-auto-level { justify-content:space-between; }
@@ -10417,6 +11114,7 @@ function mkHub() {
         #tss-hub-hdr { gap:6px;padding-left:10px;padding-right:10px; }
         .tss-deck-brandmark { display:none; }
         .tss-deck-label { font-size:10px; }
+        #tss-hub .tss-update-trigger { font-size:11px; }
         .tss-eq-footer { flex-wrap:wrap; }
       }
       @media (prefers-reduced-motion:reduce) {
@@ -10446,11 +11144,11 @@ function mkHub() {
   hub.innerHTML = `
     <div id="tss-hub-inner">
       <div id="tss-hub-hdr">
-        <div class="tss-deck-brand"><span class="tss-deck-brandmark" aria-hidden="true">${SVG.shuffle}</span><span class="tss-deck-label">True Shuffle</span></div>
+        <div class="tss-deck-brand"><span class="tss-deck-brand-slot"><span class="tss-deck-brand-original"><span class="tss-deck-brandmark" aria-hidden="true">${SVG.shuffle}</span><span class="tss-deck-label">True Shuffle</span></span><button type="button" class="tss-update-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="tss-update-providers" aria-hidden="true" tabindex="-1">Update available</button></span></div>
         <div class="tss-hub-navigation">
           <button id="tss-playback-debug" class="tss-hub-btn tss-hub-btn-icon" type="button" hidden aria-label="Playback issue: open report" title="Playback issue: open report"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6.75"/><circle cx="8" cy="12.5" r="1" fill="currentColor" stroke="none"/></svg></button>
           <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" type="button" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP">${SVG.pip}</button>
-          <button id="tss-hub-col" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Minimize player" aria-expanded="true" title="Minimize player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
+          <button id="tss-hub-col" class="tss-hub-btn tss-hub-btn-icon" type="button" hidden aria-label="Minimize player" aria-expanded="true" title="Minimize player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
           <button id="tss-hub-settings" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-controls="tss-hub-settings-view" aria-expanded="false" aria-label="Settings" title="Settings"><span class="tss-settings-gear-icon">${SVG.gear}</span><span class="tss-settings-back-icon">${SVG.back}</span></button>
         </div>
       </div>
@@ -10535,6 +11233,7 @@ function mkHub() {
 
   document.body.appendChild(hub);
   applyVisualEffects(document);
+  mountUpdateNotice(hub);
   document.getElementById('tss-reduce-visual-effects').onchange = event => setReducedVisualEffects(event.currentTarget.checked);
   document.getElementById('tss-scroll-long-titles').onchange = event => setScrollLongTitles(event.currentTarget.checked);
 
@@ -10689,6 +11388,8 @@ function updateHub() {
 
   const active  = state.active;
   const loading = state.loading;
+  const minimizeButton = document.getElementById('tss-hub-col');
+  if (minimizeButton && minimizeButton.hidden !== !active) minimizeButton.hidden = !active;
 
   const onDifferentPlaylist = active && isCollectionPage(location.href)
     && playlistBase(location.href) !== playlistBase(state.playlistUrl);
@@ -10777,25 +11478,20 @@ function updateHub() {
 
   refreshPlayBtn();
 
-  if (state.suspended) {
-    const tEl = document.getElementById('tss-hub-title');
-    const aEl = document.getElementById('tss-hub-artist');
-    const title = playerTitle() || '—';
-    if (tEl && tEl.textContent !== title) tEl.textContent = title;
-    if (aEl && aEl.textContent !== '↩ not in queue') aEl.textContent = '↩ not in queue';
-    const art = document.getElementById('tss-hub-art');
-    if (art && art.dataset.src) {
-      delete art.dataset.src;
-      art.innerHTML = SVG.note;
-    }
-    return;
-  }
-
-  const m   = state.meta[state.queue?.[state.pos]];
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue?.[state.pos];
+  const m = state.meta[currentTi];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');
   const title = playerTitle() || m?.title || '—';
-  const artist = m?.artist || '—';
+  const unavailableReasons = {
+    'preview-only': 'Only a preview is accessible',
+    'preview-limited': 'Full stream unavailable',
+    'access-restricted': 'Full stream access restricted',
+    'hls-mse-unavailable': 'Custom decoder unavailable',
+  };
+  const artist = !currentDeckAudio() && state.suspended
+    ? unavailableReasons[m?.customPlaybackReason] || 'Custom playback unavailable — retrying'
+    : m?.artist || '—';
   if (tEl && tEl.textContent !== title) tEl.textContent = title;
   if (aEl && aEl.textContent !== artist) aEl.textContent = artist;
 
@@ -11163,25 +11859,32 @@ function toggleSidebar(event = null) {
 
 
 function bindQueueRowActions(row, qi, ti, cur, past, filter) {
-  row.draggable = true;
+  const meta = state.meta[ti];
+  const epoch = state._collectionEpoch;
+  row.draggable = !cur;
   row.ondragstart = e => {
-    state.dragSrc = qi;
+    state.dragSrc = { ti, meta, epoch };
     e.dataTransfer.effectAllowed = 'move';
     row.style.opacity = '0.35';
   };
-  row.ondragend = () => { row.style.opacity = past ? '0.3' : '1'; };
+  row.ondragend = () => { state.dragSrc = null; row.style.opacity = past ? '0.3' : '1'; };
   row.ondragover = e => { e.preventDefault(); row.style.background = 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)'; };
   row.ondragleave = () => { row.style.background = cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)' : 'transparent'; };
   row.ondrop = e => {
     e.preventDefault();
-    if (state.dragSrc === null || state.dragSrc === qi) return;
-    const src = state.dragSrc;
-    const [moved] = state.queue.splice(src, 1);
-    state.queue.splice(qi, 0, moved);
-    if (state.pos === src) state.pos = qi;
-    else if (src < state.pos && qi >= state.pos) state.pos--;
-    else if (src > state.pos && qi <= state.pos) state.pos++;
+    const drag = state.dragSrc;
     state.dragSrc = null;
+    if (!drag || drag.epoch !== state._collectionEpoch || epoch !== state._collectionEpoch
+        || state.meta[drag.ti] !== drag.meta || state.meta[ti] !== meta) return;
+    const src = state.queue.indexOf(drag.ti);
+    const target = state.queue.indexOf(ti);
+    if (src < 0 || target < 0 || src === target || src === state.pos || target === state.pos) return;
+    const ownerTi = currentPlaybackTrackIndex();
+    if (drag.ti === ownerTi || ti === ownerTi) return;
+    const [moved] = state.queue.splice(src, 1);
+    state.queue.splice(target, 0, moved);
+    if (src < state.pos && target >= state.pos) state.pos--;
+    else if (src > state.pos && target <= state.pos) state.pos++;
     refreshUpcomingCrossfadePreparation();
     badges();
     renderList(filter);
@@ -11194,6 +11897,7 @@ function bindPlayNextRowAction(row, index) {
   row.oncontextmenu = e => {
     e.preventDefault();
     state.playNext.splice(index, 1);
+    recountRoundTotal();
     refreshUpcomingCrossfadePreparation();
     renderList();
   };
@@ -11242,11 +11946,31 @@ function renderList(filter) {
     count.textContent = `${current} / ${total}`;
   }
 
+  const currentTi = currentPlaybackTrackIndex();
+  const pendingTi = currentPendingPlaybackTrack()?.ti;
+  const retainedTi = retainedPlaybackTrackIndex();
+  let currentRow = null;
+
   if (state.suspended && !q) {
     const banner = document.createElement('div');
     banner.style.cssText = 'padding:6px 14px;font-size:10px;color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.06);border-bottom:1px solid rgba(255,255,255,.06);';
-    banner.textContent = '↩ external track playing — queue will resume after';
+    banner.textContent = retainedTi !== undefined
+      ? 'Custom playback unavailable — current track retained; retrying next track'
+      : 'Custom playback unavailable — retrying';
     children.push(banner);
+  }
+
+  // The outgoing deck can remain audible after its queue entry was consumed.
+  // Show that owner without putting the consumed track back into the round.
+  if (retainedTi !== undefined && !state.queue.includes(retainedTi)) {
+    const m = state.meta[retainedTi] || { title: '—', artist: '—', artwork: null };
+    if (!q || m.title.toLowerCase().includes(q) || m.artist.toLowerCase().includes(q)) {
+      currentRow = mkRow(m, -1, retainedTi, true, false);
+      currentRow._tssQueueTi = retainedTi;
+      currentRow.setAttribute('aria-current', 'true');
+      currentRow.style.cursor = 'default';
+      children.push(currentRow);
+    }
   }
 
   if (state.playNext.length && !q) {
@@ -11273,12 +11997,13 @@ function renderList(filter) {
     const m = state.meta[ti] || { title: '—', artist: '—', artwork: null };
     if (q && !m.title.toLowerCase().includes(q) && !m.artist.toLowerCase().includes(q)) return;
 
-    const cur  = qi === state.pos;
-    const past = qi <  state.pos;
+    const cur = ti === currentTi;
+    const waiting = ti === pendingTi && !cur;
+    const past = qi < state.pos && !cur;
     // mkRow captures only current/past display state in its hover handlers.
     // Queue-index/filter-dependent handlers below are rebound on every pass.
     const previous = previousRows.get(ti);
-    const flags = (cur ? 1 : 0) | (past ? 2 : 0);
+    const flags = (cur ? 1 : 0) | (past ? 2 : 0) | (waiting ? 4 : 0);
     const text = previous?.children[2];
     const image = previous?.children[1]?.querySelector('img');
     const number = previous?.lastElementChild;
@@ -11291,13 +12016,14 @@ function renderList(filter) {
       && text?.children[0]?.textContent === String(m.title ?? '')
       && text?.children[1]?.textContent === String(m.artist ?? '')
       && (image?.getAttribute('src') || '') === (m.artwork || '')
-      && previous.children[3]?.textContent === (cur ? 'playing' : '')
+      && previous.children[3]?.textContent === (cur ? 'playing' : waiting ? 'waiting' : '')
       && previous.style.opacity === (past ? '0.3' : '1')
       && numberMatches;
-    const row = reusable ? previous : mkRow(m, qi, ti, cur, past);
+    const row = reusable ? previous : mkRow(m, qi, ti, cur, past, waiting);
     previousRows.delete(ti);
     row._tssQueueTi = ti;
     row._tssQueueFlags = flags;
+    if (cur) currentRow = row;
 
     bindQueueRowActions(row, qi, ti, cur, past, filter);
     children.push(row);
@@ -11323,9 +12049,7 @@ function renderList(filter) {
   // Background refreshes must not pull the reader back to the playing track.
   list.scrollTop = preserveScroll ? scrollTop : 0;
   if (!preserveScroll && !q) {
-    let offset = state.playNext.length ? state.playNext.length + 2 : 0;
-    if (state.suspended) offset++;
-    list.children[state.pos + offset]?.scrollIntoView({ block: 'nearest', behavior: motionIsInstant() ? 'instant' : 'smooth' });
+    currentRow?.scrollIntoView({ block: 'nearest', behavior: motionIsInstant() ? 'instant' : 'smooth' });
   }
 
   refreshPlayBtn();
@@ -11399,7 +12123,7 @@ function renderHistory(filter = '') {
   }
 }
 
-function mkRow(m, qi, ti, cur, past) {
+function mkRow(m, qi, ti, cur, past, waiting = false) {
   const row = document.createElement('div');
   row.className = 'tss-queue-row';
   row.style.cssText = `
@@ -11445,8 +12169,8 @@ function mkRow(m, qi, ti, cur, past) {
 
   const status = document.createElement('span');
   status.className = 'tss-queue-status';
-  status.textContent = cur ? 'playing' : qi < 0 ? 'next' : '';
-  status.style.cssText = cur
+  status.textContent = cur ? 'playing' : waiting ? 'waiting' : qi < 0 ? 'next' : '';
+  status.style.cssText = cur || waiting
     ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12);'
     : qi < 0
       ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.1);'
@@ -11485,10 +12209,10 @@ function showCtxMenu(e, qi, ti) {
     { label: '⏭ play next',  action: () => { if (state._playbackEpoch === epoch) queueNext(ti); } },
     {
       label:    '↑ move up',
-      disabled: qi <= state.pos + 1,
+      disabled: qi <= state.pos + 1 || ti === currentPlaybackTrackIndex(),
       action:   () => {
         const index = targetIndex();
-        if (index <= state.pos + 1) return;
+        if (index <= state.pos + 1 || ti === currentPlaybackTrackIndex()) return;
         [state.queue[index], state.queue[index - 1]] = [state.queue[index - 1], state.queue[index]];
         refreshUpcomingCrossfadePreparation();
         badges(); renderList();
@@ -11496,19 +12220,19 @@ function showCtxMenu(e, qi, ti) {
     },
     {
       label:    '↓ move down',
-      disabled: qi <= state.pos || qi >= state.queue.length - 1,
+      disabled: qi <= state.pos || qi >= state.queue.length - 1 || ti === currentPlaybackTrackIndex(),
       action:   () => {
         const index = targetIndex();
-        if (index <= state.pos || index >= state.queue.length - 1) return;
+        if (index <= state.pos || index >= state.queue.length - 1 || ti === currentPlaybackTrackIndex()) return;
         [state.queue[index], state.queue[index + 1]] = [state.queue[index + 1], state.queue[index]];
         refreshUpcomingCrossfadePreparation();
         badges(); renderList();
       },
     },
     { label: '🔗 copy link', action: () => { if (m.link) navigator.clipboard.writeText(m.link).catch(() => {}); } },
-    { label: '✕ remove', disabled: qi === state.pos, action: () => {
+    { label: '✕ remove', disabled: qi === state.pos || ti === currentPlaybackTrackIndex(), action: () => {
       const index = targetIndex();
-      if (index !== -1 && index !== state.pos) removeFromQueue(index);
+      if (index !== -1 && index !== state.pos && ti !== currentPlaybackTrackIndex()) removeFromQueue(index);
     } },
   ];
 
@@ -11592,11 +12316,8 @@ async function onNav() {
   const registered = state._liveSyncSources.has(pageUrl) || pageUrl === playlistBase(state.playlistUrl || '');
   if (wasActive) {
     state.suspended = !validPage() || (!registered && !isPassiveBrowsePage(location.href));
-    if (state.suspended && Number.isInteger(state._nativeTrack)) {
-      state._nativeTrack = null;
-      pauseSoundCloudTransport();
-      pauseSoundCloud();
-    }
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
     updateHub();
   }
   try {
@@ -11637,7 +12358,10 @@ let lastUrl = location.href;
 let injectRetryTimer = null;
 function checkForNavigation() {
   if (location.href === lastUrl) return false;
+  const previousUrl = lastUrl;
   lastUrl = location.href;
+  if (location.href.split('#')[0] === previousUrl.split('#')[0]) return false;
+  updateNoticeState.closeChooser?.();
   if (injectRetryTimer) {
     clearTimeout(injectRetryTimer);
     injectRetryTimer = null;

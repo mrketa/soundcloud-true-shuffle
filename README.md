@@ -1,6 +1,6 @@
 # SoundCloud True Shuffle
 
-[![Version 6.3.0](https://img.shields.io/badge/version-6.3.0-ff5500)](CHANGELOG.md)
+[![Version 6.3.1](https://img.shields.io/badge/version-6.3.1-ff5500)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Install userscript](https://img.shields.io/badge/userscript-install-ff5500)](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)
 
@@ -28,6 +28,7 @@ The GitHub link points to the public build on `main`. Choose one installation ch
 - **Audio tools:** a two-deck player, adjustable crossfade with Smooth, Clean and DJ profiles, a five-band equalizer with saved custom presets, and Auto Level to reduce volume differences between tracks.
 - **Session controls:** a sleep timer, Stop after this round, and an explicit End shuffle session action.
 - **Playback supervision:** background scheduling and bounded stall recovery, subject to browser and operating-system limits.
+- **Update notifications:** checks once per day for a newer stable release and offers a compact Greasy Fork / GitHub release chooser in the player header.
 
 Track availability still depends on SoundCloud, your account and network conditions. Collection loading cannot make unavailable tracks playable.
 
@@ -38,7 +39,7 @@ Track availability still depends on SoundCloud, your account and network conditi
 3. Open **Queue** to manage upcoming tracks or merge another playlist. **Reshuffle**, beside Queue, reshuffles upcoming tracks without reloading the page.
 4. Open the header's **Settings** gear to adjust playback or end the session.
 
-True Shuffle normally pauses SoundCloud's native player and uses its own audio decks. Certain tracks can fall back to SoundCloud's native playback; crossfade and audio processing are unavailable in that mode.
+True Shuffle pauses SoundCloud's native player and plays tracks exclusively through its own two-deck audio engine.
 
 ### Settings
 
@@ -77,7 +78,7 @@ The compatibility targets are current Chrome, Edge, Brave, Opera, Firefox and Sa
 
 - Chromium browsers and Firefox can use Tampermonkey or Violentmonkey where supported; Safari can use Tampermonkey. Manager availability and injection permissions vary.
 - Picture-in-picture uses a separate document window where available, otherwise video PiP or an in-page mini-player. Controls and window behavior differ between modes.
-- AAC HLS playback depends on browser media capabilities and the declared userscript dependency, hls.js. Previews and HLS/MSE startup failures may use native SoundCloud playback instead.
+- AAC HLS and supported Widevine-encrypted streams play through the browser's media capabilities and the declared userscript dependency, hls.js.
 - Background recovery cannot prevent browser tab suspension, operating-system sleep, network interruptions or SoundCloud changes from interrupting playback.
 - The script integrates with SoundCloud's web interface; site changes can affect collection loading and playback.
 
@@ -95,16 +96,15 @@ For bugs or suggestions, open a [GitHub issue](https://github.com/mrketa/soundcl
 - The page type, steps to reproduce, and expected versus actual behavior.
 - A copied diagnostic report if available; a report is not required to describe a problem.
 
-## Development
+## Build
 
-Requirements: **Python 3** for the build and **Node.js** with the built-in `node:test` runner for regression tests.
+Requirements: **Python 3**.
 
 ```sh
 python build.py
-node --test tests/*.test.js
 ```
 
-The standard build copies [`SC Trueshuffle.js`](SC%20Trueshuffle.js) **verbatim** to [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js). Edit the canonical source, then regenerate the public build. The tests target that source by default; `TSS_SCRIPT` can select another script artifact explicitly. Automated tests do not replace real SoundCloud/browser integration checks.
+The standard build copies [`SC Trueshuffle.js`](SC%20Trueshuffle.js) **verbatim** to [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js). Edit the canonical source, then regenerate the public build.
 
 ### Optional diagnostic build
 
@@ -112,7 +112,7 @@ The standard build copies [`SC Trueshuffle.js`](SC%20Trueshuffle.js) **verbatim*
 python build.py --diagnostic
 ```
 
-This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifact named **SoundCloud True Shuffle (Temporary Diagnostic)**. It keeps version 6.3.0 and enables verbose diagnostic tracing. Install it locally only when needed, **disable every other True Shuffle copy**, and reload SoundCloud. Its distinct name does not isolate shared preferences. Disable it before returning to the stable script.
+This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifact named **SoundCloud True Shuffle (Temporary Diagnostic)**. It keeps version 6.3.1 and enables verbose diagnostic tracing while keeping the header report button hidden unless a fault occurs. Install it locally only when needed, **disable every other True Shuffle copy**, and reload SoundCloud. Its distinct name does not isolate shared preferences. Disable it before returning to the stable script.
 
 ### Repository layout
 
@@ -121,7 +121,6 @@ This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifa
 | [`SC Trueshuffle.js`](SC%20Trueshuffle.js) | Canonical userscript source |
 | [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js) | Public installable build |
 | [`build.py`](build.py) | Standard and diagnostic build commands |
-| [`tests/`](tests/) | Node.js regression tests |
 | [`screenshots/6.3.0/`](screenshots/6.3.0/) | Interface screenshots using demo data |
 | [`CHANGELOG.md`](CHANGELOG.md) | User-facing release notes |
 | [`LICENSE`](LICENSE) | MIT license |

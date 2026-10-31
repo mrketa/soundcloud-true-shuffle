@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## v6.3.1 - 2026-10-31
 
-- Clean up the public repository and refresh its documentation. No runtime changes.
+- Add an **Update available** header notice when a newer stable release is published on GitHub, with a compact **Greasy Fork / GitHub release** source chooser and a once-per-day check limit. Hide the minimize button when no shuffle session is active.
+- Play tracks exclusively through True Shuffle's two-deck player without falling back to SoundCloud's native player, and block detached native SoundCloud audio elements from playing in the background on Firefox.
+- Support Widevine-encrypted SoundCloud streams in the custom HLS decks where browser EME is available, including Firefox's uncaptured media-key setup order before Web Audio routing.
+- Preserve smooth crossfades when seeking into the fade window on both buffered and unbuffered HLS streams, and keep explicit Pause/Stop authoritative across active crossfades and pending resume operations.
+- Prevent long-session memory growth and progressive crossfade lags over multi-day 24/7 playback by bounding `hls.js` back-buffers, cleaning up superseded standby HLS instances and preflights, refreshing expired embedded stream metadata, deduplicating `AudioParam` automation, and releasing detached DOM row references.
+- Fix Firefox volume slider track and progress-fill styling in the main player and PiP, bind queued busy-skip requests to their target track so a failed candidate cannot skip its replacement, and keep the header report button hidden unless a playback fault occurs.
 
 ## v6.3.0 - 2026-10-24
 

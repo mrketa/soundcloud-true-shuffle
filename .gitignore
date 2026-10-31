@@ -6,14 +6,16 @@
 /HANDOFF.md
 /GreasyFork-*.md
 
-# Historical implementations and design experiments (kept locally)
+# Local test suite, backup userscripts, historical implementations and design experiments
+/tests/
 /src/
 /mockups/
 /soundcloud-true-shuffle.user.js
 /old working.js
 /SC Trueshuffle.redesign.js
 /SC Trueshuffle.v*-*.js
-
+/SC Trueshuffle.*.user.js
+/screenshots/trueshuffle-update-*
 # Only the canonical installable build is published
 /dist/*
 !/dist/SC Trueshuffle.user.js
