@@ -1,10 +1,10 @@
 # SoundCloud True Shuffle
 
-[![Version 6.3.1](https://img.shields.io/badge/version-6.3.1-ff5500)](CHANGELOG.md)
+[![Version 6.4.0](https://img.shields.io/badge/version-6.4.0-ff5500)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Install userscript](https://img.shields.io/badge/userscript-install-ff5500)](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)
 
-A userscript for SoundCloud with collection-wide shuffle, a floating player, an editable queue and audio controls.
+A userscript for SoundCloud with collection-wide shuffle, an optional **True DJ** mode, a floating player, an editable queue and audio controls.
 
 **[Install from GitHub](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)** · [Install from Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) · [Release notes](CHANGELOG.md) · [Report an issue](https://github.com/mrketa/soundcloud-true-shuffle/issues)
 
@@ -22,12 +22,13 @@ The GitHub link points to the public build on `main`. Choose one installation ch
 
 ## What it does
 
-- **Collection-wide shuffle:** collects available tracks from playlists, likes, profile tracks, reposts and the Feed before shuffling with Fisher–Yates. New rounds continue when the current round finishes.
-- **Queue control:** search and reorder upcoming tracks, use Play Next, review listening history, and merge playlists into the session. Merged sources are checked for new tracks.
-- **Floating player:** artwork, waveform, volume and playback controls, with picture-in-picture options where supported.
-- **Audio tools:** a two-deck player, adjustable crossfade with Smooth, Clean and DJ profiles, a five-band equalizer with saved custom presets, and Auto Level to reduce volume differences between tracks.
+- **Collection-wide shuffle:** collects available tracks from playlists, likes, profile tracks, reposts and the Feed silently in the background (with a configurable Feed track limit) before shuffling with Fisher–Yates. New rounds continue when the current round finishes.
+- **True DJ:** an optional Spotify-style DJ (header headphones icon beside PiP—always starting off on page load while keeping your saved DJ preferences, resetting cleanly when a session ends so starting **True DJ** is always a single click with zero background downloads while off, and switching the header brand to **True DJ**—or **Settings → DJ**) that sequences 3–4 track chapters across fresh opening sets (with cross-session opener rotation), favorites, genre pockets, throwbacks, artist spotlights, underground cuts, time-of-day energy flows and live SoundCloud `/related` discovery sets, with smooth tempo, energy, and **Camelot harmonic key** flow ordering (including Open Key and `0.5x`/`2x` BPM matching), a one-click **Switch vibe** crossfade button right in the main player & PiP controls, automatic chapter recalibration on consecutive early skips, smart waveform-aware auto-mixing (`1.5s–9.5s` dynamic lengths & Bézier curves with automatic short-bumper tightening), opt-in **EQ bass swap** (`135 Hz` low-shelf kick/sub swap) and **Waveform cue-in / cue-out** trimming, and **Local Voice** (*Studio HD · Kokoro 82M* `~88 MB` cached CPU WASM default with off-main-thread vocal DSP and zero GPU/UI lag, plus *Studio Ultra* WebGPU and *Low-Spec · Fast Lite* `~26 MB` options, adjustable talk frequency, SoundCloud handle/leetspeak artist cleanup, vocal-aware pre-transition commentary, `48 kHz` broadcast vocal EQ, an instant 2-clause **cold-open welcome intro** before Track #1, smooth music ducking, and a speaking **True DJ** cover crossfade) or **Silent** curation (one-click voice opt-out).
+- **Queue control:** search, reorder upcoming tracks by drag-and-drop or by typing a target queue slot number directly (in the Queue or PiP Queue, including filtered search results), use Play Next, review listening history, and merge playlists into the session. Merged sources automatically sync new tracks, metadata/artwork/collaborator updates, and replaced audio files without reloading.
+- **Floating player:** artwork, waveform, volume and playback controls, always-available shrink mode, a draggable **Hide player** pill, and picture-in-picture options where supported.
+- **Audio tools:** a two-deck player, adjustable crossfade with Smooth, Clean, DJ and Custom Bézier curve profiles (with built-in and saved custom transition presets plus live transition preview), a five-band equalizer with saved custom presets, and Auto Level to reduce volume differences between tracks.
 - **Session controls:** a sleep timer, Stop after this round, and an explicit End shuffle session action.
-- **Playback supervision:** background scheduling and bounded stall recovery, subject to browser and operating-system limits.
+- **Playback supervision:** background scheduling, bounded stall recovery, signed stream expiry refresh, AAC-first MSE codec selection, semantic/ARIA DOM fallbacks, and automatic `AudioContext` device-switch self-healing, subject to browser and operating-system limits.
 - **Update notifications:** checks once per day for a newer stable release and offers a compact Greasy Fork / GitHub release chooser in the player header.
 
 Track availability still depends on SoundCloud, your account and network conditions. Collection loading cannot make unavailable tracks playable.
@@ -39,17 +40,18 @@ Track availability still depends on SoundCloud, your account and network conditi
 3. Open **Queue** to manage upcoming tracks or merge another playlist. **Reshuffle**, beside Queue, reshuffles upcoming tracks without reloading the page.
 4. Open the header's **Settings** gear to adjust playback or end the session.
 
-True Shuffle pauses SoundCloud's native player and plays tracks exclusively through its own two-deck audio engine.
+True Shuffle plays shuffle tracks through its own two-deck audio engine and pauses SoundCloud's native player during active shuffle playback; clicking a SoundCloud track or transport play control directly hands playback back to SoundCloud until you resume True Shuffle.
 
 ### Settings
 
 | Tab | Controls |
 | --- | --- |
-| **Audio** | Crossfade duration and profile, Fade manual skips, Auto Level, and Open equalizer |
-| **Session** | Sleep timer, Stop after this round, and End shuffle session |
+| **Audio** | Crossfade duration and profile (Smooth, Clean, DJ, and Custom Bézier curve editor), Fade manual skips, Auto Level, and Open equalizer |
+| **DJ** | **True DJ** toggle, **Mood** (*Auto*, *Favorites*, *Discovery*, *Throwbacks*, *Chill*, *Energy*) & **Switch vibe**, **DJ Voice** (**Silent** vs. **Local Voice** with 7 host voices, **How often** commentary frequency, `20–150%` volume and live preview), plus collapsible **Voice quality** (*Studio HD · Kokoro 82M* `~88 MB` CPU WASM default, *Studio Ultra · Kokoro 82M* WebGPU `fp32`, or *Low-Spec · Fast Lite* `~26 MB` CPU WASM) and **Mixing & discovery** (**Auto-mix transitions**, **Discover related tracks**, **Bass swap**, **Skip silent intros & outros**) sections |
+| **Session** | Sleep timer, Feed track limit (1–250, default 50), Stop after this round, and End shuffle session |
 | **Info** | Listening statistics, Reduce visual effects, and Scroll long titles |
 
-**Reduce visual effects** is a manual appearance preference, not an audio-quality or hardware-detection mode. **Scroll long titles** is independent; the system's reduced-motion preference also prevents title animation. Preferences and custom EQ presets are stored locally where browser storage is available. Blocked storage can prevent settings from surviving a reload.
+**Reduce visual effects** is a manual appearance preference, not an audio-quality or hardware-detection mode. **Scroll long titles** is independent; the system's reduced-motion preference also prevents title animation. Preferences and custom crossfade and EQ presets are stored locally where browser or userscript storage is available. Blocked storage can prevent settings from surviving a reload.
 
 <details>
 <summary>More screenshots — version 6.3.0, demo data</summary>
@@ -84,7 +86,7 @@ The compatibility targets are current Chrome, Edge, Brave, Opera, Firefox and Sa
 
 ## Privacy and feedback
 
-Settings, queue caches and learned audio levels use local browser/userscript storage. Playback makes requests to SoundCloud and its media services; the userscript manager also loads the declared [hls.js dependency](https://www.jsdelivr.com/package/npm/hls.js). The script does not automatically upload diagnostic reports or send analytics telemetry.
+Settings, queue caches, DJ taste profiles and learned audio levels use local browser/userscript storage. Playback makes requests to SoundCloud and its media services; the userscript manager also loads the declared [hls.js dependency](https://www.jsdelivr.com/package/npm/hls.js), and **Local Voice** loads the selected studio neural TTS model (*Studio HD · Kokoro 82M* `~88 MB` CPU WASM default, *Studio Ultra · Kokoro 82M* `~310 MB` WebGPU, or *Low-Spec · Fast Lite* `~26 MB` CPU WASM) inside a background Web Worker when **True DJ** is enabled (**Silent** mode and leaving **True DJ** off download nothing). The script does not automatically upload diagnostic reports or send analytics telemetry.
 
 If playback stalls, try **Cancel loading** or **Settings → Session → End shuffle session**, then start a new session. A classified playback fault can reveal a **red exclamation mark next to PiP** in the header. Open it and choose **Copy report**; optional full technical details have a separate copy action. Copy the report before reloading.
 
@@ -112,7 +114,7 @@ The standard build copies [`SC Trueshuffle.js`](SC%20Trueshuffle.js) **verbatim*
 python build.py --diagnostic
 ```
 
-This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifact named **SoundCloud True Shuffle (Temporary Diagnostic)**. It keeps version 6.3.1 and enables verbose diagnostic tracing while keeping the header report button hidden unless a fault occurs. Install it locally only when needed, **disable every other True Shuffle copy**, and reload SoundCloud. Its distinct name does not isolate shared preferences. Disable it before returning to the stable script.
+This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifact named **SoundCloud True Shuffle (Temporary Diagnostic)**. It keeps the same `@version` as `SC Trueshuffle.js` and enables verbose diagnostic tracing while keeping the header report button hidden unless a fault occurs. Install it locally only when needed, **disable every other True Shuffle copy**, and reload SoundCloud. Its distinct name does not isolate shared preferences. Disable it before returning to the stable script.
 
 ### Repository layout
 

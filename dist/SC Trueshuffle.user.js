@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud True Shuffle
 // @namespace    https://greasyfork.org/scripts/soundcloud-true-shuffle
-// @version      6.3.1
+// @version      6.4.0
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @description  True full-playlist shuffle with a two-deck player, DJ crossfade, equalizer, Auto Level, queue and background playback.
 // @author       keta
@@ -24,9 +24,13 @@ const DIAGNOSTIC_BUILD = false;
 // Preserve time for the incoming track's fade-out while allowing short bumpers to fade in.
 const CROSSFADE_MIN_DURATION_SECONDS = 0.25;
 const CUSTOM_EQ_PRESETS_KEY = 'tss_eq_custom_presets_v1';
+const CUSTOM_CF_PRESETS_KEY = 'tss_cf_custom_presets_v1';
+const DJ_TELEMETRY_KEY = 'tss_dj_telemetry_v1';
+const LAST_GOOD_CLIENT_ID_KEY = 'tss_last_good_client_id';
 const BLOCKED_EQ_PRESET_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
 const PLAYBACK_DIAGNOSTIC_FAULTS = new Set([
   'crossfade-clock-stall', 'crossfade-deck-paused', 'crossfade-handoff-failed',
+  'transition-silence-gap',
   'recovery-exhausted', 'recovery-failed', 'playback-operation-failed',
   'custom-start-exhausted', 'custom-start-candidate-failed', 'hls-playback-failed',
   'audio-graph-failed', 'audio-context-resume-failed', 'audio-context-suspend-failed',
@@ -344,6 +348,9 @@ const DIAGNOSTIC_NUMBER_FIELDS = new Set([
   'sampledSchedulingLeadMs', 'schedulingSubmissionMs', 'estimatedSchedulingLeadMs',
   'observationElapsedMs', 'audioClockFromFadeStartMs',
   'incomingBaselineTime', 'incomingScheduledTime', 'incomingAdvanceMs',
+  'outgoingDuration', 'silenceGapMs', 'watcherPickupMs', 'foregroundPrepMs',
+  'streamLookupMs', 'graphResumeMs', 'incomingAdvanceDelayMs', 'bufferedStartPts',
+  'hydratedCount', 'domCount',
 ]);
 const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
   'passExhausted', 'clientIdFound', 'authFailed', 'trackMetadataFound',
@@ -360,7 +367,7 @@ const DIAGNOSTIC_BOOLEAN_FIELDS = new Set([
   'outgoingPaused',
   'bufferedDataAvailable',
   'autoLevel', 'eqEnabled', 'safetyClipper', 'foreground', 'detached', 'fatal', 'transitionDiagnosticsEnabled',
-  'progressAlreadyAtSchedule',
+  'progressAlreadyAtSchedule', 'preflightAdopted', 'standbyReadyAtWindow', 'standbyReadyAtEnd', 'reusedReadyDeck',
 ]);
 const DIAGNOSTIC_STRING_FIELDS = new Set([
   'event', 'operation', 'stage', 'failureStage', 'failureReason', 'reason',
@@ -388,7 +395,7 @@ const DIAGNOSTIC_SAFE_LABELS = {
   streamKind: new Set(['progressive', 'hls-mse', 'native', 'blob', 'none', 'unknown']),
   qualityClass: new Set(['aac-160k', 'aac-96k', 'mp3', 'opus', 'other', 'unknown']),
   hlsMode: new Set(['not-used', 'mse', 'unsupported']),
-  crossfadeCurve: new Set(['smooth', 'clean', 'dj']),
+  crossfadeCurve: new Set(['smooth', 'clean', 'dj', 'custom']),
   contextState: new Set(['running', 'suspended', 'closed', 'interrupted', 'missing', 'unknown']),
 };
 
@@ -521,13 +528,13 @@ function withDeadline(operation, timeoutMs = 10000, signal = null) {
 async function fetchSoundCloudResource(url, format = 'json', options = {}) {
   const {
     signal, timeoutMs = 10000, diagnosticTrace = null,
-    diagnosticStage = 'soundcloud-resource', ...requestOptions
+    diagnosticStage = 'soundcloud-resource', credentials = 'omit', ...requestOptions
   } = options;
   const startedAt = diagnosticTrace ? performance.now() : 0;
   let responseStatus = null;
   try {
     return await withDeadline(async requestSignal => {
-      const response = await fetch(url, { ...requestOptions, signal: requestSignal });
+      const response = await fetch(url, { credentials, ...requestOptions, signal: requestSignal });
       responseStatus = Number(response.status);
       const data = response.ok ? await response[format]() : null;
       if (diagnosticTrace) {
@@ -550,9 +557,13 @@ async function fetchSoundCloudResource(url, format = 'json', options = {}) {
 
 function invalidatePlaybackSession() {
   state._pipTrackMenuClose?.();
+  if (state._brandmarkPrefading && typeof syncBrandmarkCrossfade === 'function') {
+    syncBrandmarkCrossfade('cancel-prefade');
+  }
   state.dragSrc = null;
   state._playbackEpoch++;
   state._collectionEpoch++;
+  state._nextRoundQueue = null;
   state._playbackAbort.abort();
   state._playbackAbort = new AbortController();
   state._pendingPlaybackResume = null;
@@ -591,12 +602,141 @@ function loadCustomEqPresets() {
   return localPresets;
 }
 
+const CF_TEMPLATES = {
+  'S-Curve':      { mode: 'linked', in: [0.42, 0, 0.58, 1],       out: [0.42, 1, 0.58, 0] },
+  'Warm Blend':   { mode: 'split',  in: [0.24, 0.42, 0.56, 0.96], out: [0.44, 0.96, 0.76, 0.42] },
+  'Intro Tease':  { mode: 'split',  in: [0.16, 0.38, 0.78, 0.34], out: [0.68, 1, 0.88, 0.78] },
+  'Vocal Safe':   { mode: 'split',  in: [0.46, 0.04, 0.68, 0.78], out: [0.32, 0.78, 0.54, 0.04] },
+  'Long Tail':    { mode: 'split',  in: [0.16, 0.82, 0.42, 1],    out: [0.18, 0.34, 0.78, 0.22] },
+  'Late Cut':     { mode: 'linked', in: [0.76, 0.04, 0.92, 0.96], out: [0.76, 0.96, 0.92, 0.04] },
+  'Fast In':      { mode: 'linked', in: [0.12, 0.86, 0.36, 1],    out: [0.12, 0.14, 0.36, 0] },
+  'Full Overlap': { mode: 'split',  in: [0.14, 0.92, 0.34, 1],    out: [0.66, 1, 0.86, 0.92] },
+  'Radio Dip':    { mode: 'split',  in: [0.64, 0, 0.86, 0.96],    out: [0.14, 0.04, 0.36, 0] },
+};
+const CF_TEMPLATE_TOOLTIPS = {
+  'S-Curve':      'Balanced, rounded transition (50% / 50% at midpoint)',
+  'Warm Blend':   'Equal-power blend (~72% at midpoint) — keeps loudness steady with no mid-fade dip',
+  'Intro Tease':  'Sneaks the next intro in softly underneath before handing over in the final third',
+  'Vocal Safe':   'Gentle mid-fade dip (~36%) — avoids clashing vocals or keys without going silent',
+  'Long Tail':    'Next track takes the lead quickly while the old track lingers softly underneath',
+  'Late Cut':     'Holds the current track full until near the end, then cuts across quickly',
+  'Fast In':      'Brings the next track in right away and fades the current track early',
+  'Full Overlap': 'Club-style overlap — keeps both tracks near 100% through the middle',
+  'Radio Dip':    'Fades the current track almost out before bringing the next track in',
+};
+const BLOCKED_CF_PRESET_NAMES = new Set([
+  ...BLOCKED_EQ_PRESET_NAMES, 'smooth', 'clean', 'dj', 'custom',
+  ...Object.keys(CF_TEMPLATES).map(name => name.toLowerCase()),
+]);
+
+function sanitizeCrossfadeCurveConfig(value) {
+  const fallback = CF_TEMPLATES['S-Curve'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { mode: fallback.mode, in: fallback.in.slice(), out: fallback.out.slice() };
+  }
+  const clampTuple = (arr, def) => (Array.isArray(arr) && arr.length === 4
+    ? arr.map((item, idx) => {
+      const parsed = Number(item);
+      return Number.isFinite(parsed)
+        ? Math.round(Math.max(0, Math.min(1, parsed)) * 1000) / 1000
+        : def[idx];
+    })
+    : def.slice());
+  const mode = value.mode === 'split' ? 'split' : 'linked';
+  const inc = clampTuple(value.in, fallback.in);
+  const mirroredOut = [
+    inc[0],
+    Math.round((1 - inc[1]) * 1000) / 1000,
+    inc[2],
+    Math.round((1 - inc[3]) * 1000) / 1000,
+  ];
+  const out = mode === 'split' ? clampTuple(value.out, mirroredOut) : mirroredOut;
+  return { mode, in: inc, out };
+}
+
+function sanitizeCustomCfPresets(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([name, cfg]) => {
+    const trimmed = String(name).trim().replace(/\s+/g, ' ');
+    return trimmed.length > 0
+      && !BLOCKED_CF_PRESET_NAMES.has(trimmed.toLowerCase())
+      && cfg && typeof cfg === 'object' && !Array.isArray(cfg)
+      && Array.isArray(cfg.in) && cfg.in.length === 4;
+  }).slice(0, 20).map(([name, cfg]) => [
+    String(name).trim().replace(/\s+/g, ' ').slice(0, 24),
+    sanitizeCrossfadeCurveConfig(cfg),
+  ]));
+}
+
+function localCustomCfPresets() {
+  try {
+    return sanitizeCustomCfPresets(JSON.parse(safeStorage.getItem('tss_cf_custom_presets') || '{}'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function loadCustomCfPresets() {
+  const localPresets = localCustomCfPresets();
+  try {
+    if (typeof GM_getValue !== 'function') return localPresets;
+    const stored = GM_getValue(CUSTOM_CF_PRESETS_KEY, null);
+    if (stored && typeof stored === 'object' && !Array.isArray(stored) && stored.__tssCfPresets === 1) {
+      return sanitizeCustomCfPresets(stored.presets);
+    }
+    if (Object.keys(localPresets).length > 0 && typeof GM_setValue === 'function') {
+      GM_setValue(CUSTOM_CF_PRESETS_KEY, { __tssCfPresets: 1, presets: localPresets });
+    }
+  } catch (_) {}
+  return localPresets;
+}
+
+function loadCustomCrossfadeConfig() {
+  try {
+    const raw = safeStorage.getItem('tss_cf_custom_curve');
+    if (raw) return sanitizeCrossfadeCurveConfig(JSON.parse(raw));
+  } catch (_) {}
+  return sanitizeCrossfadeCurveConfig(null);
+}
+
+function resolveInitialCrossfadePreset(customCfg, customPresets) {
+  const current = sanitizeCrossfadeCurveConfig(customCfg);
+  const near = (a, b) => Math.abs(a - b) <= 0.002;
+  const matches = candidate => {
+    if (!candidate) return false;
+    const normalized = sanitizeCrossfadeCurveConfig(candidate);
+    if (normalized.mode !== current.mode) return false;
+    if (!normalized.in.every((val, idx) => near(val, current.in[idx]))) return false;
+    return normalized.mode !== 'split' || normalized.out.every((val, idx) => near(val, current.out[idx]));
+  };
+  const savedName = String(safeStorage.getItem('tss_cf_preset') || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+  if (savedName) {
+    if (Object.prototype.hasOwnProperty.call(CF_TEMPLATES, savedName) && matches(CF_TEMPLATES[savedName])) {
+      return savedName;
+    }
+    if (customPresets && Object.prototype.hasOwnProperty.call(customPresets, savedName) && matches(customPresets[savedName])) {
+      return savedName;
+    }
+  }
+  for (const name of Object.keys(CF_TEMPLATES)) {
+    if (matches(CF_TEMPLATES[name])) return name;
+  }
+  for (const name of Object.keys(customPresets || {})) {
+    if (Object.prototype.hasOwnProperty.call(customPresets, name) && matches(customPresets[name])) return name;
+  }
+  return 'Custom';
+}
+
 
 
 const state = {
   _diagnosticBuild: DIAGNOSTIC_BUILD,
   active:       false,
   stopAfterRound: false,
+  feedTrackLimit: (() => {
+    const saved = Number(safeStorage.getItem('tss_feed_track_limit'));
+    return Number.isFinite(saved) && saved >= 1 ? Math.min(250, Math.round(saved)) : 50;
+  })(),
   queue:        [],
   playNext:     [],
   pos:          0,
@@ -608,7 +748,9 @@ const state = {
   _playbackEpoch: 0,
   _playbackAbort: new AbortController(),
   _collectionEpoch: 0,
+  _nextRoundQueue: null,
   _userPaused: false,
+  _nativePlayUnlocked: false,
   _pendingPlaybackResume: null,
   lastTitle:    '',
   lastProgress: 0,
@@ -642,13 +784,20 @@ const state = {
   _likeStateTrack: null,
   _likeStateLastCheck: 0,
   crossfadeSeconds: Math.max(0, Math.min(12, Number(safeStorage.getItem('tss_crossfade_seconds')) || 0)),
-  crossfadeCurve: ['smooth', 'clean', 'dj'].includes(safeStorage.getItem('tss_crossfade_curve'))
+  crossfadeCurve: ['smooth', 'clean', 'dj', 'custom'].includes(safeStorage.getItem('tss_crossfade_curve'))
     ? safeStorage.getItem('tss_crossfade_curve')
     : 'smooth',
+  customCrossfade: loadCustomCrossfadeConfig(),
+  customCfPresets: loadCustomCfPresets(),
+  crossfadePreset: resolveInitialCrossfadePreset(loadCustomCrossfadeConfig(), loadCustomCfPresets()),
+  _cfSaveFailed: false,
+  _cfPersistTimer: null,
+  _cfCustomPresetsPending: false,
   crossfadeManual: safeStorage.getItem('tss_crossfade_manual') !== 'false',
   _playbackVolumeStored: safeStorage.getItem('tss_playback_volume') !== null
     || safeStorage.getItem('tss_crossfade_output') !== null,
-  _playbackVolumeInitialized: false,
+  _playbackVolumeInitialized: safeStorage.getItem('tss_playback_volume') !== null
+    || safeStorage.getItem('tss_crossfade_output') !== null,
   playbackVolume: (() => {
     const saved = safeStorage.getItem('tss_playback_volume') ?? safeStorage.getItem('tss_crossfade_output');
     if (saved === null) return 0.1;
@@ -689,6 +838,7 @@ const state = {
   _deckGains: [0, 0],
   _audioContext: null,
   _audioGraphSuspension: null,
+  _audioGraphResumeEpoch: 0,
   _audioGraphFailed: false,
   _audioMaster: null,
   _audioClipper: null,
@@ -705,7 +855,6 @@ const state = {
   _streamCache: new Map(),
   _widevineCapability: null,
   _clientId: '',
-  _lastSoundCloudVolume: null,
   _soundCloudVolumeModel: null,
   _customPlaybackRetryTimer: null,
   _pipBridgePlayer: null,
@@ -727,6 +876,14 @@ const state = {
   _playTimeWasAudible: false,
   _playTimeRemainderMs: 0,
   _liveSyncSources: new Map(),
+  _liveSyncBundleUrls: [],
+  _liveSyncUserIds: new Map(),
+  _liveSyncPendingForce: false,
+  _liveSyncDeferredResults: null,
+  _liveSyncMetaCursor: 0,
+  _liveSyncStubCursor: 0,
+  _liveSyncLastMetaSweepAt: 0,
+  _liveSyncLastPlaylistMetaFallbackAt: 0,
   _liveSyncInFlight: false,
   _liveSyncLastCheck: 0,
   _liveSyncTimer: null,
@@ -740,6 +897,76 @@ const state = {
   _tabTitleBeforePlayback: null,
   _tabTitleValue: '',
   _browserMetadataKey: '',
+  djMode: (() => {
+    safeStorage.removeItem('tss_dj_mode');
+    return false;
+  })(),
+  djCommentaryMode: safeStorage.getItem('tss_dj_commentary') === 'silent' ? 'silent' : 'voice',
+  djVoiceModel: ['hq', 'hq-gpu', 'lite'].includes(safeStorage.getItem('tss_dj_voice_model'))
+    ? safeStorage.getItem('tss_dj_voice_model')
+    : 'hq',
+  djVoiceId: safeStorage.getItem('tss_dj_voice_id') || 'am_michael',
+  djVoiceVolume: (() => {
+    const raw = safeStorage.getItem('tss_dj_voice_volume');
+    if (raw === null || raw === '') return 1;
+    const saved = Number(raw);
+    return Number.isFinite(saved) && saved > 0 ? Math.max(0.2, Math.min(1.5, saved)) : 1;
+  })(),
+  djTalkFrequency: ['every', 'relaxed', 'minimal'].includes(safeStorage.getItem('tss_dj_talk_freq'))
+    ? safeStorage.getItem('tss_dj_talk_freq')
+    : 'every',
+  djAutoMix: safeStorage.getItem('tss_dj_automix') !== 'false',
+  djBassSwap: safeStorage.getItem('tss_dj_bass_swap') === 'true',
+  djCueTrim: safeStorage.getItem('tss_dj_cue_trim') === 'true',
+  djDiscoveryEnabled: safeStorage.getItem('tss_dj_discovery') !== 'false',
+  djFocus: ['auto', 'favorites', 'discovery', 'throwbacks', 'chill', 'energy'].includes(safeStorage.getItem('tss_dj_focus'))
+    ? safeStorage.getItem('tss_dj_focus')
+    : 'auto',
+  _djTelemetry: null,
+  _djTelemetryDirty: false,
+  _djTelemetryTimer: null,
+  _djWaveformFeatures: new Map(),
+  _djCueOutBypass: null,
+  _djRelatedCache: new Map(),
+  _djChapter: null,
+  _djPendingChapter: null,
+  _djChapterHistory: [],
+  _djAutoChaptersSinceSpoken: 0,
+  _djRecentScripts: [],
+  _djCurrentTrackTi: null,
+  _djCurrentTrackStartedAt: 0,
+  _djSkipStreak: 0,
+  _djSessionCooldowns: new Map(),
+  _djWaveformWarmInFlight: new Set(),
+  _djTransitionCache: null,
+  _djPlanSeq: 0,
+  _djPlanAbort: null,
+  _djPlanningInFlight: false,
+  _djVibeSwitching: false,
+  _djWorkerRetryAfter: 0,
+  _djVibeSwitchFade: 0,
+  _djBannerBadge: '',
+  _djBannerText: '',
+  _djSpeaking: false,
+  _djOpeningIntroActive: false,
+  _djOpeningIntroCancel: null,
+  _djOpeningHandoff: false,
+  _djWorker: null,
+  _djWorkerBlobUrl: '',
+  _djWorkerStatus: 'idle',
+  _djWorkerBackend: '',
+  _djWorkerProgress: 0,
+  _djWorkerError: '',
+  _djWorkerReqSeq: 0,
+  _djWorkerPending: new Map(),
+  _djMusicBus: null,
+  _djVoiceGain: null,
+  _djMusicBusContext: null,
+  _djActiveVoiceSource: null,
+  _djVoiceSources: new Set(),
+  _djDuckTimer: null,
+  _djMusicBusAppliedGain: 1,
+  _djDuckRampAnchor: null,
   stats: {
     played:     0,
     playCounts: {},
@@ -978,6 +1205,7 @@ function formatPlaybackClock(seconds) {
 }
 
 function paused() {
+  if (typeof state !== 'undefined' && state?._djOpeningIntroActive && !state._userPaused) return false;
   const deck = currentDeckAudio();
   return !deck || deck.paused || deck.ended;
 }
@@ -985,6 +1213,7 @@ function paused() {
 function soundCloudPaused() {
   const btn = document.querySelector('.playControls__play');
   if (!btn) return null;
+  if (btn.classList?.contains?.('playing') || btn.classList?.contains?.('sc-button-pause')) return false;
   const labels = [btn.getAttribute('aria-label') || '', btn.title || ''].map(value => value.trim().toLowerCase());
   if (labels.some(label => label.startsWith('pause'))) return false;
   if (labels.some(label => label.startsWith('play'))) return true;
@@ -1000,8 +1229,25 @@ function isTrueShuffleAudio(audio) {
 
 
 function pauseSoundCloud() {
-  const nativeAudios = [...document.querySelectorAll('audio')]
-    .filter(audio => !isTrueShuffleAudio(audio));
+  if (typeof state !== 'undefined' && state) {
+    state._lastNativePlayIntentAt = 0;
+    state._lastNativePlayIntentUrl = '';
+  }
+  const observed = [];
+  if (typeof state !== 'undefined' && state?._observedNativeAudios instanceof Set) {
+    for (const entry of [...state._observedNativeAudios]) {
+      const audio = entry && typeof entry.deref === 'function' ? entry.deref() : entry;
+      if (!audio) {
+        state._observedNativeAudios.delete(entry);
+        continue;
+      }
+      observed.push(audio);
+    }
+  }
+  const nativeAudios = new Set(
+    [...document.querySelectorAll('audio'), ...observed]
+      .filter(audio => audio && !isTrueShuffleAudio(audio))
+  );
   nativeAudios.forEach(audio => {
     if (!audio.paused) {
       try { audio.pause(); } catch (_) {}
@@ -1025,6 +1271,44 @@ function pauseSoundCloudTransport() {
 function installNativePlaybackGuard() {
   if (state._nativePlaybackGuardInstalled) return;
   state._nativePlaybackGuardInstalled = true;
+  const nativeBlocked = () => Boolean(
+    state.loading
+    || (state.active && (!state._userPaused || state._pendingPlaybackResume))
+    || state._nativePlayUnlocked === false
+  );
+  const pauseForNativeHandoff = () => {
+    state._lastNativePlayIntentAt = Date.now();
+    state._nativePlayUnlocked = true;
+    state._nativeHandoffActive = true;
+    state._nativeHandoffRestoreVolume = true;
+    if (!state.active || state.loading) return;
+    if (!state._userPaused || state._pendingPlaybackResume) {
+      if (typeof pause === 'function') pause();
+      else {
+        state._userPaused = true;
+        state._pendingPlaybackResume = null;
+        state._decks?.forEach(audio => {
+          try { if (audio && !audio.paused) audio.pause(); } catch (_) {}
+        });
+      }
+      if (typeof refreshPlayBtn === 'function') refreshPlayBtn();
+      if (typeof updateHub === 'function') updateHub();
+    }
+    if (typeof syncBrowserNowPlaying === 'function') syncBrowserNowPlaying();
+  };
+  const rememberNativeAudio = audio => {
+    if (!audio || isTrueShuffleAudio(audio)) return;
+    if (!(state._observedNativeAudios instanceof Set)) state._observedNativeAudios = new Set();
+    for (const entry of [...state._observedNativeAudios]) {
+      const refAudio = entry && typeof entry.deref === 'function' ? entry.deref() : entry;
+      if (!refAudio || refAudio === audio) state._observedNativeAudios.delete(entry);
+    }
+    if (state._observedNativeAudios.size >= 16) {
+      const oldest = state._observedNativeAudios.values().next().value;
+      state._observedNativeAudios.delete(oldest);
+    }
+    state._observedNativeAudios.add(typeof WeakRef === 'function' ? new WeakRef(audio) : audio);
+  };
 
   // Detached native players never reach document's capture listener. Guard the
   // page's actual play boundary, exporting callbacks before crossing Firefox's Xray.
@@ -1035,7 +1319,12 @@ function installNativePlaybackGuard() {
     const prototype = realm?.HTMLMediaElement?.prototype;
     const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'play');
     const canExport = typeof exportFunction === 'function';
-    const sameRealm = typeof window !== 'undefined' && realm === window;
+    const sameRealm = typeof window !== 'undefined' && (
+      realm === window || (
+        typeof window.HTMLMediaElement === 'function'
+        && realm?.HTMLMediaElement === window.HTMLMediaElement
+      )
+    );
     if (typeof descriptor?.value === 'function' && (canExport || sameRealm)) {
       const originalPlay = descriptor.value;
       const pausedGetter = Object.getOwnPropertyDescriptor(prototype, 'paused')?.get;
@@ -1046,7 +1335,7 @@ function installNativePlaybackGuard() {
       const exportCallback = callback => canExport ? exportFunction(callback, realm) : callback;
       const stopObservedAudio = exportCallback(function (event) {
         const audio = event.currentTarget;
-        if (isTrueShuffleAudio(audio)) return;
+        if (isTrueShuffleAudio(audio) || !nativeBlocked()) return;
         try { audio.pause(); } catch (_) {}
       });
       const guardedPlay = exportCallback(function (...args) {
@@ -1059,11 +1348,28 @@ function installNativePlaybackGuard() {
           if (mediaReceiver && this.tagName === 'AUDIO') foreignAudio = !isTrueShuffleAudio(this);
         } catch (_) {}
         if (!foreignAudio) return Reflect.apply(originalPlay, this, args);
+        rememberNativeAudio(this);
         if (!observed.has(this) && typeof this.addEventListener === 'function') {
           try {
             this.addEventListener('play', stopObservedAudio, true);
             observed.add(this);
           } catch (_) {}
+        }
+        if (nativeBlocked() && state._lastNativePlayIntentAt > 0
+            && Date.now() - state._lastNativePlayIntentAt < 5000 && !state.loading
+            && (!state._lastNativePlayIntentUrl
+              || state._lastNativePlayIntentUrl === (typeof location !== 'undefined' ? String(location?.href || '').split(/[?#]/)[0] : ''))) {
+          pauseForNativeHandoff();
+        }
+        if (!nativeBlocked()) {
+          if (state._nativeHandoffActive && state._nativeHandoffRestoreVolume !== false) {
+            state._nativeHandoffRestoreVolume = false;
+            try {
+              if (this.muted) this.muted = false;
+              if (this.volume === 0) this.volume = 1;
+            } catch (_) {}
+          }
+          return Reflect.apply(originalPlay, this, args);
         }
         try { this.pause(); } catch (_) {}
         const error = ExceptionConstructor
@@ -1076,35 +1382,251 @@ function installNativePlaybackGuard() {
   } catch (_) {}
 
   document.addEventListener('click', event => {
-    const button = event.target?.closest?.('.playControls__play');
-    if (!button || state._nativeGuardButtonAction) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    queueMicrotask(() => {
-      pauseSoundCloudTransport();
-      pauseSoundCloud();
-    });
+    const target = typeof event.target?.closest === 'function' ? event.target : event.target?.parentElement;
+    const button = target?.closest?.('.playControls__play')
+      || (target?.closest?.('.playControls')
+        ? target?.closest?.('button[aria-label*="Play" i], button[aria-label*="Pause" i]')
+        : null);
+    if (button) {
+      if (state._nativeGuardButtonAction) return;
+      if (!state.loading && (!state.active || (state._userPaused && !state._pendingPlaybackResume))) {
+        state._nativePlayUnlocked = true;
+        return;
+      }
+      if (!nativeBlocked()) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      queueMicrotask(() => {
+        if (!nativeBlocked()) return;
+        pauseSoundCloudTransport();
+        pauseSoundCloud();
+      });
+      return;
+    }
+    if (target?.closest?.('#tss-hub, #tss-sidebar, #tss-stats-overlay, .tss-stats-surface, #tss-eq-overlay, #tss-cf-overlay, .tss-modal-surface, #tss-modal-backdrop, .tss-modal-backdrop, #tss-inline-pip, #tss-pip-host, #tss-ctx, #tss-update-providers, #tss-debug-overlay, #tss-debug-help-overlay, #tss-merge-toast')) {
+      state._lastNativePlayIntentAt = 0;
+      state._lastNativePlayIntentUrl = '';
+      return;
+    }
+    const primaryPlainClick = (event.button == null || event.button === 0)
+      && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey;
+    if (!primaryPlainClick) {
+      state._lastNativePlayIntentAt = 0;
+      state._lastNativePlayIntentUrl = '';
+      return;
+    }
+    if (event.isTrusted !== false && !state._nativeGuardButtonAction && !state.loading) {
+      const explicitPlayControl = target?.closest?.(
+        '.playButton, .sc-button-play, [class*="playButton"], [class*="PlayButton"], .playableTile__playButton, .trackItem__playButton, .trackItem__coverArt, .sound__coverArt, .soundTitle__playButton, .fullHero__play, .waveform__layer, button[aria-label^="Play" i], button[title^="Play" i]',
+      );
+      const rowPlayTarget = explicitPlayControl || target?.closest?.(
+        '.trackItem, .trackList__item, .compactTrackList__item, .systemPlaylistTrackList__item',
+      );
+      const navAnchor = !explicitPlayControl ? target?.closest?.('a[href]') : null;
+      const excludedTarget = navAnchor || target?.closest?.(
+        '.playControls, .tss-badge, .trackItem__actions, .soundActions, .sc-button-like, .sc-button-repost, .sc-button-share, .sc-button-more, .sc-button-queue, .sc-button-delete, .sc-button-edit, .sc-button-copylink, .sc-button-follow, .sc-button-addtoset, a.trackItem__username, a.soundTitle__username, button[aria-label*="Like" i], button[aria-label*="Unlike" i], button[aria-label*="Repost" i], button[aria-label*="Share" i], button[aria-label*="More" i]',
+      );
+      if (rowPlayTarget && !excludedTarget) {
+        pauseForNativeHandoff();
+        return;
+      }
+      if (navAnchor) {
+        state._lastNativePlayIntentAt = 0;
+        state._lastNativePlayIntentUrl = '';
+        return;
+      }
+      if (event.isTrusted === true && !excludedTarget) {
+        state._lastNativePlayIntentAt = Date.now();
+        state._lastNativePlayIntentUrl = typeof location !== 'undefined' ? String(location?.href || '').split(/[?#]/)[0] : '';
+      }
+    }
   }, true);
 
   document.addEventListener('play', event => {
     const audio = event.target;
     if (audio?.tagName !== 'AUDIO' || isTrueShuffleAudio(audio)) return;
-    // True Shuffle owns audio output, including before a session is started.
+    rememberNativeAudio(audio);
+    if (nativeBlocked() && state._lastNativePlayIntentAt > 0
+        && Date.now() - state._lastNativePlayIntentAt < 5000 && !state.loading
+        && (!state._lastNativePlayIntentUrl
+          || state._lastNativePlayIntentUrl === (typeof location !== 'undefined' ? String(location?.href || '').split(/[?#]/)[0] : ''))) {
+      pauseForNativeHandoff();
+    }
+    if (!nativeBlocked()) return;
     try { audio.pause(); } catch (_) {}
     queueMicrotask(() => {
+      if (!nativeBlocked()) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     });
+  }, true);
+
+  document.addEventListener('keydown', event => {
+    if (event.isTrusted === false || state._nativeGuardButtonAction || state.loading) return;
+    if (state.active && (!state._userPaused || state._pendingPlaybackResume)) return;
+    const isPlayShortcut = event.code === 'Space' || event.key === ' ' || event.key === 'MediaPlayPause' || event.key === 'MediaPlay';
+    if (!isPlayShortcut) return;
+    const target = typeof event.target?.closest === 'function' ? event.target : event.target?.parentElement;
+    if (target?.closest?.('input, textarea, select, [contenteditable="true"], #tss-hub, #tss-sidebar, #tss-stats-overlay, .tss-stats-surface, #tss-eq-overlay, #tss-cf-overlay, .tss-modal-surface, #tss-modal-backdrop, .tss-modal-backdrop, #tss-inline-pip, #tss-pip-host, #tss-ctx, #tss-update-providers, #tss-debug-overlay, #tss-debug-help-overlay, #tss-merge-toast')) return;
+    state._nativePlayUnlocked = true;
+    state._lastNativePlayIntentAt = Date.now();
+    state._lastNativePlayIntentUrl = typeof location !== 'undefined' ? String(location?.href || '').split(/[?#]/)[0] : '';
   }, true);
 
   // SoundCloud may restore its native player shortly after a hard reload.
   // Catch both an already-running element and delayed autoplay initialization.
   [0, 100, 500, 1500, 3000].forEach(delay => {
     setTimeout(() => {
+      if (!nativeBlocked()) return;
+      if (state._lastNativePlayIntentAt > 0 && Date.now() - state._lastNativePlayIntentAt < 5000) return;
       pauseSoundCloudTransport();
       pauseSoundCloud();
     }, delay);
   });
+}
+
+function rememberSoundCloudClientId(candidate, fromLiveObserver = false) {
+  const id = typeof candidate === 'string' ? candidate.trim() : '';
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) return '';
+  if (typeof state !== 'undefined' && state) {
+    state._clientId = id;
+    if (fromLiveObserver) state._observedClientId = id;
+  }
+  if (id.length >= 16 && typeof safeStorage !== 'undefined' && typeof safeStorage?.setItem === 'function') {
+    safeStorage.setItem(typeof LAST_GOOD_CLIENT_ID_KEY === 'string' ? LAST_GOOD_CLIENT_ID_KEY : 'tss_last_good_client_id', id);
+  }
+  return id;
+}
+
+function forgetSoundCloudClientId(rejectedId) {
+  const id = typeof rejectedId === 'string' ? rejectedId.trim() : '';
+  if (!id) return;
+  if (typeof state !== 'undefined' && state) {
+    if (state._clientId === id) state._clientId = '';
+    if (state._observedClientId === id) state._observedClientId = '';
+  }
+  if (typeof safeStorage !== 'undefined' && typeof safeStorage?.getItem === 'function'
+      && typeof safeStorage?.removeItem === 'function') {
+    const storageKey = typeof LAST_GOOD_CLIENT_ID_KEY === 'string' ? LAST_GOOD_CLIENT_ID_KEY : 'tss_last_good_client_id';
+    if (safeStorage.getItem(storageKey) === id) safeStorage.removeItem(storageKey);
+  }
+}
+
+// Passively observe public SoundCloud API client_id tokens across both URL query
+// parameters and X-Client-Id headers without ever reading Authorization/OAuth/cookies.
+function installSoundCloudClientIdObserver(targetWindow = null) {
+  if (!targetWindow && state._clientIdObserverInstalled) return;
+  if (!targetWindow) state._clientIdObserverInstalled = true;
+
+  const inspectApiEndpoint = rawUrl => {
+    if (!rawUrl) return null;
+    try {
+      const base = typeof location !== 'undefined' && location?.href ? location.href : 'https://soundcloud.com/';
+      const parsed = new URL(String(rawUrl), base);
+      if (!/^https?:$/.test(parsed.protocol)) return null;
+      if (parsed.hostname !== 'api-v2.soundcloud.com' && parsed.hostname !== 'api.soundcloud.com') return null;
+      const queryId = parsed.searchParams.get('client_id');
+      if (queryId && /^[A-Za-z0-9_-]{8,64}$/.test(queryId)) {
+        rememberSoundCloudClientId(queryId, true);
+      }
+      return parsed;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const inspectClientIdHeaderBag = headers => {
+    if (!headers) return;
+    try {
+      if (typeof headers.get === 'function') {
+        const val = headers.get('X-Client-Id') || headers.get('x-client-id');
+        if (val) rememberSoundCloudClientId(val, true);
+        return;
+      }
+      if (Array.isArray(headers)) {
+        for (const pair of headers) {
+          if (Array.isArray(pair) && String(pair[0] || '').toLowerCase() === 'x-client-id') {
+            rememberSoundCloudClientId(pair[1], true);
+          }
+        }
+        return;
+      }
+      if (typeof headers === 'object') {
+        for (const key of Object.keys(headers)) {
+          if (key.toLowerCase() === 'x-client-id') {
+            rememberSoundCloudClientId(headers[key], true);
+          }
+        }
+      }
+    } catch (_) {}
+  };
+
+  try {
+    const host = targetWindow
+      || (typeof pageWindow !== 'undefined' ? pageWindow : (typeof window !== 'undefined' ? window : null));
+    const realm = host?.wrappedJSObject || host;
+    if (!realm) return;
+    const canExport = !targetWindow && typeof exportFunction === 'function';
+    const sameRealm = Boolean(targetWindow) || (typeof window !== 'undefined' && (
+      realm === window || (
+        typeof window.XMLHttpRequest === 'function'
+        && realm?.XMLHttpRequest === window.XMLHttpRequest
+      )
+    ));
+    if (!canExport && !sameRealm) return;
+    const exportCallback = callback => canExport ? exportFunction(callback, realm) : callback;
+
+    const fetchDesc = Object.getOwnPropertyDescriptor(realm, 'fetch');
+    if (typeof fetchDesc?.value === 'function' && !fetchDesc.value._tssClientIdObserved) {
+      const originalFetch = fetchDesc.value;
+      const wrappedFetch = exportCallback(function (input, init) {
+        try {
+          const urlStr = typeof input === 'string'
+            ? input
+            : (input && typeof input === 'object' && 'url' in input ? input.url : String(input || ''));
+          const apiUrl = inspectApiEndpoint(urlStr);
+          if (apiUrl) {
+            if (init && typeof init === 'object' && init.headers) inspectClientIdHeaderBag(init.headers);
+            if (input && typeof input === 'object' && input.headers) inspectClientIdHeaderBag(input.headers);
+          }
+        } catch (_) {}
+        return Reflect.apply(originalFetch, this, arguments);
+      });
+      try { wrappedFetch._tssClientIdObserved = true; } catch (_) {}
+      Object.defineProperty(realm, 'fetch', { ...fetchDesc, value: wrappedFetch });
+    }
+
+    const xhrProto = realm.XMLHttpRequest?.prototype;
+    const openDesc = xhrProto && Object.getOwnPropertyDescriptor(xhrProto, 'open');
+    const setHeaderDesc = xhrProto && Object.getOwnPropertyDescriptor(xhrProto, 'setRequestHeader');
+    if (typeof openDesc?.value === 'function' && typeof setHeaderDesc?.value === 'function'
+        && !openDesc.value._tssClientIdObserved) {
+      const originalOpen = openDesc.value;
+      const originalSetHeader = setHeaderDesc.value;
+      const apiXhrs = typeof WeakSet === 'function' ? new WeakSet() : null;
+      const wrappedOpen = exportCallback(function (_method, url) {
+        try {
+          const apiUrl = inspectApiEndpoint(url);
+          if (apiXhrs && this && typeof this === 'object') {
+            if (apiUrl) apiXhrs.add(this);
+            else apiXhrs.delete(this);
+          }
+        } catch (_) {}
+        return Reflect.apply(originalOpen, this, arguments);
+      });
+      const wrappedSetHeader = exportCallback(function (name, value) {
+        try {
+          if (apiXhrs?.has(this) && String(name || '').toLowerCase() === 'x-client-id') {
+            rememberSoundCloudClientId(value, true);
+          }
+        } catch (_) {}
+        return Reflect.apply(originalSetHeader, this, arguments);
+      });
+      try { wrappedOpen._tssClientIdObserved = true; } catch (_) {}
+      Object.defineProperty(xhrProto, 'open', { ...openDesc, value: wrappedOpen });
+      Object.defineProperty(xhrProto, 'setRequestHeader', { ...setHeaderDesc, value: wrappedSetHeader });
+    }
+  } catch (_) {}
 }
 
 function playbackResumeCurrent(resume) {
@@ -1129,6 +1651,16 @@ function pauseCrossfadeSchedule() {
   const [outgoingGain, incomingGain] = crossfadeGains(progress, schedule.curve);
   setAudioParamImmediately(state._deckAudioGraphs[schedule.outgoingIndex]?.mixGain.gain, outgoingGain, now);
   setAudioParamImmediately(state._deckAudioGraphs[schedule.incomingIndex]?.mixGain.gain, incomingGain, now);
+  if (schedule.bassSwap && typeof djBassSwapGains === 'function') {
+    const [outBassDb, inBassDb] = djBassSwapGains(progress, schedule.bassCross);
+    const outGraph = state._deckAudioGraphs[schedule.outgoingIndex];
+    const inGraph = state._deckAudioGraphs[schedule.incomingIndex];
+    setAudioParamImmediately(outGraph?.djBassFilter?.gain, outBassDb, now);
+    setAudioParamImmediately(inGraph?.djBassFilter?.gain, inBassDb, now);
+    if (outGraph) outGraph.appliedDjBassGain = outBassDb;
+    if (inGraph) inGraph.appliedDjBassGain = inBassDb;
+  }
+  if (typeof syncBrandmarkCrossfade === 'function') syncBrandmarkCrossfade('pause', { progress });
 }
 
 function resumeCrossfadeSchedule() {
@@ -1179,19 +1711,63 @@ function resumeCrossfadeSchedule() {
     plan.outgoing = [outgoingGain, ...(first < 0 ? [] : plan.outgoing.slice(first))];
     plan.incoming = [incomingGain, ...(first < 0 ? [] : plan.incoming.slice(first))];
   }
-  schedulePairedCrossfade(state._deckAudioGraphs[schedule.outgoingIndex].mixGain.gain,
-    state._deckAudioGraphs[schedule.incomingIndex].mixGain.gain, plan, startTime, remaining);
+  const outMixParam = state._deckAudioGraphs[schedule.outgoingIndex]?.mixGain?.gain;
+  const inMixParam = state._deckAudioGraphs[schedule.incomingIndex]?.mixGain?.gain;
+  if (remaining > 0) {
+    schedulePairedCrossfade(outMixParam, inMixParam, plan, startTime, remaining);
+  } else {
+    setAudioParamImmediately(outMixParam, plan.outgoing.at(-1) ?? 0, now);
+    setAudioParamImmediately(inMixParam, plan.incoming.at(-1) ?? 1, now);
+    state._deckGains[schedule.outgoingIndex] = plan.outgoing.at(-1) ?? 0;
+    state._deckGains[schedule.incomingIndex] = plan.incoming.at(-1) ?? 1;
+  }
+  if (schedule.bassSwap) {
+    const outGraph = state._deckAudioGraphs[schedule.outgoingIndex];
+    const inGraph = state._deckAudioGraphs[schedule.incomingIndex];
+    if (remaining > 0 && typeof schedulePairedBassSwap === 'function') {
+      schedulePairedBassSwap(
+        outGraph?.djBassFilter?.gain,
+        inGraph?.djBassFilter?.gain,
+        schedule.bassCross,
+        startTime,
+        remaining,
+        progress,
+      );
+    } else {
+      setAudioParamImmediately(outGraph?.djBassFilter?.gain, 0, now);
+      setAudioParamImmediately(inGraph?.djBassFilter?.gain, 0, now);
+      if (outGraph) outGraph.appliedDjBassGain = 0;
+      if (inGraph) inGraph.appliedDjBassGain = 0;
+    }
+  }
   delete schedule.pausedAt;
+  if (typeof syncBrandmarkCrossfade === 'function') {
+    syncBrandmarkCrossfade('start', {
+      token: schedule.token,
+      durationMs: remaining * 1000,
+      delayMs: Math.max(0, (startTime - now) * 1000),
+      progress,
+    });
+  }
 }
 
 function pause() {
   state._userPaused = true;
+  state._nativePlayUnlocked = true;
   state._pendingPlaybackResume = null;
+  state._endedGapMonitor = null;
+  state._handoffAudioMonitor = null;
+  if (typeof cancelDjOpeningIntro === 'function') cancelDjOpeningIntro('pause');
+  if (typeof cancelActiveDjVoiceSpeech === 'function') cancelActiveDjVoiceSpeech({ fastFade: true });
   if (state._playbackRequest) state._playbackRequest.nextRequested = null;
   state._crossfadePauseGeneration = (state._crossfadePauseGeneration || 0) + 1;
   if (state._crossfading) state._crossfadePausedByUser = true;
   if (state._crossfadeSchedule?.incomingClockObservation) delete state._crossfadeSchedule.incomingClockObservation;
   pauseCrossfadeSchedule();
+  if (typeof syncBrandmarkCrossfade === 'function') {
+    if (state._crossfading && !state._crossfadeSchedule) syncBrandmarkCrossfade('pause');
+    else if (!state._crossfading) syncBrandmarkCrossfade('cancel-prefade');
+  }
   const deck = currentDeckAudio();
   if (deck) {
     state._decks.forEach(audio => {
@@ -1200,8 +1776,10 @@ function pause() {
     if (state._crossfading) void suspendAudioGraph(state._playbackAbort.signal);
     return;
   }
-  pauseSoundCloudTransport();
-  pauseSoundCloud();
+  if (!state._nativeHandoffActive) {
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
+  }
 }
 
 async function toggle() {
@@ -1216,6 +1794,11 @@ async function toggle() {
     refreshPlayBtn();
     return;
   }
+  if (state._djOpeningIntroActive && !state._userPaused) {
+    pause();
+    refreshPlayBtn();
+    return;
+  }
   if (deck && !deck.paused && !deck.ended && !state._userPaused) {
     pause();
     refreshPlayBtn();
@@ -1224,6 +1807,24 @@ async function toggle() {
   const retryGraph = Number.isInteger(state._deckTrack)
     && (state._userPaused || !deck || deck.paused)
     && (state._audioGraphFailed || state._audioContext?.state === 'closed');
+  if (retryGraph && state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (pendingCurrent && pending.ti === state._deckTrack && !Number.isFinite(pending.position)) {
+      pending.position = Number(deck?.currentTime) || 0;
+    }
+    state._playbackRequest = null;
+    state.busy = false;
+  }
   if ((pendingCurrent || retryGraph) && !state.busy) {
     const ti = pendingCurrent ? pending.ti : state._deckTrack;
     const countPlay = pendingCurrent ? pending.countPlay : false;
@@ -1231,7 +1832,11 @@ async function toggle() {
     const initialSeek = state._deckSeekRequest;
     state._pendingPlaybackTrack = null;
     state._userPaused = false;
+    state._nativePlayUnlocked = false;
+    state._nativeHandoffActive = false;
     state._crossfadePausedByUser = false;
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
     await runPlaybackOperation('resume prepared', async isCurrent => {
       const played = await playAt(ti, countPlay);
       if (!isCurrent()) return played;
@@ -1274,6 +1879,10 @@ async function toggle() {
     });
     const intent = { epoch, signal, identities, pauseGeneration: state._crossfadePauseGeneration || 0 };
     state._pendingPlaybackResume = intent;
+    state._nativePlayUnlocked = false;
+    state._nativeHandoffActive = false;
+    pauseSoundCloudTransport();
+    pauseSoundCloud();
     const isCurrent = () => playbackResumeCurrent(intent);
     let accepted = false;
     try {
@@ -1282,8 +1891,15 @@ async function toggle() {
         playDeckWithDeadline(audio, index, signal, isCurrent, null, intent)));
       if (!isCurrent() || played.some(result => result !== true)) return;
       resumeCrossfadeSchedule();
+      if (state._crossfading && !state._crossfadeSchedule && typeof syncBrandmarkCrossfade === 'function') {
+        syncBrandmarkCrossfade('resume');
+      }
       state._userPaused = false;
+      state._nativePlayUnlocked = false;
+      state._nativeHandoffActive = false;
       state._crossfadePausedByUser = false;
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
       accepted = true;
     } catch (_) {
       if (!isCurrent()) return;
@@ -1292,13 +1908,20 @@ async function toggle() {
         if (accepted) state._pendingPlaybackResume = null;
         else pause();
       }
-      if (state._playbackEpoch === epoch) refreshPlayBtn();
+      if (state._playbackEpoch === epoch) {
+        refreshPlayBtn();
+        if (typeof syncBrowserNowPlaying === 'function') syncBrowserNowPlaying();
+      }
     }
     return;
   }
   const ti = state.queue[state.pos];
   if (ti === undefined || state.busy) return;
   state._userPaused = false;
+  state._nativePlayUnlocked = false;
+  state._nativeHandoffActive = false;
+  pauseSoundCloudTransport();
+  pauseSoundCloud();
   await runPlaybackOperation('resume', () => playAt(ti, false));
 }
 
@@ -1306,9 +1929,24 @@ function seekTo(ratio) {
   ratio = Math.max(0, Math.min(1, ratio));
   const deck = currentDeckAudio();
   if (deck && ((Number.isFinite(deck.duration) && deck.duration > 0) || ratio === 0)) {
-    const time = ratio === 0 ? 0 : deck.duration * ratio;
+    const time = ratio === 0 ? 0 : Math.min(deck.duration * ratio, Math.max(0, deck.duration - 0.05));
+    state._endedGapMonitor = null;
+    state._handoffAudioMonitor = null;
+    if (Number.isInteger(state._deckTrack)) {
+      state._djCueOutBypass = ratio >= 0.8
+        ? { epoch: state._playbackEpoch, track: state._deckTrack }
+        : null;
+    }
     state._deckSeekRequest = { epoch: state._playbackEpoch, audio: deck, time };
     deck.currentTime = time;
+    const schedule = state._crossfadeSchedule;
+    if (schedule && state._decks?.[schedule.incomingIndex] === deck) {
+      schedule.lastIncomingTime = time;
+      schedule.lastIncomingAdvanceAt = Date.now();
+      if (Number.isFinite(deck.duration) && deck.duration - time < 0.25 && typeof settleScheduledCrossfade === 'function') {
+        settleScheduledCrossfade();
+      }
+    }
     void state._watcherTick?.();
     updateProgressBar();
     return;
@@ -1337,7 +1975,9 @@ function updateProgressBar(timing = playbackTiming()) {
   const percent = String(Math.round(ratio * 100));
   if (seekbar && seekbar.getAttribute('aria-valuenow') !== percent) seekbar.setAttribute('aria-valuenow', percent);
   if (!state._waveformBars?.[0]?.isConnected) {
+    if (!p && !seekbar && !document.getElementById('tss-wave-bars')) return;
     state._waveformBars = [...document.querySelectorAll('#tss-wave-bars i')];
+    state._lastWaveformPlayed = 0;
   }
   const bars = state._waveformBars;
   const played = Math.round(ratio * bars.length);
@@ -1378,25 +2018,82 @@ function soundCloudHref(href) {
 
 function getLink(el) {
   const a = el.querySelector('.trackItem__trackTitle, .soundTitle__title, a.sc-link-primary');
-  if (!a) return null;
-  return soundCloudHref(a.getAttribute('href'));
+  const href = a?.getAttribute?.('href')
+    || a?.closest?.('a[href]')?.getAttribute?.('href')
+    || el.querySelector('a.sc-link-primary')?.getAttribute?.('href');
+  if (href) return soundCloudHref(href);
+  if (typeof el?.querySelectorAll === 'function') {
+    const reservedRoots = new Set([
+      'you', 'stream', 'feed', 'discover', 'search', 'charts', 'pages',
+      'settings', 'messages', 'notifications', 'upload', 'pro', 'terms-of-use',
+      'imprint', 'people', 'stations', 'tags',
+    ]);
+    const reservedSubs = new Set([
+      'sets', 'likes', 'tracks', 'reposts', 'albums', 'playlists',
+      'followers', 'following', 'comments', 'recommended', 'spotlight', 'popular-tracks',
+    ]);
+    for (const anchor of el.querySelectorAll('a[href]')) {
+      const candidate = soundCloudHref(anchor?.getAttribute?.('href'));
+      if (!candidate) continue;
+      try {
+        const parsed = new URL(candidate);
+        if (!/^(?:www\.|m\.)?soundcloud\.com$/i.test(parsed.hostname)) continue;
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const validSecret = parts.length === 3 && /^s-[a-z0-9_-]+$/i.test(parts[2]);
+        if ((parts.length === 2 || validSecret)
+            && !reservedRoots.has(parts[0].toLowerCase())
+            && !reservedSubs.has(parts[1].toLowerCase())) {
+          return candidate;
+        }
+      } catch (_) {}
+    }
+  }
+  return null;
 }
 
 function waveformUrl(el) {
   const direct = el.querySelector('[data-waveform-url]')?.getAttribute('data-waveform-url');
   if (direct) return direct;
   if (el._tssWaveformUrl !== undefined) return el._tssWaveformUrl;
-  const match = el.outerHTML.match(/https?:\/\/wave\.sndcdn\.com\/[^"'\s<>)]+/i);
+  const waveEl = el.querySelector('img[src*="wave.sndcdn.com"], [style*="wave.sndcdn.com"]');
+  const attrVal = waveEl ? (waveEl.getAttribute?.('src') || waveEl.getAttribute?.('style') || '') : '';
+  const attrMatch = attrVal && attrVal.match(/https?:\/\/wave\.sndcdn\.com\/[^\x22\x27\s<>)]+/i);
+  if (attrMatch) {
+    const url = attrMatch[0].replace(/&amp;/g, '&');
+    el._tssWaveformUrl = url;
+    return url;
+  }
+  const html = String(el.outerHTML || '');
+  const match = html.length <= 32768 ? html.match(/https?:\/\/wave\.sndcdn\.com\/[^\x22\x27\s<>)]+/i) : null;
   const url = match ? match[0].replace(/&amp;/g, '&') : null;
-  if (url) el._tssWaveformUrl = url;
+  el._tssWaveformUrl = url;
   return url;
 }
 
 function getArtistLink(el) {
   const a = el.querySelector('.trackItem__username, .soundTitle__username')
     || el.querySelector('a.sc-link-secondary');
-  if (!a) return null;
-  return soundCloudHref(a.getAttribute('href'));
+  if (a) return soundCloudHref(a.getAttribute('href'));
+  if (typeof el?.querySelectorAll === 'function') {
+    const reservedRoots = new Set([
+      'you', 'stream', 'feed', 'discover', 'search', 'charts', 'pages',
+      'settings', 'messages', 'notifications', 'upload', 'pro', 'terms-of-use',
+      'imprint', 'people', 'stations', 'tags',
+    ]);
+    for (const anchor of el.querySelectorAll('a[href]')) {
+      const candidate = soundCloudHref(anchor?.getAttribute?.('href'));
+      if (!candidate) continue;
+      try {
+        const parsed = new URL(candidate);
+        if (!/^(?:www\.|m\.)?soundcloud\.com$/i.test(parsed.hostname)) continue;
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts.length === 1 && !reservedRoots.has(parts[0].toLowerCase())) {
+          return candidate;
+        }
+      } catch (_) {}
+    }
+  }
+  return null;
 }
 
 function trackId(m) {
@@ -1418,7 +2115,7 @@ function indexTrackMeta(index, meta, ti) {
   if (previousKey && previousKey !== key && index.byKey.get(previousKey) === ti) index.byKey.delete(previousKey);
   index.keys[ti] = key;
   if (key) index.byKey.set(key, ti);
-  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl);
+  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl).replace(/\/s-[a-z0-9_-]+$/i, '');
   const previousLink = index.links[ti];
   if (previousLink && previousLink !== link) index.byLink.get(previousLink)?.delete(ti);
   index.links[ti] = link;
@@ -1439,7 +2136,7 @@ function matchingTrackIndex(index, meta) {
   if (!key) return undefined;
   const exact = index.byKey.get(key);
   if (exact !== undefined) return exact;
-  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl);
+  const link = normalizeTrackUrl(meta?.link || meta?.permalink_url || meta?.permalinkUrl).replace(/\/s-[a-z0-9_-]+$/i, '');
   const candidates = index.byLink.get(link);
   if (!candidates) return undefined;
   let match;
@@ -1452,41 +2149,113 @@ function matchingTrackIndex(index, meta) {
 }
 
 function getMeta(el) {
-  const likeButton = el.querySelector('.sc-button-like');
-  const artistNames = [...new Set([...el.querySelectorAll('.trackItem__username, .soundTitle__username')]
+  const likeButton = el.querySelector('.sc-button-like')
+    || el.querySelector?.('button[aria-label*="Like" i], button[aria-label*="Unlike" i], button[title*="Like" i], button[title*="Unlike" i]');
+  const artistNames = [...new Set([...(typeof el.querySelectorAll === 'function' ? el.querySelectorAll('.trackItem__username, .soundTitle__username') : [])]
     .map(node => node.textContent.trim())
     .filter(name => name && name !== '—'))];
   const fallbackArtist = artistNames.length ? '' : el.querySelector('.sc-link-secondary')?.textContent.trim();
-  return {
-    title:   el.querySelector('.trackItem__trackTitle, .soundTitle__title, .sc-link-primary')?.textContent.trim() || '—',
-    artist:  artistNames.join(', ') || fallbackArtist || '—',
+  let durationMs = null;
+  const durEl = el.querySelector?.('.trackItem__additional [aria-hidden="true"], .soundBadge__additional [aria-hidden="true"], .trackItem__additional, .soundBadge__additional')
+    || el.querySelector?.('time, [data-testid*="duration" i], [class*="duration" i], [class*="Duration"]');
+  const durText = String(durEl?.textContent || '').trim();
+  const durMatch = durText && durText.match(/(?:^|\s)(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)(?:\s|$)/);
+  if (durMatch) {
+    const secs = (Number(durMatch[1] || 0) * 3600) + (Number(durMatch[2]) * 60) + Number(durMatch[3]);
+    if (secs > 0 && secs <= 86400) durationMs = secs * 1000;
+  }
+  const link = getLink(el);
+  const artistLink = getArtistLink(el);
+  let titleText = (el.querySelector('.trackItem__trackTitle, .soundTitle__title') || el.querySelector('.sc-link-primary'))?.textContent.trim() || '';
+  let artistText = artistNames.join(', ') || fallbackArtist || '';
+  if ((!titleText || !artistText) && typeof el.querySelectorAll === 'function') {
+    for (const anchor of el.querySelectorAll('a[href]')) {
+      const resolved = typeof soundCloudHref === 'function'
+        ? soundCloudHref(anchor?.getAttribute?.('href'))
+        : anchor?.getAttribute?.('href');
+      if (!resolved) continue;
+      const text = String(anchor.textContent || anchor.getAttribute?.('aria-label') || '').trim();
+      if (!text || text === '—') continue;
+      if (!titleText && link && resolved === link) titleText = text;
+      else if (!artistText && artistLink && resolved === artistLink) artistText = text;
+    }
+  }
+  const meta = {
+    title:   titleText || '—',
+    artist:  artistText || '—',
     artwork: artwork(el),
-    link:    getLink(el),
-    artistLink: getArtistLink(el),
+    link,
+    artistLink,
     waveform: waveformUrl(el),
     liked: likeButton ? soundCloudLikeButtonState(likeButton) : null,
     sourcePage: location.href.split(/[?#]/)[0].replace(/\/+$/, ''),
   };
+  if (artistNames.length > 1) meta.domMultiArtist = true;
+  if (durationMs !== null) meta.durationMs = durationMs;
+  return meta;
 }
 
 const LIVE_SYNC_INTERVAL_MS = 10_000;
 
 function playlistSnapshotFromHtml(html, sourcePage = '') {
-  const match = String(html || '').match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\])\s*;\s*<\/script\s*>/);
-  if (!match) return null;
+  const rawHtml = String(html || '');
+  const match = rawHtml.match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\])\s*;\s*<\/script\s*>/);
+  let entries = null;
   try {
-    const hydration = JSON.parse(match[1]);
-    if (!Array.isArray(hydration)) return null;
-    const entries = hydration.filter(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
+    if (match) {
+      const hydration = JSON.parse(match[1]);
+      if (!Array.isArray(hydration)) return null;
+      entries = hydration.filter(item => item?.hydratable === 'playlist' && item?.data?.kind === 'playlist');
+    } else {
+      const jsonScripts = rawHtml.matchAll(/<script\b[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script\s*>/gi);
+      const found = [];
+      for (const scriptMatch of jsonScripts) {
+        const body = String(scriptMatch[1] || '').trim();
+        if (!body || body.length > 8_000_000) continue;
+        let root;
+        try { root = JSON.parse(body); } catch (_) { continue; }
+        const seen = typeof WeakSet === 'function' ? new WeakSet() : null;
+        const stack = [root];
+        let visited = 0;
+        while (stack.length && visited < 20000) {
+          const node = stack.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (seen) {
+            if (seen.has(node)) continue;
+            seen.add(node);
+          }
+          visited++;
+          if (node.hydratable === 'playlist' && node.data?.kind === 'playlist' && Array.isArray(node.data?.tracks)) {
+            found.push(node);
+            continue;
+          }
+          if (node.kind === 'playlist' && Array.isArray(node.tracks)) {
+            found.push({ hydratable: 'playlist', data: node });
+            continue;
+          }
+          const values = Array.isArray(node) ? node : Object.values(node);
+          for (let i = values.length - 1; i >= 0; i--) {
+            if (values[i] && typeof values[i] === 'object') stack.push(values[i]);
+          }
+        }
+      }
+      if (!found.length) return null;
+      entries = found;
+    }
     const wanted = normalizeTrackUrl(sourcePage);
-    const matching = wanted ? entries.filter(item => normalizeTrackUrl(item.data.permalink_url || item.data.permalinkUrl) === wanted) : [];
+    const wantedBase = wanted.replace(/\/s-[a-z0-9_-]+$/i, '');
+    const matching = wanted ? entries.filter(item => {
+      const candidate = normalizeTrackUrl(item.data.permalink_url || item.data.permalinkUrl);
+      const candidateBase = candidate.replace(/\/s-[a-z0-9_-]+$/i, '');
+      return Boolean(candidate && (candidate === wanted || candidateBase === wantedBase));
+    }) : [];
     const entry = matching.length === 1 ? matching[0]
       : matching.length ? null
         : entries.length === 1 && (!wanted || !normalizeTrackUrl(entries[0].data.permalink_url || entries[0].data.permalinkUrl)) ? entries[0] : null;
     if (!Array.isArray(entry?.data?.tracks)) return null;
     const rawTracks = entry.data.tracks;
     const tracks = rawTracks.filter(track => soundCloudInteger(track?.id, 1) !== null);
-    const trackCount = soundCloudInteger(entry.data.track_count);
+    const trackCount = soundCloudInteger(entry.data.track_count ?? entry.data.trackCount);
     if (!tracks.length && !(trackCount === 0 && rawTracks.length === 0)) return null;
     return {
       id: entry.data.id || null,
@@ -1503,7 +2272,12 @@ function syncTrackPlaybackAccess(meta, track) {
   if (!meta || !track) return false;
   const access = String(track.access || '').toLowerCase();
   const policy = String(track.policy || '').toUpperCase();
-  const durationMs = Number(track.duration || track.full_duration);
+  const rawDur = Number(track.duration);
+  const fullDur = Number(track.full_duration);
+  const durationMs = Math.max(
+    Number.isFinite(fullDur) && fullDur > 0 ? fullDur : 0,
+    Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 0,
+  );
   const transcodings = Array.isArray(track.media?.transcodings)
     ? track.media.transcodings
     : (Array.isArray(track.transcodings) ? track.transcodings : []);
@@ -1527,17 +2301,109 @@ function syncTrackPlaybackAccess(meta, track) {
   return preview || accessRestricted;
 }
 
+function soundCloudMediaSignature(track) {
+  const transcodings = Array.isArray(track?.media?.transcodings)
+    ? track.media.transcodings
+    : (Array.isArray(track?.transcodings) ? track.transcodings : []);
+  if (!transcodings.length) return null;
+  const parts = [];
+  for (const item of transcodings) {
+    const rawUrl = typeof item?.url === 'string' ? item.url.trim() : '';
+    if (!rawUrl) continue;
+    try {
+      const pathname = new URL(rawUrl, 'https://api-v2.soundcloud.com').pathname.replace(/\/+$/, '');
+      if (pathname) parts.push(pathname);
+    } catch (_) {
+      const stripped = rawUrl.split(/[?#]/)[0].replace(/\/+$/, '');
+      if (stripped) parts.push(stripped);
+    }
+  }
+  return parts.length ? parts.sort().join('|') : null;
+}
+
 function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
   if (!track?.permalink_url || !track?.title) return null;
   const artworkUrl = track.artwork_url || track.user?.avatar_url || null;
+  const rawGenre = typeof track.genre === 'string' ? track.genre.trim().slice(0, 48) : '';
+  const rawTagList = typeof track.tag_list === 'string' ? track.tag_list : '';
+  const parsedTags = [];
+  if (rawTagList) {
+    const tagRegex = /\x22([^\x22]+)\x22|(\S+)/g;
+    let match;
+    while ((match = tagRegex.exec(rawTagList)) && parsedTags.length < 8) {
+      const token = String(match[1] || match[2] || '').trim().replace(/^#+/, '').toLowerCase();
+      if (token.length >= 2 && token.length <= 32 && !parsedTags.includes(token)) parsedTags.push(token);
+    }
+  }
+  const rawDate = String(track.release_date || track.display_date || track.created_at || '').trim();
+  const yearMatch = rawDate.match(/\b(19[7-9]\d|20\d\d)\b/);
+  const directBpm = Number(track.bpm);
+  const textBpmMatch = !Number.isFinite(directBpm) || directBpm <= 0
+    ? `${track.title || ''} ${rawTagList}`.match(/\b([6-9]\d|1\d\d|2[01]\d)\s*bpm\b/i)
+    : null;
+  const parsedBpm = Number.isFinite(directBpm) && directBpm >= 55 && directBpm <= 220
+    ? Math.round(directBpm)
+    : (textBpmMatch ? Number(textBpmMatch[1]) : null);
+  const secretToken = typeof track.secret_token === 'string' && /^s-[A-Za-z0-9_-]+$/.test(track.secret_token.trim())
+    ? track.secret_token.trim()
+    : '';
+  const basePermalink = String(track.permalink_url || '').replace(/\/+$/, '');
+  const resolvedLink = secretToken && !/\/s-[a-z0-9_-]+(?:[?#]|$)/i.test(basePermalink)
+    ? `${basePermalink}/${secretToken}`
+    : track.permalink_url;
+  const collabArtists = [];
+  const seenArtists = new Set();
+  const addArtistCandidate = rawName => {
+    const trimmed = String(rawName || '').trim();
+    if (!trimmed || trimmed === '—') return;
+    const lowered = trimmed.toLowerCase();
+    if (seenArtists.has(lowered)) return;
+    seenArtists.add(lowered);
+    collabArtists.push(trimmed);
+  };
+  for (const group of [track.authors, track.collaborators, track.co_authors]) {
+    if (!Array.isArray(group)) continue;
+    for (const entry of group) {
+      if (typeof entry === 'string') addArtistCandidate(entry);
+      else addArtistCandidate(entry?.username || entry?.name || entry?.user?.username || entry?.user?.name);
+    }
+  }
+  const publisherArtist = String(track.publisher_metadata?.artist || '').trim();
+  const primaryUserArtist = String(track.user?.username || '').trim();
+  const apiMultiArtist = Boolean(collabArtists.length && (
+    collabArtists.length > 1
+    || (primaryUserArtist && !seenArtists.has(primaryUserArtist.toLowerCase()))
+  ));
+  const combinedCollabArtist = (() => {
+    if (!collabArtists.length) return '';
+    if (primaryUserArtist && !seenArtists.has(primaryUserArtist.toLowerCase())) {
+      return [primaryUserArtist, ...collabArtists].join(', ');
+    }
+    return collabArtists.join(', ');
+  })();
+  const resolvedArtist = (publisherArtist && (!apiMultiArtist || publisherArtist.includes(', ') || publisherArtist.toLowerCase() !== primaryUserArtist.toLowerCase())
+    ? publisherArtist
+    : '')
+    || combinedCollabArtist
+    || publisherArtist
+    || primaryUserArtist
+    || collabArtists[0]
+    || '—';
+
   const meta = {
     soundcloudId: soundCloudInteger(track.id, 1),
     title: track.title || '—',
-    artist: String(track.publisher_metadata?.artist || '').trim() || String(track.user?.username || '').trim() || '—',
-    artwork: artworkUrl ? artworkUrl.replace(/-([a-z]+|t\d+x\d+)\.(jpg|png)$/i, '-t200x200.$2') : null,
-    link: track.permalink_url,
+    artist: resolvedArtist,
+    artwork: artworkUrl ? artworkUrl.replace(/-([a-z]+|t\d+x\d+)(\.(?:jpe?g|png|webp))(?=$|\?)/i, '-t200x200$2') : null,
+    link: resolvedLink,
     artistLink: track.user?.permalink_url || null,
     waveform: track.waveform_url || null,
+    lastModified: typeof track.last_modified === 'string' && track.last_modified.trim()
+      ? track.last_modified.trim()
+      : null,
+    mediaSignature: typeof soundCloudMediaSignature === 'function'
+      ? soundCloudMediaSignature(track)
+      : null,
     trackAuthorization: track.track_authorization || null,
     hls_aac_160_url: track.hls_aac_160_url || track.streams?.hls_aac_160_url
       || track.media?.hls_aac_160_url || track.media?.streams?.hls_aac_160_url || null,
@@ -1554,6 +2420,16 @@ function metaFromSoundCloudTrack(track, sourcePage, playlistPosition = null) {
       })).filter(item => item.url)
       : [],
     liked: typeof track.user_favorite === 'boolean' ? track.user_favorite : null,
+    genre: rawGenre || null,
+    tags: parsedTags,
+    createdAt: rawDate || null,
+    uploadYear: yearMatch ? Number(yearMatch[1]) : null,
+    playbackCount: soundCloudInteger(track.playback_count, 0),
+    likesCount: soundCloudInteger(track.likes_count ?? track.favoritings_count, 0),
+    bpm: parsedBpm,
+    keySignature: typeof track.key_signature === 'string' && track.key_signature.trim()
+      ? track.key_signature.trim().slice(0, 24)
+      : null,
     sourcePage,
     playlistPosition: Number.isFinite(Number(playlistPosition)) ? Number(playlistPosition) : null,
   };
@@ -1602,7 +2478,8 @@ const SVG = {
   timer:   `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><circle cx="8" cy="9" r="5"/><path d="M6 1.5h4M8 1.5V4m3.7 1.3L13 4M8 6v3l2 1"/></svg>`,
   info:    `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><circle cx="8" cy="8" r="6"/><path d="M8 7.5v4"/><circle cx="8" cy="4.8" r=".8" fill="currentColor" stroke="none"/></svg>`,
   note:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:18px;height:18px;flex-shrink:0;opacity:0.25"><path d="M9 3v7.27A3 3 0 1 0 11 13V6h2V3H9zm-3 12a1 1 0 110-2 1 1 0 010 2z"/></svg>`,
-  shuffle: `<svg viewBox="0 0 24 24" fill="currentColor" style="display:block;width:12px;height:12px;flex-shrink:0"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>`,
+  shuffle: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M1.75 11.5H3.5C7.5 11.5 7.5 4.5 11.5 4.5H13.85M12.15 2.55L14.25 4.5l-2.1 1.95M1.75 4.5H3.5C4.58 4.5 5.37 5.01 6.02 5.76M8.98 10.24C9.63 10.99 10.42 11.5 11.5 11.5H13.85M12.15 9.55L14.25 11.5l-2.1 1.95"/></svg>`,
+  brandmarkShuffle: `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><defs><linearGradient id="tss-brandmark-grad" gradientUnits="userSpaceOnUse" x1="-3.6" y1="0" x2="1" y2="0"><stop id="tss-brandmark-stop-a" offset="0%" stop-color="#aebaf3" stop-opacity="1" style="stop-color:var(--tss-a,#aebaf3)"/><stop id="tss-brandmark-stop-b" offset="100%" stop-color="#ffffff" stop-opacity=".22"/></linearGradient></defs><path id="tss-brandmark-paths" d="M1.75 11.5H3.5C7.5 11.5 7.5 4.5 11.5 4.5H13.85M12.15 2.55L14.25 4.5l-2.1 1.95M1.75 4.5H3.5C4.58 4.5 5.37 5.01 6.02 5.76M8.98 10.24C9.63 10.99 10.42 11.5 11.5 11.5H13.85M12.15 9.55L14.25 11.5l-2.1 1.95"/></svg>`,
   artwork: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><rect x="2" y="2" width="12" height="12" rx="2"/><circle cx="5.3" cy="5.3" r="1.3" fill="currentColor" stroke="none"/><path d="M3.5 12l3.2-3.5 2.1 2 1.5-1.6 2.2 3.1"/></svg>`,
   list:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><rect x="1" y="2.5" width="14" height="1.5" rx="0.75"/><rect x="1" y="7.25" width="14" height="1.5" rx="0.75"/><rect x="1" y="12" width="14" height="1.5" rx="0.75"/></svg>`,
   more:    `<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:13px;height:13px;flex-shrink:0"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>`,
@@ -1611,6 +2488,10 @@ const SVG = {
   volume:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M2 6h3l3-2.5v9L5 10H2z"/><path d="M11 5.5a4 4 0 010 5"/><path d="M13 3.5a7 7 0 010 9"/></svg>`,
   heart:   `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M8 13.6S2.2 10.2 2.2 5.8A3.1 3.1 0 018 4.25 3.1 3.1 0 0113.8 5.8C13.8 10.2 8 13.6 8 13.6z"/></svg>`,
   heartFilled:`<svg viewBox="0 0 16 16" fill="currentColor" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M8 14.2l-.42-.25C5.62 12.78 1.5 9.86 1.5 5.77A3.82 3.82 0 018 3.04a3.82 3.82 0 016.5 2.73c0 4.09-4.12 7.01-6.08 8.18L8 14.2z"/></svg>`,
+  djHeadphones:`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:14px;height:14px;flex-shrink:0"><path d="M2.5 9.5V8a5.5 5.5 0 0111 0v1.5"/><rect x="2" y="9" width="2.8" height="4.5" rx="1.2" fill="currentColor" stroke="none"/><rect x="11.2" y="9" width="2.8" height="4.5" rx="1.2" fill="currentColor" stroke="none"/></svg>`,
+  djVibe:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M8 1.8l1.25 3.25L12.5 6.3 9.25 7.55 8 10.8 6.75 7.55 3.5 6.3l3.25-1.25z"/><path d="M12.6 10.4l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6z"/></svg>`,
+  djWave:  `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true" style="display:block;width:13px;height:13px;flex-shrink:0"><path d="M2.5 6.5v3M5.2 4v8M8 2.5v11M10.8 4.8v6.4M13.5 6.5v3"/></svg>`,
+  trueDjCover: `<svg class="tss-true-dj-svg" viewBox="0 0 120 120" fill="none" aria-hidden="true" style="display:block;width:100%;height:100%"><rect width="120" height="120" fill="#090c15"/><circle cx="60" cy="58" r="54" fill="rgba(174,186,243,.055)"/><circle cx="60" cy="58" r="42" fill="rgba(174,186,243,.08)"/><circle class="tss-dj-cover-halo" cx="60" cy="60" r="46" stroke="rgba(174,186,243,.28)" stroke-width="1.2" stroke-dasharray="18 10" stroke-linecap="round"/><circle cx="60" cy="60" r="39.5" stroke="rgba(174,186,243,.15)" stroke-width="1"/><circle cx="60" cy="60" r="33" fill="#0d111d" stroke="rgba(210,222,255,.22)" stroke-width="1.25"/><path d="M39 43A27 27 0 0177 39M81 77A27 27 0 0143 81" stroke="rgba(174,186,243,.14)" stroke-width="1" stroke-linecap="round"/><path d="M41 60.5v-3a19 19 0 0138 0v3" stroke="#e3e9ff" stroke-width="2.5" stroke-linecap="round"/><path d="M44.5 57.5a15.5 15.5 0 0131 0" stroke="rgba(174,186,243,.42)" stroke-width="1.15" stroke-linecap="round"/><rect x="37" y="57" width="7" height="14" rx="3.3" fill="#aebaf3"/><rect x="76" y="57" width="7" height="14" rx="3.3" fill="#aebaf3"/><g class="tss-dj-cover-bars"><rect class="tss-dj-bar-1" x="48.5" y="59" width="2.8" height="8" rx="1.4" fill="#aebaf3"/><rect class="tss-dj-bar-2" x="53.6" y="55.5" width="2.8" height="15" rx="1.4" fill="#d5ddff"/><rect class="tss-dj-bar-3" x="58.6" y="52.5" width="2.8" height="21" rx="1.4" fill="#ffffff"/><rect class="tss-dj-bar-4" x="63.6" y="55.5" width="2.8" height="15" rx="1.4" fill="#d5ddff"/><rect class="tss-dj-bar-5" x="68.7" y="59" width="2.8" height="8" rx="1.4" fill="#aebaf3"/></g></svg>`,
 };
 
 function recordPlaybackDiagnostic(event, details = {}) {
@@ -1648,6 +2529,7 @@ function recordTransitionDiagnostic(event, details = {}) {
     case 'transition-requested': case 'fade-window': case 'fade-trigger':
     case 'fade-scheduled': case 'incoming-clock-progress': case 'fade-completed': case 'fade-fallback':
     case 'transition-no-mix': case 'natural-end': case 'watcher-delay':
+    case 'bumper-handoff': case 'transition-gap-recovered':
       break;
     default: return null;
   }
@@ -1658,6 +2540,10 @@ function recordTransitionDiagnostic(event, details = {}) {
     if (DIAGNOSTIC_NUMBER_FIELDS.has(key) && typeof value === 'number' && Number.isFinite(value)) clean[key] = value;
     else if (DIAGNOSTIC_BOOLEAN_FIELDS.has(key) && typeof value === 'boolean') clean[key] = value;
     else if (event === 'hls-error' && (key === 'errorType' || key === 'errorDetail')) clean[key] = hlsDiagnosticCode(value);
+    else if (event === 'bumper-handoff' && (key === 'streamSource' || key === 'mediaWaitOutcome')) {
+      const safe = safeDiagnosticString(key, value);
+      if (safe) clean[key] = safe;
+    }
   }
   return recordPlaybackDiagnostic(event, {
     playbackEpoch: state._playbackEpoch,
@@ -2182,12 +3068,27 @@ function compactPlaybackReport(snapshot) {
   }
   if (fault) {
     const timing = [];
-    for (const [label, key] of [['elapsed', 'elapsedMs'], ['clock stalled', 'clockStalledFor'], ['media stalled', 'mediaStalledFor'], ['stalled', 'stalledFor']]) {
-      if (typeof fault[key] === 'number') timing.push(`${label}=${number(fault[key])}ms`);
+    if (fault.event === 'transition-silence-gap') {
+      for (const [label, key] of [
+        ['silence gap', 'silenceGapMs'], ['watcher', 'watcherPickupMs'], ['prep wait', 'foregroundPrepMs'],
+        ['lookup', 'streamLookupMs'], ['buffer wait', 'mediaWaitElapsedMs'], ['graph', 'graphResumeMs'],
+        ['play', 'playElapsedMs'], ['first advance', 'incomingAdvanceDelayMs'],
+      ]) {
+        if (typeof fault[key] === 'number') timing.push(`${label}=${number(fault[key])}ms`);
+      }
+      if (typeof fault.outgoingDuration === 'number') timing.push(`out=${number(fault.outgoingDuration)}s`);
+      if (typeof fault.incomingDuration === 'number') timing.push(`in=${number(fault.incomingDuration)}s`);
+    } else {
+      for (const [label, key] of [['elapsed', 'elapsedMs'], ['clock stalled', 'clockStalledFor'], ['media stalled', 'mediaStalledFor'], ['stalled', 'stalledFor']]) {
+        if (typeof fault[key] === 'number') timing.push(`${label}=${number(fault[key])}ms`);
+      }
+      if (typeof fault.elapsed === 'number') timing.push(`fade elapsed=${number(fault.elapsed)}s`);
+      if (typeof fault.duration === 'number') timing.push(`duration=${number(fault.duration)}s`);
     }
-    if (typeof fault.elapsed === 'number') timing.push(`fade elapsed=${number(fault.elapsed)}s`);
-    if (typeof fault.duration === 'number') timing.push(`duration=${number(fault.duration)}s`);
     if (timing.length) append(`Fault timing: ${timing.join('; ')}`);
+    if (fault.event === 'transition-silence-gap') {
+      append(`Handoff: source=${fault.streamSource || 'unknown'}; wait=${fault.mediaWaitOutcome || 'unknown'}; preflight=${flag(fault.preflightAdopted)}; reused=${flag(fault.reusedReadyDeck)}; window ready=${flag(fault.standbyReadyAtWindow)}; end ready=${flag(fault.standbyReadyAtEnd)}; startPts=${number(fault.bufferedStartPts)}s`);
+    }
   }
   const before = Number.isFinite(faultTime)
     ? (incident?.diagnostics || events).filter(entry => Date.parse(entry.at) < faultTime
@@ -2211,7 +3112,7 @@ function compactPlaybackReport(snapshot) {
     const relevant = [];
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index];
-      if (!/^(?:recovery-|crossfade-|custom-start-|hls-|audio-|playback-|fade-|transition-|preparation-|media-(?:waiting|stalled))/.test(entry.event || '')) continue;
+      if (!/^(?:recovery-|crossfade-|custom-start-|hls-|audio-|playback-|fade-|transition-|bumper-|preparation-|media-(?:waiting|stalled))/.test(entry.event || '')) continue;
       const detail = entry.failureReason || entry.reason || entry.recoveryOutcome || entry.outcome || entry.errorName || entry.errorDetail || '';
       const key = `${entry.event}|${detail}|${entry.status ?? ''}|${entry.event === 'audio-graph-failed' ? entry.phase || '' : ''}`;
       if (seen.has(key)) continue;
@@ -2290,6 +3191,7 @@ function showPlaybackReportHelp() {
   overlay.querySelector('#tss-debug-help-back').onclick = close;
   overlay.onclick = event => { if (event.target === overlay) close(); };
   overlay.onkeydown = event => {
+    event.stopPropagation();
     if (event.key === 'Escape') { event.preventDefault(); close(); }
     if (event.key === 'Tab') {
       const first = overlay.querySelector('#tss-debug-help-close');
@@ -2298,6 +3200,7 @@ function showPlaybackReportHelp() {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     }
   };
+  overlay.onkeyup = event => event.stopPropagation();
   reportDialog?.setAttribute('inert', '');
   reportDialog?.setAttribute('aria-hidden', 'true');
   document.body.appendChild(overlay);
@@ -2333,6 +3236,7 @@ function showPlaybackDiagnostics() {
   overlay.querySelector('#tss-debug-close').onclick = close;
   overlay.onclick = event => { if (event.target === overlay) close(); };
   overlay.onkeydown = event => {
+    event.stopPropagation();
     if (event.key === 'Escape') { event.preventDefault(); close(); }
     if (event.key === 'Tab') {
       const first = overlay.querySelector('#tss-debug-close');
@@ -2341,6 +3245,7 @@ function showPlaybackDiagnostics() {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     }
   };
+  overlay.onkeyup = event => event.stopPropagation();
   overlay.querySelector('#tss-debug-help').onclick = showPlaybackReportHelp;
   overlay.querySelector('#tss-debug-clear').onclick = () => {
     state._playbackDiagnostics = [];
@@ -2417,7 +3322,7 @@ const EQ_PRESETS = {
 };
 
 const DEFAULT_WAVE_HEIGHTS = [34,58,82,48,72,96,62,42,78,54,88,66,38,74,100,56,84,46,68,92,52,76,40,86,64,98,44,72,58,90,50,80,36,70,94,60,84,46,76,54,100,68,42,88,58,74,48,92,64,82,38,70,56,86];
-const WAVEFORM_CACHE_LIMIT = 300;
+const WAVEFORM_CACHE_LIMIT = 512;
 const waveformCache = new Map();
 let waveformRequest = 0;
 
@@ -2441,53 +3346,110 @@ function soundCloudTrackMatches(meta, track) {
   const expectedId = soundCloudInteger(meta.soundcloudId ?? meta.id, 1);
   const actualId = soundCloudInteger(track.id ?? track.soundcloudId, 1);
   if (expectedId !== null && actualId !== null) return expectedId === actualId;
-  const expectedUrl = normalizeTrackUrl(meta.link || meta.permalink_url || meta.permalinkUrl);
-  const actualUrl = normalizeTrackUrl(track.permalink_url || track.permalinkUrl || track.link);
+  const expectedUrl = normalizeTrackUrl(meta.link || meta.permalink_url || meta.permalinkUrl).replace(/\/s-[a-z0-9_-]+$/i, '');
+  const actualUrl = normalizeTrackUrl(track.permalink_url || track.permalinkUrl || track.link).replace(/\/s-[a-z0-9_-]+$/i, '');
   return Boolean(expectedUrl && actualUrl === expectedUrl);
 }
 
+function soundCloudHydrationRoots() {
+  const direct = typeof pageWindow !== 'undefined' ? pageWindow?.__sc_hydration : null;
+  if (Array.isArray(direct)) return direct;
+  if (typeof document === 'undefined' || typeof document?.querySelectorAll !== 'function') return null;
+  const pageKey = typeof location !== 'undefined' ? String(location?.href || '').split(/[?#]/)[0] : '';
+  if (typeof state !== 'undefined' && state?._jsonHydrationCache?.pageKey === pageKey) {
+    return state._jsonHydrationCache.roots;
+  }
+  const roots = [];
+  try {
+    for (const script of document.querySelectorAll('script[type="application/json"]')) {
+      const text = String(script.textContent || '').trim();
+      if (!text || text.length > 8_000_000) continue;
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) roots.push(...parsed);
+        else if (parsed && typeof parsed === 'object') roots.push(parsed);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  const resolved = roots.length ? roots : null;
+  if (typeof state !== 'undefined' && state) {
+    state._jsonHydrationCache = { pageKey, roots: resolved };
+  }
+  return resolved;
+}
+
 function hydrationWaveformUrl(meta) {
-  const roots = pageWindow.__sc_hydration;
+  const roots = typeof soundCloudHydrationRoots === 'function'
+    ? soundCloudHydrationRoots()
+    : pageWindow.__sc_hydration;
   if (!Array.isArray(roots)) return null;
 
-  const wantedUrl = normalizeTrackUrl(meta?.link);
-  const seen = new WeakSet();
-  const stack = [...roots];
+  const wantedUrl = normalizeTrackUrl(meta?.link).replace(/\/s-[a-z0-9_-]+$/i, '');
+  if (!wantedUrl) return null;
 
-  while (stack.length) {
-    const value = stack.pop();
-    if (!value || typeof value !== 'object' || seen.has(value)) continue;
-    seen.add(value);
-
-    const wave = value.waveform_url || value.waveformUrl;
-    if (wave) {
-      const candidateUrl = normalizeTrackUrl(value.permalink_url || value.permalinkUrl || '');
-      if (wantedUrl && candidateUrl === wantedUrl) return wave;
+  let cachedEntry = typeof hydrationWaveformUrl._cache?.get === 'function'
+    ? hydrationWaveformUrl._cache.get(roots)
+    : null;
+  if (!cachedEntry || cachedEntry.length !== roots.length) {
+    const map = typeof Map === 'function' ? new Map() : null;
+    const seen = typeof WeakSet === 'function' ? new WeakSet() : null;
+    const stack = [...roots];
+    while (stack.length) {
+      const value = stack.pop();
+      if (!value || typeof value !== 'object') continue;
+      if (seen) {
+        if (seen.has(value)) continue;
+        seen.add(value);
+      }
+      const wave = value.waveform_url || value.waveformUrl;
+      if (wave) {
+        const candidateUrl = normalizeTrackUrl(value.permalink_url || value.permalinkUrl || '').replace(/\/s-[a-z0-9_-]+$/i, '');
+        if (candidateUrl) {
+          if (map) map.set(candidateUrl, wave);
+          else if (candidateUrl === wantedUrl) return wave;
+        }
+      }
+      for (const child of Object.values(value)) {
+        if (child && typeof child === 'object') stack.push(child);
+      }
     }
-
-    for (const child of Object.values(value)) {
-      if (child && typeof child === 'object') stack.push(child);
+    if (!map) return null;
+    cachedEntry = { length: roots.length, map };
+    if (typeof WeakMap === 'function') {
+      if (!hydrationWaveformUrl._cache) hydrationWaveformUrl._cache = new WeakMap();
+      hydrationWaveformUrl._cache.set(roots, cachedEntry);
     }
   }
-  return null;
+  return cachedEntry.map.get(wantedUrl) || null;
 }
 
 async function resolveWaveformUrl(meta, options = {}) {
-  const direct = meta?.waveform || hydrationWaveformUrl(meta);
+  const direct = meta?.waveform || (meta?._audioReplacedAt ? null : hydrationWaveformUrl(meta));
   if (direct) {
     if (meta && !meta.waveform) meta.waveform = direct;
     return direct;
   }
-  const wantedUrl = normalizeTrackUrl(meta?.link);
+  const wantedUrl = normalizeTrackUrl(meta?.link).replace(/\/s-[a-z0-9_-]+$/i, '');
   if (!wantedUrl) return null;
   const isCurrent = options.isCurrent || (() => !options.signal?.aborted);
   try {
-    const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), options);
+    const rejected = typeof Set === 'function' ? new Set() : null;
+    let clientId = await discoverSoundCloudClientIdFromBundle(rejected || undefined, options);
     if (!clientId || !isCurrent()) return null;
-    const response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`, 'json', options);
-    if (!response.ok || !isCurrent()) return null;
+    let response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`, 'json', options);
+    if ((response?.status === 401 || response?.status === 403) && rejected && isCurrent()) {
+      rejected.add(clientId);
+      if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+      else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = null;
+      const freshClientId = await discoverSoundCloudClientIdFromBundle(rejected, { ...options, bundleOnly: true });
+      if (freshClientId && freshClientId !== clientId && isCurrent()) {
+        clientId = freshClientId;
+        response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(meta.link)}&client_id=${encodeURIComponent(clientId)}`, 'json', options);
+      }
+    }
+    if (!response?.ok || !isCurrent()) return null;
     const track = response.data;
-    const candidateUrl = normalizeTrackUrl(track?.permalink_url || track?.permalinkUrl || '');
+    const candidateUrl = normalizeTrackUrl(track?.permalink_url || track?.permalinkUrl || '').replace(/\/s-[a-z0-9_-]+$/i, '');
     const resolved = candidateUrl === wantedUrl ? (track?.waveform_url || track?.waveformUrl) : null;
     if (resolved) meta.waveform = resolved;
     return resolved || null;
@@ -2526,7 +3488,13 @@ async function loadTrackWaveform(meta) {
   const signal = state._playbackAbort?.signal;
   const isCurrent = () => request === waveformRequest && epoch === state._playbackEpoch && !signal?.aborted;
   if (!key) { renderWaveform(); return; }
-  if (waveformCache.has(key)) { renderWaveform(waveformCache.get(key)); return; }
+  if (waveformCache.has(key)) {
+    const cached = waveformCache.get(key);
+    waveformCache.delete(key);
+    waveformCache.set(key, cached);
+    renderWaveform(cached);
+    return;
+  }
   try {
     const url = await resolveWaveformUrl(meta, { signal, isCurrent });
     if (!isCurrent()) return;
@@ -2535,7 +3503,9 @@ async function loadTrackWaveform(meta) {
     if (!isCurrent()) return;
     if (!response.ok) throw new Error(`waveform ${response.status}`);
     const payload = response.data;
-    const heights = downsampleWaveform(payload?.samples || payload?.data || payload);
+    const rawSamples = payload?.samples || payload?.data || payload;
+    if (typeof recordDjWaveformFeatures === 'function') recordDjWaveformFeatures(key, rawSamples, meta);
+    const heights = downsampleWaveform(rawSamples);
     if (!heights) throw new Error('waveform samples missing');
     waveformCache.set(key, heights);
     // Older evicted waveforms can be fetched again when revisited.
@@ -2565,7 +3535,16 @@ function mkWorker() {
       };
     `;
     url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-    return new Worker(url);
+    const worker = new Worker(url);
+    if (typeof setTimeout === 'function') {
+      const revokeUrl = url;
+      url = null;
+      const timer = setTimeout(() => {
+        try { URL.revokeObjectURL(revokeUrl); } catch (_) {}
+      }, 4000);
+      timer?.unref?.();
+    }
+    return worker;
   } catch (_) {
     return null;
   } finally {
@@ -2631,6 +3610,5277 @@ function saveLifetimeStats() {
     state._lifetimePending = null;
     return true;
   } catch (_) { return false; }
+}
+
+
+const DJ_VOICES = [
+  { id: 'am_michael', name: 'Xavier', label: 'Xavier · US Laid-back Host' },
+  { id: 'af_heart',   name: 'Maya',   label: 'Maya · US Warm & Smooth' },
+  { id: 'af_bella',   name: 'Bella',  label: 'Bella · US Expressive' },
+  { id: 'am_fenrir',  name: 'Cole',   label: 'Cole · US Deep Studio' },
+  { id: 'am_puck',    name: 'Puck',   label: 'Puck · US Upbeat' },
+  { id: 'bf_emma',    name: 'Emma',   label: 'Emma · UK Radio Host' },
+  { id: 'bm_george',  name: 'George', label: 'George · UK Classic' },
+];
+const DJ_VOICE_IDS = new Set(DJ_VOICES.map(item => item.id));
+const DJ_VOICE_MODELS = [
+  {
+    id: 'hq',
+    label: 'Studio HD · Kokoro 82M (Recommended)',
+    shortLabel: 'Studio HD (CPU)',
+    cacheKey: 'tss_dj_voice_cached_hq_v1',
+    noteIdle: 'Studio HD neural voice (~88 MB one-time browser cache, CPU WASM · 0 GPU lag). Opting out unloads memory immediately.',
+    noteReady: 'Studio HD voice ready on device (Kokoro 82M cached · 0 cloud calls · 0 GPU lag).',
+  },
+  {
+    id: 'hq-gpu',
+    label: 'Studio Ultra · Kokoro 82M (WebGPU)',
+    shortLabel: 'Studio Ultra (GPU)',
+    cacheKey: 'tss_dj_voice_cached_hq_gpu_v1',
+    noteIdle: 'Studio Ultra GPU voice (~310 MB one-time browser cache, WebGPU accelerated · auto-falls back to CPU if unavailable).',
+    noteReady: 'Studio Ultra voice ready on device (Kokoro 82M WebGPU cached · 0 cloud calls).',
+  },
+  {
+    id: 'lite',
+    label: 'Low-Spec · Fast Lite (~26 MB CPU)',
+    shortLabel: 'Fast Lite (Low-Spec)',
+    cacheKey: 'tss_dj_voice_cached_lite_v1',
+    noteIdle: 'Lightweight low-spec voice (~26 MB one-time browser cache, minimal RAM & CPU · 0 GPU usage).',
+    noteReady: 'Fast Lite voice ready on device (~26 MB cached · 0 cloud calls · low-spec friendly).',
+  },
+];
+const DJ_VOICE_MODEL_IDS = new Set(DJ_VOICE_MODELS.map(item => item.id));
+
+function djVoiceModelMeta(modelId = state.djVoiceModel) {
+  return DJ_VOICE_MODELS.find(item => item.id === modelId) || DJ_VOICE_MODELS[0];
+}
+
+function isDjVoiceModelCached(modelId = state.djVoiceModel) {
+  return safeStorage.getItem(djVoiceModelMeta(modelId).cacheKey) === '1';
+}
+const DJ_FOCUS_MODES = ['auto', 'favorites', 'discovery', 'throwbacks', 'chill', 'energy'];
+const DJ_TALK_FREQUENCIES = [
+  { id: 'every', label: 'Every set (3–4 songs)', shortLabel: 'Every set' },
+  { id: 'relaxed', label: 'Relaxed (every 2–3 sets)', shortLabel: 'Relaxed' },
+  { id: 'minimal', label: 'Start & vibe switches only', shortLabel: 'Minimal' },
+];
+const DJ_TALK_FREQ_IDS = new Set(DJ_TALK_FREQUENCIES.map(item => item.id));
+const DJ_RECENT_OPENERS_LIMIT = 32;
+const DJ_CAMELOT_NOTE_MAP = {
+  'abm': '1A', 'g#m': '1A', 'b': '1B', 'cb': '1B',
+  'ebm': '2A', 'd#m': '2A', 'f#': '2B', 'gb': '2B',
+  'bbm': '3A', 'a#m': '3A', 'db': '3B', 'c#': '3B',
+  'fm': '4A', 'ab': '4B', 'g#': '4B',
+  'cm': '5A', 'eb': '5B', 'd#': '5B',
+  'gm': '6A', 'bb': '6B', 'a#': '6B',
+  'dm': '7A', 'f': '7B',
+  'am': '8A', 'c': '8B',
+  'em': '9A', 'g': '9B',
+  'bm': '10A', 'd': '10B',
+  'f#m': '11A', 'gbm': '11A', 'a': '11B',
+  'c#m': '12A', 'dbm': '12A', 'e': '12B',
+};
+
+function djParseCamelotToken(raw, options = {}) {
+  const clean = String(raw || '').trim();
+  if (!clean) return '';
+  const cam = clean.match(/^(1[0-2]|[1-9])\s*([ABab])$/);
+  if (cam) {
+    return `${Number(cam[1])}${cam[2].toUpperCase()}`;
+  }
+  if (options.allowOpenKey !== false) {
+    const openKey = clean.match(/^(1[0-2]|[1-9])\s*([mMdD])$/);
+    if (openKey) {
+      const num = Number(openKey[1]);
+      const camelotNum = ((num + 6) % 12) + 1;
+      const side = openKey[2].toUpperCase() === 'M' ? 'A' : 'B';
+      return `${camelotNum}${side}`;
+    }
+  }
+  const noteMatch = clean.match(/^([A-Ga-g])\s*([#♯b♭])?\s*(maj|major|min|minor|m)?$/i);
+  if (noteMatch) {
+    const root = noteMatch[1].toLowerCase();
+    const accRaw = noteMatch[2] || '';
+    const acc = (accRaw === '♯' || accRaw === '#') ? '#' : ((accRaw === '♭' || accRaw === 'b') ? 'b' : '');
+    const qualRaw = (noteMatch[3] || '').toLowerCase();
+    const isMinor = qualRaw === 'm' || qualRaw === 'min' || qualRaw === 'minor';
+    const lookup = `${root}${acc}${isMinor ? 'm' : ''}`;
+    return DJ_CAMELOT_NOTE_MAP[lookup] || '';
+  }
+  return '';
+}
+
+function djResolveCamelotKey(meta) {
+  if (!meta || typeof meta !== 'object') return '';
+  if (typeof meta._camelotKey === 'string') return meta._camelotKey;
+  let resolved = '';
+  if (meta.keySignature) {
+    resolved = djParseCamelotToken(meta.keySignature, { allowOpenKey: true });
+  }
+  if (!resolved && typeof meta.title === 'string') {
+    const bracketCam = meta.title.match(/[\[(]\s*(1[0-2]|[1-9])([AB])\s*[\])]/i);
+    if (bracketCam) {
+      resolved = `${Number(bracketCam[1])}${bracketCam[2].toUpperCase()}`;
+    } else {
+      const bracketKey = meta.title.match(/[\[(]\s*([A-G][#b]?\s*(?:maj|major|min|minor|m))\s*[\])]/i);
+      if (bracketKey) resolved = djParseCamelotToken(bracketKey[1], { allowOpenKey: false });
+    }
+  }
+  if (!resolved && Array.isArray(meta.tags)) {
+    for (const tag of meta.tags) {
+      const candidate = djParseCamelotToken(tag, { allowOpenKey: false });
+      if (candidate) { resolved = candidate; break; }
+    }
+  }
+  meta._camelotKey = resolved;
+  return resolved;
+}
+
+function djHarmonicCompatibility(keyA, keyB) {
+  const a = String(keyA || '').trim().toUpperCase();
+  const b = String(keyB || '').trim().toUpperCase();
+  const mA = a.match(/^(1[0-2]|[1-9])([AB])$/);
+  const mB = b.match(/^(1[0-2]|[1-9])([AB])$/);
+  if (!mA || !mB) return null;
+  const nA = Number(mA[1]);
+  const sA = mA[2];
+  const nB = Number(mB[1]);
+  const sB = mB[2];
+  if (nA === nB && sA === sB) return 1.0;
+  const diff = Math.min(Math.abs(nA - nB), 12 - Math.abs(nA - nB));
+  if (nA === nB && sA !== sB) return 0.92;
+  if (sA === sB && diff === 1) return 0.92;
+  if (sA === sB && diff === 2) return 0.65;
+  if (sA !== sB && diff === 1) return 0.6;
+  if (diff <= 3) return 0.42;
+  return 0.12;
+}
+const DJ_DAYPARTS = ['morning', 'afternoon', 'evening', 'night'];
+const DJ_TELEMETRY_TRACK_LIMIT = 1500;
+const DJ_TELEMETRY_ARTIST_LIMIT = 300;
+const DJ_TELEMETRY_GENRE_LIMIT = 200;
+const DJ_WAVEFORM_FEATURE_LIMIT = 512;
+const DJ_RELATED_CACHE_LIMIT = 32;
+const DJ_RELATED_CACHE_TTL_MS = 30 * 60_000;
+const DJ_SESSION_COOLDOWN_LIMIT = 128;
+const DJ_MAX_SESSION_DISCOVERY_TRACKS = 96;
+const DJ_DUCK_GAIN = 0.24;
+const DJ_DUCK_ATTACK_SEC = 0.24;
+const DJ_DUCK_RELEASE_SEC = 0.44;
+const DJ_JUNK_TAGS = new Set([
+  'soundcloud', 'music', 'audio', 'track', 'song', 'songs', 'new', 'official',
+  'free', 'download', 'freedl', 'remix', 'edit', 'bootleg', 'flip', 'vip',
+  'mp3', 'wav', 'prod', 'original', 'mix', '2020', '2021', '2022', '2023', '2024', '2025', '2026',
+]);
+const DJ_CANONICAL_GENRE_MAP = {
+  'dnb': 'Drum & Bass',
+  'drum & bass': 'Drum & Bass',
+  'drum and bass': 'Drum & Bass',
+  'drumandbass': 'Drum & Bass',
+  'liquid dnb': 'Drum & Bass',
+  'neurofunk': 'Drum & Bass',
+  'house': 'House',
+  'deep house': 'House',
+  'tech house': 'House',
+  'progressive house': 'House',
+  'bass house': 'House',
+  'techno': 'Techno',
+  'hard techno': 'Techno',
+  'melodic techno': 'Techno',
+  'acid techno': 'Techno',
+  'phonk': 'Phonk',
+  'drift phonk': 'Phonk',
+  'wave phonk': 'Phonk',
+  'hip-hop': 'Hip-Hop',
+  'hip hop': 'Hip-Hop',
+  'hiphop': 'Hip-Hop',
+  'hip-hop & rap': 'Hip-Hop',
+  'rap': 'Hip-Hop',
+  'trap': 'Trap',
+  'drill': 'Trap',
+  'ambient': 'Ambient',
+  'downtempo': 'Ambient',
+  'chillout': 'Ambient',
+  'drone': 'Ambient',
+  'ukg': 'UK Garage',
+  'uk garage': 'UK Garage',
+  'garage': 'UK Garage',
+  '2step': 'UK Garage',
+  'speed garage': 'UK Garage',
+  'dubstep': 'Dubstep',
+  'riddim': 'Dubstep',
+  '140': 'Dubstep',
+  'trance': 'Trance',
+  'psytrance': 'Trance',
+  'eurodance': 'Trance',
+  'lofi': 'Lo-Fi',
+  'lo-fi': 'Lo-Fi',
+  'chillhop': 'Lo-Fi',
+  'synthwave': 'Synthwave',
+  'retrowave': 'Synthwave',
+  'vaporwave': 'Synthwave',
+  'hyperpop': 'Hyperpop',
+  'glitchcore': 'Hyperpop',
+  'digicore': 'Hyperpop',
+  'jungle': 'Jungle & Breaks',
+  'breakcore': 'Jungle & Breaks',
+  'breaks': 'Jungle & Breaks',
+  'breakbeat': 'Jungle & Breaks',
+  'r&b': 'R&B',
+  'rnb': 'R&B',
+  'r&b & soul': 'R&B',
+  'soul': 'R&B',
+  'indie': 'Indie',
+  'alternative': 'Indie',
+  'alternative rock': 'Indie',
+  'shoegaze': 'Indie',
+  'pop': 'Pop',
+  'dance & edm': 'Electronic',
+  'electronic': 'Electronic',
+  'edm': 'Electronic',
+  'electro': 'Electronic',
+  'wave': 'Wave',
+  'hardwave': 'Wave',
+  'hardstyle': 'Hardstyle',
+  'hardcore': 'Hardstyle',
+  'amapiano': 'Amapiano',
+  'afrobeats': 'Afrobeats',
+  'reggaeton': 'Latin',
+  'latin': 'Latin',
+  'rock': 'Rock',
+  'metal': 'Rock',
+  'punk': 'Rock',
+  'jazz': 'Jazz',
+  'jazz & blues': 'Jazz',
+  'classical': 'Classical',
+};
+
+function djDaypart(nowMs = Date.now()) {
+  const hour = new Date(nowMs).getHours();
+  if (hour >= 5 && hour < 12) return 'morning';
+  if (hour >= 12 && hour < 17) return 'afternoon';
+  if (hour >= 17 && hour < 22) return 'evening';
+  return 'night';
+}
+
+function djSafeKey(raw, maxLen = 80) {
+  const cleaned = String(raw ?? '').trim().toLowerCase().replace(/\s+/g, ' ').slice(0, maxLen);
+  if (!cleaned || BLOCKED_EQ_PRESET_NAMES.has(cleaned)) return '';
+  return cleaned;
+}
+
+function djTrackTelemetryKey(meta) {
+  if (!meta || typeof meta !== 'object') return '';
+  const scId = Number(meta.soundcloudId);
+  if (Number.isInteger(scId) && scId > 0) return `sc:${scId}`;
+  const link = typeof normalizeTrackUrl === 'function'
+    ? normalizeTrackUrl(meta.link)
+    : String(meta.link || '').split(/[?#]/)[0].replace(/\/+$/, '');
+  if (!link || BLOCKED_EQ_PRESET_NAMES.has(link.toLowerCase())) return '';
+  return link.slice(0, 160);
+}
+
+function djTitleCaseGenre(raw) {
+  return String(raw || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(word => word.length <= 3 && /^(?:uk|us|dj|mc|dnb|edm|r&b)$/i.test(word)
+      ? word.toUpperCase()
+      : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function djExtractCanonicalGenres(meta) {
+  if (!meta || typeof meta !== 'object') return [];
+  const candidates = [];
+  if (typeof meta.genre === 'string' && meta.genre.trim()) candidates.push(meta.genre.trim());
+  if (Array.isArray(meta.tags)) candidates.push(...meta.tags);
+  const resolved = [];
+  for (const raw of candidates) {
+    const norm = String(raw || '').trim().replace(/^#+/, '').toLowerCase().replace(/\s+/g, ' ');
+    if (!norm || norm.length < 2 || norm.length > 32 || DJ_JUNK_TAGS.has(norm)) continue;
+    if (BLOCKED_EQ_PRESET_NAMES.has(norm)) continue;
+    let label = Object.prototype.hasOwnProperty.call(DJ_CANONICAL_GENRE_MAP, norm)
+      ? DJ_CANONICAL_GENRE_MAP[norm]
+      : '';
+    if (!label) {
+      for (const [needle, mapped] of Object.entries(DJ_CANONICAL_GENRE_MAP)) {
+        if (needle.length >= 4 && norm.includes(needle)) {
+          label = mapped;
+          break;
+        }
+      }
+    }
+    if (!label && /^[a-z][a-z0-9 &/-]{2,21}$/i.test(norm) && !/^\d+$/.test(norm)) {
+      label = djTitleCaseGenre(norm);
+    }
+    if (label && !resolved.includes(label)) {
+      resolved.push(label);
+      if (resolved.length >= 3) break;
+    }
+  }
+  return resolved;
+}
+
+function sanitizeDjTelemetry(value) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const num = (v, min = 0, max = 1e9, fallback = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+  };
+  const int = (v, max = 1e8) => Math.floor(num(v, 0, max, 0));
+
+  const cleanTracks = {};
+  if (src.tracks && typeof src.tracks === 'object' && !Array.isArray(src.tracks)) {
+    const entries = Object.entries(src.tracks)
+      .filter(([key, item]) => key && !BLOCKED_EQ_PRESET_NAMES.has(key.toLowerCase())
+        && item && typeof item === 'object' && !Array.isArray(item))
+      .sort((a, b) => (num(b[1].lastPlayedAt) + (b[1].liked ? 604800000 : 0))
+        - (num(a[1].lastPlayedAt) + (a[1].liked ? 604800000 : 0)))
+      .slice(0, DJ_TELEMETRY_TRACK_LIMIT);
+    for (const [key, item] of entries) {
+      const todSrc = item.tod && typeof item.tod === 'object' ? item.tod : {};
+      cleanTracks[key.slice(0, 160)] = {
+        title: String(item.title || '').slice(0, 110),
+        artist: String(item.artist || '').slice(0, 80),
+        genre: String(item.genre || '').slice(0, 36),
+        year: item.year ? int(item.year, 2100) : 0,
+        scPlays: int(item.scPlays, 1e10),
+        plays: int(item.plays),
+        completes: int(item.completes),
+        earlySkips: int(item.earlySkips),
+        midSkips: int(item.midSkips),
+        replays: int(item.replays),
+        promotions: int(item.promotions),
+        removals: int(item.removals),
+        liked: item.liked === true ? true : (item.liked === false ? false : null),
+        listenSec: Math.round(num(item.listenSec, 0, 1e8, 0) * 10) / 10,
+        avgCompletion: Math.round(num(item.avgCompletion, 0, 1, 0.5) * 1000) / 1000,
+        energy: Math.round(num(item.energy, 0, 1, 0) * 1000) / 1000,
+        firstSeenAt: int(item.firstSeenAt, 9e15),
+        lastPlayedAt: int(item.lastPlayedAt, 9e15),
+        lastCompletedAt: int(item.lastCompletedAt, 9e15),
+        lastSkippedAt: int(item.lastSkippedAt, 9e15),
+        isDiscovery: item.isDiscovery === true,
+        discoveryConverted: item.discoveryConverted === true,
+        tod: {
+          morning: int(todSrc.morning),
+          afternoon: int(todSrc.afternoon),
+          evening: int(todSrc.evening),
+          night: int(todSrc.night),
+        },
+      };
+    }
+  }
+
+  const cleanArtists = {};
+  if (src.artists && typeof src.artists === 'object' && !Array.isArray(src.artists)) {
+    const entries = Object.entries(src.artists)
+      .filter(([key, item]) => djSafeKey(key) && item && typeof item === 'object' && !Array.isArray(item))
+      .sort((a, b) => num(b[1].lastPlayedAt) - num(a[1].lastPlayedAt))
+      .slice(0, DJ_TELEMETRY_ARTIST_LIMIT);
+    for (const [key, item] of entries) {
+      cleanArtists[djSafeKey(key)] = {
+        name: String(item.name || key).slice(0, 80),
+        score: Math.round(num(item.score, -8, 30, 0) * 100) / 100,
+        plays: int(item.plays),
+        completes: int(item.completes),
+        skips: int(item.skips),
+        likes: int(item.likes),
+        lastPlayedAt: int(item.lastPlayedAt, 9e15),
+      };
+    }
+  }
+
+  const cleanGenres = {};
+  if (src.genres && typeof src.genres === 'object' && !Array.isArray(src.genres)) {
+    const entries = Object.entries(src.genres)
+      .filter(([key, item]) => djSafeKey(key, 48) && item && typeof item === 'object' && !Array.isArray(item))
+      .sort((a, b) => num(b[1].lastPlayedAt) - num(a[1].lastPlayedAt))
+      .slice(0, DJ_TELEMETRY_GENRE_LIMIT);
+    for (const [key, item] of entries) {
+      const todSrc = item.todScores && typeof item.todScores === 'object' ? item.todScores : {};
+      cleanGenres[djSafeKey(key, 48)] = {
+        label: String(item.label || key).slice(0, 40),
+        score: Math.round(num(item.score, -8, 30, 0) * 100) / 100,
+        plays: int(item.plays),
+        completes: int(item.completes),
+        skips: int(item.skips),
+        lastPlayedAt: int(item.lastPlayedAt, 9e15),
+        todScores: {
+          morning: Math.round(num(todSrc.morning, -6, 20, 0) * 100) / 100,
+          afternoon: Math.round(num(todSrc.afternoon, -6, 20, 0) * 100) / 100,
+          evening: Math.round(num(todSrc.evening, -6, 20, 0) * 100) / 100,
+          night: Math.round(num(todSrc.night, -6, 20, 0) * 100) / 100,
+        },
+      };
+    }
+  }
+
+  const cleanTod = {};
+  const rawTod = src.tod && typeof src.tod === 'object' ? src.tod : {};
+  for (const part of DJ_DAYPARTS) {
+    const item = rawTod[part] && typeof rawTod[part] === 'object' ? rawTod[part] : {};
+    cleanTod[part] = {
+      sessions: int(item.sessions),
+      completes: int(item.completes),
+      avgEnergy: Math.round(num(item.avgEnergy, 0, 1, 0.45) * 1000) / 1000,
+    };
+  }
+
+  const cleanArchetypes = {};
+  if (src.archetypes && typeof src.archetypes === 'object' && !Array.isArray(src.archetypes)) {
+    for (const [key, item] of Object.entries(src.archetypes)) {
+      const safe = djSafeKey(key, 36);
+      if (!safe || !item || typeof item !== 'object') continue;
+      cleanArchetypes[safe] = {
+        starts: int(item.starts),
+        completes: int(item.completes),
+        vibeSwitches: int(item.vibeSwitches),
+        score: Math.round(num(item.score, -5, 15, 0) * 100) / 100,
+      };
+    }
+  }
+
+  const cleanRecentOpeners = [];
+  if (Array.isArray(src.recentOpeners)) {
+    const seen = new Set();
+    for (const rawKey of src.recentOpeners) {
+      if (typeof rawKey !== 'string') continue;
+      const trimmed = rawKey.trim().slice(0, 160);
+      if (!trimmed || BLOCKED_EQ_PRESET_NAMES.has(trimmed.toLowerCase()) || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      cleanRecentOpeners.push(trimmed);
+      if (cleanRecentOpeners.length >= DJ_RECENT_OPENERS_LIMIT) break;
+    }
+  }
+
+  return {
+    __tssDjTelemetry: 1,
+    v: 1,
+    updatedAt: int(src.updatedAt, 9e15),
+    totalSessions: int(src.totalSessions),
+    recentOpeners: cleanRecentOpeners,
+    tracks: cleanTracks,
+    artists: cleanArtists,
+    genres: cleanGenres,
+    tod: cleanTod,
+    archetypes: cleanArchetypes,
+  };
+}
+
+function recordDjRecentOpeners(trackIndices) {
+  if (!Array.isArray(trackIndices) || !trackIndices.length) return;
+  const tel = loadDjTelemetry();
+  const nextKeys = [];
+  for (const ti of trackIndices) {
+    const key = djTrackTelemetryKey(state.meta?.[ti]);
+    if (key && !nextKeys.includes(key)) nextKeys.push(key);
+  }
+  if (!nextKeys.length) return;
+  const existing = Array.isArray(tel.recentOpeners) ? tel.recentOpeners : [];
+  const merged = [...nextKeys, ...existing.filter(k => !nextKeys.includes(k))].slice(0, DJ_RECENT_OPENERS_LIMIT);
+  tel.recentOpeners = merged;
+  scheduleDjTelemetrySave();
+}
+
+function loadDjTelemetry() {
+  if (state._djTelemetry && state._djTelemetry.__tssDjTelemetry === 1) return state._djTelemetry;
+  let loaded = null;
+  try {
+    if (typeof GM_getValue === 'function') {
+      const gmRaw = GM_getValue(DJ_TELEMETRY_KEY, null);
+      if (gmRaw && typeof gmRaw === 'object' && !Array.isArray(gmRaw) && gmRaw.__tssDjTelemetry === 1) {
+        loaded = sanitizeDjTelemetry(gmRaw);
+      } else if (typeof gmRaw === 'string' && gmRaw.trim()) {
+        const parsed = JSON.parse(gmRaw);
+        if (parsed && parsed.__tssDjTelemetry === 1) loaded = sanitizeDjTelemetry(parsed);
+      }
+    }
+  } catch (_) {}
+  if (!loaded) {
+    try {
+      const localRaw = safeStorage.getItem(DJ_TELEMETRY_KEY);
+      if (localRaw) {
+        const parsed = JSON.parse(localRaw);
+        if (parsed && typeof parsed === 'object') loaded = sanitizeDjTelemetry(parsed);
+      }
+    } catch (_) {}
+  }
+  state._djTelemetry = loaded || sanitizeDjTelemetry(null);
+  return state._djTelemetry;
+}
+
+function flushDjTelemetry() {
+  clearTimeout(state._djTelemetryTimer);
+  state._djTelemetryTimer = null;
+  if (!state._djTelemetry) return false;
+  const clean = sanitizeDjTelemetry({
+    ...state._djTelemetry,
+    updatedAt: Date.now(),
+  });
+  state._djTelemetry = clean;
+  let savedAny = false;
+  try {
+    if (typeof GM_setValue === 'function') {
+      GM_setValue(DJ_TELEMETRY_KEY, clean);
+      savedAny = true;
+    }
+  } catch (_) {}
+  try {
+    if (safeStorage.setItem(DJ_TELEMETRY_KEY, JSON.stringify(clean))) savedAny = true;
+  } catch (_) {}
+  if (savedAny) state._djTelemetryDirty = false;
+  return savedAny;
+}
+
+function scheduleDjTelemetrySave(delayMs = 1800) {
+  state._djTelemetryDirty = true;
+  if (state._djTelemetryTimer) return;
+  state._djTelemetryTimer = setTimeout(() => {
+    state._djTelemetryTimer = null;
+    flushDjTelemetry();
+  }, Math.max(50, Number(delayMs) || 1800));
+}
+
+function ensureDjTrackEntry(tel, meta, nowMs = Date.now()) {
+  const key = djTrackTelemetryKey(meta);
+  if (!key) return null;
+  const genres = djExtractCanonicalGenres(meta);
+  let entry = Object.prototype.hasOwnProperty.call(tel.tracks, key) ? tel.tracks[key] : null;
+  if (!entry) {
+    entry = {
+      title: String(meta.title || '').slice(0, 110),
+      artist: String(meta.artist || '').slice(0, 80),
+      genre: genres[0] || '',
+      year: Number(meta.uploadYear) || 0,
+      scPlays: Number(meta.playbackCount) || 0,
+      plays: 0,
+      completes: 0,
+      earlySkips: 0,
+      midSkips: 0,
+      replays: 0,
+      promotions: 0,
+      removals: 0,
+      liked: typeof meta.liked === 'boolean' ? meta.liked : null,
+      listenSec: 0,
+      avgCompletion: 0.5,
+      energy: 0,
+      firstSeenAt: nowMs,
+      lastPlayedAt: 0,
+      lastCompletedAt: 0,
+      lastSkippedAt: 0,
+      isDiscovery: meta.isDjDiscovery === true,
+      discoveryConverted: false,
+      tod: { morning: 0, afternoon: 0, evening: 0, night: 0 },
+    };
+    tel.tracks[key] = entry;
+  } else {
+    if (meta.title && meta.title !== '—') entry.title = String(meta.title).slice(0, 110);
+    if (meta.artist && meta.artist !== '—') entry.artist = String(meta.artist).slice(0, 80);
+    if (genres[0]) entry.genre = genres[0];
+    if (Number(meta.uploadYear) > 0) entry.year = Number(meta.uploadYear);
+    if (Number(meta.playbackCount) > 0) entry.scPlays = Number(meta.playbackCount);
+    if (typeof meta.liked === 'boolean') entry.liked = meta.liked;
+    if (meta.isDjDiscovery === true) entry.isDiscovery = true;
+  }
+  return entry;
+}
+
+function updateDjEntityAffinity(tel, meta, deltaScore, flags = {}, nowMs = Date.now()) {
+  if (!meta || typeof meta !== 'object') return;
+  const daypart = djDaypart(nowMs);
+  const artistRaw = String(meta.artist || '').trim();
+  const artistKey = artistRaw && artistRaw !== '—' ? djSafeKey(artistRaw) : '';
+  if (artistKey) {
+    const artist = Object.prototype.hasOwnProperty.call(tel.artists, artistKey)
+      ? tel.artists[artistKey]
+      : (tel.artists[artistKey] = {
+        name: artistRaw.slice(0, 80), score: 0, plays: 0, completes: 0, skips: 0, likes: 0, lastPlayedAt: 0,
+      });
+    artist.name = artistRaw.slice(0, 80);
+    artist.score = Math.max(-8, Math.min(30, Math.round((artist.score * 0.94 + deltaScore) * 100) / 100));
+    if (flags.play) { artist.plays++; artist.lastPlayedAt = nowMs; }
+    if (flags.complete) artist.completes++;
+    if (flags.skip) artist.skips++;
+    if (flags.like) artist.likes++;
+  }
+
+  const genres = djExtractCanonicalGenres(meta);
+  genres.forEach((label, idx) => {
+    const gKey = djSafeKey(label, 48);
+    if (!gKey) return;
+    const weight = idx === 0 ? 1 : 0.55;
+    const genre = Object.prototype.hasOwnProperty.call(tel.genres, gKey)
+      ? tel.genres[gKey]
+      : (tel.genres[gKey] = {
+        label, score: 0, plays: 0, completes: 0, skips: 0, lastPlayedAt: 0,
+        todScores: { morning: 0, afternoon: 0, evening: 0, night: 0 },
+      });
+    genre.label = label;
+    genre.score = Math.max(-8, Math.min(30, Math.round((genre.score * 0.95 + deltaScore * weight) * 100) / 100));
+    genre.todScores[daypart] = Math.max(-6, Math.min(20,
+      Math.round(((genre.todScores[daypart] || 0) * 0.93 + deltaScore * weight * 0.85) * 100) / 100));
+    if (flags.play) { genre.plays++; genre.lastPlayedAt = nowMs; }
+    if (flags.complete) genre.completes++;
+    if (flags.skip) genre.skips++;
+  });
+}
+
+function recordDjTrackImpression(ti) {
+  const meta = state.meta?.[ti];
+  if (!meta) return;
+  const nowMs = Date.now();
+  const tel = loadDjTelemetry();
+  const entry = ensureDjTrackEntry(tel, meta, nowMs);
+  if (entry) {
+    entry.plays++;
+    entry.lastPlayedAt = nowMs;
+  }
+  updateDjEntityAffinity(tel, meta, 0.15, { play: true }, nowMs);
+  state._djCurrentTrackTi = ti;
+  state._djCurrentTrackStartedAt = nowMs;
+  scheduleDjTelemetrySave();
+}
+
+function recordDjTrackOutcome(ti, reason = 'natural-end', metricsOverride = null) {
+  const meta = state.meta?.[ti];
+  if (!meta) return { completed: false, earlySkip: false, shouldRecalibrate: false };
+  const nowMs = Date.now();
+  const tel = loadDjTelemetry();
+  const entry = ensureDjTrackEntry(tel, meta, nowMs);
+  const timing = metricsOverride || (typeof playbackTiming === 'function' ? playbackTiming() : { current: 0, duration: 0 });
+  const durationSec = Math.max(0, Number(timing.duration) || (Number(meta.durationMs) / 1000) || 0);
+  const wallElapsedSec = state._djCurrentTrackTi === ti && state._djCurrentTrackStartedAt > 0
+    ? Math.max(0, (nowMs - state._djCurrentTrackStartedAt) / 1000)
+    : 0;
+  const currentSec = Math.max(0, Number(timing.current) || 0);
+  const listenedSec = Math.min(
+    durationSec > 0 ? durationSec : 3600,
+    Math.max(currentSec, Math.min(wallElapsedSec, durationSec > 0 ? durationSec : wallElapsedSec)),
+  );
+  const ratio = durationSec > 0
+    ? Math.max(0, Math.min(1, Math.max(currentSec / durationSec, Number(state.lastProgress) || 0)))
+    : (reason === 'natural-end' ? 1 : Math.max(0, Math.min(1, Number(state.lastProgress) || 0)));
+
+  const completed = reason === 'natural-end' || ratio >= 0.78 || listenedSec >= 150;
+  const isManualExit = reason === 'manual-skip' || reason === 'vibe-switch';
+  const earlySkip = !completed && isManualExit && ratio < 0.18 && listenedSec < 22;
+  const midSkip = !completed && !earlySkip && isManualExit && ratio < 0.65;
+  const daypart = djDaypart(nowMs);
+
+  if (entry) {
+    entry.listenSec = Math.round((entry.listenSec + listenedSec) * 10) / 10;
+    entry.avgCompletion = Math.round((entry.avgCompletion * 0.72 + (completed ? 1 : ratio) * 0.28) * 1000) / 1000;
+    if (completed) {
+      entry.completes++;
+      entry.lastCompletedAt = nowMs;
+      entry.tod[daypart] = (entry.tod[daypart] || 0) + 1;
+      if (entry.isDiscovery) entry.discoveryConverted = true;
+    } else if (earlySkip) {
+      entry.earlySkips++;
+      entry.lastSkippedAt = nowMs;
+    } else if (midSkip) {
+      entry.midSkips++;
+      entry.lastSkippedAt = nowMs;
+    }
+  }
+
+  let delta = 0;
+  if (completed) delta = 1.65;
+  else if (earlySkip) delta = -1.45;
+  else if (midSkip) delta = -0.35;
+  else if (ratio >= 0.55) delta = 0.45;
+  updateDjEntityAffinity(tel, meta, delta, { complete: completed, skip: earlySkip }, nowMs);
+
+  if (completed) {
+    const todBucket = tel.tod[daypart];
+    if (todBucket) {
+      todBucket.completes++;
+      if (entry?.energy > 0) {
+        todBucket.avgEnergy = Math.round((todBucket.avgEnergy * 0.85 + entry.energy * 0.15) * 1000) / 1000;
+      }
+    }
+  }
+
+  const activeChapter = state._djChapter;
+  if (activeChapter?.archetype) {
+    const archKey = djSafeKey(activeChapter.archetype, 36);
+    if (archKey) {
+      const arch = tel.archetypes[archKey] || (tel.archetypes[archKey] = { starts: 0, completes: 0, vibeSwitches: 0, score: 0 });
+      if (completed) {
+        arch.completes++;
+        arch.score = Math.max(-5, Math.min(15, Math.round((arch.score * 0.94 + 0.65) * 100) / 100));
+      } else if (reason === 'vibe-switch' || earlySkip) {
+        if (reason === 'vibe-switch') arch.vibeSwitches++;
+        arch.score = Math.max(-5, Math.min(15, Math.round((arch.score * 0.94 - (reason === 'vibe-switch' ? 0.9 : 0.45)) * 100) / 100));
+      }
+    }
+  }
+
+  if (earlySkip || (reason === 'vibe-switch' && !completed)) {
+    const cooldownMs = reason === 'vibe-switch' ? 14 * 60_000 : 10 * 60_000;
+    djSetSessionCooldown('artist', meta.artist, cooldownMs, nowMs);
+    for (const genreLabel of djExtractCanonicalGenres(meta).slice(0, 1)) {
+      djSetSessionCooldown('genre', genreLabel, cooldownMs, nowMs);
+    }
+  }
+
+  let shouldRecalibrate = false;
+  if (completed) {
+    state._djSkipStreak = 0;
+  } else if (earlySkip) {
+    state._djSkipStreak = (Number(state._djSkipStreak) || 0) + 1;
+    if (state.djMode && state._djSkipStreak >= 2 && reason === 'manual-skip' && !state._djVibeSwitching) {
+      shouldRecalibrate = true;
+    }
+  }
+
+  if (state._djCurrentTrackTi === ti) {
+    state._djCurrentTrackTi = null;
+    state._djCurrentTrackStartedAt = 0;
+  }
+  scheduleDjTelemetrySave();
+  return { completed, earlySkip, shouldRecalibrate };
+}
+
+function recordDjExplicitSignal(ti, signalType) {
+  const meta = state.meta?.[ti];
+  if (!meta) return;
+  const nowMs = Date.now();
+  const tel = loadDjTelemetry();
+  const entry = ensureDjTrackEntry(tel, meta, nowMs);
+  if (! (state._djSessionCooldowns instanceof Map)) state._djSessionCooldowns = new Map();
+
+  if (signalType === 'like') {
+    if (entry) {
+      entry.liked = true;
+      if (entry.isDiscovery) entry.discoveryConverted = true;
+    }
+    updateDjEntityAffinity(tel, meta, 2.8, { like: true }, nowMs);
+  } else if (signalType === 'unlike') {
+    if (entry) entry.liked = false;
+    updateDjEntityAffinity(tel, meta, -0.8, {}, nowMs);
+  } else if (signalType === 'play-next' || signalType === 'jump-to') {
+    if (entry) {
+      entry.promotions++;
+      if (signalType === 'jump-to') entry.replays++;
+    }
+    updateDjEntityAffinity(tel, meta, 1.5, {}, nowMs);
+  } else if (signalType === 'queue-remove') {
+    if (entry) entry.removals++;
+    updateDjEntityAffinity(tel, meta, -1.7, { skip: true }, nowMs);
+    djSetSessionCooldown('artist', meta.artist, 15 * 60_000, nowMs);
+  }
+  scheduleDjTelemetrySave();
+}
+
+function analyzeDjWaveformEnvelope(samples) {
+  if (!Array.isArray(samples) || samples.length < 16) return null;
+  let peak = 0;
+  const values = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.max(0, Number(samples[i]) || 0);
+    values[i] = v;
+    if (v > peak) peak = v;
+  }
+  if (peak <= 0) return null;
+  const invPeak = 1 / peak;
+  for (let i = 0; i < values.length; i++) values[i] *= invPeak;
+
+  const rmsSlice = (startFrac, endFrac) => {
+    const s = Math.max(0, Math.min(values.length - 1, Math.floor(values.length * startFrac)));
+    const e = Math.max(s + 1, Math.min(values.length, Math.ceil(values.length * endFrac)));
+    let sumSq = 0;
+    for (let i = s; i < e; i++) sumSq += values[i] * values[i];
+    return Math.sqrt(sumSq / (e - s));
+  };
+
+  const introEarly = rmsSlice(0, 0.05);
+  const introMid = rmsSlice(0.06, 0.16);
+  const introEnergy = rmsSlice(0, 0.12);
+  const bodyEnergy = rmsSlice(0.2, 0.8);
+  const preOutro = rmsSlice(0.76, 0.88);
+  const outroEnergy = rmsSlice(0.88, 1.0);
+  const outroTailEnergy = rmsSlice(0.95, 1.0);
+  const outroSlope = outroTailEnergy - preOutro;
+  const introRise = introMid - introEarly;
+
+  const buckets = [];
+  const win = Math.max(1, Math.floor(values.length / 24));
+  for (let i = 0; i < values.length; i += win) {
+    let acc = 0;
+    const end = Math.min(values.length, i + win);
+    for (let j = i; j < end; j++) acc += values[j];
+    buckets.push(acc / (end - i));
+  }
+  buckets.sort((a, b) => a - b);
+  const p25 = buckets[Math.floor(buckets.length * 0.25)] || 0;
+  const p90 = buckets[Math.min(buckets.length - 1, Math.floor(buckets.length * 0.9))] || 0;
+
+  const n = values.length;
+  const radius = Math.max(1, Math.min(4, Math.floor(n / 300)));
+  const smooth = new Float32Array(n);
+  let runSum = 0;
+  let runStart = 0;
+  let runEnd = 0;
+  for (let i = 0; i < n; i++) {
+    const targetStart = Math.max(0, i - radius);
+    const targetEnd = Math.min(n, i + radius + 1);
+    while (runEnd < targetEnd) runSum += values[runEnd++];
+    while (runStart < targetStart) runSum -= values[runStart++];
+    smooth[i] = runSum / Math.max(1, runEnd - runStart);
+  }
+
+  const maxCueInIdx = Math.floor(n * 0.14);
+  let silenceEndIdx = 0;
+  while (silenceEndIdx < maxCueInIdx && smooth[silenceEndIdx] < 0.04) silenceEndIdx++;
+  let cueInFrac = silenceEndIdx > 0 ? Math.max(0, (silenceEndIdx - 1) / n) : 0;
+  if (bodyEnergy >= 0.38 && rmsSlice(0, 0.03) < Math.min(0.15, bodyEnergy * 0.32)) {
+    const step = Math.max(1, Math.floor(n * 0.005));
+    const winLen = Math.max(2, Math.floor(n * 0.015));
+    const jumpThresh = Math.max(0.24, bodyEnergy * 0.5);
+    const quietCeil = Math.max(0.14, bodyEnergy * 0.3);
+    for (let pos = silenceEndIdx; pos + winLen <= maxCueInIdx; pos += step) {
+      const leadFrac = pos / n;
+      if (leadFrac > 0.005 && rmsSlice(0, leadFrac) > quietCeil) break;
+      let wSq = 0;
+      for (let k = pos; k < pos + winLen; k++) wSq += values[k] * values[k];
+      if (Math.sqrt(wSq / winLen) >= jumpThresh) {
+        cueInFrac = Math.max(cueInFrac, leadFrac - 0.006);
+        break;
+      }
+    }
+  }
+  cueInFrac = Math.round(Math.max(0, Math.min(0.14, cueInFrac)) * 10000) / 10000;
+
+  const minCueOutIdx = Math.ceil(n * 0.8);
+  let tailAudibleIdx = n - 1;
+  while (tailAudibleIdx > minCueOutIdx && smooth[tailAudibleIdx] < 0.045) tailAudibleIdx--;
+  const deadTailFrac = tailAudibleIdx < n - 1 ? Math.min(1, (tailAudibleIdx + 2) / n) : 1;
+  let cueOutFrac = deadTailFrac;
+  if (bodyEnergy >= 0.36) {
+    const winLen = Math.max(2, Math.floor(n * 0.015));
+    const step = Math.max(1, Math.floor(n * 0.005));
+    const lowTailCeil = Math.max(0.16, bodyEnergy * 0.34);
+    let outroFloorIdx = tailAudibleIdx;
+    for (let pos = tailAudibleIdx; pos - winLen >= minCueOutIdx; pos -= step) {
+      let wSq = 0;
+      for (let k = pos - winLen; k < pos; k++) wSq += values[k] * values[k];
+      if (Math.sqrt(wSq / winLen) < lowTailCeil) outroFloorIdx = pos - winLen;
+      else break;
+    }
+    if (tailAudibleIdx - outroFloorIdx >= winLen) {
+      cueOutFrac = Math.min(deadTailFrac, outroFloorIdx / n + 0.018);
+    }
+  }
+  cueOutFrac = Math.round(Math.max(0.8, Math.min(1, cueOutFrac)) * 10000) / 10000;
+  const cueInEnergy = rmsSlice(cueInFrac, Math.min(1, cueInFrac + 0.1));
+  const cueOutEnergy = rmsSlice(Math.max(0, cueOutFrac - 0.1), cueOutFrac);
+
+  return {
+    introEnergy: Math.round(introEnergy * 1000) / 1000,
+    bodyEnergy: Math.round(bodyEnergy * 1000) / 1000,
+    outroEnergy: Math.round(outroEnergy * 1000) / 1000,
+    outroTailEnergy: Math.round(outroTailEnergy * 1000) / 1000,
+    outroSlope: Math.round(outroSlope * 1000) / 1000,
+    introRise: Math.round(introRise * 1000) / 1000,
+    dynamicRange: Math.round(Math.max(0, p90 - p25) * 1000) / 1000,
+    cueInFrac,
+    cueOutFrac,
+    cueInEnergy: Math.round(cueInEnergy * 1000) / 1000,
+    cueOutEnergy: Math.round(cueOutEnergy * 1000) / 1000,
+  };
+}
+
+function recordDjWaveformFeatures(waveformKey, rawSamples, meta = null) {
+  if (!waveformKey) return null;
+  const analyzed = analyzeDjWaveformEnvelope(rawSamples);
+  if (!analyzed) return null;
+  if (!(state._djWaveformFeatures instanceof Map)) state._djWaveformFeatures = new Map();
+  state._djWaveformFeatures.delete(waveformKey);
+  state._djWaveformFeatures.set(waveformKey, analyzed);
+  if (state._djWaveformFeatures.size > DJ_WAVEFORM_FEATURE_LIMIT) {
+    state._djWaveformFeatures.delete(state._djWaveformFeatures.keys().next().value);
+  }
+  if (meta && state._djTelemetry) {
+    const key = djTrackTelemetryKey(meta);
+    if (key && state._djTelemetry.tracks?.[key]) {
+      state._djTelemetry.tracks[key].energy = analyzed.bodyEnergy;
+    }
+  }
+  return analyzed;
+}
+
+async function warmDjTrackWaveform(meta) {
+  if (!meta || typeof waveformTrackKey !== 'function' || typeof resolveWaveformUrl !== 'function') return null;
+  const key = waveformTrackKey(meta);
+  if (!key) return null;
+  if (state._djWaveformFeatures instanceof Map && state._djWaveformFeatures.has(key)) {
+    return state._djWaveformFeatures.get(key);
+  }
+  if (!(state._djWaveformWarmInFlight instanceof Set)) state._djWaveformWarmInFlight = new Set();
+  if (state._djWaveformWarmInFlight.has(key)) return null;
+  state._djWaveformWarmInFlight.add(key);
+  try {
+    const signal = state._playbackAbort?.signal;
+    const epoch = state._playbackEpoch;
+    const isCurrent = () => state.active && state._playbackEpoch === epoch && !signal?.aborted;
+    const url = await resolveWaveformUrl(meta, { signal, isCurrent });
+    if (!url || !isCurrent()) return null;
+    const response = await fetchSoundCloudResource(url, 'json', { signal, credentials: 'omit', timeoutMs: 5000 });
+    if (!response.ok || !isCurrent()) return null;
+    const rawSamples = response.data?.samples || response.data?.data || response.data;
+    const feat = recordDjWaveformFeatures(key, rawSamples, meta);
+    if (typeof downsampleWaveform === 'function' && typeof waveformCache !== 'undefined') {
+      const heights = downsampleWaveform(rawSamples);
+      if (heights && !waveformCache.has(key)) {
+        waveformCache.set(key, heights);
+        if (waveformCache.size > WAVEFORM_CACHE_LIMIT) waveformCache.delete(waveformCache.keys().next().value);
+      }
+    }
+    return feat;
+  } catch (_) {
+    return null;
+  } finally {
+    state._djWaveformWarmInFlight.delete(key);
+  }
+}
+
+function djBpmCompatibility(rawBpmA, rawBpmB) {
+  const a = Number(rawBpmA);
+  const b = Number(rawBpmB);
+  if (!(a >= 50 && a <= 230 && b >= 50 && b <= 230)) return null;
+  let minRel = Infinity;
+  for (const mult of [1, 0.5, 2]) {
+    const scaledB = b * mult;
+    const rel = Math.abs(a - scaledB) / Math.max(a, scaledB);
+    if (rel < minRel) minRel = rel;
+  }
+  if (minRel <= 0.035) return 1.0;
+  if (minRel <= 0.075) return Math.round((1 - (minRel - 0.035) * 9) * 1000) / 1000;
+  if (minRel <= 0.14) return Math.round(Math.max(0.25, 0.64 - (minRel - 0.075) * 5.5) * 1000) / 1000;
+  return 0.05;
+}
+
+function computeDjTransitionSpec(outgoingTi, incomingTi) {
+  const userBase = Number(state.crossfadeSeconds) > 0 ? Number(state.crossfadeSeconds) : 4.5;
+  const outMeta = Number.isInteger(outgoingTi) ? state.meta?.[outgoingTi] : null;
+  const inMeta = Number.isInteger(incomingTi) ? state.meta?.[incomingTi] : null;
+  const outKey = outMeta && typeof waveformTrackKey === 'function' ? waveformTrackKey(outMeta) : '';
+  const inKey = inMeta && typeof waveformTrackKey === 'function' ? waveformTrackKey(inMeta) : '';
+  const outFeat = outKey && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(outKey) : null;
+  const inFeat = inKey && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(inKey) : null;
+  const chapterBoundary = Boolean(
+    Number.isInteger(incomingTi)
+    && (state._djPendingChapter?.openTi === incomingTi || state._djChapter?.openTi === incomingTi),
+  );
+  const voiceMode = state.djCommentaryMode === 'voice';
+  const cueTrim = Boolean(state.djMode && state.djCueTrim);
+  const liveOutAudio = outgoingTi === state._deckTrack && typeof currentDeckAudio === 'function' ? currentDeckAudio() : null;
+  const standbyIdx = state._deckIndex >= 0 ? 1 - state._deckIndex : -1;
+  const liveInAudio = standbyIdx >= 0 && state._deckTracks?.[standbyIdx] === incomingTi ? state._decks?.[standbyIdx] : null;
+  const rawOutDur = Number(outMeta?.durationMs) / 1000;
+  const rawInDur = Number(inMeta?.durationMs) / 1000;
+  const outDur = Number.isFinite(rawOutDur) && rawOutDur > 0
+    ? rawOutDur
+    : (Number.isFinite(liveOutAudio?.duration) && liveOutAudio.duration > 0 ? liveOutAudio.duration : NaN);
+  const inDur = Number.isFinite(rawInDur) && rawInDur > 0
+    ? rawInDur
+    : (Number.isFinite(liveInAudio?.duration) && liveInAudio.duration > 0 ? liveInAudio.duration : NaN);
+  const outBpm = Number(outMeta?.bpm) || 0;
+  const inBpm = Number(inMeta?.bpm) || 0;
+  const outCamelot = djResolveCamelotKey(outMeta);
+  const inCamelot = djResolveCamelotKey(inMeta);
+
+  const cached = state._djTransitionCache;
+  if (cached
+      && cached.outgoingTi === outgoingTi
+      && cached.incomingTi === incomingTi
+      && cached.userBase === userBase
+      && cached.outFeat === outFeat
+      && cached.inFeat === inFeat
+      && cached.chapterBoundary === chapterBoundary
+      && cached.voiceMode === voiceMode
+      && cached.cueTrim === cueTrim
+      && cached.outDur === outDur
+      && cached.inDur === inDur
+      && cached.outBpm === outBpm
+      && cached.inBpm === inBpm
+      && cached.outCamelot === outCamelot
+      && cached.inCamelot === inCamelot) {
+    return cached;
+  }
+
+  const bpmCompat = djBpmCompatibility(outBpm, inBpm);
+  const harmCompat = djHarmonicCompatibility(outCamelot, inCamelot);
+  const harmonicClash = harmCompat !== null && harmCompat <= 0.2;
+  const harmonicMatch = harmCompat !== null && harmCompat >= 0.85;
+  const effOutTail = cueTrim && outDur >= 45 && Number.isFinite(outFeat?.cueOutEnergy)
+    ? outFeat.cueOutEnergy
+    : outFeat?.outroTailEnergy;
+  const effInIntro = cueTrim && inDur >= 45 && Number.isFinite(inFeat?.cueInEnergy)
+    ? inFeat.cueInEnergy
+    : inFeat?.introEnergy;
+  let seconds = userBase;
+  let templateName = 'Warm Blend';
+
+  if (chapterBoundary && voiceMode) {
+    seconds = Math.max(3.0, Math.min(5.0, userBase * 0.92));
+    templateName = 'S-Curve';
+  } else if (outFeat && inFeat) {
+    if (outFeat.outroSlope < -0.14 && effInIntro < 0.38) {
+      if ((bpmCompat !== null && bpmCompat < 0.2) || harmonicClash) {
+        seconds = Math.max(3.0, Math.min(4.2, userBase * 0.86));
+        templateName = harmonicClash ? 'Vocal Safe' : 'S-Curve';
+      } else {
+        const tempoBonus = (bpmCompat !== null && bpmCompat >= 0.85 ? 0.35 : 0) + (harmonicMatch ? 0.35 : 0);
+        seconds = Math.max(5.2, Math.min(8.8, userBase * 1.45 + tempoBonus));
+        templateName = 'Full Overlap';
+      }
+    } else if (effOutTail > 0.52 && effInIntro > 0.54) {
+      seconds = Math.max(2.0, Math.min(3.5, userBase * 0.62));
+      templateName = outFeat.dynamicRange < 0.24 ? 'Vocal Safe' : 'Late Cut';
+    } else if (outFeat.outroSlope < -0.12 && effInIntro >= 0.48) {
+      seconds = Math.max(3.0, Math.min(5.4, userBase * 0.9));
+      templateName = 'Fast In';
+    } else if (effOutTail > 0.46 && effInIntro < 0.35) {
+      const clash = (bpmCompat !== null && bpmCompat < 0.2) || harmonicClash;
+      seconds = clash
+        ? Math.max(2.8, Math.min(4.0, userBase * 0.82))
+        : Math.max(4.0, Math.min(6.8, userBase * 1.18 + (harmonicMatch ? 0.3 : 0)));
+      templateName = clash ? 'Vocal Safe' : 'Long Tail';
+    } else {
+      const clash = (bpmCompat !== null && bpmCompat < 0.2) || harmonicClash;
+      seconds = clash
+        ? Math.max(2.4, Math.min(3.8, userBase * 0.78))
+        : Math.max(3.0, Math.min(6.2, userBase + (harmonicMatch ? 0.25 : 0)));
+      templateName = clash ? 'Vocal Safe' : 'Warm Blend';
+    }
+  } else {
+    const clash = (bpmCompat !== null && bpmCompat < 0.2) || harmonicClash;
+    seconds = clash
+      ? Math.max(2.4, Math.min(3.8, userBase * 0.8))
+      : Math.max(2.8, Math.min(6.0, userBase + (harmonicMatch ? 0.25 : 0)));
+    templateName = chapterBoundary ? 'S-Curve' : (clash ? 'Vocal Safe' : 'Warm Blend');
+  }
+
+  const minDurFloor = typeof CROSSFADE_MIN_DURATION_SECONDS === 'number' ? CROSSFADE_MIN_DURATION_SECONDS : 0.25;
+  const validDurs = [outDur, inDur].filter(d => Number.isFinite(d) && d > 0);
+  const minDur = validDurs.length ? Math.min(...validDurs) : Infinity;
+  if (minDur < 35) {
+    const ratio = minDur < 15 ? 0.25 : 0.28;
+    seconds = minDur < 4
+      ? Math.max(minDurFloor, minDur * ratio)
+      : Math.min(seconds, minDur * ratio);
+    if (minDur < 15 && (templateName === 'Full Overlap' || templateName === 'Long Tail')) {
+      templateName = 'Fast In';
+    }
+  } else {
+    if (Number.isFinite(outDur) && outDur > 4) seconds = Math.min(seconds, outDur * 0.42);
+    if (Number.isFinite(inDur) && inDur > 4) seconds = Math.min(seconds, inDur * 0.42);
+  }
+  const minClamp = minDur < 4.5 ? minDurFloor : 1.5;
+  seconds = Math.round(Math.max(minClamp, Math.min(9.5, seconds)) * 10) / 10;
+
+  const template = CF_TEMPLATES[templateName] || CF_TEMPLATES['Warm Blend'];
+  const curve = sanitizeCrossfadeCurveConfig(template);
+  const profile = { seconds, templateName, curve };
+  const nextSpec = {
+    outgoingTi,
+    incomingTi,
+    userBase,
+    outFeat,
+    inFeat,
+    chapterBoundary,
+    voiceMode,
+    cueTrim,
+    outDur,
+    inDur,
+    outBpm,
+    inBpm,
+    outCamelot,
+    inCamelot,
+    seconds,
+    templateName,
+    curve,
+    profile,
+  };
+  state._djTransitionCache = nextSpec;
+  return nextSpec;
+}
+
+function resolveDjTransitionProfile(outgoingTi, incomingTi) {
+  return computeDjTransitionSpec(outgoingTi, incomingTi).profile;
+}
+
+function resolveDjAutoFadeSeconds(outgoingTi, incomingTi) {
+  if (!state.djMode || !state.djAutoMix) return Number(state.crossfadeSeconds) || 0;
+  return computeDjTransitionSpec(outgoingTi, incomingTi).seconds;
+}
+
+function resolveDjAutoCurveSnapshot(outgoingTi, incomingTi) {
+  if (!state.djMode || !state.djAutoMix) return null;
+  return computeDjTransitionSpec(outgoingTi, incomingTi).curve;
+}
+
+function resolveDjCueInSeconds(ti, audio = null, fadeSec = 0) {
+  if (!state.djMode || !state.djCueTrim || !Number.isInteger(ti)) return 0;
+  const meta = state.meta?.[ti];
+  const mediaDur = Number(audio?.duration);
+  const dur = Number.isFinite(mediaDur) && mediaDur > 0
+    ? mediaDur
+    : (Number(meta?.durationMs) / 1000 || 0);
+  if (!(dur >= 45)) return 0;
+  const key = meta && typeof waveformTrackKey === 'function' ? waveformTrackKey(meta) : '';
+  const feat = key && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(key) : null;
+  if (!feat || !(Number(feat.cueInFrac) > 0.002)) return 0;
+  let target = Math.min(12, dur * 0.14, dur * Number(feat.cueInFrac));
+  if (target < 0.45) return 0;
+  if (audio) {
+    let bufferedEnd = null;
+    let bufferedStart = 0;
+    if (audio.buffered?.length > 0) {
+      for (let i = 0; i < audio.buffered.length; i++) {
+        try {
+          const s = Number(audio.buffered.start(i));
+          const e = Number(audio.buffered.end(i));
+          if (Number.isFinite(s) && Number.isFinite(e) && s <= 0.5 && e > s) {
+            bufferedStart = Math.max(0, s);
+            bufferedEnd = e;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    if (bufferedEnd !== null) {
+      const safetyLead = Math.min(3.5, Math.max(1.8, (Number(fadeSec) || 0) * 0.45));
+      target = Math.min(target, Math.max(0, bufferedEnd - safetyLead));
+      if (target <= bufferedStart + 0.35) return 0;
+    } else {
+      const deckIdx = Array.isArray(state._decks) ? state._decks.indexOf(audio) : -1;
+      if (deckIdx >= 0 && state._deckHlsPlayers?.[deckIdx]) return 0;
+    }
+  }
+  return target >= 0.45 ? Math.round(target * 100) / 100 : 0;
+}
+
+function resolveDjCueOutTrimSeconds(ti, durationSec = 0, fadeSec = 0) {
+  if (!state.djMode || !state.djCueTrim || !Number.isInteger(ti)) return 0;
+  if (state._djCueOutBypass?.epoch === state._playbackEpoch && state._djCueOutBypass.track === ti) return 0;
+  const meta = state.meta?.[ti];
+  const dur = Number.isFinite(durationSec) && durationSec > 0
+    ? durationSec
+    : (Number(meta?.durationMs) / 1000 || 0);
+  if (!(dur >= 45)) return 0;
+  const key = meta && typeof waveformTrackKey === 'function' ? waveformTrackKey(meta) : '';
+  const feat = key && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(key) : null;
+  if (!feat || !(Number(feat.cueOutFrac) < 0.996)) return 0;
+  const rawTrim = dur * (1 - Number(feat.cueOutFrac));
+  const maxByBody = Math.max(0, dur - Math.max(28, (Number(fadeSec) || 0) * 2 + 10));
+  const clamped = Math.min(22, dur * 0.2, maxByBody, rawTrim);
+  return clamped >= 0.8 ? Math.round(clamped * 100) / 100 : 0;
+}
+
+const DJ_ACRONYM_KEEP = new Set(['DJ', 'MC', 'UK', 'US', 'USA', 'LA', 'NYC', 'VIP', 'EP', 'LP', 'BPM', 'DNB', 'UKG', 'EDM', 'USB', 'NRG', 'SOS', 'ID', 'II', 'III', 'IV']);
+const DJ_LEET_WORD_MAP = {
+  'lxst': 'Lost',
+  'cxntury': 'Century',
+  'blvck': 'Black',
+  'svdden': 'Sudden',
+  'ghxst': 'Ghost',
+  'phxnk': 'Phonk',
+  'trvp': 'Trap',
+  'wrld': 'World',
+  'shdw': 'Shadow',
+  'nght': 'Night',
+  'drk': 'Dark',
+  'kng': 'King',
+  'mnd': 'Mind',
+  'vpr': 'Vapor',
+  'luv': 'Love',
+  'hxrt': 'Heart',
+  'sxul': 'Soul',
+  'deadmau5': 'Deadmouse',
+  '6lack': 'Black',
+};
+const DJ_VALID_ONSET_CLUSTERS = new Set([
+  'b', 'c', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 'q', 'r', 's', 't', 'v', 'w', 'x', 'y', 'z',
+  'bl', 'br', 'ch', 'cl', 'cr', 'cz', 'dj', 'dr', 'dw', 'fl', 'fr', 'gh', 'gl', 'gn', 'gr', 'gw',
+  'kh', 'kl', 'kn', 'kr', 'kw', 'll', 'mc', 'ph', 'pl', 'pr', 'ps', 'qu', 'rh', 'sc', 'sh', 'sk',
+  'sl', 'sm', 'sn', 'sp', 'sq', 'st', 'sw', 'th', 'tr', 'ts', 'tw', 'vl', 'vr', 'wh', 'wr', 'zh',
+  'chr', 'sch', 'scr', 'shr', 'skw', 'spl', 'spr', 'str', 'thr', 'thw',
+]);
+
+function normalizeDjSpeechCasing(text) {
+  return String(text || '').replace(/\b[A-Z]{3,}\b/g, word =>
+    DJ_ACRONYM_KEEP.has(word) ? word : word.charAt(0) + word.slice(1).toLowerCase());
+}
+
+function normalizeDjUnicodeText(raw) {
+  const str = String(raw ?? '');
+  try {
+    return typeof str.normalize === 'function' ? str.normalize('NFKC') : str;
+  } catch (_) {
+    return str;
+  }
+}
+
+function normalizeDjHandleTokens(text) {
+  return String(text || '')
+    .replace(/^(?:xx|x)[_\s-]+|[_\s-]+(?:xx|x)$/gi, '')
+    .replace(/([A-Za-z0-9])_\d{1,5}\b/g, '$1')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(tok => {
+      const lower = tok.toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(DJ_LEET_WORD_MAP, lower)) {
+        return DJ_LEET_WORD_MAP[lower];
+      }
+      if (/^[A-Za-z0-9]{3,}$/.test(tok) && /[A-Za-z]/.test(tok) && /\d/.test(tok) && !/^(?:\d+(?:st|nd|rd|th|s)|mp3|2step|v\d+)$/i.test(tok)) {
+        const deLeet = tok.replace(/(?<=[A-Za-z])[013457](?=[A-Za-z]|$)/g, d => (
+          d === '0' ? 'o' : d === '1' ? 'i' : d === '3' ? 'e' : d === '4' ? 'a' : d === '5' ? 's' : 't'
+        ));
+        return deLeet.charAt(0).toUpperCase() + deLeet.slice(1).toLowerCase();
+      }
+      return tok;
+    })
+    .join(' ');
+}
+
+function isDjArtistPronounceable(cleaned) {
+  const text = String(cleaned || '').trim();
+  if (!text || text === '—') return false;
+  const words = text.split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  let pronounceableWords = 0;
+  for (const rawWord of words) {
+    if (/^(?:and|with|featuring|the|of|in|on|by)$/i.test(rawWord)) continue;
+    const upper = rawWord.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    if (!upper) continue;
+    if (DJ_ACRONYM_KEEP.has(upper) || /^[A-Z]{2}$/.test(upper) || /^\d{1,4}$/.test(upper)) {
+      pronounceableWords++;
+      continue;
+    }
+    const alpha = rawWord.replace(/[^A-Za-z]/g, '').toLowerCase();
+    if (!alpha || /\d{2,}/.test(rawWord)) return false;
+    const vowelMatch = alpha.match(/[aeiouy]/);
+    if (!vowelMatch) return false;
+    const onset = alpha.slice(0, vowelMatch.index);
+    if (onset.length >= 2 && !DJ_VALID_ONSET_CLUSTERS.has(onset)) return false;
+    if (/[bcdfghjklmnpqrstvwxz]{5,}/.test(alpha)) return false;
+    pronounceableWords++;
+  }
+  return pronounceableWords > 0;
+}
+
+function cleanArtistForDjSpeech(rawArtist, options = {}) {
+  const fallback = options.allowEmpty ? '' : 'this artist';
+  let artist = normalizeDjUnicodeText(rawArtist).trim();
+  if (!artist || artist === '—') return fallback;
+  artist = artist
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/@[A-Za-z0-9_.-]+/g, '')
+    .replace(/\[[^\]]*\]|\([^)]*(?:official|records|music|collective|free|dl|soundcloud|exclusive)[^)]*\)/gi, '')
+    .replace(/\(\s*\)|\[\s*\]|\{\s*\}/g, '')
+    .replace(/\b(?:feat|ft)(?:\.|\b)/gi, 'featuring')
+    .replace(/\bw\//gi, 'with')
+    .replace(/\s*&\s*/g, ' and ');
+  artist = normalizeDjHandleTokens(artist)
+    .replace(/[_|]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  artist = normalizeDjSpeechCasing(artist);
+  if (artist.length > 42) artist = artist.slice(0, 42).replace(/\s+\S*$/, '').trim();
+  if (!artist || !isDjArtistPronounceable(artist)) return fallback;
+  return artist;
+}
+
+function cleanTitleForDjSpeech(rawTitle, rawArtist = '') {
+  let title = normalizeDjUnicodeText(rawTitle).trim();
+  if (!title || title === '—') return 'this cut';
+  title = title
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\.(?:mp3|wav|flac|m4a|ogg|aiff)\b/gi, '')
+    .replace(/^\d{1,2}\s*[.)\-–—]\s+(?=[A-Za-z])/g, '')
+    .replace(/\s*[\[(]\s*\d{2,3}(?:\.\d+)?\s*bpm\s*[\])]/gi, '')
+    .replace(/\s*[\[(]\s*(?:\d{1,2}[AB]|[A-G][#b]?\s*(?:maj|major|min|minor|m))\s*[\])]/gi, '')
+    .replace(/\s*[\[(]\s*\d{3}\s*kbps\s*[\])]/gi, '')
+    .replace(/\[[^\]]*(?:prod|free|dl|download|official|premiere|out now|buy|link|lyric|video|audio|hq|hd|stream|visualizer)[^\]]*\]/gi, '')
+    .replace(/\([^)]*(?:prod|free|dl|download|official|premiere|out now|buy|link|lyric|video|audio|hq|hd|stream|visualizer)[^)]*\)/gi, '')
+    .replace(/(?:^|\s)#[A-Za-z][\w-]*/g, '')
+    .replace(/(?:^|\s|\()@[A-Za-z0-9_.-]+\)?/g, match => (match.startsWith('(') && !match.endsWith(')') ? '(' : ''))
+    .replace(/\(\s*\)|\[\s*\]|\{\s*\}/g, '')
+    .replace(/\s+(?:prod\.?|produced)\s+by\s+.+$/i, '')
+    .replace(/\[[^\]]{18,}\]/g, '')
+    .trim();
+
+  const artistClean = normalizeDjUnicodeText(rawArtist).trim();
+  if (artistClean && artistClean !== '—') {
+    const escaped = artistClean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    title = title.replace(new RegExp(`^${escaped}\\s*[-–—:|]\\s*`, 'i'), '');
+  }
+
+  title = title
+    .replace(/\b(?:feat|ft)(?:\.|\b)/gi, 'featuring')
+    .replace(/\bw\//gi, 'with')
+    .replace(/\s*&\s*/g, ' and ')
+    .replace(/[_*~|]+/g, ' ')
+    .replace(/\s*[-–—]\s*$/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  title = normalizeDjSpeechCasing(title);
+  if (title.length > 52) {
+    const splitClause = title.split(/\s+[-–—(|]\s+/)[0];
+    title = (splitClause && splitClause.length >= 4 ? splitClause : title.slice(0, 52).replace(/\s+\S*$/, '')).trim();
+  }
+  return title || 'this cut';
+}
+
+function pickNonRepeatingDjTemplate(templates, recentRing) {
+  if (!Array.isArray(templates) || !templates.length) return { banner: '', speech: '' };
+  const ring = Array.isArray(recentRing) ? recentRing : [];
+  const fresh = templates.filter(item => !ring.includes(item.key));
+  const pool = fresh.length ? fresh : templates;
+  const chosen = pool[Math.floor(Math.random() * pool.length)];
+  if (chosen?.key) {
+    ring.push(chosen.key);
+    if (ring.length > 18) ring.splice(0, ring.length - 18);
+  }
+  return chosen;
+}
+
+function djColdOpenLeadLine(voiceId = state.djVoiceId, daypartOverride = '') {
+  const hostObj = DJ_VOICES.find(v => v.id === voiceId) || DJ_VOICES[0];
+  const hostName = hostObj?.name || 'Xavier';
+  const daypart = daypartOverride || djDaypart();
+  if (daypart === 'morning') return `Good morning, ${hostName} here.`;
+  if (daypart === 'afternoon') return `Good afternoon, ${hostName} here.`;
+  if (daypart === 'evening') return `Good evening, ${hostName} here.`;
+  return `Hey, ${hostName} here.`;
+}
+
+function splitDjOpeningClauses(speechText) {
+  const clean = String(speechText || '').trim();
+  if (!clean) return null;
+  const dotIdx = clean.indexOf('. ');
+  if (dotIdx >= 10 && dotIdx <= 76) {
+    const lead = clean.slice(0, dotIdx + 1).trim();
+    const follow = clean.slice(dotIdx + 2).trim();
+    if (lead && follow.length >= 8) return { lead, follow };
+  }
+  const dashIdx = clean.indexOf(' — ');
+  if (dashIdx >= 10 && dashIdx <= 76) {
+    const lead = `${clean.slice(0, dashIdx).trim()}.`;
+    const follow = clean.slice(dashIdx + 3).trim();
+    if (lead && follow.length >= 8) return { lead, follow };
+  }
+  return null;
+}
+
+function buildDjChapterScript(chapter, context = {}) {
+  const openMeta = state.meta?.[chapter.openTi] || {};
+  const artistSpeech = cleanArtistForDjSpeech(openMeta.artist, { allowEmpty: true });
+  const titleSpeech = cleanTitleForDjSpeech(openMeta.title, openMeta.artist);
+  const pairComma = artistSpeech ? `${artistSpeech}, ${titleSpeech}` : titleSpeech;
+  const pairWith = artistSpeech ? `${artistSpeech} with ${titleSpeech}` : titleSpeech;
+  const pairOn = artistSpeech ? `${artistSpeech} on ${titleSpeech}` : titleSpeech;
+  const leadTarget = artistSpeech || titleSpeech;
+  const artistVisual = String(openMeta.artist && openMeta.artist !== '—' ? openMeta.artist : 'Unknown Artist').trim();
+  const titleVisual = String(openMeta.title && openMeta.title !== '—' ? openMeta.title : 'Untitled').trim();
+  const daypart = context.daypart || djDaypart();
+  const greeting = daypart === 'morning' ? 'Good morning'
+    : daypart === 'afternoon' ? 'Alright, good afternoon'
+    : daypart === 'evening' ? 'Good evening'
+    : 'Late night session';
+  const tel = loadDjTelemetry();
+  const tKey = djTrackTelemetryKey(openMeta);
+  const trackTel = tKey ? tel.tracks[tKey] : null;
+  const playCount = Number(trackTel?.plays) || 0;
+  const reason = context.reason || chapter.reason || 'auto';
+  const genreLabel = chapter.genreLabel || 'Fresh Cuts';
+  const seedArtistSpeech = cleanArtistForDjSpeech(chapter.seedMeta?.artist || openMeta.djSeedArtist || '', { allowEmpty: true });
+  const seedArtistVisual = String(chapter.seedMeta?.artist || openMeta.djSeedArtist || '').trim();
+  const year = Number(chapter.throwbackYear || openMeta.uploadYear) || 0;
+  const isColdOpen = Boolean(context.opening || chapter.isColdOpen);
+  const hostObj = DJ_VOICES.find(v => v.id === state.djVoiceId) || DJ_VOICES[0];
+  const hostName = hostObj?.name || 'Xavier';
+  const leadSpeech = djColdOpenLeadLine(state.djVoiceId, daypart);
+
+  let templates = [];
+
+  if (reason === 'skip-recalibrate') {
+    templates = [
+      {
+        key: 'recal-1',
+        banner: `Pivoting the vibe — moving into ${artistVisual} — "${titleVisual}".`,
+        speech: `Got you, not feeling that wave right now. Let's switch lanes with ${pairComma}.`,
+      },
+      {
+        key: 'recal-2',
+        banner: `Recalibrating your set — ${chapter.badge.replace(/^DJ\s*·\s*/, '')} starting with ${artistVisual}.`,
+        speech: `Alright, let's pivot away from that and lock into something better for right now. Here's ${pairWith}.`,
+      },
+      {
+        key: 'recal-3',
+        banner: `Switching gears after those skips — kicking off with ${artistVisual}.`,
+        speech: `Sounds like you want a different energy, so I'm flipping the set. Starting off with ${leadTarget}.`,
+      },
+    ];
+  } else if (reason === 'vibe-switch') {
+    const lane = chapter.archetype === 'discovery-radar' ? 'some fresh SoundCloud finds'
+      : chapter.archetype === 'throwback-gems' ? 'a few throwback gems'
+      : chapter.archetype === 'late-night-chill' ? 'a smoother, laid-back groove'
+      : chapter.archetype === 'energy-flow' ? 'a higher-energy run'
+      : chapter.genreLabel ? `a ${chapter.genreLabel} pocket`
+      : 'a brand new vibe';
+    templates = [
+      {
+        key: `switch-1-${chapter.archetype}`,
+        banner: `Switching up the vibe · ${lane} starting with ${artistVisual} — "${titleVisual}".`,
+        speech: `Alright, switching up the vibe. Let's move into ${lane}, starting with ${pairOn}.`,
+      },
+      {
+        key: `switch-2-${chapter.archetype}`,
+        banner: `New chapter · ${chapter.badge.replace(/^DJ\s*·\s*/, '')} led by ${artistVisual}.`,
+        speech: `Let's take this somewhere else. Pulling up ${lane}, kicking things off with ${leadTarget}.`,
+      },
+      {
+        key: `switch-3-${chapter.archetype}`,
+        banner: `Fresh direction · ${artistVisual} — "${titleVisual}" leads the next block.`,
+        speech: `New vibe coming right up. Here's ${pairWith} to set the tone.`,
+      },
+    ];
+  } else if (isColdOpen || chapter.archetype === 'opening-groove') {
+    if (state.djFocus && state.djFocus !== 'auto' && chapter.archetype !== 'opening-groove') {
+      const focusLane = state.djFocus === 'favorites' ? 'your heavy-rotation favorites'
+        : state.djFocus === 'discovery' ? 'some fresh SoundCloud discovery cuts'
+        : state.djFocus === 'throwbacks' ? (year ? `a ${year} throwback pocket` : 'some throwback gems from your vault')
+        : state.djFocus === 'chill' ? 'a smooth, laid-back groove'
+        : 'a high-energy run right from the jump';
+      templates = [
+        {
+          key: `cold-focus-1-${state.djFocus}`,
+          banner: `${greeting} · ${hostName} opening with ${focusLane} — ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Opening with ${focusLane}, ${pairOn}.`,
+        },
+        {
+          key: `cold-focus-2-${state.djFocus}`,
+          banner: `True DJ live · ${focusLane} led by ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Up first in ${focusLane}, ${pairWith}.`,
+        },
+        {
+          key: `cold-focus-3-${state.djFocus}`,
+          banner: `Opening set · ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Starting ${focusLane} right off with ${pairComma}.`,
+        },
+      ];
+    } else {
+      templates = [
+        {
+          key: 'open-1',
+          banner: `${greeting} · ${hostName} kicking off your session with ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Kicking off your session with ${pairComma}.`,
+        },
+        {
+          key: 'open-2',
+          banner: `${greeting} — easing in with favorites led by ${artistVisual}.`,
+          speech: `${leadSpeech} Starting your set off with ${pairOn}.`,
+        },
+        {
+          key: 'open-3',
+          banner: `Session live · ${hostName} opening with ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Let's get your session rolling with ${pairComma}.`,
+        },
+        {
+          key: 'open-4',
+          banner: `${greeting} session · First up: ${artistVisual} — "${titleVisual}".`,
+          speech: `${leadSpeech} Up first, ${pairWith}.`,
+        },
+      ];
+    }
+  } else if (chapter.archetype === 'heavy-rotation') {
+    const playCallout = playCount >= 4 ? `You've had this in heavy rotation with ${playCount} plays — ` : '';
+    templates = [
+      {
+        key: 'heavy-1',
+        banner: `${playCallout}Heavy rotation right now: ${artistVisual} — "${titleVisual}".`,
+        speech: playCount >= 4
+          ? (artistSpeech
+            ? `Next up, tracks you've had on repeat lately. You've spun ${artistSpeech} ${playCount} times, here's ${titleSpeech}.`
+            : `Next up, tracks you've had on repeat lately. You've spun ${titleSpeech} ${playCount} times.`)
+          : `Next up, a block of tracks you've been keeping in heavy rotation. Starting with ${pairComma}.`,
+      },
+      {
+        key: 'heavy-2',
+        banner: `Your current go-to cuts — starting with ${artistVisual}.`,
+        speech: `Staying with the songs you rarely skip. First in this run, ${pairWith}.`,
+      },
+      {
+        key: 'heavy-3',
+        banner: `On repeat lately · ${artistVisual} — "${titleVisual}".`,
+        speech: `Time for a few undeniable favorites from your rotation, kicking off with ${leadTarget}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'discovery-radar') {
+    const seedPhraseSpeech = seedArtistSpeech
+      ? `Since you've been vibing with ${seedArtistSpeech}, I dug into SoundCloud for a few related cuts.`
+      : `I dug into SoundCloud to pull a few fresh tracks outside your queue.`;
+    const seedPhraseVisual = seedArtistVisual
+      ? `Inspired by ${seedArtistVisual} · SoundCloud discovery starting with ${artistVisual} — "${titleVisual}".`
+      : `SoundCloud discovery radar · starting with ${artistVisual} — "${titleVisual}".`;
+    templates = [
+      {
+        key: 'disc-1',
+        banner: seedPhraseVisual,
+        speech: `${seedPhraseSpeech} Starting with ${pairComma}.`,
+      },
+      {
+        key: 'disc-2',
+        banner: `Fresh off SoundCloud${seedArtistVisual ? ` for your ${seedArtistVisual} rotation` : ''} · ${artistVisual}.`,
+        speech: `Switching into discovery mode with something new in your lane. Check out ${pairOn}.`,
+      },
+      {
+        key: 'disc-3',
+        banner: `New discovery set · ${artistVisual} — "${titleVisual}".`,
+        speech: `Here's a pocket of tracks you haven't heard in this playlist yet, led by ${leadTarget}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'genre-vibe') {
+    templates = [
+      {
+        key: 'genre-1',
+        banner: `Locking into a ${genreLabel} pocket — starting with ${artistVisual} — "${titleVisual}".`,
+        speech: `Let's lock into a ${genreLabel} pocket for the next few tracks. Starting with ${pairComma}.`,
+      },
+      {
+        key: 'genre-2',
+        banner: `${genreLabel} session · ${artistVisual} leads this block.`,
+        speech: `Shifting the room into ${genreLabel}. Kicking this run off with ${pairOn}.`,
+      },
+      {
+        key: 'genre-3',
+        banner: `Curated ${genreLabel} run · opening with "${titleVisual}" by ${artistVisual}.`,
+        speech: `Pulling together some ${genreLabel} from your collection, led by ${leadTarget}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'throwback-gems') {
+    templates = [
+      {
+        key: 'tb-1',
+        banner: year
+          ? `Rewinding to ${year} · ${artistVisual} — "${titleVisual}".`
+          : `Digging back into deeper playlist cuts — ${artistVisual} — "${titleVisual}".`,
+        speech: year
+          ? `Let's take it back to ${year} for a moment. Here's ${pairWith}.`
+          : `Pulling out a few gems you haven't spun in a while, starting with ${pairOn}.`,
+      },
+      {
+        key: 'tb-2',
+        banner: `Haven't played these in a minute · starting with ${artistVisual}.`,
+        speech: year
+          ? `Rewinding the clock back to ${year}, kicking off this throwback block with ${leadTarget}.`
+          : `Dusting off a pocket of your collection that deserves another listen. Starting with ${leadTarget}.`,
+      },
+      {
+        key: 'tb-3',
+        banner: year
+          ? `From the ${year} vault · ${artistVisual} — "${titleVisual}".`
+          : `Classic crate pull · ${artistVisual} — "${titleVisual}".`,
+        speech: year
+          ? `Going back into the ${year} vault next. Here's ${pairOn}.`
+          : `Bringing back a few deeper favorites from your collection, led by ${leadTarget}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'artist-spotlight') {
+    const spotTarget = artistSpeech || 'one artist';
+    templates = [
+      {
+        key: 'spot-1',
+        banner: `Artist spotlight · A mini-set built around ${artistVisual}, starting with "${titleVisual}".`,
+        speech: `You've got a strong run from ${spotTarget} in here, so let's do a quick spotlight, starting with ${titleSpeech}.`,
+      },
+      {
+        key: 'spot-2',
+        banner: `Back-to-back ${artistVisual} energy · opening with "${titleVisual}".`,
+        speech: `Highlighting ${spotTarget} for the next few tracks. First up, ${titleSpeech}.`,
+      },
+      {
+        key: 'spot-3',
+        banner: `Double-shot of ${artistVisual} · kicking off with "${titleVisual}".`,
+        speech: `Locking in on ${spotTarget} for a back-to-back run, starting right off with ${titleSpeech}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'underground-cuts') {
+    templates = [
+      {
+        key: 'ug-1',
+        banner: `SoundCloud underground gems · low-playcount cuts starting with ${artistVisual} — "${titleVisual}".`,
+        speech: `Diving into the SoundCloud underground with a few hidden gems. Starting with ${pairComma}.`,
+      },
+      {
+        key: 'ug-2',
+        banner: `Deep crate dig · ${artistVisual} — "${titleVisual}".`,
+        speech: `Pulling a few under-the-radar cuts from deep in your crate, led by ${leadTarget}.`,
+      },
+      {
+        key: 'ug-3',
+        banner: `Sleeper picks · ${artistVisual} — "${titleVisual}".`,
+        speech: `Time for a few sleeper cuts that fly under the radar. Here's ${pairWith}.`,
+      },
+    ];
+  } else if (chapter.archetype === 'late-night-chill') {
+    templates = [
+      {
+        key: 'chill-1',
+        banner: `Dialing things down · smooth & atmospheric cuts starting with ${artistVisual}.`,
+        speech: `Dialing the tempo down for a smoother stretch. Easing in with ${pairOn}.`,
+      },
+      {
+        key: 'chill-2',
+        banner: `After-hours flow · ${artistVisual} — "${titleVisual}".`,
+        speech: `Keeping things warm and laid-back for the next few tracks, starting with ${leadTarget}.`,
+      },
+      {
+        key: 'chill-3',
+        banner: `Low-lit groove · ${artistVisual} — "${titleVisual}".`,
+        speech: `Letting the room breathe a little with a mellow pocket. Here's ${pairComma}.`,
+      },
+    ];
+  } else {
+    templates = [
+      {
+        key: 'energy-1',
+        banner: `Picking up the pace · high-energy run starting with ${artistVisual} — "${titleVisual}".`,
+        speech: `Turning the energy up a notch for this next block. Here's ${pairWith}.`,
+      },
+      {
+        key: 'energy-2',
+        banner: `Up-tempo momentum · led by ${artistVisual} — "${titleVisual}".`,
+        speech: `Keeping the momentum moving forward, starting right in with ${leadTarget}.`,
+      },
+      {
+        key: 'energy-3',
+        banner: `Peak-time push · ${artistVisual} — "${titleVisual}".`,
+        speech: `Pushing the tempo into higher gear now, kicking off with ${pairOn}.`,
+      },
+    ];
+  }
+
+  if (!Array.isArray(state._djRecentScripts)) state._djRecentScripts = [];
+  const picked = pickNonRepeatingDjTemplate(templates, state._djRecentScripts);
+  return {
+    bannerText: picked.banner,
+    speechText: picked.speech,
+  };
+}
+
+function djPruneSessionCooldowns(nowMs = Date.now()) {
+  if (!(state._djSessionCooldowns instanceof Map)) {
+    state._djSessionCooldowns = new Map();
+    return;
+  }
+  for (const [k, until] of state._djSessionCooldowns.entries()) {
+    if (!(until > nowMs)) state._djSessionCooldowns.delete(k);
+  }
+  while (state._djSessionCooldowns.size > DJ_SESSION_COOLDOWN_LIMIT) {
+    state._djSessionCooldowns.delete(state._djSessionCooldowns.keys().next().value);
+  }
+}
+
+function djSetSessionCooldown(kind, rawName, durationMs, nowMs = Date.now()) {
+  if (!rawName || !(durationMs > 0)) return false;
+  if (!(state._djSessionCooldowns instanceof Map)) state._djSessionCooldowns = new Map();
+  const safe = djSafeKey(rawName, 48);
+  if (!safe) return false;
+  if (state._djSessionCooldowns.size >= DJ_SESSION_COOLDOWN_LIMIT) djPruneSessionCooldowns(nowMs);
+  const key = `${kind}:${safe}`;
+  state._djSessionCooldowns.delete(key);
+  state._djSessionCooldowns.set(key, nowMs + durationMs);
+  return true;
+}
+
+function djSessionEntityCooledDown(kind, rawName, nowMs = Date.now()) {
+  if (!(state._djSessionCooldowns instanceof Map) || !rawName) return false;
+  const safe = djSafeKey(rawName, 48);
+  if (!safe) return false;
+  const key = `${kind}:${safe}`;
+  const until = state._djSessionCooldowns.get(key);
+  if (!until) return false;
+  if (until <= nowMs) {
+    state._djSessionCooldowns.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function djEstimateTrackEnergy(tiOrMeta) {
+  const meta = typeof tiOrMeta === 'number' ? state.meta?.[tiOrMeta] : tiOrMeta;
+  if (!meta) return 0.5;
+  const key = typeof waveformTrackKey === 'function' ? waveformTrackKey(meta) : '';
+  const wf = key && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(key) : null;
+  if (wf && Number.isFinite(wf.bodyEnergy) && wf.bodyEnergy > 0) return wf.bodyEnergy;
+  const tKey = djTrackTelemetryKey(meta);
+  const telEnergy = tKey ? state._djTelemetry?.tracks?.[tKey]?.energy : 0;
+  if (Number.isFinite(telEnergy) && telEnergy > 0) return telEnergy;
+  const bpm = Number(meta.bpm);
+  if (bpm >= 50 && bpm <= 230) return Math.max(0.15, Math.min(0.95, (bpm - 68) / 115));
+  return 0.5;
+}
+
+function orderDjChapterFlow(trackIndices, anchorMeta = null, archetype = '') {
+  if (!Array.isArray(trackIndices) || trackIndices.length <= 1) return Array.isArray(trackIndices) ? trackIndices.slice() : [];
+  if (archetype === 'artist-spotlight') {
+    const remaining = trackIndices.slice();
+    if (remaining.length <= 2) return remaining;
+    const ordered = [remaining.shift()];
+    while (remaining.length > 0) {
+      const prevMeta = state.meta?.[ordered[ordered.length - 1]];
+      const prevEnergy = djEstimateTrackEnergy(ordered[ordered.length - 1]);
+      let bestIdx = 0;
+      let bestFit = -Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const candTi = remaining[i];
+        const candMeta = state.meta?.[candTi];
+        const bpmFit = djBpmCompatibility(prevMeta?.bpm, candMeta?.bpm);
+        const harmFit = djHarmonicCompatibility(djResolveCamelotKey(prevMeta), djResolveCamelotKey(candMeta));
+        const energyDiff = Math.abs(djEstimateTrackEnergy(candTi) - prevEnergy);
+        const fit = (bpmFit !== null ? bpmFit * 1.6 : 0.65)
+          + (harmFit !== null ? (harmFit - 0.5) * 0.75 : 0)
+          - energyDiff * 0.9 - i * 0.08;
+        if (fit > bestFit) { bestFit = fit; bestIdx = i; }
+      }
+      ordered.push(remaining.splice(bestIdx, 1)[0]);
+    }
+    return ordered;
+  }
+
+  const remaining = trackIndices.slice();
+  const ordered = [];
+  let prevMeta = anchorMeta;
+  let prevEnergy = anchorMeta ? (() => {
+    const bpm = Number(anchorMeta.bpm);
+    const key = typeof waveformTrackKey === 'function' ? waveformTrackKey(anchorMeta) : '';
+    const wf = key && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(key) : null;
+    if (wf?.bodyEnergy > 0) return wf.bodyEnergy;
+    return bpm >= 50 && bpm <= 230 ? Math.max(0.15, Math.min(0.95, (bpm - 68) / 115)) : 0.5;
+  })() : null;
+  let prevArtistKey = djSafeKey(anchorMeta?.artist);
+
+  while (remaining.length > 0) {
+    let bestIdx = 0;
+    let bestFit = -Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const candTi = remaining[i];
+      const candMeta = state.meta?.[candTi] || {};
+      const candEnergy = djEstimateTrackEnergy(candTi);
+      const candArtistKey = djSafeKey(candMeta.artist);
+      // Preserve primary taste score preference for opener while rewarding smooth tempo/energy handoffs
+      let fit = ordered.length === 0 ? -i * 0.35 : -i * 0.14;
+      if (prevMeta) {
+        const bpmFit = djBpmCompatibility(prevMeta.bpm, candMeta.bpm);
+        if (bpmFit !== null) fit += (bpmFit - 0.5) * (ordered.length === 0 ? 1.45 : 2.1);
+        const harmFit = djHarmonicCompatibility(djResolveCamelotKey(prevMeta), djResolveCamelotKey(candMeta));
+        if (harmFit !== null) fit += (harmFit - 0.5) * (ordered.length === 0 ? 0.65 : 0.95);
+      }
+      if (prevEnergy !== null) {
+        const dE = candEnergy - prevEnergy;
+        if (archetype === 'late-night-chill') {
+          fit += dE <= 0.05 ? 0.55 - Math.abs(dE) * 0.8 : -dE * 1.6;
+        } else if (archetype === 'energy-flow') {
+          fit += dE >= -0.05 ? 0.55 + Math.min(0.35, dE) : dE * 1.6;
+        } else {
+          fit -= Math.abs(dE) * 1.15;
+        }
+      }
+      if (prevArtistKey && candArtistKey && prevArtistKey === candArtistKey) {
+        fit -= 2.2;
+      }
+      if (fit > bestFit) {
+        bestFit = fit;
+        bestIdx = i;
+      }
+    }
+    const chosenTi = remaining.splice(bestIdx, 1)[0];
+    ordered.push(chosenTi);
+    prevMeta = state.meta?.[chosenTi] || null;
+    prevEnergy = djEstimateTrackEnergy(chosenTi);
+    prevArtistKey = djSafeKey(prevMeta?.artist);
+  }
+  return ordered;
+}
+
+function scoreDjCandidateTrack(ti, context = {}) {
+  const meta = state.meta?.[ti];
+  if (!meta || !trackAvailable(ti)) return -Infinity;
+  const nowMs = context.nowMs || Date.now();
+  const daypart = context.daypart || djDaypart(nowMs);
+  const tel = loadDjTelemetry();
+  const tKey = djTrackTelemetryKey(meta);
+  const trackTel = tKey ? tel.tracks[tKey] : null;
+  const artistKey = djSafeKey(meta.artist);
+  const artistTel = artistKey ? tel.artists[artistKey] : null;
+  const genres = djExtractCanonicalGenres(meta);
+
+  let score = 1.0;
+  const priority = Number(state.priority?.[ti] ?? 1);
+  if (priority <= 0.3) score -= 3.5;
+  else if (priority > 1.2) score += 2.2;
+
+  if (meta.liked === true || trackTel?.liked === true) score += 2.6;
+  if (trackTel && trackTel.plays > 0) {
+    score += Math.min(3.4, Math.log1p(trackTel.completes) * 1.45);
+    score += Math.min(3.0, (trackTel.replays + trackTel.promotions) * 0.85);
+    score += (trackTel.avgCompletion - 0.5) * 2.4;
+    score -= Math.min(5.0, trackTel.earlySkips * 1.15);
+    score -= Math.min(4.0, trackTel.removals * 1.5);
+    score += Math.min(2.0, (trackTel.tod?.[daypart] || 0) * 0.45);
+    if (trackTel.lastPlayedAt > 0) {
+      const minsAgo = (nowMs - trackTel.lastPlayedAt) / 60_000;
+      if (minsAgo < 25) score -= 6.5;
+      else if (minsAgo < 90) score -= 2.8;
+    }
+  } else {
+    // Fresh-cut crate balance so unplayed playlist songs aren't permanently starved behind early plays
+    score += 1.05;
+  }
+  if (artistTel) score += Math.max(-3.5, Math.min(4.5, artistTel.score * 0.28));
+  for (const gLabel of genres) {
+    const gTel = tel.genres[djSafeKey(gLabel, 48)];
+    if (gTel) {
+      score += Math.max(-2.5, Math.min(3.5, gTel.score * 0.22));
+      score += Math.max(-1.5, Math.min(2.2, (gTel.todScores?.[daypart] || 0) * 0.25));
+    }
+  }
+
+  if (context.anchorBpm) {
+    const bpmCompat = djBpmCompatibility(context.anchorBpm, meta.bpm);
+    if (bpmCompat !== null) score += (bpmCompat - 0.45) * 0.85;
+  }
+  if (context.anchorCamelot) {
+    const hFit = djHarmonicCompatibility(context.anchorCamelot, djResolveCamelotKey(meta));
+    if (hFit !== null) score += (hFit - 0.48) * 0.7;
+  }
+
+  if (context.isOpening === true && tKey && Array.isArray(tel.recentOpeners) && (context.availableCount || 99) > 5) {
+    const recentIdx = tel.recentOpeners.indexOf(tKey);
+    if (recentIdx >= 0) {
+      const cooldownScale = (context.availableCount || 99) >= 10 ? 1 : 0.45;
+      score -= (recentIdx < 12 ? 9.5 : 5.0) * cooldownScale;
+    }
+  }
+
+  if (djSessionEntityCooledDown('artist', meta.artist, nowMs)) score -= 5.5;
+  if (genres[0] && djSessionEntityCooledDown('genre', genres[0], nowMs)) score -= 4.5;
+  if (context.excludeSet?.has(ti)) score -= 12;
+  if (Array.isArray(state.history) && state.history.slice(-8).includes(ti)) score -= 7;
+
+  score += (Math.random() - 0.5) * 1.35;
+  return score;
+}
+
+async function fetchDjRelatedTracks(seedTi, options = {}) {
+  const seedMeta = state.meta?.[seedTi];
+  const seedId = Number(seedMeta?.soundcloudId);
+  if (!state.djDiscoveryEnabled || !Number.isInteger(seedId) || seedId <= 0) return [];
+  if (typeof fetchSoundCloudResource !== 'function' || typeof discoverSoundCloudClientIdFromBundle !== 'function') return [];
+
+  const nowMs = Date.now();
+  if (!(state._djRelatedCache instanceof Map)) state._djRelatedCache = new Map();
+  const existingKeys = new Set();
+  let sessionDiscoveryCount = 0;
+  for (const m of state.meta || []) {
+    if (m?.isDjDiscovery) sessionDiscoveryCount++;
+    const k = djTrackTelemetryKey(m);
+    if (k) existingKeys.add(k);
+    if (Number.isInteger(Number(m?.soundcloudId)) && Number(m.soundcloudId) > 0) {
+      existingKeys.add(`sc:${Number(m.soundcloudId)}`);
+    }
+  }
+  if (sessionDiscoveryCount >= DJ_MAX_SESSION_DISCOVERY_TRACKS) return [];
+
+  const cachedEntry = state._djRelatedCache.get(seedId);
+  let normalizedCandidates = null;
+  if (cachedEntry && Array.isArray(cachedEntry.items) && nowMs - (cachedEntry.at || 0) < DJ_RELATED_CACHE_TTL_MS) {
+    state._djRelatedCache.delete(seedId);
+    state._djRelatedCache.set(seedId, cachedEntry);
+    normalizedCandidates = cachedEntry.items;
+  } else if (Array.isArray(cachedEntry)) {
+    normalizedCandidates = cachedEntry
+      .map(item => metaFromSoundCloudTrack(item, 'https://soundcloud.com/discover/dj-related'))
+      .filter(Boolean);
+  }
+
+  if (!normalizedCandidates) {
+    try {
+      const signal = options.signal || state._playbackAbort?.signal || null;
+      const clientId = state._clientId || await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
+      if (!clientId || signal?.aborted) return [];
+      const url = `https://api-v2.soundcloud.com/tracks/${seedId}/related?client_id=${encodeURIComponent(clientId)}&limit=14`;
+      const response = await fetchSoundCloudResource(url, 'json', { signal, credentials: 'omit', timeoutMs: 6500 });
+      if ((response?.status === 401 || response?.status === 403) && typeof forgetSoundCloudClientId === 'function') {
+        forgetSoundCloudClientId(clientId);
+      }
+      if (!response?.ok || signal?.aborted) return [];
+      const rawCollection = Array.isArray(response.data?.collection)
+        ? response.data.collection
+        : (Array.isArray(response.data) ? response.data : []);
+      // Store only compact normalized track metadata (never raw API descriptions/user graphs)
+      normalizedCandidates = [];
+      for (const rawItem of rawCollection) {
+        const norm = metaFromSoundCloudTrack(rawItem, 'https://soundcloud.com/discover/dj-related');
+        if (!norm || norm.customPlaybackUnavailable) continue;
+        const hasStream = (Array.isArray(norm.transcodings) && norm.transcodings.length > 0)
+          || Boolean(norm.hls_aac_160_url || norm.hls_aac_96_url);
+        if (!hasStream) continue;
+        const durSec = (Number(norm.durationMs) || 0) / 1000;
+        if (durSec > 0 && (durSec < 42 || durSec > 720)) continue;
+        normalizedCandidates.push(norm);
+        if (normalizedCandidates.length >= 10) break;
+      }
+      state._djRelatedCache.delete(seedId);
+      state._djRelatedCache.set(seedId, { at: Date.now(), items: normalizedCandidates });
+      while (state._djRelatedCache.size > DJ_RELATED_CACHE_LIMIT) {
+        state._djRelatedCache.delete(state._djRelatedCache.keys().next().value);
+      }
+    } catch (_) {
+      return [];
+    }
+  }
+
+  const injected = [];
+  for (const baseCandidate of normalizedCandidates) {
+    if (injected.length >= 4 || sessionDiscoveryCount + injected.length >= DJ_MAX_SESSION_DISCOVERY_TRACKS) break;
+    if (!baseCandidate || baseCandidate.customPlaybackUnavailable) continue;
+    const hasStream = (Array.isArray(baseCandidate.transcodings) && baseCandidate.transcodings.length > 0)
+      || Boolean(baseCandidate.hls_aac_160_url || baseCandidate.hls_aac_96_url);
+    if (!hasStream) continue;
+    const durSec = (Number(baseCandidate.durationMs) || 0) / 1000;
+    if (durSec > 0 && (durSec < 42 || durSec > 720)) continue;
+    const key = djTrackTelemetryKey(baseCandidate);
+    if (!key || existingKeys.has(key)) continue;
+    if (djSessionEntityCooledDown('artist', baseCandidate.artist, nowMs)) continue;
+    existingKeys.add(key);
+    const candidate = {
+      ...baseCandidate,
+      tags: Array.isArray(baseCandidate.tags) ? baseCandidate.tags.slice() : [],
+      transcodings: Array.isArray(baseCandidate.transcodings) ? baseCandidate.transcodings.slice() : [],
+      isDjDiscovery: true,
+      djSeedArtist: seedMeta.artist || '',
+      djSeedTitle: seedMeta.title || '',
+    };
+    const newTi = state.meta.length;
+    state.meta.push(candidate);
+    if (Array.isArray(state.els)) state.els.push(null);
+    injected.push(newTi);
+  }
+  return injected;
+}
+
+function selectDiverseDjBlock(scoredList, desiredCount, options = {}) {
+  if (!Array.isArray(scoredList) || !scoredList.length || !(desiredCount > 0)) return [];
+  const picked = [];
+  const usedArtists = new Map();
+  const maxPerArtist = options.maxPerArtist || 1;
+  const temperature = Number(options.temperature) > 0 ? Number(options.temperature) : 1.35;
+  const poolSize = Math.min(scoredList.length, Math.max(desiredCount * 4, 18));
+  const pool = scoredList.slice(0, poolSize);
+
+  while (picked.length < desiredCount && pool.length > 0) {
+    const eligible = [];
+    let topScore = -Infinity;
+    for (const item of pool) {
+      const meta = state.meta?.[item.ti];
+      const aKey = djSafeKey(meta?.artist) || `ti:${item.ti}`;
+      if ((usedArtists.get(aKey) || 0) >= maxPerArtist) continue;
+      eligible.push(item);
+      if (item.score > topScore) topScore = item.score;
+    }
+    if (!eligible.length) break;
+
+    let totalWeight = 0;
+    const weights = new Array(eligible.length);
+    for (let i = 0; i < eligible.length; i++) {
+      const diff = Number.isFinite(eligible[i].score - topScore) ? (eligible[i].score - topScore) : 0;
+      const w = Math.exp(Math.max(-6, Math.min(0, diff / temperature)));
+      weights[i] = w;
+      totalWeight += w;
+    }
+    let r = Math.random() * totalWeight;
+    let chosenItem = eligible[eligible.length - 1];
+    for (let i = 0; i < eligible.length; i++) {
+      r -= weights[i];
+      if (r <= 0) {
+        chosenItem = eligible[i];
+        break;
+      }
+    }
+    const poolIdx = pool.indexOf(chosenItem);
+    if (poolIdx >= 0) pool.splice(poolIdx, 1);
+    const aKey = djSafeKey(state.meta?.[chosenItem.ti]?.artist) || `ti:${chosenItem.ti}`;
+    usedArtists.set(aKey, (usedArtists.get(aKey) || 0) + 1);
+    picked.push(chosenItem.ti);
+  }
+
+  if (picked.length < desiredCount) {
+    for (const item of scoredList) {
+      if (picked.length >= desiredCount) break;
+      if (!picked.includes(item.ti)) picked.push(item.ti);
+    }
+  }
+  return picked;
+}
+
+async function planNextDjChapter(options = {}) {
+  const nowMs = Date.now();
+  const daypart = djDaypart(nowMs);
+  const focus = DJ_FOCUS_MODES.includes(options.focus) ? options.focus : (state.djFocus || 'auto');
+  const reason = options.reason || 'auto';
+  const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue?.[state.pos];
+  const excludeSet = new Set(options.excludeIndices || []);
+  if (!options.allowCurrent && Number.isInteger(currentTi)) excludeSet.add(currentTi);
+
+  const available = [];
+  for (let ti = 0; ti < (state.meta?.length || 0); ti++) {
+    if (!trackAvailable(ti)) continue;
+    if (excludeSet.has(ti)) continue;
+    available.push(ti);
+  }
+  if (!available.length && Number.isInteger(currentTi) && trackAvailable(currentTi)) {
+    available.push(currentTi);
+  }
+  if (!available.length) return null;
+
+  const targetSize = Math.min(4, Math.max(1, available.length >= 6 ? 4 : (available.length >= 3 ? 3 : available.length)));
+  const tel = loadDjTelemetry();
+  const historyArchetypes = Array.isArray(state._djChapterHistory) ? state._djChapterHistory : [];
+  const lastArch = historyArchetypes[historyArchetypes.length - 1]?.archetype || '';
+  const secondLastArch = historyArchetypes[historyArchetypes.length - 2]?.archetype || '';
+  const lastGenre = historyArchetypes[historyArchetypes.length - 1]?.genreLabel || '';
+
+  const anchorMeta = !options.opening && Number.isInteger(currentTi) ? state.meta?.[currentTi] : null;
+  const anchorBpm = Number(anchorMeta?.bpm) || 0;
+  const anchorCamelot = anchorMeta ? djResolveCamelotKey(anchorMeta) : '';
+  const isOpening = Boolean(options.opening);
+  const scoredAll = available
+    .map(ti => ({
+      ti,
+      score: scoreDjCandidateTrack(ti, {
+        nowMs,
+        daypart,
+        excludeSet,
+        anchorBpm,
+        anchorCamelot,
+        isOpening,
+        availableCount: available.length,
+      }),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  let chosenArchetype = '';
+  let chosenTracks = [];
+  let badge = 'DJ · Mix';
+  let shortTag = 'dj';
+  let genreLabel = '';
+  let artistLabel = '';
+  let seedMeta = null;
+  let throwbackYear = 0;
+
+  if (options.opening === true && focus === 'auto') {
+    chosenArchetype = 'opening-groove';
+  } else if (focus === 'favorites') {
+    chosenArchetype = lastArch === 'heavy-rotation' ? 'artist-spotlight' : 'heavy-rotation';
+  } else if (focus === 'discovery') {
+    chosenArchetype = 'discovery-radar';
+  } else if (focus === 'throwbacks') {
+    chosenArchetype = 'throwback-gems';
+  } else if (focus === 'chill') {
+    chosenArchetype = 'late-night-chill';
+  } else if (focus === 'energy') {
+    chosenArchetype = 'energy-flow';
+  } else {
+    const cyclePool = [
+      'genre-vibe',
+      'heavy-rotation',
+      ...(state.djDiscoveryEnabled ? ['discovery-radar'] : []),
+      'throwback-gems',
+      'artist-spotlight',
+      'underground-cuts',
+      daypart === 'night' ? 'late-night-chill' : 'energy-flow',
+    ].filter(arch => arch !== lastArch && arch !== secondLastArch);
+    const weighted = cyclePool.map(arch => {
+      const archScore = tel.archetypes?.[arch]?.score || 0;
+      let w = 1 + Math.max(-0.6, Math.min(1.5, archScore * 0.15));
+      if (reason === 'skip-recalibrate' && arch === 'heavy-rotation') w += 1.4;
+      if (arch === 'discovery-radar' && historyArchetypes.length >= 1
+          && !historyArchetypes.slice(-2).some(h => h.archetype === 'discovery-radar')) w += 0.55;
+      return { arch, w: w + Math.random() * 0.65 };
+    }).sort((a, b) => b.w - a.w);
+    chosenArchetype = weighted[0]?.arch || 'heavy-rotation';
+  }
+
+  if (chosenArchetype === 'discovery-radar' && state.djDiscoveryEnabled) {
+    const existingUnheardDiscovery = available.filter(ti => {
+      const m = state.meta[ti];
+      const tk = djTrackTelemetryKey(m);
+      return m?.isDjDiscovery && (!tk || !(tel.tracks[tk]?.plays > 0));
+    });
+    let discPool = existingUnheardDiscovery.slice(0, 4);
+    if (discPool.length < 2) {
+      const seedCandidates = scoredAll.filter(item => Number.isInteger(Number(state.meta[item.ti]?.soundcloudId)));
+      for (const seedItem of seedCandidates.slice(0, 3)) {
+        seedMeta = state.meta[seedItem.ti];
+        const fetched = await fetchDjRelatedTracks(seedItem.ti, { signal: options.signal });
+        if (fetched.length > 0) {
+          discPool = [...discPool, ...fetched].slice(0, 4);
+          break;
+        }
+      }
+    } else {
+      const firstDisc = state.meta[discPool[0]];
+      if (firstDisc?.djSeedArtist) seedMeta = { artist: firstDisc.djSeedArtist, title: firstDisc.djSeedTitle || '' };
+    }
+    if (discPool.length >= 2) {
+      chosenTracks = discPool.slice(0, Math.min(4, discPool.length));
+      badge = 'DJ · Discovery';
+      shortTag = 'discovery';
+    } else {
+      chosenArchetype = focus === 'discovery' ? 'underground-cuts' : 'genre-vibe';
+    }
+  }
+
+  if (chosenArchetype === 'genre-vibe' && !chosenTracks.length) {
+    const clusters = new Map();
+    for (const item of scoredAll) {
+      for (const g of djExtractCanonicalGenres(state.meta[item.ti])) {
+        if (g === lastGenre || djSessionEntityCooledDown('genre', g, nowMs)) continue;
+        if (!clusters.has(g)) clusters.set(g, []);
+        clusters.get(g).push(item);
+      }
+    }
+    const viable = [...clusters.entries()]
+      .filter(([, list]) => list.length >= Math.min(3, targetSize))
+      .map(([g, list]) => {
+        const topSlice = list.slice(0, 4);
+        const avg = topSlice.reduce((s, x) => s + x.score, 0) / topSlice.length;
+        return { g, list, rank: avg + Math.min(1.2, list.length * 0.08) + Math.random() * 0.6 };
+      })
+      .sort((a, b) => b.rank - a.rank);
+    if (viable.length) {
+      genreLabel = viable[0].g;
+      chosenTracks = selectDiverseDjBlock(viable[0].list, targetSize, { maxPerArtist: 2 });
+      badge = `DJ · ${genreLabel}`;
+      shortTag = 'vibe';
+    } else {
+      chosenArchetype = 'heavy-rotation';
+    }
+  }
+
+  if (chosenArchetype === 'artist-spotlight' && !chosenTracks.length) {
+    const byArtist = new Map();
+    for (const item of scoredAll) {
+      const artist = String(state.meta[item.ti]?.artist || '').trim();
+      if (!artist || artist === '—' || djSessionEntityCooledDown('artist', artist, nowMs)) continue;
+      const aKey = djSafeKey(artist);
+      if (!aKey) continue;
+      if (!byArtist.has(aKey)) byArtist.set(aKey, { artist, list: [] });
+      byArtist.get(aKey).list.push(item);
+    }
+    const viableArtists = [...byArtist.values()]
+      .filter(entry => entry.list.length >= 2)
+      .map(entry => ({
+        ...entry,
+        rank: entry.list[0].score + Math.min(1.5, entry.list.length * 0.25) + Math.random() * 0.5,
+      }))
+      .sort((a, b) => b.rank - a.rank);
+    if (viableArtists.length) {
+      artistLabel = viableArtists[0].artist;
+      chosenTracks = viableArtists[0].list.slice(0, Math.min(3, targetSize)).map(x => x.ti);
+      badge = `DJ · ${artistLabel.length > 18 ? `${artistLabel.slice(0, 17)}…` : artistLabel}`;
+      shortTag = 'spotlight';
+    } else {
+      chosenArchetype = 'heavy-rotation';
+    }
+  }
+
+  const currentYear = new Date(nowMs).getFullYear();
+  if (chosenArchetype === 'throwback-gems' && !chosenTracks.length) {
+    const throwbacks = scoredAll.filter(({ ti }) => {
+      const m = state.meta[ti];
+      const yr = Number(m?.uploadYear) || 0;
+      const tk = djTrackTelemetryKey(m);
+      const tr = tk ? tel.tracks[tk] : null;
+      const longUnplayed = !tr || !tr.lastPlayedAt || (nowMs - tr.lastPlayedAt > 14 * 86400_000);
+      return (yr > 0 && yr <= currentYear - 2) || longUnplayed;
+    });
+    if (throwbacks.length >= Math.min(2, targetSize)) {
+      chosenTracks = selectDiverseDjBlock(throwbacks, targetSize);
+      const firstYr = Number(state.meta[chosenTracks[0]]?.uploadYear) || 0;
+      if (firstYr > 0 && firstYr <= currentYear - 2) throwbackYear = firstYr;
+      badge = throwbackYear ? `DJ · ${throwbackYear} Throwback` : 'DJ · Throwbacks';
+      shortTag = 'throwback';
+    } else {
+      chosenArchetype = 'heavy-rotation';
+    }
+  }
+
+  if (chosenArchetype === 'underground-cuts' && !chosenTracks.length) {
+    const underground = scoredAll
+      .filter(({ ti }) => {
+        const plays = Number(state.meta[ti]?.playbackCount);
+        return (Number.isFinite(plays) && plays > 0 && plays < 30_000)
+          || (!Number.isFinite(plays) && (state.meta[ti]?.playlistPosition || 0) > Math.max(8, state.meta.length * 0.5));
+      });
+    if (underground.length >= Math.min(2, targetSize)) {
+      chosenTracks = selectDiverseDjBlock(underground, targetSize);
+      badge = 'DJ · Underground';
+      shortTag = 'gem';
+    } else {
+      chosenArchetype = 'heavy-rotation';
+    }
+  }
+
+  if ((chosenArchetype === 'late-night-chill' || chosenArchetype === 'energy-flow') && !chosenTracks.length) {
+    const wantChill = chosenArchetype === 'late-night-chill';
+    const sortedMood = scoredAll.slice().sort((a, b) => {
+      const eA = djEstimateTrackEnergy(state.meta[a.ti]);
+      const eB = djEstimateTrackEnergy(state.meta[b.ti]);
+      const moodBonusA = wantChill ? (1 - eA) * 2.2 : eA * 2.2;
+      const moodBonusB = wantChill ? (1 - eB) * 2.2 : eB * 2.2;
+      return (b.score + moodBonusB) - (a.score + moodBonusA);
+    });
+    chosenTracks = selectDiverseDjBlock(sortedMood, targetSize);
+    badge = wantChill ? 'DJ · Late Night' : 'DJ · High Energy';
+    shortTag = wantChill ? 'chill' : 'energy';
+  }
+
+  if (!chosenTracks.length) {
+    if (chosenArchetype === 'opening-groove') {
+      const sessionSlot = (Number(tel.totalSessions) || 0) % 4;
+      const openingPool = scoredAll.map(item => {
+        const m = state.meta[item.ti];
+        const tk = djTrackTelemetryKey(m);
+        const tr = tk ? tel.tracks[tk] : null;
+        let bonus = 0;
+        if (sessionSlot === 1) {
+          bonus = djEstimateTrackEnergy(m) * 1.15;
+        } else if (sessionSlot === 2) {
+          bonus = (!tr || !(tr.plays > 0)) ? 1.45 : 0;
+        } else if (sessionSlot === 3) {
+          bonus = Math.min(1.2, (tr?.tod?.[daypart] || 0) * 0.35) + (1 - Math.abs(djEstimateTrackEnergy(m) - 0.58)) * 0.6;
+        } else {
+          bonus = (!tr || !(tr.plays > 0)) ? 0.55 : 0;
+        }
+        return { ti: item.ti, score: item.score + bonus };
+      }).sort((a, b) => b.score - a.score);
+      chosenTracks = selectDiverseDjBlock(openingPool, targetSize, { temperature: 1.65 });
+      badge = 'DJ · Opening Set';
+      shortTag = 'opener';
+    } else {
+      chosenArchetype = 'heavy-rotation';
+      const rotationPool = scoredAll.map(item => {
+        const tk = djTrackTelemetryKey(state.meta[item.ti]);
+        const bonus = Math.min(2.4, Math.log1p(tel.tracks[tk]?.completes || 0) * 0.9)
+          + (state.meta[item.ti]?.liked ? 0.9 : 0);
+        return { ti: item.ti, score: item.score + bonus };
+      }).sort((a, b) => b.score - a.score);
+      chosenTracks = selectDiverseDjBlock(rotationPool, targetSize, { temperature: 1.25 });
+      badge = 'DJ · Heavy Rotation';
+      shortTag = 'rotation';
+    }
+  }
+
+  if (!chosenTracks.length) return null;
+
+  chosenTracks = orderDjChapterFlow(chosenTracks, anchorMeta, chosenArchetype);
+  if (chosenTracks.length > 1) {
+    const firstDurMs = Number(state.meta?.[chosenTracks[0]]?.durationMs);
+    if (Number.isFinite(firstDurMs) && firstDurMs > 0 && firstDurMs < 35_000) {
+      const fullIdx = chosenTracks.findIndex(ti => {
+        const d = Number(state.meta?.[ti]?.durationMs);
+        return !(Number.isFinite(d) && d > 0 && d < 35_000);
+      });
+      if (fullIdx > 0) {
+        const [promoted] = chosenTracks.splice(fullIdx, 1);
+        chosenTracks.unshift(promoted);
+      }
+    }
+  }
+  if (chosenArchetype === 'throwback-gems') {
+    const firstYr = Number(state.meta[chosenTracks[0]]?.uploadYear) || 0;
+    throwbackYear = (firstYr > 0 && firstYr <= currentYear - 2) ? firstYr : 0;
+    badge = throwbackYear ? `DJ · ${throwbackYear} Throwback` : 'DJ · Throwbacks';
+  }
+
+  const chapter = {
+    id: `djch-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
+    archetype: chosenArchetype,
+    badge,
+    shortTag,
+    tracks: chosenTracks,
+    openTi: chosenTracks[0],
+    genreLabel,
+    artistLabel,
+    seedMeta,
+    throwbackYear,
+    reason,
+    isColdOpen: Boolean(options.opening),
+    createdAt: nowMs,
+    bannerText: '',
+    speechText: '',
+    voicePcm: null,
+    voicePromise: null,
+    spoken: false,
+  };
+  const script = buildDjChapterScript(chapter, { daypart, reason, opening: Boolean(options.opening) });
+  chapter.bannerText = script.bannerText;
+  chapter.speechText = script.speechText;
+  return chapter;
+}
+
+function applyDjChapterToQueue(chapter, options = {}) {
+  if (!chapter || !Array.isArray(chapter.tracks) || !chapter.tracks.length) return false;
+  const insertAtCurrent = options.atCurrent === true;
+  const insertIndex = insertAtCurrent
+    ? Math.max(0, Math.min(state.queue.length, state.pos))
+    : Math.max(0, Math.min(state.queue.length, state.pos + 1));
+
+  const before = state.queue.slice(0, insertIndex);
+  const currentHead = !insertAtCurrent && state.pos < state.queue.length ? state.queue[state.pos] : null;
+  const cleanChapterTracks = chapter.tracks.filter(ti => insertAtCurrent || ti !== currentHead);
+  if (!cleanChapterTracks.length) return false;
+  chapter.tracks = cleanChapterTracks;
+  chapter.openTi = cleanChapterTracks[0];
+
+  const used = new Set([...before, ...cleanChapterTracks]);
+  const after = state.queue.slice(insertIndex).filter(ti => !used.has(ti));
+  state.queue = [...before, ...cleanChapterTracks, ...after];
+  if (!insertAtCurrent && currentHead !== null) {
+    state.pos = before.indexOf(currentHead);
+    if (state.pos < 0) state.pos = 0;
+  }
+
+  for (const ti of cleanChapterTracks) {
+    const meta = state.meta?.[ti];
+    if (meta) {
+      meta._djChapterId = chapter.id;
+      meta._djChapterShort = meta.isDjDiscovery ? 'discovery' : chapter.shortTag;
+    }
+  }
+
+  state._djTransitionCache = null;
+  if (typeof recountRoundTotal === 'function') recountRoundTotal();
+  if (!insertAtCurrent && typeof refreshUpcomingCrossfadePreparation === 'function') {
+    refreshUpcomingCrossfadePreparation();
+  }
+  for (const warmTi of cleanChapterTracks.slice(0, 2)) {
+    const warmMeta = state.meta?.[warmTi];
+    if (warmMeta) void warmDjTrackWaveform(warmMeta);
+  }
+  return true;
+}
+
+const DJ_UPSAMPLE_HALF_BAND = [
+  0.626753745, -0.184296972, 0.08548591, -0.04074841,
+  0.017733465, -0.006422798, 0.001653314, -0.000158253,
+];
+
+function applyDjBiquadInPlace(samples, b0, b1, b2, a0, a1, a2) {
+  const invA0 = 1 / a0;
+  const nb0 = b0 * invA0;
+  const nb1 = b1 * invA0;
+  const nb2 = b2 * invA0;
+  const na1 = a1 * invA0;
+  const na2 = a2 * invA0;
+  let z1 = 0;
+  let z2 = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i];
+    const y = nb0 * x + z1;
+    z1 = nb1 * x - na1 * y + z2;
+    z2 = nb2 * x - na2 * y;
+    samples[i] = y;
+  }
+}
+
+function applyDjStudioVocalEq(samples, sampleRate) {
+  if (!samples?.length || !(sampleRate >= 16000)) return samples;
+  // 1. 80 Hz Butterworth highpass: removes sub-bass & plosive rumble
+  {
+    const w0 = (2 * Math.PI * 80) / sampleRate;
+    const c = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * Math.SQRT1_2);
+    applyDjBiquadInPlace(samples, (1 + c) * 0.5, -(1 + c), (1 + c) * 0.5, 1 + alpha, -2 * c, 1 - alpha);
+  }
+  // 2. 185 Hz +1.8 dB peaking (Q=0.85): broadcast studio vocal chest warmth
+  {
+    const w0 = (2 * Math.PI * 185) / sampleRate;
+    const c = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * 0.85);
+    const A = Math.pow(10, 1.8 / 40);
+    applyDjBiquadInPlace(samples, 1 + alpha * A, -2 * c, 1 - alpha * A, 1 + alpha / A, -2 * c, 1 - alpha / A);
+  }
+  // 3. 350 Hz -1.4 dB peaking (Q=1.25): carves out boxy low-mid muddiness for open clarity
+  {
+    const w0 = (2 * Math.PI * 350) / sampleRate;
+    const c = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * 1.25);
+    const A = Math.pow(10, -1.4 / 40);
+    applyDjBiquadInPlace(samples, 1 + alpha * A, -2 * c, 1 - alpha * A, 1 + alpha / A, -2 * c, 1 - alpha / A);
+  }
+  // 4. 3100 Hz +1.8 dB peaking (Q=0.90): condenser vocal presence & consonant intelligibility
+  {
+    const w0 = (2 * Math.PI * 3100) / sampleRate;
+    const c = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * 0.90);
+    const A = Math.pow(10, 1.8 / 40);
+    applyDjBiquadInPlace(samples, 1 + alpha * A, -2 * c, 1 - alpha * A, 1 + alpha / A, -2 * c, 1 - alpha / A);
+  }
+  // 5. 8600 Hz +1.2 dB peaking (Q=0.75) + 13800 Hz Butterworth lowpass: silky studio air without sibilance
+  if (sampleRate > 24000) {
+    {
+      const w0 = (2 * Math.PI * 8600) / sampleRate;
+      const c = Math.cos(w0);
+      const alpha = Math.sin(w0) / (2 * 0.75);
+      const A = Math.pow(10, 1.2 / 40);
+      applyDjBiquadInPlace(samples, 1 + alpha * A, -2 * c, 1 - alpha * A, 1 + alpha / A, -2 * c, 1 - alpha / A);
+    }
+    {
+      const w0 = (2 * Math.PI * 13800) / sampleRate;
+      const c = Math.cos(w0);
+      const alpha = Math.sin(w0) / (2 * Math.SQRT1_2);
+      applyDjBiquadInPlace(samples, (1 - c) * 0.5, 1 - c, (1 - c) * 0.5, 1 + alpha, -2 * c, 1 - alpha);
+    }
+  }
+  return samples;
+}
+
+function isDjFloat32Samples(val) {
+  return Boolean(val && (val instanceof Float32Array
+    || (ArrayBuffer.isView(val) && Object.prototype.toString.call(val) === '[object Float32Array]')));
+}
+
+function prepareDjVoiceSamples(rawSamples, sampleRate = 24000) {
+  if (!isDjFloat32Samples(rawSamples) || rawSamples.length < 64) return null;
+  const rate = Math.max(8000, Math.min(96000, Number(sampleRate) || 24000));
+  const threshold = 0.0022;
+  let first = 0;
+  let last = rawSamples.length - 1;
+  while (first < last && Math.abs(rawSamples[first]) < threshold) first++;
+  while (last > first && Math.abs(rawSamples[last]) < threshold) last--;
+  const pad = Math.floor(rate * 0.038);
+  first = Math.max(0, first - pad);
+  last = Math.min(rawSamples.length - 1, last + pad);
+  const length = Math.max(1, last - first + 1);
+  const base = new Float32Array(length);
+
+  let dcSum = 0;
+  for (let i = 0; i < length; i++) {
+    const s = Number(rawSamples[first + i]) || 0;
+    base[i] = s;
+    dcSum += s;
+  }
+  const dcMean = dcSum / length;
+
+  let rawPeak = 0;
+  for (let i = 0; i < length; i++) {
+    const centered = base[i] - dcMean;
+    base[i] = centered;
+    const abs = Math.abs(centered);
+    if (abs > rawPeak) rawPeak = abs;
+  }
+  if (rawPeak < 0.003) return null;
+
+  let out = base;
+  let outRate = rate;
+  if (rate <= 28000) {
+    // 31-tap Kaiser-windowed (beta=7.5, -74.6 dB mirror rejection) polyphase 2x upsampler
+    // prevents browser AudioBufferSourceNode linear-interpolation ultrasonic buzz above 12 kHz.
+    outRate = rate * 2;
+    out = new Float32Array(length * 2);
+    const c0 = DJ_UPSAMPLE_HALF_BAND[0];
+    const c1 = DJ_UPSAMPLE_HALF_BAND[1];
+    const c2 = DJ_UPSAMPLE_HALF_BAND[2];
+    const c3 = DJ_UPSAMPLE_HALF_BAND[3];
+    const c4 = DJ_UPSAMPLE_HALF_BAND[4];
+    const c5 = DJ_UPSAMPLE_HALF_BAND[5];
+    const c6 = DJ_UPSAMPLE_HALF_BAND[6];
+    const c7 = DJ_UPSAMPLE_HALF_BAND[7];
+    for (let k = 0; k < length; k++) {
+      out[2 * k] = base[k];
+      const s0 = base[k] + (k + 1 < length ? base[k + 1] : 0);
+      const s1 = (k >= 1 ? base[k - 1] : 0) + (k + 2 < length ? base[k + 2] : 0);
+      const s2 = (k >= 2 ? base[k - 2] : 0) + (k + 3 < length ? base[k + 3] : 0);
+      const s3 = (k >= 3 ? base[k - 3] : 0) + (k + 4 < length ? base[k + 4] : 0);
+      const s4 = (k >= 4 ? base[k - 4] : 0) + (k + 5 < length ? base[k + 5] : 0);
+      const s5 = (k >= 5 ? base[k - 5] : 0) + (k + 6 < length ? base[k + 6] : 0);
+      const s6 = (k >= 6 ? base[k - 6] : 0) + (k + 7 < length ? base[k + 7] : 0);
+      const s7 = (k >= 7 ? base[k - 7] : 0) + (k + 8 < length ? base[k + 8] : 0);
+      out[2 * k + 1] = c0 * s0 + c1 * s1 + c2 * s2 + c3 * s3 + c4 * s4 + c5 * s5 + c6 * s6 + c7 * s7;
+    }
+  }
+
+  applyDjStudioVocalEq(out, outRate);
+
+  const outLen = out.length;
+  let eqPeak = 0;
+  for (let i = 0; i < outLen; i++) {
+    const abs = Math.abs(out[i]);
+    if (abs > eqPeak) eqPeak = abs;
+  }
+  if (eqPeak < 0.002) return null;
+
+  // Broadcast vocal leveler (4 ms attack, 85 ms release, 2.8:1 ratio above -14 dBFS)
+  // + gated active-speech RMS makeup (-11.4 dBFS target) + transparent 0.96 true-peak soft limiter.
+  const preGain = eqPeak > 0.015 ? Math.min(4.0, 0.85 / eqPeak) : 1;
+  const attCoeff = Math.exp(-1 / Math.max(1, outRate * 0.004));
+  const relCoeff = Math.exp(-1 / Math.max(1, outRate * 0.085));
+  const compThresh = 0.20;
+  const compSlope = 1 - (1 / 2.8);
+  let env = 0;
+  let activeSqSum = 0;
+  let activeCount = 0;
+  let totalSqSum = 0;
+  for (let i = 0; i < outLen; i++) {
+    const x = out[i] * preGain;
+    const ax = Math.abs(x);
+    env = ax > env ? attCoeff * env + (1 - attCoeff) * ax : relCoeff * env + (1 - relCoeff) * ax;
+    let gr = 1;
+    if (env > compThresh) {
+      gr = Math.exp(-compSlope * Math.log(env / compThresh));
+    }
+    const y = x * gr;
+    out[i] = y;
+    const y2 = y * y;
+    totalSqSum += y2;
+    if (Math.abs(y) > 0.025) {
+      activeSqSum += y2;
+      activeCount++;
+    }
+  }
+
+  const measuredRms = activeCount >= Math.min(256, Math.floor(outLen * 0.08))
+    ? Math.sqrt(activeSqSum / activeCount)
+    : Math.sqrt(totalSqSum / Math.max(1, outLen));
+  const makeupGain = measuredRms > 0.01 ? Math.max(0.85, Math.min(2.85, 0.27 / measuredRms)) : 1;
+
+  for (let i = 0; i < outLen; i++) {
+    let v = out[i] * makeupGain;
+    const abs = Math.abs(v);
+    if (abs > 0.80) {
+      const sign = v < 0 ? -1 : 1;
+      v = sign * (0.80 + 0.16 * Math.tanh((abs - 0.80) / 0.16));
+    }
+    out[i] = v;
+  }
+
+  const fadeInLen = Math.min(Math.floor(outLen * 0.25), Math.max(48, Math.floor(outRate * 0.020)));
+  const fadeOutLen = Math.min(Math.floor(outLen * 0.25), Math.max(64, Math.floor(outRate * 0.028)));
+  for (let i = 0; i < fadeInLen; i++) {
+    const w = 0.5 * (1 - Math.cos((Math.PI * i) / fadeInLen));
+    out[i] *= w;
+  }
+  for (let i = 0; i < fadeOutLen; i++) {
+    const w = 0.5 * (1 - Math.cos((Math.PI * i) / fadeOutLen));
+    out[outLen - 1 - i] *= w;
+  }
+  out[0] = 0;
+  out[outLen - 1] = 0;
+  return { samples: out, sampleRate: outRate };
+}
+
+function createDjVoiceWorkerSource(modelMode = state?.djVoiceModel) {
+  const resolvedMode = DJ_VOICE_MODEL_IDS.has(modelMode) ? modelMode : 'hq';
+  const useGpuBundle = resolvedMode === 'hq-gpu';
+  const dspHelperBlock = typeof prepareDjVoiceSamples === 'function'
+    && typeof applyDjStudioVocalEq === 'function'
+    && typeof applyDjBiquadInPlace === 'function'
+    && typeof isDjFloat32Samples === 'function'
+    ? `
+    const DJ_UPSAMPLE_HALF_BAND = ${JSON.stringify(DJ_UPSAMPLE_HALF_BAND)};
+    ${applyDjBiquadInPlace.toString()}
+    ${applyDjStudioVocalEq.toString()}
+    ${isDjFloat32Samples.toString()}
+    ${prepareDjVoiceSamples.toString()}`
+    : '';
+  const gpuHelperBlock = useGpuBundle
+    ? `
+    async function probeGpuAdapter() {
+      try {
+        const nav = typeof navigator !== 'undefined' ? navigator : self.navigator;
+        if (!nav || !nav.gpu || typeof nav.gpu.requestAdapter !== 'function') return false;
+        const adapter = await nav.gpu.requestAdapter();
+        return Boolean(adapter);
+      } catch (_) {
+        return false;
+      }
+    }
+    const GPU_EP = ['webgpu'];`
+    : '';
+  return `
+    const MODEL_MODE = ${JSON.stringify(resolvedMode)};
+    const ORT_CANDIDATES = ${JSON.stringify(
+      useGpuBundle
+        ? [
+          {
+            esm: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.bundle.min.mjs',
+            wasmBase: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/',
+          },
+          {
+            esm: 'https://unpkg.com/onnxruntime-web@1.21.0/dist/ort.bundle.min.mjs',
+            wasmBase: 'https://unpkg.com/onnxruntime-web@1.21.0/dist/',
+          },
+        ]
+        : [
+          {
+            esm: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.wasm.bundle.min.mjs',
+            wasmBase: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/',
+          },
+          {
+            esm: 'https://unpkg.com/onnxruntime-web@1.21.0/dist/ort.wasm.bundle.min.mjs',
+            wasmBase: 'https://unpkg.com/onnxruntime-web@1.21.0/dist/',
+          },
+        ]
+    )};
+    const PHONEMIZER_URLS = [
+      'https://cdn.jsdelivr.net/npm/phonemizer@1.2.1/dist/phonemizer.js',
+      'https://unpkg.com/phonemizer@1.2.1/dist/phonemizer.js',
+      'https://cdn.jsdelivr.net/npm/phonemizer@1.2.1/+esm',
+    ];
+    const KOKORO_BASE = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231';
+    const KOKORO_LEGACY_BASE = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main';
+    const LITE_TOK_URL = 'https://huggingface.co/onnx-community/kitten-tts-nano-0.1-ONNX/resolve/2aa48850b3c619a1214a1013ebce9e181548c358/tokenizer.json';
+    const LITE_TOK_LEGACY_URL = 'https://huggingface.co/onnx-community/kitten-tts-nano-0.1-ONNX/resolve/main/tokenizer.json';
+    const LITE_VOICES_URL = 'https://huggingface.co/KittenML/kitten-tts-nano-0.8-int8/resolve/84781d74e29ee25217551556398b42f80593a813/voices.npz';
+    const LITE_VOICES_LEGACY_URL = 'https://huggingface.co/KittenML/kitten-tts-nano-0.8-int8/resolve/main/voices.npz';
+    const LITE_MODEL_URL = 'https://huggingface.co/KittenML/kitten-tts-nano-0.8-int8/resolve/84781d74e29ee25217551556398b42f80593a813/kitten_tts_nano_v0_8.onnx';
+    const LITE_MODEL_LEGACY_URL = 'https://huggingface.co/KittenML/kitten-tts-nano-0.8-int8/resolve/main/kitten_tts_nano_v0_8.onnx';
+    const CACHE_NAME = 'tss-dj-voice-v3';
+
+    if (typeof caches !== 'undefined' && caches && typeof caches.delete === 'function') {
+      try {
+        void caches.delete('tss-dj-voice-v1').catch(() => {});
+        void caches.delete('tss-dj-voice-v2').catch(() => {});
+      } catch (_) {}
+    }
+
+    const KOKORO_VOICES = {
+      am_michael: { voice: 'am_michael', prior: 1.08, prefix: 'a' },
+      af_heart:   { voice: 'af_heart',   prior: 1.06, prefix: 'a' },
+      af_bella:   { voice: 'af_bella',   prior: 1.05, prefix: 'a' },
+      am_fenrir:  { voice: 'am_fenrir',  prior: 1.08, prefix: 'a' },
+      am_puck:    { voice: 'am_puck',    prior: 1.05, prefix: 'a' },
+      bf_emma:    { voice: 'bf_emma',    prior: 1.05, prefix: 'b' },
+      bm_george:  { voice: 'bm_george',  prior: 1.08, prefix: 'b' },
+    };
+
+    const LITE_VOICES = {
+      am_michael: { key: 'expr-voice-2-m', prior: 1.14, lang: 'en-us' },
+      af_heart:   { key: 'expr-voice-3-f', prior: 1.12, lang: 'en-us' },
+      af_bella:   { key: 'expr-voice-2-f', prior: 1.12, lang: 'en-us' },
+      am_fenrir:  { key: 'expr-voice-3-m', prior: 1.13, lang: 'en-us' },
+      am_puck:    { key: 'expr-voice-4-m', prior: 1.12, lang: 'en-us' },
+      bf_emma:    { key: 'expr-voice-4-f', prior: 1.12, lang: 'en-us' },
+      bm_george:  { key: 'expr-voice-5-m', prior: 1.14, lang: 'en-us' },
+    };${gpuHelperBlock}${dspHelperBlock}
+
+    let engine = null;
+    let loadingPromise = null;
+    let preferredInitVoice = 'am_michael';
+    const kokoroVoiceMap = new Map();
+    const utteranceCache = new Map();
+    const fileProgress = new Map();
+    let lastProgressSent = -1;
+    let lastProgressAt = 0;
+
+    function emitProgress(force = false) {
+      if (engine) return;
+      let loaded = 0;
+      let total = 0;
+      for (const entry of fileProgress.values()) {
+        loaded += entry.loaded || 0;
+        total += Math.max(entry.total || 0, entry.loaded || 0);
+      }
+      if (total <= 0) return;
+      const pct = Math.max(1, Math.min(99, Math.round((loaded / total) * 98)));
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (!force && (pct <= lastProgressSent || (pct < 98 && now - lastProgressAt < 90))) return;
+      lastProgressSent = pct;
+      lastProgressAt = now;
+      self.postMessage({ type: 'progress', progress: pct });
+    }
+
+    const dynamicImport = typeof globalThis.__tssDynamicImport === 'function'
+      ? globalThis.__tssDynamicImport
+      : url => import(url);
+
+    async function loadOrtRuntime() {
+      let lastErr = null;
+      for (const candidate of ORT_CANDIDATES) {
+        try {
+          const mod = await dynamicImport(candidate.esm);
+          if (mod && mod.InferenceSession) return { mod, wasmBase: candidate.wasmBase };
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error('ONNX Runtime unavailable');
+    }
+
+    async function loadPhonemizerModule() {
+      let lastErr = null;
+      for (const url of PHONEMIZER_URLS) {
+        try {
+          const mod = await dynamicImport(url);
+          const fn = mod && (mod.phonemize || (mod.default && mod.default.phonemize));
+          if (typeof fn === 'function') return mod;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error('Phonemizer unavailable');
+    }
+
+    async function fetchCachedBytes(url, key, fallbackTotal, trackProgress = true, fallbackUrl = '') {
+      let cache = null;
+      if (typeof caches !== 'undefined' && caches && typeof caches.open === 'function') {
+        try { cache = await caches.open(CACHE_NAME); } catch (_) {}
+      }
+      const cacheLookupUrls = fallbackUrl && fallbackUrl !== url ? [url, fallbackUrl] : [url];
+      if (cache) {
+        for (const lookupUrl of cacheLookupUrls) {
+          try {
+            const hit = await cache.match(lookupUrl);
+            if (hit && hit.ok) {
+              const bytes = new Uint8Array(await hit.arrayBuffer());
+              if (trackProgress) {
+                fileProgress.set(key, { loaded: bytes.byteLength, total: bytes.byteLength });
+                emitProgress();
+              }
+              return bytes;
+            }
+          } catch (_) {}
+        }
+      }
+      let resp = null;
+      let fetchErr = null;
+      for (const candidateUrl of cacheLookupUrls) {
+        try {
+          const attempt = await fetch(candidateUrl);
+          if (attempt && attempt.ok) {
+            resp = attempt;
+            break;
+          }
+          fetchErr = new Error('HTTP ' + (attempt ? attempt.status : 0));
+        } catch (err) {
+          fetchErr = err;
+        }
+      }
+      if (!resp) throw fetchErr || new Error('Network fetch failed');
+      const expected = Number(resp.headers && resp.headers.get && resp.headers.get('content-length')) || fallbackTotal || 0;
+      if (resp.body && typeof resp.body.getReader === 'function') {
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let loaded = 0;
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+          if (step.value && step.value.byteLength) {
+            chunks.push(step.value);
+            loaded += step.value.byteLength;
+            if (trackProgress) {
+              fileProgress.set(key, { loaded, total: Math.max(expected, loaded) });
+              emitProgress();
+            }
+          }
+        }
+        const merged = new Uint8Array(loaded);
+        let offset = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          merged.set(chunks[i], offset);
+          offset += chunks[i].byteLength;
+          chunks[i] = null;
+        }
+        chunks.length = 0;
+        if (trackProgress) {
+          fileProgress.set(key, { loaded, total: loaded });
+          emitProgress(true);
+        }
+        if (cache && loaded > 0) {
+          try {
+            await cache.put(url, new Response(merged, {
+              headers: { 'content-type': 'application/octet-stream' },
+            }));
+          } catch (_) {}
+        }
+        return merged;
+      }
+      const buf = await resp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      if (trackProgress) {
+        fileProgress.set(key, { loaded: bytes.byteLength, total: bytes.byteLength });
+        emitProgress(true);
+      }
+      if (cache && bytes.byteLength > 0) {
+        try {
+          await cache.put(url, new Response(bytes, {
+            headers: { 'content-type': 'application/octet-stream' },
+          }));
+        } catch (_) {}
+      }
+      return bytes;
+    }
+
+    function parseVoicesNpz(bytes) {
+      const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      const dv = new DataView(ab);
+      const dec = new TextDecoder('utf-8');
+      let eocd = bytes.length - 22;
+      while (eocd >= 0 && dv.getUint32(eocd, true) !== 0x06054b50) eocd--;
+      if (eocd < 0) throw new Error('Invalid voice archive');
+      const count = dv.getUint16(eocd + 10, true);
+      let cd = dv.getUint32(eocd + 16, true);
+      const out = new Map();
+      for (let i = 0; i < count; i++) {
+        if (dv.getUint32(cd, true) !== 0x02014b50) break;
+        const nameLen = dv.getUint16(cd + 28, true);
+        const extraLen = dv.getUint16(cd + 30, true);
+        const commentLen = dv.getUint16(cd + 32, true);
+        const name = dec.decode(bytes.subarray(cd + 46, cd + 46 + nameLen)).replace(/\\.npy$/i, '');
+        let localOff = dv.getUint32(cd + 42, true);
+        const compSize = dv.getUint32(cd + 20, true);
+        if (compSize === 0xffffffff || localOff === 0xffffffff) {
+          let eo = cd + 46 + nameLen;
+          const eEnd = eo + extraLen;
+          while (eo + 4 <= eEnd) {
+            const eid = dv.getUint16(eo, true);
+            const esz = dv.getUint16(eo + 2, true);
+            if (eid === 0x0001) {
+              let p = eo + 4;
+              if (dv.getUint32(cd + 24, true) === 0xffffffff) p += 8;
+              if (compSize === 0xffffffff) p += 8;
+              if (localOff === 0xffffffff) localOff = Number(dv.getBigUint64(p, true));
+            }
+            eo += 4 + esz;
+          }
+        }
+        const lNameLen = dv.getUint16(localOff + 26, true);
+        const lExtraLen = dv.getUint16(localOff + 28, true);
+        const dataOff = localOff + 30 + lNameLen + lExtraLen;
+        const major = bytes[dataOff + 6];
+        const hdrLen = major === 1 ? dv.getUint16(dataOff + 8, true) : dv.getUint32(dataOff + 8, true);
+        const hdrStart = dataOff + (major === 1 ? 10 : 12);
+        const hdr = dec.decode(bytes.subarray(hdrStart, hdrStart + hdrLen));
+        const m = hdr.match(/shape'\\s*:\\s*\\((\\d+)\\s*,\\s*(\\d+)\\)/);
+        if (m) {
+          const rows = Number(m[1]);
+          const cols = Number(m[2]);
+          const fStart = hdrStart + hdrLen;
+          out.set(name, { rows, cols, data: new Float32Array(ab.slice(fStart, fStart + rows * cols * 4)) });
+        }
+        cd += 46 + nameLen + extraLen + commentLen;
+      }
+      if (out.size === 0) throw new Error('No voice embeddings found');
+      return out;
+    }
+
+    async function ensureKokoroVoice(voiceName, trackProgress = false) {
+      const existing = kokoroVoiceMap.get(voiceName);
+      if (existing) return existing;
+      const bytes = await fetchCachedBytes(
+        KOKORO_BASE + '/voices/' + voiceName + '.bin',
+        'voice_' + voiceName,
+        522240,
+        trackProgress,
+        KOKORO_LEGACY_BASE + '/voices/' + voiceName + '.bin',
+      );
+      const aligned = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      const f32 = new Float32Array(aligned);
+      kokoroVoiceMap.set(voiceName, f32);
+      return f32;
+    }
+
+    const DECADE_WORDS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+    const UNIT_WORDS = ['oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+
+    function spokenYear(y) {
+      const n = Number(y);
+      if (n === 2000) return 'two thousand';
+      if (n > 2000 && n < 2010) return 'two thousand ' + UNIT_WORDS[n - 2000];
+      const hi = Math.floor(n / 100);
+      const lo = n % 100;
+      const hiStr = hi === 19 ? 'nineteen' : hi === 20 ? 'twenty' : String(hi);
+      const loStr = lo === 0
+        ? 'hundred'
+        : lo < 20
+          ? (lo < 10 ? 'oh ' + UNIT_WORDS[lo] : UNIT_WORDS[lo])
+          : (DECADE_WORDS[Math.floor(lo / 10)] + (lo % 10 ? ' ' + UNIT_WORDS[lo % 10] : ''));
+      return hiStr + ' ' + loStr;
+    }
+
+    function normalizeForSpeech(raw) {
+      return String(raw || '')
+        .replace(/[‘’]/g, "'")
+        .replace(/["“”]/g, '')
+        .replace(/—/g, ', ')
+        .replace(/&/g, ' and ')
+        .replace(/\\+/g, ' plus ')
+        .replace(/%/g, ' percent ')
+        .replace(/\\bD[Rr]\\.(?=\\s+[A-Z])/g, 'Doctor')
+        .replace(/\\bMr\\.(?=\\s+[A-Z])/g, 'Mister')
+        .replace(/\\bMs\\.(?=\\s+[A-Z])/g, 'Miss')
+        .replace(/\\bMrs\\.(?=\\s+[A-Z])/g, 'Mrs')
+        .replace(/\\b(?:feat|ft)\\.?\\b/gi, 'featuring')
+        .replace(/\\b(19[6-9]\\d|20[0-3]\\d)\\b/g, m => spokenYear(m))
+        .replace(/\\s+/g, ' ')
+        .trim();
+    }
+
+    const KOKORO_PUNC_RE = /(\\s*[;:,.!?¡¿—…"«»“”()\\{\\}\\[\\]]+\\s*)+/g;
+    const LITE_PUNC_RE = /(\\s*[;:,.!?—…"()\\[\\]]+\\s*)+/g;
+    const WORD_OR_PUNC_RE = /[\\p{L}\\p{M}\\p{N}_]+|[^\\p{L}\\p{M}\\p{N}_\\s]/gu;
+
+    async function kokoroTextToIpa(phonemizeFn, cleaned, prefix) {
+      if (!cleaned) return '';
+      const lang = prefix === 'b' ? 'en' : 'en-us';
+      const parts = [];
+      let cursor = 0;
+      for (const m of cleaned.matchAll(KOKORO_PUNC_RE)) {
+        if (m.index > cursor) parts.push({ punc: false, text: cleaned.slice(cursor, m.index) });
+        if (m[0].length > 0) parts.push({ punc: true, text: m[0] });
+        cursor = m.index + m[0].length;
+      }
+      if (cursor < cleaned.length) parts.push({ punc: false, text: cleaned.slice(cursor) });
+      const chunks = [];
+      for (const part of parts) {
+        if (part.punc) {
+          chunks.push(part.text);
+        } else {
+          const ipaLines = await phonemizeFn(part.text, lang);
+          chunks.push(Array.isArray(ipaLines) ? ipaLines.filter(Boolean).join(' ') : String(ipaLines || ''));
+        }
+      }
+      let ipa = chunks.join('')
+        .replace(/kəkˈoːɹoʊ/g, 'kˈoʊkəɹoʊ')
+        .replace(/kəkˈɔːɹəʊ/g, 'kˈəʊkəɹəʊ')
+        .replace(/ʲ/g, 'j')
+        .replace(/r/g, 'ɹ')
+        .replace(/x/g, 'k')
+        .replace(/ɬ/g, 'l')
+        .replace(/(?<=[a-zɹː])(?=hˈʌndɹɪd)/g, ' ')
+        .replace(/ z(?=[;:,.!?¡¿—…"«»“” ]|$)/g, 'z');
+      if (prefix === 'a') {
+        ipa = ipa.replace(/(?<=nˈaɪn)ti(?!ː)/g, 'di');
+      }
+      return ipa.trim();
+    }
+
+    async function liteTextToIpaWithPunct(phonemizeFn, cleaned, lang) {
+      if (!cleaned) return '';
+      const parts = [];
+      let cursor = 0;
+      for (const m of cleaned.matchAll(LITE_PUNC_RE)) {
+        if (m.index > cursor) parts.push({ punc: false, text: cleaned.slice(cursor, m.index) });
+        parts.push({ punc: true, text: m[0] });
+        cursor = m.index + m[0].length;
+      }
+      if (cursor < cleaned.length) parts.push({ punc: false, text: cleaned.slice(cursor) });
+      const out = [];
+      for (const part of parts) {
+        if (part.punc) {
+          out.push(part.text);
+        } else {
+          const ipaLines = await phonemizeFn(part.text, lang);
+          out.push(Array.isArray(ipaLines) ? ipaLines.join(' ') : String(ipaLines || ''));
+        }
+      }
+      const tokens = out.join('').match(WORD_OR_PUNC_RE) || [];
+      return tokens.join(' ');
+    }
+
+    async function ensureModel() {
+      if (engine) return engine;
+      if (loadingPromise) return loadingPromise;
+      loadingPromise = (async () => {
+        self.postMessage({ type: 'status', status: 'loading', progress: 0 });
+        if (MODEL_MODE === 'lite') {
+          fileProgress.clear();
+          fileProgress.set('tok', { loaded: 0, total: 4200 });
+          fileProgress.set('voices', { loaded: 0, total: 3278902 });
+          fileProgress.set('model', { loaded: 0, total: 24369971 });
+          const [ortLoaded, phonMod, tokBytes, voicesBytes, modelBytes] = await Promise.all([
+            loadOrtRuntime(),
+            loadPhonemizerModule(),
+            fetchCachedBytes(LITE_TOK_URL, 'tok', 4200, true, LITE_TOK_LEGACY_URL),
+            fetchCachedBytes(LITE_VOICES_URL, 'voices', 3278902, true, LITE_VOICES_LEGACY_URL),
+            fetchCachedBytes(LITE_MODEL_URL, 'model', 24369971, true, LITE_MODEL_LEGACY_URL),
+          ]);
+          const ortMod = ortLoaded.mod;
+          const phonemizeFn = phonMod.phonemize || (phonMod.default && phonMod.default.phonemize);
+          if (typeof phonemizeFn !== 'function') throw new Error('Phonemizer unavailable');
+          ortMod.env.wasm.wasmPaths = ortLoaded.wasmBase;
+          ortMod.env.wasm.numThreads = 1;
+          ortMod.env.wasm.simd = true;
+          const parsedTok = JSON.parse(new TextDecoder('utf-8').decode(tokBytes));
+          const vocab = parsedTok && parsedTok.model && parsedTok.model.vocab;
+          if (!vocab) throw new Error('Tokenizer vocab unavailable');
+          const voices = parseVoicesNpz(voicesBytes);
+          const session = await ortMod.InferenceSession.create(modelBytes, {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all',
+          });
+          engine = { kind: 'lite', backend: 'wasm', ortMod, phonemizeFn, vocab, voices, session };
+          self.postMessage({ type: 'status', status: 'ready', progress: 100, backend: 'wasm' });
+          return engine;
+        }
+
+        const initSpec = KOKORO_VOICES[preferredInitVoice] || KOKORO_VOICES.am_michael;
+        let tryGpu = false;
+        if (MODEL_MODE === 'hq-gpu' && typeof probeGpuAdapter === 'function') {
+          tryGpu = await probeGpuAdapter();
+        }
+        const primaryModelUrl = tryGpu
+          ? (KOKORO_BASE + '/onnx/model.onnx')
+          : (KOKORO_BASE + '/onnx/model_quantized.onnx');
+        const primaryModelLegacyUrl = tryGpu
+          ? (KOKORO_LEGACY_BASE + '/onnx/model.onnx')
+          : (KOKORO_LEGACY_BASE + '/onnx/model_quantized.onnx');
+        const primaryExpectedBytes = tryGpu ? 325532232 : 92361116;
+
+        fileProgress.clear();
+        fileProgress.set('tok', { loaded: 0, total: 4400 });
+        fileProgress.set('voice_' + initSpec.voice, { loaded: 0, total: 522240 });
+        fileProgress.set('model', { loaded: 0, total: primaryExpectedBytes });
+
+        const [ortLoaded, phonMod, tokBytes, , primaryModelBytes] = await Promise.all([
+          loadOrtRuntime(),
+          loadPhonemizerModule(),
+          fetchCachedBytes(KOKORO_BASE + '/tokenizer.json', 'tok', 4400, true, KOKORO_LEGACY_BASE + '/tokenizer.json'),
+          ensureKokoroVoice(initSpec.voice, true),
+          fetchCachedBytes(primaryModelUrl, 'model', primaryExpectedBytes, true, primaryModelLegacyUrl),
+        ]);
+        const ortMod = ortLoaded.mod;
+        const phonemizeFn = phonMod.phonemize || (phonMod.default && phonMod.default.phonemize);
+        if (typeof phonemizeFn !== 'function') throw new Error('Phonemizer unavailable');
+        ortMod.env.wasm.wasmPaths = ortLoaded.wasmBase;
+        ortMod.env.wasm.numThreads = 1;
+        ortMod.env.wasm.simd = true;
+        const parsedTok = JSON.parse(new TextDecoder('utf-8').decode(tokBytes));
+        const vocab = parsedTok && parsedTok.model && parsedTok.model.vocab;
+        if (!vocab) throw new Error('Tokenizer vocab unavailable');
+
+        let session = null;
+        let activeBackend = 'wasm';
+        if (tryGpu && typeof GPU_EP !== 'undefined') {
+          try {
+            session = await ortMod.InferenceSession.create(primaryModelBytes, {
+              executionProviders: GPU_EP,
+              graphOptimizationLevel: 'all',
+            });
+            activeBackend = GPU_EP[0];
+          } catch (_) {
+            session = null;
+          }
+        }
+        if (!session) {
+          let wasmModelBytes = primaryModelBytes;
+          if (tryGpu) {
+            wasmModelBytes = await fetchCachedBytes(
+              KOKORO_BASE + '/onnx/model_quantized.onnx',
+              'model',
+              92361116,
+              true,
+              KOKORO_LEGACY_BASE + '/onnx/model_quantized.onnx',
+            );
+          }
+          session = await ortMod.InferenceSession.create(wasmModelBytes, {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all',
+          });
+          activeBackend = MODEL_MODE === 'hq-gpu' ? 'wasm-fallback' : 'wasm';
+        }
+        engine = { kind: 'kokoro', backend: activeBackend, ortMod, phonemizeFn, vocab, session };
+        self.postMessage({ type: 'status', status: 'ready', progress: 100, backend: activeBackend });
+        return engine;
+      })();
+      try {
+        return await loadingPromise;
+      } catch (err) {
+        loadingPromise = null;
+        throw err;
+      }
+    }
+
+    async function synthesizeCached(rawText, voiceId, userSpeed) {
+      const cleaned = normalizeForSpeech(rawText);
+      if (!cleaned) return null;
+      const speedMul = Math.max(0.85, Math.min(1.25, Number(userSpeed) || 1.0));
+      const cacheKey = MODEL_MODE + '|' + voiceId + '|' + speedMul.toFixed(2) + '|' + cleaned;
+      const hit = utteranceCache.get(cacheKey);
+      if (hit) return hit;
+
+      const eng = await ensureModel();
+      let inputIds = null;
+      let styleVec = null;
+      let styleCols = 256;
+      let effectiveSpeed = 1.0;
+
+      if (eng.kind === 'kokoro') {
+        const spec = KOKORO_VOICES[voiceId] || KOKORO_VOICES.am_michael;
+        const ipa = await kokoroTextToIpa(eng.phonemizeFn, cleaned, spec.prefix);
+        const core = [];
+        for (const ch of ipa) {
+          const tid = eng.vocab[ch];
+          if (tid !== undefined) {
+            core.push(tid);
+            if (core.length >= 510) break;
+          }
+        }
+        if (core.length === 0) throw new Error('Empty phonetic input');
+        const voiceF32 = await ensureKokoroVoice(spec.voice, false);
+        const maxRow = Math.max(0, Math.floor(voiceF32.length / 256) - 1);
+        const refIdx = Math.min(core.length, maxRow);
+        styleVec = voiceF32.slice(refIdx * 256, (refIdx + 1) * 256);
+        inputIds = new BigInt64Array(core.length + 2);
+        inputIds[0] = 0n;
+        for (let i = 0; i < core.length; i++) inputIds[i + 1] = BigInt(core[i]);
+        inputIds[core.length + 1] = 0n;
+        effectiveSpeed = spec.prior * speedMul;
+      } else {
+        const spec = LITE_VOICES[voiceId] || LITE_VOICES.am_michael;
+        const clauseText = /[.!?]+$/.test(cleaned)
+          ? cleaned.replace(/[.!?]+$/, ',')
+          : (/[,;:]$/.test(cleaned) ? cleaned : cleaned + ',');
+        const ipa = await liteTextToIpaWithPunct(eng.phonemizeFn, clauseText, spec.lang);
+        const ids = [0];
+        for (const ch of ipa) {
+          const tid = eng.vocab[ch];
+          if (tid !== undefined) ids.push(tid);
+        }
+        if (ids.length <= 1) throw new Error('Empty phonetic input');
+        ids.push(0);
+        inputIds = new BigInt64Array(ids.length);
+        for (let i = 0; i < ids.length; i++) inputIds[i] = BigInt(ids[i]);
+        const vEntry = eng.voices.get(spec.key) || eng.voices.values().next().value;
+        styleCols = vEntry.cols;
+        const refIdx = Math.max(0, Math.min(clauseText.length, vEntry.rows - 1));
+        styleVec = vEntry.data.slice(refIdx * vEntry.cols, (refIdx + 1) * vEntry.cols);
+        effectiveSpeed = spec.prior * speedMul;
+      }
+
+      let tIn = null;
+      let tSt = null;
+      let tSp = null;
+      let oTensor = null;
+      try {
+        tIn = new eng.ortMod.Tensor('int64', inputIds, [1, inputIds.length]);
+        tSt = new eng.ortMod.Tensor('float32', styleVec, [1, styleCols]);
+        tSp = new eng.ortMod.Tensor('float32', new Float32Array([effectiveSpeed]), [1]);
+        let out;
+        try {
+          out = await eng.session.run({ input_ids: tIn, style: tSt, speed: tSp });
+        } catch (runErr) {
+          if (typeof GPU_EP !== 'undefined' && eng.kind === 'kokoro' && eng.backend === GPU_EP[0]) {
+            try { eng.session && eng.session.release && (await eng.session.release()); } catch (_) {}
+            const wasmBytes = await fetchCachedBytes(
+              KOKORO_BASE + '/onnx/model_quantized.onnx',
+              'model',
+              92361116,
+              false,
+              KOKORO_LEGACY_BASE + '/onnx/model_quantized.onnx',
+            );
+            eng.session = await eng.ortMod.InferenceSession.create(wasmBytes, {
+              executionProviders: ['wasm'],
+              graphOptimizationLevel: 'all',
+            });
+            eng.backend = 'wasm-fallback';
+            self.postMessage({ type: 'status', status: 'ready', progress: 100, backend: 'wasm-fallback' });
+            out = await eng.session.run({ input_ids: tIn, style: tSt, speed: tSp });
+          } else {
+            throw runErr;
+          }
+        }
+        oTensor = out[eng.session.outputNames[0]];
+        const raw = oTensor
+          ? (typeof oTensor.getData === 'function' ? await oTensor.getData() : oTensor.data)
+          : null;
+        if (!raw || !raw.length) throw new Error('Empty audio output');
+        const trimmedLen = eng.kind === 'lite' && raw.length > 6000 ? raw.length - 5000 : raw.length;
+        const pcm = new Float32Array(trimmedLen);
+        pcm.set(raw.subarray(0, trimmedLen));
+        const prepared = typeof prepareDjVoiceSamples === 'function'
+          ? prepareDjVoiceSamples(pcm, 24000)
+          : { samples: pcm, sampleRate: 24000, prepared: false };
+        if (!prepared || !prepared.samples || !prepared.samples.length) {
+          throw new Error('Empty audio output');
+        }
+        const entry = {
+          samples: prepared.samples,
+          sampleRate: prepared.sampleRate,
+          prepared: prepared.prepared !== false,
+        };
+        if (utteranceCache.size >= 4) {
+          utteranceCache.delete(utteranceCache.keys().next().value);
+        }
+        utteranceCache.set(cacheKey, entry);
+        return entry;
+      } finally {
+        try { tIn && tIn.dispose && tIn.dispose(); } catch (_) {}
+        try { tSt && tSt.dispose && tSt.dispose(); } catch (_) {}
+        try { tSp && tSp.dispose && tSp.dispose(); } catch (_) {}
+        try { oTensor && oTensor.dispose && oTensor.dispose(); } catch (_) {}
+      }
+    }
+
+    let chain = Promise.resolve();
+    let canceledUpTo = 0;
+    let pendingSynthCount = 0;
+
+    self.onmessage = event => {
+      const msg = event && event.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'warmup') {
+        const preloadText = String(msg.preloadText || '').trim();
+        const preloadVoice = String(msg.voice || 'am_michael');
+        preferredInitVoice = preloadVoice;
+        chain = chain.then(async () => {
+          await ensureModel();
+          if (preloadText && pendingSynthCount === 0) {
+            try { await synthesizeCached(preloadText, preloadVoice, 1.0); } catch (_) {}
+          }
+        }).catch(err => {
+          self.postMessage({ type: 'error', id: msg.id || 0, message: String((err && err.message) || err || 'Voice load failed') });
+        });
+        return;
+      }
+      if (msg.type === 'cancel') {
+        if (Number.isFinite(msg.upToId)) canceledUpTo = Math.max(canceledUpTo, msg.upToId);
+        return;
+      }
+      if (msg.type === 'synthesize') {
+        const id = Number(msg.id) || 0;
+        const text = String(msg.text || '').trim();
+        const voice = String(msg.voice || 'am_michael');
+        const speed = Math.max(0.85, Math.min(1.25, Number(msg.speed) || 1.0));
+        preferredInitVoice = voice;
+        const cleanedFast = normalizeForSpeech(text);
+        const fastKey = MODEL_MODE + '|' + voice + '|' + speed.toFixed(2) + '|' + cleanedFast;
+        const fastHit = cleanedFast ? utteranceCache.get(fastKey) : null;
+        if (fastHit && id > canceledUpTo) {
+          const transfer = new Float32Array(fastHit.samples.length);
+          transfer.set(fastHit.samples);
+          self.postMessage({ type: 'audio', id, samples: transfer, sampleRate: fastHit.sampleRate, prepared: Boolean(fastHit.prepared) }, [transfer.buffer]);
+          return;
+        }
+        pendingSynthCount++;
+        chain = chain.then(async () => {
+          if (id <= canceledUpTo || !text) {
+            self.postMessage({ type: 'canceled', id });
+            return;
+          }
+          try {
+            const generated = await synthesizeCached(text, voice, speed);
+            if (id <= canceledUpTo || !generated) {
+              self.postMessage({ type: 'canceled', id });
+              return;
+            }
+            const transfer = new Float32Array(generated.samples.length);
+            transfer.set(generated.samples);
+            self.postMessage({ type: 'audio', id, samples: transfer, sampleRate: generated.sampleRate, prepared: Boolean(generated.prepared) }, [transfer.buffer]);
+          } catch (err) {
+            self.postMessage({ type: 'error', id, message: String((err && err.message) || err || 'Synthesis failed') });
+          }
+        }).finally(() => {
+          pendingSynthCount = Math.max(0, pendingSynthCount - 1);
+        });
+      }
+    };
+    self.postMessage({ type: 'booted' });
+  `;
+}
+
+function clearDjChapterVoiceState(chapter) {
+  if (!chapter) return;
+  chapter.voicePcm = null;
+  chapter.voicePromise = null;
+  chapter.voiceLeadPromise = null;
+  chapter.voiceFollowPromise = null;
+  chapter.voiceFailed = false;
+}
+
+function cancelPendingDjVoiceSyntheses() {
+  if (state._djWorker && Number.isFinite(state._djWorkerReqSeq) && state._djWorkerReqSeq > 0) {
+    try { state._djWorker.postMessage({ type: 'cancel', upToId: state._djWorkerReqSeq }); } catch (_) {}
+  }
+  if (state._djWorkerPending instanceof Map) {
+    for (const pending of state._djWorkerPending.values()) {
+      clearTimeout(pending.timer);
+      try { pending.resolve(null); } catch (_) {}
+    }
+    state._djWorkerPending.clear();
+  }
+}
+
+function terminateDjVoiceWorker() {
+  if (typeof cancelActiveDjVoiceSpeech === 'function') cancelActiveDjVoiceSpeech({ immediate: false });
+  cancelPendingDjVoiceSyntheses();
+  const worker = state._djWorker;
+  state._djWorker = null;
+  state._djWorkerRetryAfter = 0;
+  if (state._djWorkerBlobUrl) {
+    try { (pageWindow.URL || URL).revokeObjectURL(state._djWorkerBlobUrl); } catch (_) {}
+    state._djWorkerBlobUrl = '';
+  }
+  try { worker?.terminate(); } catch (_) {}
+  state._djWorkerStatus = 'idle';
+  state._djWorkerBackend = '';
+  state._djWorkerProgress = 0;
+  state._djWorkerError = '';
+  clearDjChapterVoiceState(state._djPendingChapter);
+  clearDjChapterVoiceState(state._djChapter);
+  if (typeof syncDjControls === 'function') syncDjControls();
+}
+
+function ensureDjVoiceWorker() {
+  if (state._djWorker) return state._djWorker;
+  if (state._djWorkerStatus === 'unavailable') return null;
+  if (state._djWorkerStatus === 'fallback' && Number(state._djWorkerRetryAfter) > Date.now()) return null;
+  const WorkerCtor = pageWindow?.Worker || (typeof Worker !== 'undefined' ? Worker : null);
+  const BlobCtor = pageWindow?.Blob || (typeof Blob !== 'undefined' ? Blob : null);
+  const UrlApi = pageWindow?.URL || (typeof URL !== 'undefined' ? URL : null);
+  if (typeof WorkerCtor !== 'function' || typeof BlobCtor !== 'function' || typeof UrlApi?.createObjectURL !== 'function') {
+    state._djWorkerStatus = 'unavailable';
+    state._djWorkerError = 'Web Workers unavailable in this browser';
+    if (typeof syncDjControls === 'function') syncDjControls();
+    return null;
+  }
+  const workerModelId = DJ_VOICE_MODEL_IDS.has(state.djVoiceModel) ? state.djVoiceModel : 'hq';
+  let blobUrl = '';
+  try {
+    const blob = new BlobCtor([createDjVoiceWorkerSource(workerModelId)], { type: 'text/javascript' });
+    blobUrl = UrlApi.createObjectURL(blob);
+    const worker = new WorkerCtor(blobUrl, { type: 'module' });
+    state._djWorker = worker;
+    state._djWorkerBlobUrl = blobUrl;
+    state._djWorkerStatus = 'loading';
+    state._djWorkerBackend = '';
+    state._djWorkerProgress = 0;
+    state._djWorkerError = '';
+    if (!(state._djWorkerPending instanceof Map)) state._djWorkerPending = new Map();
+
+    worker.onmessage = event => {
+      if (state._djWorker !== worker) return;
+      const msg = event?.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'booted') {
+        if (state._djWorkerBlobUrl) {
+          try { UrlApi.revokeObjectURL(state._djWorkerBlobUrl); } catch (_) {}
+          state._djWorkerBlobUrl = '';
+        }
+        return;
+      }
+      if (msg.type === 'progress') {
+        state._djWorkerStatus = 'loading';
+        state._djWorkerProgress = Math.max(state._djWorkerProgress || 0, Math.min(99, Number(msg.progress) || 0));
+        if (typeof syncDjControls === 'function') syncDjControls();
+        return;
+      }
+      if (msg.type === 'status') {
+        state._djWorkerStatus = msg.status === 'ready' ? 'ready' : 'loading';
+        if (msg.backend) state._djWorkerBackend = String(msg.backend);
+        if (msg.status === 'ready') {
+          state._djWorkerProgress = 100;
+          state._djWorkerError = '';
+          safeStorage.setItem(djVoiceModelMeta(workerModelId).cacheKey, '1');
+          if (msg.backend === 'wasm-fallback') {
+            safeStorage.setItem(djVoiceModelMeta('hq').cacheKey, '1');
+          }
+        }
+        if (typeof syncDjControls === 'function') syncDjControls();
+        if (state._djOpeningIntroActive) {
+          if (typeof updateHub === 'function') updateHub();
+          if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+        }
+        return;
+      }
+      if (msg.type === 'audio' || msg.type === 'canceled' || msg.type === 'error') {
+        if (msg.type === 'audio') {
+          if (state._djWorkerStatus !== 'ready') {
+            state._djWorkerStatus = 'ready';
+            state._djWorkerProgress = 100;
+          }
+          safeStorage.setItem(djVoiceModelMeta(workerModelId).cacheKey, '1');
+        }
+        if (msg.type === 'error') {
+          if (state._djWorkerStatus !== 'ready') state._djWorkerStatus = 'fallback';
+          state._djWorkerError = String(msg.message || 'Voice synthesis unavailable');
+          if (typeof syncDjControls === 'function') syncDjControls();
+          if (state._djOpeningIntroActive) {
+            if (typeof updateHub === 'function') updateHub();
+            if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+          }
+        }
+        const id = Number(msg.id) || 0;
+        const pending = state._djWorkerPending?.get(id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          state._djWorkerPending.delete(id);
+          if (msg.type === 'audio' && isDjFloat32Samples(msg.samples)) {
+            pending.resolve(
+              msg.prepared
+                ? { samples: msg.samples, sampleRate: Math.max(8000, Math.min(96000, Number(msg.sampleRate) || 48000)) }
+                : prepareDjVoiceSamples(msg.samples, msg.sampleRate),
+            );
+          } else {
+            pending.resolve(null);
+          }
+        }
+      }
+    };
+
+    const handleWorkerFatalError = () => {
+      if (state._djWorker !== worker) return;
+      state._djWorker = null;
+      if (state._djWorkerBlobUrl) {
+        try { UrlApi.revokeObjectURL(state._djWorkerBlobUrl); } catch (_) {}
+        state._djWorkerBlobUrl = '';
+      }
+      try { worker.terminate?.(); } catch (_) {}
+      state._djWorkerStatus = 'fallback';
+      state._djWorkerRetryAfter = Date.now() + 15_000;
+      state._djWorkerError = 'Local voice failed to load — True DJ continues silently';
+      if (state._djWorkerPending instanceof Map) {
+        for (const pending of state._djWorkerPending.values()) {
+          clearTimeout(pending.timer);
+          pending.resolve(null);
+        }
+        state._djWorkerPending.clear();
+      }
+      if (typeof syncDjControls === 'function') syncDjControls();
+      if (state._djOpeningIntroActive) {
+        if (typeof updateHub === 'function') updateHub();
+        if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+      }
+    };
+    worker.onerror = handleWorkerFatalError;
+    worker.onmessageerror = handleWorkerFatalError;
+
+    const validVoice = DJ_VOICE_IDS.has(state.djVoiceId) ? state.djVoiceId : 'am_michael';
+    worker.postMessage({
+      type: 'warmup',
+      id: 0,
+      voice: validVoice,
+      preloadText: djColdOpenLeadLine(validVoice),
+    });
+    if (typeof syncDjControls === 'function') syncDjControls();
+    return worker;
+  } catch (_) {
+    if (blobUrl) {
+      try { UrlApi.revokeObjectURL(blobUrl); } catch (_) {}
+    }
+    state._djWorker = null;
+    state._djWorkerBlobUrl = '';
+    state._djWorkerStatus = 'fallback';
+    state._djWorkerRetryAfter = Date.now() + 15_000;
+    state._djWorkerError = 'Local voice blocked by browser environment';
+    if (typeof syncDjControls === 'function') syncDjControls();
+    return null;
+  }
+}
+
+function synthesizeDjSpeech(text, voiceId = state.djVoiceId, timeoutMs = 45_000) {
+  const cleanText = String(text || '').trim();
+  if (!cleanText || state.djCommentaryMode !== 'voice') return Promise.resolve(null);
+  const worker = ensureDjVoiceWorker();
+  if (!worker) return Promise.resolve(null);
+  const reqId = (Number(state._djWorkerReqSeq) || 0) + 1;
+  state._djWorkerReqSeq = reqId;
+  const validVoice = DJ_VOICE_IDS.has(voiceId) ? voiceId : 'am_michael';
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      state._djWorkerPending?.delete(reqId);
+      resolve(null);
+    }, timeoutMs);
+    state._djWorkerPending.set(reqId, { resolve, timer });
+    try {
+      worker.postMessage({ type: 'synthesize', id: reqId, text: cleanText, voice: validVoice, speed: 1.0 });
+    } catch (_) {
+      clearTimeout(timer);
+      state._djWorkerPending.delete(reqId);
+      resolve(null);
+    }
+  });
+}
+
+function preSynthesizeDjChapterVoice(chapter) {
+  if (!chapter || state.djCommentaryMode !== 'voice' || !chapter.speechText) return null;
+  if (chapter.voicePcm) return Promise.resolve(chapter.voicePcm);
+  if (chapter.voicePromise) return chapter.voicePromise;
+
+  const clauses = chapter.isColdOpen ? splitDjOpeningClauses(chapter.speechText) : null;
+  if (clauses) {
+    const voiceId = state.djVoiceId;
+    const leadPromise = synthesizeDjSpeech(clauses.lead, voiceId).then(pcm => {
+      if (chapter.voiceLeadPromise === leadPromise) {
+        if (pcm) {
+          chapter.voicePcm = pcm;
+          chapter.voiceFailed = false;
+        } else {
+          chapter.voiceFailed = true;
+        }
+      }
+      return pcm;
+    }).finally(() => {
+      if (chapter.voiceLeadPromise === leadPromise) chapter.voiceLeadPromise = null;
+      if (chapter.voicePromise === leadPromise) chapter.voicePromise = null;
+    });
+    const followPromise = synthesizeDjSpeech(clauses.follow, voiceId);
+    chapter.voiceLeadPromise = leadPromise;
+    chapter.voiceFollowPromise = followPromise;
+    chapter.voicePromise = leadPromise;
+    return leadPromise;
+  }
+
+  const promise = synthesizeDjSpeech(chapter.speechText, state.djVoiceId).then(pcm => {
+    if (chapter.voicePromise === promise) {
+      if (pcm) {
+        chapter.voicePcm = pcm;
+        chapter.voiceFailed = false;
+      } else {
+        chapter.voiceFailed = true;
+      }
+    }
+    return pcm;
+  }).finally(() => {
+    if (chapter.voicePromise === promise) chapter.voicePromise = null;
+  });
+  chapter.voicePromise = promise;
+  return promise;
+}
+
+function ensureDjVoiceAudioBus() {
+  clearTimeout(state._djBusTeardownTimer);
+  state._djBusTeardownTimer = null;
+  if (typeof ensureAutoLevelAudioGraph === 'function' && (!state._audioContext || state._audioContext.state === 'closed')) {
+    if (!ensureAutoLevelAudioGraph()) return false;
+  }
+  const context = state._audioContext;
+  const master = state._audioMaster;
+  if (!context || !master || typeof context.createGain !== 'function') return false;
+
+  if (state._djMusicBusContext !== context || !state._djMusicBus || !state._djVoiceGain) {
+    try { state._djMusicBus?.disconnect(); } catch (_) {}
+    try { state._djVoiceGain?.disconnect(); } catch (_) {}
+    const musicBus = context.createGain();
+    const voiceGain = context.createGain();
+    musicBus.gain.value = 1;
+    voiceGain.gain.value = Math.max(0.2, Math.min(1.5, Number(state.djVoiceVolume) || 1));
+    musicBus.connect(master);
+    voiceGain.connect(master);
+
+    state._djMusicBus = musicBus;
+    state._djVoiceGain = voiceGain;
+    state._djVoiceInput = voiceGain;
+    state._djVoiceFilters = null;
+    state._djMusicBusContext = context;
+    state._djMusicBusAppliedGain = 1;
+    state._djDuckRampAnchor = null;
+  }
+
+  for (const graph of state._deckAudioGraphs || []) {
+    if (!graph?.mixGain || graph._djBusRouted === state._djMusicBus) continue;
+    try {
+      graph.mixGain.disconnect();
+      graph.mixGain.connect(state._djMusicBus);
+      graph._djBusRouted = state._djMusicBus;
+    } catch (_) {
+      try { graph.mixGain.connect(master); } catch (_) {}
+      return false;
+    }
+  }
+  return true;
+}
+
+function teardownDjVoiceAudioBus(options = {}) {
+  clearTimeout(state._djBusTeardownTimer);
+  state._djBusTeardownTimer = null;
+  if (!state._djMusicBus && !state._djVoiceGain) return;
+  const context = state._audioContext;
+  const now = Number(context?.currentTime) || 0;
+  const canDefer = options.immediate !== true && context?.state === 'running' && Number.isFinite(now);
+  if (canDefer && (state._djSpeaking || state._djActiveVoiceSource || (state._djVoiceSources instanceof Set && state._djVoiceSources.size > 0) || currentDjMusicBusGain(now) < 0.995)) {
+    cancelActiveDjVoiceSpeech({ immediate: false });
+  }
+  const anchor = state._djDuckRampAnchor;
+  const anchorEnd = anchor
+    ? Math.max(Number(anchor.t1) || 0, Number(anchor.t2) || 0)
+    : 0;
+  const rampSettleUntil = Math.max(
+    Number(state._djVoiceFadeOutUntil) || 0,
+    currentDjMusicBusGain(now) < 0.995 ? anchorEnd : 0,
+  );
+  if (canDefer && rampSettleUntil > now + 0.005) {
+    const waitMs = Math.min(450, Math.ceil((rampSettleUntil - now + 0.025) * 1000));
+    state._djBusTeardownTimer = setTimeout(() => {
+      state._djBusTeardownTimer = null;
+      if (state.djMode && state.djCommentaryMode === 'voice') return;
+      teardownDjVoiceAudioBus({ immediate: true });
+    }, waitMs);
+    return;
+  }
+
+  const master = state._audioMaster;
+  for (const graph of state._deckAudioGraphs || []) {
+    if (!graph?.mixGain || !graph._djBusRouted) continue;
+    try { graph.mixGain.disconnect(); } catch (_) {}
+    if (master) {
+      try { graph.mixGain.connect(master); } catch (_) {}
+    }
+    delete graph._djBusRouted;
+  }
+  if (Array.isArray(state._djVoiceFilters)) {
+    for (const flt of state._djVoiceFilters) {
+      try { flt?.disconnect?.(); } catch (_) {}
+    }
+  }
+  try { state._djMusicBus?.disconnect(); } catch (_) {}
+  try { state._djVoiceGain?.disconnect(); } catch (_) {}
+  state._djMusicBus = null;
+  state._djVoiceGain = null;
+  state._djVoiceInput = null;
+  state._djVoiceFilters = null;
+  state._djMusicBusContext = null;
+  state._djMusicBusAppliedGain = 1;
+  state._djDuckRampAnchor = null;
+  state._djVoiceFadeOutUntil = 0;
+}
+
+function currentDjMusicBusGain(now) {
+  const anchor = state._djDuckRampAnchor;
+  if (!anchor || !Number.isFinite(now)) {
+    const g = Number(state._djMusicBusAppliedGain);
+    return Number.isFinite(g) ? Math.max(0.05, Math.min(1, g)) : 1;
+  }
+  if (now <= anchor.t0) return anchor.g0;
+  if (now <= anchor.t1) {
+    const p = (now - anchor.t0) / Math.max(0.001, anchor.t1 - anchor.t0);
+    return anchor.g0 + (anchor.g1 - anchor.g0) * Math.max(0, Math.min(1, p));
+  }
+  if (anchor.holdUntil && now <= anchor.holdUntil) {
+    return anchor.g1;
+  }
+  if (anchor.t2 && now < anchor.t2) {
+    const startRelease = anchor.holdUntil || anchor.t1;
+    const p = (now - startRelease) / Math.max(0.001, anchor.t2 - startRelease);
+    return anchor.g1 + (anchor.g2 - anchor.g1) * Math.max(0, Math.min(1, p));
+  }
+  return anchor.g2 ?? anchor.g1 ?? 1;
+}
+
+function cancelActiveDjVoiceSpeech(options = {}) {
+  clearTimeout(state._djDuckTimer);
+  state._djDuckTimer = null;
+  state._djVoiceFadeOutUntil = 0;
+  const voiceSet = state._djVoiceSources instanceof Set ? state._djVoiceSources : null;
+  const wasSpeaking = Boolean(state._djSpeaking || state._djActiveVoiceSource || (voiceSet && voiceSet.size > 0));
+  state._djSpeaking = false;
+
+  const context = state._audioContext;
+  const now = Number(context?.currentTime) || 0;
+  const canRamp = context?.state === 'running' && Number.isFinite(now);
+  const fastFade = options.fastFade === true && canRamp;
+  const immediate = (options.immediate === true && !fastFade) || !canRamp;
+  const voiceFadeSec = fastFade ? 0.018 : 0.045;
+
+  const entries = voiceSet ? [...voiceSet] : [];
+  if (voiceSet) voiceSet.clear();
+  if (state._djActiveVoiceSource && !entries.some(e => e.source === state._djActiveVoiceSource)) {
+    entries.push({
+      source: state._djActiveVoiceSource,
+      utteranceGain: state._djActiveVoiceSource._utteranceGain || null,
+      voiceStart: state._djActiveVoiceSource._voiceStart,
+      notifyEnded: null,
+    });
+  }
+  state._djActiveVoiceSource = null;
+
+  for (const entry of entries) {
+    const src = entry.source;
+    if (!src) continue;
+    const uGain = entry.utteranceGain || src._utteranceGain || null;
+    const uParam = uGain?.gain;
+    let cleaned = false;
+    let cleanupTimer = null;
+    const cleanupNodes = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (cleanupTimer !== null) {
+        clearTimeout(cleanupTimer);
+        cleanupTimer = null;
+      }
+      try { src.onended = null; } catch (_) {}
+      try { src.disconnect(); } catch (_) {}
+      try { uGain?.disconnect(); } catch (_) {}
+      if (typeof entry.notifyEnded === 'function') entry.notifyEnded();
+    };
+    const vStart = Number.isFinite(entry.voiceStart) ? entry.voiceStart : src._voiceStart;
+    const notStartedYet = Number.isFinite(vStart) && now < vStart - 0.002;
+    if (!immediate && !notStartedYet && uParam && typeof uParam.linearRampToValueAtTime === 'function') {
+      try {
+        src.onended = cleanupNodes;
+        const curUGain = Number.isFinite(Number(uParam.value)) ? Math.max(0, Math.min(1, Number(uParam.value))) : 1;
+        uParam.cancelScheduledValues(0);
+        try { uParam.value = curUGain; } catch (_) {}
+        uParam.setValueAtTime(curUGain, now);
+        uParam.linearRampToValueAtTime(0, now + voiceFadeSec);
+        src.stop(now + voiceFadeSec + 0.004);
+        state._djVoiceFadeOutUntil = Math.max(Number(state._djVoiceFadeOutUntil) || 0, now + voiceFadeSec + 0.008);
+        cleanupTimer = setTimeout(cleanupNodes, 550);
+      } catch (_) {
+        try { src.stop(); } catch (_) {}
+        cleanupNodes();
+      }
+    } else {
+      try { src.stop(); } catch (_) {}
+      cleanupNodes();
+    }
+  }
+
+  const busParam = state._djMusicBus?.gain;
+  if (busParam) {
+    const curBus = currentDjMusicBusGain(now);
+    const busFadeSec = fastFade ? 0.04 : 0.18;
+    if (!immediate && curBus < 0.995 && typeof busParam.linearRampToValueAtTime === 'function') {
+      try {
+        busParam.cancelScheduledValues(0);
+        try { busParam.value = curBus; } catch (_) {}
+        busParam.setValueAtTime(curBus, now);
+        busParam.linearRampToValueAtTime(1, now + busFadeSec);
+        state._djDuckRampAnchor = { t0: now, g0: curBus, t1: now + busFadeSec, g1: 1, holdUntil: 0, t2: 0, g2: 1 };
+        state._djMusicBusAppliedGain = 1;
+      } catch (_) {
+        setAudioParamImmediately(busParam, 1, now);
+        state._djDuckRampAnchor = null;
+        state._djMusicBusAppliedGain = 1;
+      }
+    } else {
+      setAudioParamImmediately(busParam, 1, now);
+      state._djDuckRampAnchor = null;
+      state._djMusicBusAppliedGain = 1;
+    }
+  }
+
+  if (wasSpeaking) {
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  }
+}
+
+async function playDjVoicePcm(pcm, options = {}) {
+  if (!pcm?.samples?.length || (!options.preview && (!state.active || state._userPaused))) return false;
+  if (!ensureDjVoiceAudioBus()) return false;
+  const context = state._audioContext;
+  if (!context || typeof context.createBuffer !== 'function' || typeof context.createBufferSource !== 'function') {
+    return false;
+  }
+  if (context.state !== 'running' && typeof resumeAudioGraph === 'function') {
+    if (options.preview) {
+      try { await context.resume(); } catch (_) {}
+    } else {
+      const ok = await resumeAudioGraph(state._playbackAbort?.signal);
+      if (!ok || state._userPaused) return false;
+    }
+  }
+  if (context.state !== 'running') return false;
+
+  if (!(state._djVoiceSources instanceof Set)) state._djVoiceSources = new Set();
+  const voiceSet = state._djVoiceSources;
+  const now = Math.max(0, Number(context.currentTime) || 0);
+
+  let latestVoiceEnd = 0;
+  if (options.appendAfterActive && voiceSet.size > 0) {
+    for (const item of voiceSet) {
+      if (Number.isFinite(item.voiceEnd) && item.voiceEnd > latestVoiceEnd) {
+        latestVoiceEnd = item.voiceEnd;
+      }
+    }
+  }
+  const appendingToActive = Boolean(options.appendAfterActive && voiceSet.size > 0 && latestVoiceEnd > now + 0.01);
+  if (!appendingToActive) {
+    cancelActiveDjVoiceSpeech({ immediate: false });
+  }
+
+  const buffer = context.createBuffer(1, pcm.samples.length, pcm.sampleRate);
+  if (typeof buffer.copyToChannel === 'function') {
+    buffer.copyToChannel(pcm.samples, 0);
+  } else {
+    buffer.getChannelData(0).set(pcm.samples);
+  }
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  const utteranceGain = context.createGain();
+  utteranceGain.gain.value = 1;
+
+  if (state._audioMaster?.gain && Number.isFinite(state.playbackVolume) && (
+    !Number.isFinite(state._appliedMasterGain)
+    || Math.abs(state._appliedMasterGain - state.playbackVolume) > 0.0001
+  )) {
+    try {
+      setAudioParamImmediately(state._audioMaster.gain, state.playbackVolume, now);
+      state._appliedMasterGain = state.playbackVolume;
+    } catch (_) {
+      state._audioMaster.gain.value = state.playbackVolume;
+    }
+  }
+  const voiceVol = Math.max(0.2, Math.min(1.5, Number(state.djVoiceVolume) || 1));
+  const vParam = state._djVoiceGain.gain;
+  if (Math.abs((Number(vParam.value) || 0) - voiceVol) > 1e-4) {
+    try {
+      setAudioParamImmediately(vParam, voiceVol, now);
+    } catch (_) {
+      vParam.value = voiceVol;
+    }
+  }
+
+  const startOffset = appendingToActive
+    ? Math.max(0.03, latestVoiceEnd - now + 0.055)
+    : (options.coldOpen ? 0.06 : 0.18);
+  const voiceStart = now + startOffset;
+  const voiceEnd = voiceStart + buffer.duration;
+  const curBus = (options.coldOpen && !appendingToActive) ? DJ_DUCK_GAIN : currentDjMusicBusGain(now);
+  const needsDuckAttack = Math.abs(curBus - DJ_DUCK_GAIN) > 0.005 && !(options.coldOpen && !appendingToActive);
+  const duckAttackEnd = needsDuckAttack ? now + (appendingToActive ? 0.08 : DJ_DUCK_ATTACK_SEC) : now;
+  const releaseStart = Math.max(duckAttackEnd + 0.02, voiceEnd - 0.06);
+  const releaseEnd = releaseStart + DJ_DUCK_RELEASE_SEC;
+
+  const busParam = state._djMusicBus?.gain;
+  if (busParam && typeof busParam.linearRampToValueAtTime === 'function') {
+    try {
+      busParam.cancelScheduledValues(0);
+      try { busParam.value = curBus; } catch (_) {}
+      busParam.setValueAtTime(curBus, now);
+      if (needsDuckAttack) {
+        busParam.linearRampToValueAtTime(DJ_DUCK_GAIN, duckAttackEnd);
+      } else if (Math.abs(curBus - DJ_DUCK_GAIN) > 1e-5) {
+        busParam.setValueAtTime(DJ_DUCK_GAIN, now);
+      }
+      busParam.setValueAtTime(DJ_DUCK_GAIN, releaseStart);
+      busParam.linearRampToValueAtTime(1, releaseEnd);
+      state._djDuckRampAnchor = {
+        t0: now,
+        g0: curBus,
+        t1: duckAttackEnd,
+        g1: DJ_DUCK_GAIN,
+        holdUntil: releaseStart,
+        t2: releaseEnd,
+        g2: 1,
+      };
+      state._djMusicBusAppliedGain = 1;
+    } catch (_) {}
+  }
+
+  let endedNotified = false;
+  const notifyEnded = () => {
+    if (endedNotified) return;
+    endedNotified = true;
+    if (typeof options.onEnded === 'function') {
+      try { options.onEnded(); } catch (_) {}
+    }
+  };
+
+  const entry = { source, utteranceGain, voiceStart, voiceEnd, notifyEnded };
+  source._utteranceGain = utteranceGain;
+  source._voiceStart = voiceStart;
+  source._voiceEnd = voiceEnd;
+  source.connect(utteranceGain);
+  utteranceGain.connect(state._djVoiceInput || state._djVoiceGain);
+  voiceSet.add(entry);
+  state._djActiveVoiceSource = source;
+  state._djSpeaking = true;
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+
+  const finishEntry = () => {
+    voiceSet.delete(entry);
+    try { source.onended = null; } catch (_) {}
+    try { source.disconnect(); } catch (_) {}
+    try { utteranceGain.disconnect(); } catch (_) {}
+    if (voiceSet.size === 0) {
+      clearTimeout(state._djDuckTimer);
+      state._djDuckTimer = null;
+      state._djActiveVoiceSource = null;
+      state._djSpeaking = false;
+      if (typeof syncDjControls === 'function') syncDjControls();
+      if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+    } else if (state._djActiveVoiceSource === source) {
+      let latestEntry = null;
+      for (const rem of voiceSet) latestEntry = rem;
+      state._djActiveVoiceSource = latestEntry ? latestEntry.source : null;
+    }
+    notifyEnded();
+  };
+
+  let retriedClockDrift = false;
+  const finishAllOnTimer = () => {
+    state._djDuckTimer = null;
+    if (!retriedClockDrift && voiceSet.size > 0 && context?.state === 'running') {
+      const liveNow = Number(context.currentTime) || 0;
+      let latestEnd = 0;
+      for (const rem of voiceSet) {
+        if (Number.isFinite(rem.voiceEnd) && rem.voiceEnd > latestEnd) latestEnd = rem.voiceEnd;
+      }
+      if (Number.isFinite(liveNow) && liveNow > now + 0.05 && liveNow < latestEnd - 0.02) {
+        retriedClockDrift = true;
+        state._djDuckTimer = setTimeout(finishAllOnTimer, Math.min(2000, Math.ceil((latestEnd - liveNow + 0.25) * 1000)));
+        return;
+      }
+    }
+    const remaining = [...voiceSet];
+    voiceSet.clear();
+    state._djActiveVoiceSource = null;
+    state._djSpeaking = false;
+    for (const rem of remaining) {
+      try { rem.source.onended = null; } catch (_) {}
+      try { rem.source.disconnect(); } catch (_) {}
+      try { rem.utteranceGain.disconnect(); } catch (_) {}
+    }
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+    for (const rem of remaining) {
+      rem.notifyEnded();
+    }
+  };
+
+  source.onended = finishEntry;
+  let maxEnd = voiceEnd;
+  for (const item of voiceSet) {
+    if (Number.isFinite(item.voiceEnd) && item.voiceEnd > maxEnd) maxEnd = item.voiceEnd;
+  }
+  clearTimeout(state._djDuckTimer);
+  state._djDuckTimer = setTimeout(finishAllOnTimer, Math.ceil((Math.max(0.05, maxEnd - now) + 0.35) * 1000));
+
+  try {
+    source.start(voiceStart);
+    return true;
+  } catch (_) {
+    finishEntry();
+    return false;
+  }
+}
+
+function shouldSpeakForDjChapter(chapter, options = {}) {
+  if (state.djCommentaryMode !== 'voice' || !chapter?.speechText) return false;
+  if (chapter.isColdOpen || chapter.reason === 'vibe-switch' || chapter.reason === 'skip-recalibrate') {
+    if (options.advance) state._djAutoChaptersSinceSpoken = 0;
+    return true;
+  }
+  const freq = DJ_TALK_FREQ_IDS.has(state.djTalkFrequency) ? state.djTalkFrequency : 'every';
+  if (freq === 'minimal') return false;
+  if (freq === 'relaxed') {
+    const nextCount = (Number(state._djAutoChaptersSinceSpoken) || 0) + 1;
+    if (options.advance) {
+      if (nextCount < 2) {
+        state._djAutoChaptersSinceSpoken = nextCount;
+        return false;
+      }
+      state._djAutoChaptersSinceSpoken = 0;
+      return true;
+    }
+    return nextCount >= 2;
+  }
+  if (options.advance) state._djAutoChaptersSinceSpoken = 0;
+  return true;
+}
+
+function activateDjChapter(chapter) {
+  if (!chapter) return;
+  if (state._djChapter && state._djChapter !== chapter) {
+    clearDjChapterVoiceState(state._djChapter);
+  }
+  state._djChapter = chapter;
+  if (state._djPendingChapter && state._djPendingChapter.id !== chapter.id) {
+    clearDjChapterVoiceState(state._djPendingChapter);
+  }
+  state._djPendingChapter = null;
+  state._djBannerBadge = chapter.badge || 'DJ · Mix';
+  state._djBannerText = chapter.bannerText || '';
+
+  if (!Array.isArray(state._djChapterHistory)) state._djChapterHistory = [];
+  if (!state._djChapterHistory.some(item => item.id === chapter.id)) {
+    state._djChapterHistory.push({
+      id: chapter.id,
+      archetype: chapter.archetype,
+      genreLabel: chapter.genreLabel || '',
+      at: Date.now(),
+    });
+    if (state._djChapterHistory.length > 24) {
+      state._djChapterHistory.splice(0, state._djChapterHistory.length - 24);
+    }
+    const tel = loadDjTelemetry();
+    const archKey = djSafeKey(chapter.archetype, 36);
+    if (archKey) {
+      const arch = tel.archetypes[archKey] || (tel.archetypes[archKey] = { starts: 0, completes: 0, vibeSwitches: 0, score: 0 });
+      arch.starts++;
+      scheduleDjTelemetrySave();
+    }
+  }
+
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+
+  const openDurMs = Number.isInteger(chapter.openTi) ? Number(state.meta?.[chapter.openTi]?.durationMs) : NaN;
+  const openIsShortBumper = !chapter.isColdOpen && Number.isFinite(openDurMs) && openDurMs > 0 && openDurMs < 35_000;
+
+  if (chapter.spoken) {
+    state._djAutoChaptersSinceSpoken = 0;
+    clearDjChapterVoiceState(chapter);
+  } else if (!openIsShortBumper && shouldSpeakForDjChapter(chapter, { advance: true })) {
+    chapter.spoken = true;
+    const epoch = state._playbackEpoch;
+    const chapterId = chapter.id;
+    const speakWhenReady = async () => {
+      let followPromise = chapter.voiceFollowPromise || null;
+      let pcm = chapter.voicePcm;
+      if (!pcm) {
+        const pending = preSynthesizeDjChapterVoice(chapter);
+        followPromise = followPromise || chapter.voiceFollowPromise || null;
+        if (!pending) {
+          clearDjChapterVoiceState(chapter);
+          return;
+        }
+        let raceTimer = null;
+        const raced = await Promise.race([
+          pending,
+          new Promise(resolve => { raceTimer = setTimeout(() => resolve('timeout'), 25_000); }),
+        ]).finally(() => {
+          if (raceTimer !== null) clearTimeout(raceTimer);
+        });
+        if (raced === 'timeout' || !raced) {
+          clearDjChapterVoiceState(chapter);
+          return;
+        }
+        pcm = raced;
+      }
+      clearDjChapterVoiceState(chapter);
+      if (!state.active || state._userPaused || !state.djMode || state.djCommentaryMode !== 'voice') return;
+      if (state._playbackEpoch !== epoch || state._djChapter?.id !== chapterId) return;
+      const spoke = await playDjVoicePcm(pcm);
+      if (spoke && followPromise) {
+        void followPromise.then(followPcm => {
+          if (!followPcm || !state.active || state._userPaused || !state.djMode || state.djCommentaryMode !== 'voice') return;
+          if (state._playbackEpoch !== epoch || state._djChapter?.id !== chapterId) return;
+          void playDjVoicePcm(followPcm, { appendAfterActive: true });
+        }).catch(() => {});
+      }
+    };
+    void speakWhenReady();
+  } else {
+    clearDjChapterVoiceState(chapter);
+  }
+}
+
+function cancelInFlightDjPlan() {
+  state._djPlanSeq = (Number(state._djPlanSeq) || 0) + 1;
+  if (state._djPlanAbort) {
+    try { state._djPlanAbort.abort(); } catch (_) {}
+    state._djPlanAbort = null;
+  }
+  state._djPlanningInFlight = false;
+}
+
+function nextDjPlanTicket(parentSignal = state._playbackAbort?.signal) {
+  if (state._djPlanAbort) {
+    try { state._djPlanAbort.abort(); } catch (_) {}
+  }
+  const seq = (Number(state._djPlanSeq) || 0) + 1;
+  state._djPlanSeq = seq;
+  const AbortCtor = typeof AbortController === 'function' ? AbortController : null;
+  if (!AbortCtor) {
+    state._djPlanAbort = null;
+    return { seq, signal: parentSignal || null, release() {} };
+  }
+  const ctrl = new AbortCtor();
+  state._djPlanAbort = ctrl;
+  let onParentAbort = null;
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      try { ctrl.abort(); } catch (_) {}
+    } else if (typeof parentSignal.addEventListener === 'function') {
+      onParentAbort = () => { try { ctrl.abort(); } catch (_) {} };
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+  return {
+    seq,
+    signal: ctrl.signal,
+    release() {
+      if (onParentAbort && parentSignal && typeof parentSignal.removeEventListener === 'function') {
+        try { parentSignal.removeEventListener('abort', onParentAbort); } catch (_) {}
+        onParentAbort = null;
+      }
+      if (state._djPlanAbort === ctrl) state._djPlanAbort = null;
+    },
+  };
+}
+
+function onDjTrackTransitionStart(ti) {
+  if (!state.djMode) return;
+  state._djTransitionCache = null;
+  const upcomingTi = typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : state.queue?.[state.pos + 1];
+  if (Number.isInteger(upcomingTi) && state.meta?.[upcomingTi]) {
+    void warmDjTrackWaveform(state.meta[upcomingTi]);
+  }
+  if (state._djPendingChapter && state._djPendingChapter.tracks?.includes(ti)) {
+    if (state._djPendingChapter.openTi !== ti) {
+      state._djPendingChapter.openTi = ti;
+      const script = buildDjChapterScript(state._djPendingChapter, { reason: state._djPendingChapter.reason });
+      state._djPendingChapter.bannerText = script.bannerText;
+      state._djPendingChapter.speechText = script.speechText;
+      clearDjChapterVoiceState(state._djPendingChapter);
+    }
+    activateDjChapter(state._djPendingChapter);
+    return;
+  }
+  if (state._djPendingChapter) {
+    clearDjChapterVoiceState(state._djPendingChapter);
+    state._djPendingChapter = null;
+  }
+  if (state._djChapter && !state._djChapter.tracks?.includes(ti) && !state._djPlanningInFlight) {
+    const ticket = nextDjPlanTicket();
+    state._djPlanningInFlight = true;
+    void (async () => {
+      const epoch = state._playbackEpoch;
+      try {
+        const fallbackChapter = await planNextDjChapter({ allowCurrent: true, signal: ticket.signal });
+        if (!fallbackChapter || !state.active || !state.djMode || state._playbackEpoch !== epoch || state._djPlanSeq !== ticket.seq) return;
+        if (!fallbackChapter.tracks.includes(ti)) {
+          fallbackChapter.tracks = [ti, ...fallbackChapter.tracks.filter(x => x !== ti)].slice(0, 4);
+          fallbackChapter.openTi = ti;
+          const script = buildDjChapterScript(fallbackChapter, {});
+          fallbackChapter.bannerText = script.bannerText;
+          fallbackChapter.speechText = script.speechText;
+        }
+        activateDjChapter(fallbackChapter);
+      } finally {
+        ticket.release();
+        if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+      }
+    })();
+  } else {
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  }
+}
+
+async function maybePrepareUpcomingDjChapter(remainingSeconds) {
+  if (!state.djMode || !state.active || state._userPaused || state._djPlanningInFlight) return false;
+  if (state.playNext?.length > 0) return false;
+  if (state._djPendingChapter) {
+    const upcomingSlice = Array.isArray(state.queue)
+      ? state.queue.slice(Math.max(0, (Number(state.pos) || 0) + 1))
+      : [];
+    const upcomingSet = new Set(upcomingSlice);
+    const stillReachable = Array.isArray(state._djPendingChapter.tracks)
+      && state._djPendingChapter.tracks.some(ti => upcomingSet.has(ti));
+    if (!stillReachable) {
+      clearDjChapterVoiceState(state._djPendingChapter);
+      state._djPendingChapter = null;
+    } else {
+      if (shouldSpeakForDjChapter(state._djPendingChapter, { advance: false })
+          && !state._djPendingChapter.voicePcm && !state._djPendingChapter.voicePromise
+          && !state._djPendingChapter.voiceFailed) {
+        preSynthesizeDjChapterVoice(state._djPendingChapter);
+      }
+      if (Number.isInteger(state._djPendingChapter.openTi) && state.meta?.[state._djPendingChapter.openTi]) {
+        void warmDjTrackWaveform(state.meta[state._djPendingChapter.openTi]);
+      }
+      return true;
+    }
+  }
+
+  const nextTi = typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : state.queue?.[state.pos + 1];
+  const activeChapter = state._djChapter;
+  const nextStillInChapter = Boolean(activeChapter && Number.isInteger(nextTi)
+    && activeChapter.tracks?.includes(nextTi) && nextTi !== state._deckTrack);
+  if (nextStillInChapter) return false;
+
+  const configuredFade = Number(state.crossfadeSeconds) > 0 ? Number(state.crossfadeSeconds) : (state.djAutoMix ? 4.5 : 0);
+  const leadThreshold = Math.max(40, configuredFade + 32);
+  if (Number.isFinite(remainingSeconds) && remainingSeconds > leadThreshold) return false;
+
+  const ticket = nextDjPlanTicket();
+  state._djPlanningInFlight = true;
+  const epoch = state._playbackEpoch;
+  try {
+    const excludeIndices = [];
+    if (Number.isInteger(state._deckTrack)) excludeIndices.push(state._deckTrack);
+    if (activeChapter?.tracks) excludeIndices.push(...activeChapter.tracks);
+    const upcoming = await planNextDjChapter({ excludeIndices, signal: ticket.signal });
+    if (!upcoming || !state.active || !state.djMode || state._playbackEpoch !== epoch || state._djPlanSeq !== ticket.seq) return false;
+    if (!applyDjChapterToQueue(upcoming, { atCurrent: false })) return false;
+    state._djPendingChapter = upcoming;
+    if (Number.isInteger(upcoming.openTi) && state.meta?.[upcoming.openTi]) {
+      void warmDjTrackWaveform(state.meta[upcoming.openTi]);
+    }
+    if (shouldSpeakForDjChapter(upcoming, { advance: false })) {
+      preSynthesizeDjChapterVoice(upcoming);
+    }
+    if (typeof badges === 'function') badges();
+    if (typeof renderList === 'function') renderList();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+    return true;
+  } finally {
+    ticket.release();
+    if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+  }
+}
+
+function maybeSpeakDjPreTransition(cueRemainingSeconds, configuredFadeSeconds = 0) {
+  if (!state.djMode || !state.active || state._userPaused || state.djCommentaryMode !== 'voice') return false;
+  if (state._djSpeaking || state._djOpeningIntroActive || state._crossfading) return false;
+  const pending = state._djPendingChapter;
+  if (!pending || pending.spoken || !pending.voicePcm || !Number.isInteger(pending.openTi)) return false;
+  if (!shouldSpeakForDjChapter(pending, { advance: false })) return false;
+
+  const nextTi = typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : state.queue?.[state.pos + 1];
+  if (nextTi !== pending.openTi) return false;
+
+  const timing = typeof playbackTiming === 'function' ? playbackTiming() : null;
+  if (!timing || !(Number(timing.duration) >= 35)) return false;
+
+  const inMeta = state.meta?.[pending.openTi];
+  const inDurMs = Number(inMeta?.durationMs);
+  if (Number.isFinite(inDurMs) && inDurMs > 0 && inDurMs < 35_000) return false;
+  const inKey = inMeta && typeof waveformTrackKey === 'function' ? waveformTrackKey(inMeta) : '';
+  const inFeat = inKey && state._djWaveformFeatures instanceof Map ? state._djWaveformFeatures.get(inKey) : null;
+  const incomingIntroEnergy = Math.max(Number(inFeat?.introEnergy) || 0, Number(inFeat?.cueInEnergy) || 0);
+  if (incomingIntroEnergy < 0.56) return false;
+
+  const voiceDurSec = pending.voicePcm.samples?.length
+    ? pending.voicePcm.samples.length / (Number(pending.voicePcm.sampleRate) || 48000)
+    : 3.0;
+  const estTotalVoiceSec = pending.voiceFollowPromise ? (voiceDurSec + 2.1) : voiceDurSec;
+  const fadeBase = Math.max(0, Number(configuredFadeSeconds) || 0);
+  const leadSec = fadeBase + Math.min(5.2, Math.max(1.6, estTotalVoiceSec - 0.55));
+  const minWindowSec = Math.max(0.8, fadeBase * 0.45);
+  if (!(Number.isFinite(cueRemainingSeconds) && cueRemainingSeconds <= leadSec && cueRemainingSeconds > minWindowSec)) {
+    return false;
+  }
+
+  // Hit the post: speak over the outgoing outro so True DJ finishes right as the incoming beat/vocal drops
+  pending.spoken = true;
+  state._djAutoChaptersSinceSpoken = 0;
+  const epoch = state._playbackEpoch;
+  const chapterId = pending.id;
+  const pcm = pending.voicePcm;
+  const followPromise = pending.voiceFollowPromise || null;
+  clearDjChapterVoiceState(pending);
+  void (async () => {
+    const spoke = await playDjVoicePcm(pcm);
+    if (spoke && followPromise) {
+      void followPromise.then(followPcm => {
+        if (!followPcm || !state.active || state._userPaused || !state.djMode || state.djCommentaryMode !== 'voice') return;
+        if (state._playbackEpoch !== epoch) return;
+        if (state._djPendingChapter?.id !== chapterId && state._djChapter?.id !== chapterId) return;
+        void playDjVoicePcm(followPcm, { appendAfterActive: true });
+      }).catch(() => {});
+    }
+  })();
+  return true;
+}
+
+async function initializeDjSessionOnStart(epoch) {
+  if (!state.djMode) return false;
+  cancelDjOpeningIntro('restart');
+  state._djChapter = null;
+  state._djPendingChapter = null;
+  state._djSkipStreak = 0;
+  state._djAutoChaptersSinceSpoken = 0;
+  state._djOpeningHandoff = false;
+  state._djTransitionCache = null;
+  const tel = loadDjTelemetry();
+  tel.totalSessions = (Number(tel.totalSessions) || 0) + 1;
+  const daypart = djDaypart();
+  if (tel.tod?.[daypart]) tel.tod[daypart].sessions++;
+  scheduleDjTelemetrySave();
+
+  if (state.djCommentaryMode === 'voice') {
+    ensureDjVoiceWorker();
+    ensureDjVoiceAudioBus();
+  } else if (state.djAutoMix && typeof ensureAutoLevelAudioGraph === 'function') {
+    ensureAutoLevelAudioGraph();
+  }
+
+  const ticket = nextDjPlanTicket();
+  state._djPlanningInFlight = true;
+  try {
+    const opening = await planNextDjChapter({ opening: true, allowCurrent: true, signal: ticket.signal });
+    if (!opening || state._playbackEpoch !== epoch || !state.active || state._djPlanSeq !== ticket.seq) return false;
+    applyDjChapterToQueue(opening, { atCurrent: true });
+    recordDjRecentOpeners(opening.tracks);
+    state._djPendingChapter = opening;
+    if (shouldSpeakForDjChapter(opening, { advance: false })) preSynthesizeDjChapterVoice(opening);
+    return true;
+  } finally {
+    ticket.release();
+    if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+  }
+}
+
+function cancelDjOpeningIntro(reason = 'cancel') {
+  const cancelFn = state._djOpeningIntroCancel;
+  state._djOpeningIntroCancel = null;
+  const wasActive = Boolean(state._djOpeningIntroActive);
+  state._djOpeningIntroActive = false;
+  if (typeof cancelFn === 'function') {
+    try { cancelFn(reason); } catch (_) {}
+  }
+  if (reason === 'skip-intro' || reason === 'vibe-switch' || reason === 'silent') {
+    if (wasActive) cancelPendingDjVoiceSyntheses();
+    cancelActiveDjVoiceSpeech({ immediate: false });
+  } else if (reason === 'pause') {
+    if (wasActive) cancelPendingDjVoiceSyntheses();
+    cancelActiveDjVoiceSpeech({ fastFade: true });
+  } else if (reason === 'stop') {
+    if (wasActive) cancelPendingDjVoiceSyntheses();
+    cancelActiveDjVoiceSpeech({ immediate: true });
+  }
+  if (wasActive) {
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof updateHub === 'function') updateHub();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  }
+}
+
+async function runDjOpeningIntro(epoch) {
+  if (!state.djMode || !state.active || state._userPaused || state._playbackEpoch !== epoch) return false;
+  const opening = state._djPendingChapter;
+  if (!opening || !opening.speechText) return false;
+
+  if (state.djCommentaryMode !== 'voice'
+      || state._djWorkerStatus === 'error'
+      || state._djWorkerStatus === 'fallback'
+      || state._djWorkerStatus === 'unavailable') {
+    state._djOpeningHandoff = true;
+    return false;
+  }
+
+  const openTi = Number.isInteger(opening.openTi) ? opening.openTi : state.queue?.[state.pos];
+  const openingId = opening.id;
+  const signal = state._playbackAbort?.signal;
+  const isIntroCurrent = () => state.active && !state._userPaused && state.djMode
+    && state.djCommentaryMode === 'voice' && state._playbackEpoch === epoch && !signal?.aborted;
+  const isChapterStillActive = () => isIntroCurrent() && state._djChapter?.id === openingId;
+
+  // Pre-buffer Song #1 on Deck 0 in parallel while DJ synthesizes & speaks the cold-open intro
+  if (Number.isInteger(openTi) && state._deckIndex === -1 && typeof prepareCrossfadeDeck === 'function') {
+    void prepareCrossfadeDeck(0, openTi, {
+      signal,
+      isCurrent: () => state.active && state._playbackEpoch === epoch && state.queue?.[state.pos] === openTi,
+    }).catch(() => {});
+  }
+
+  let cancelledReason = null;
+  let resolveCancel = null;
+  const cancelPromise = new Promise(resolve => { resolveCancel = resolve; });
+  state._djOpeningIntroActive = true;
+  state._djOpeningIntroCancel = reason => {
+    cancelledReason = reason || 'cancel';
+    if (resolveCancel) resolveCancel(cancelledReason);
+  };
+
+  state._djChapter = opening;
+  state._djPendingChapter = null;
+  opening.spoken = true;
+  state._djBannerBadge = opening.badge || 'DJ · Opening Set';
+  state._djBannerText = opening.bannerText || '';
+  if (!Array.isArray(state._djChapterHistory)) state._djChapterHistory = [];
+  if (!state._djChapterHistory.some(item => item.id === opening.id)) {
+    state._djChapterHistory.push({
+      id: opening.id,
+      archetype: opening.archetype,
+      genreLabel: opening.genreLabel || '',
+      at: Date.now(),
+    });
+    if (state._djChapterHistory.length > 24) {
+      state._djChapterHistory.splice(0, state._djChapterHistory.length - 24);
+    }
+    const tel = loadDjTelemetry();
+    const archKey = djSafeKey(opening.archetype, 36);
+    if (archKey) {
+      const arch = tel.archetypes[archKey] || (tel.archetypes[archKey] = { starts: 0, completes: 0, vibeSwitches: 0, score: 0 });
+      arch.starts++;
+      scheduleDjTelemetrySave();
+    }
+  }
+  if (typeof badges === 'function') badges();
+  if (typeof renderList === 'function') renderList();
+  if (typeof updateHub === 'function') updateHub();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+
+  const finishOpeningWithOptionalVibeSwitch = async () => {
+    if (cancelledReason === 'vibe-switch' && state.active && !state._userPaused && state.djMode && state._playbackEpoch === epoch) {
+      const switched = await planNextDjChapter({
+        focus: state.djFocus,
+        reason: 'vibe-switch',
+        opening: true,
+        allowCurrent: true,
+        signal,
+      });
+      if (switched && state.active && !state._userPaused && state.djMode && state._playbackEpoch === epoch) {
+        applyDjChapterToQueue(switched, { atCurrent: true });
+        state._djPendingChapter = switched;
+        activateDjChapter(switched);
+        if (typeof badges === 'function') badges();
+        if (typeof renderList === 'function') renderList();
+      }
+    }
+    state._djOpeningHandoff = !cancelledReason || cancelledReason === 'skip-intro' || cancelledReason === 'vibe-switch';
+    return !cancelledReason;
+  };
+
+  try {
+    let followPromise = opening.voiceFollowPromise || null;
+    let pcm = opening.voicePcm;
+    if (!pcm) {
+      const pending = preSynthesizeDjChapterVoice(opening);
+      followPromise = followPromise || opening.voiceFollowPromise || null;
+      if (!pending) {
+        clearDjChapterVoiceState(opening);
+        state._djOpeningHandoff = true;
+        return false;
+      }
+      const isWarmOrCached = state._djWorkerStatus === 'ready' || isDjVoiceModelCached();
+      const waitLimitMs = isWarmOrCached ? 5_800 : 1_800;
+      let synthTimer = null;
+      const raced = await Promise.race([
+        pending,
+        cancelPromise.then(() => null),
+        new Promise(resolve => { synthTimer = setTimeout(() => resolve('timeout'), waitLimitMs); }),
+      ]).finally(() => {
+        if (synthTimer !== null) clearTimeout(synthTimer);
+      });
+      if (!raced || raced === 'timeout' || cancelledReason || !isIntroCurrent()) {
+        const shouldDropInOverSong = raced === 'timeout' && !cancelledReason && isIntroCurrent();
+        clearDjChapterVoiceState(opening);
+        if (shouldDropInOverSong) {
+          const lateStartedAt = Date.now();
+          void pending.then(async latePcm => {
+            if (!latePcm || !isChapterStillActive() || state._djSpeaking) return;
+            if (Date.now() - lateStartedAt > 30_000) return;
+            const spokeLate = await playDjVoicePcm(latePcm);
+            if (spokeLate && followPromise) {
+              void followPromise.then(lateFollow => {
+                if (!lateFollow || !isChapterStillActive()) return;
+                void playDjVoicePcm(lateFollow, { appendAfterActive: true });
+              }).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+        await finishOpeningWithOptionalVibeSwitch();
+        return false;
+      }
+      pcm = raced;
+    }
+    clearDjChapterVoiceState(opening);
+    if (cancelledReason || !isIntroCurrent()) {
+      await finishOpeningWithOptionalVibeSwitch();
+      return false;
+    }
+
+    let followAppended = false;
+    let resolveSpeechDone = null;
+    const speechDonePromise = new Promise(resolve => { resolveSpeechDone = resolve; });
+    const started = await playDjVoicePcm(pcm, {
+      coldOpen: true,
+      onEnded: () => {
+        if (!followAppended && !followPromise && resolveSpeechDone) resolveSpeechDone('ended');
+      },
+    });
+    if (!started || cancelledReason || !isIntroCurrent()) {
+      await finishOpeningWithOptionalVibeSwitch();
+      return false;
+    }
+    if (typeof updateHub === 'function') updateHub();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+
+    // Speak the greeting solo like Spotify DJ (chaining Clause 2 seamlessly if ready during Clause 1,
+    // or rolling Song #1 in smoothly right after Clause 1 so Clause 2 drops over the ducked intro beat).
+    const calcSoloMs = totalSec => {
+      const overlapTail = totalSec >= 2.2 ? 0.85 : Math.min(0.35, totalSec * 0.25);
+      return Math.max(0, Math.round((0.06 + totalSec - overlapTail) * 1000));
+    };
+    const leadClipSec = pcm.samples.length / (Number(pcm.sampleRate) || 48000);
+    const soloLeadMs = followPromise
+      ? Math.max(0, Math.round((0.06 + leadClipSec + 0.45) * 1000))
+      : calcSoloMs(leadClipSec);
+    const leadWallStartedAt = Date.now();
+    let soloTimer = null;
+    let resolveSoloHandoff = null;
+    const soloHandoffPromise = new Promise(resolve => { resolveSoloHandoff = resolve; });
+
+    if (soloLeadMs > 0) {
+      soloTimer = setTimeout(() => resolveSoloHandoff('handoff'), soloLeadMs);
+    } else {
+      resolveSoloHandoff('handoff');
+    }
+
+    if (followPromise) {
+      void followPromise.then(async followPcm => {
+        if (!followPcm || cancelledReason || !isChapterStillActive()) return;
+        followAppended = true;
+        const appended = await playDjVoicePcm(followPcm, {
+          coldOpen: Boolean(state._djOpeningIntroActive),
+          appendAfterActive: true,
+          onEnded: () => {
+            if (resolveSpeechDone) resolveSpeechDone('ended');
+          },
+        });
+        if (!appended) {
+          followAppended = false;
+          return;
+        }
+        if (state._djOpeningIntroActive && !cancelledReason) {
+          const followSec = followPcm.samples.length / (Number(followPcm.sampleRate) || 48000);
+          const combinedSec = leadClipSec + 0.055 + followSec;
+          const remainingMs = Math.max(0, calcSoloMs(combinedSec) - (Date.now() - leadWallStartedAt));
+          if (soloTimer !== null) clearTimeout(soloTimer);
+          soloTimer = setTimeout(() => resolveSoloHandoff('handoff'), remainingMs);
+        }
+      }).catch(() => {});
+    }
+
+    await Promise.race([
+      speechDonePromise,
+      cancelPromise,
+      soloHandoffPromise,
+    ]).finally(() => {
+      if (soloTimer !== null) {
+        clearTimeout(soloTimer);
+        soloTimer = null;
+      }
+    });
+    return await finishOpeningWithOptionalVibeSwitch();
+  } finally {
+    state._djOpeningIntroActive = false;
+    state._djOpeningIntroCancel = null;
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof updateHub === 'function') updateHub();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  }
+}
+
+function cleanupDjSessionOnStop() {
+  if (Number.isInteger(state._djCurrentTrackTi)) {
+    recordDjTrackOutcome(state._djCurrentTrackTi, 'stop');
+  }
+  cancelDjOpeningIntro('stop');
+  cancelInFlightDjPlan();
+  cancelActiveDjVoiceSpeech({ immediate: true });
+  cancelPendingDjVoiceSyntheses();
+  clearDjChapterVoiceState(state._djChapter);
+  clearDjChapterVoiceState(state._djPendingChapter);
+  terminateDjVoiceWorker();
+  state._djChapter = null;
+  state._djPendingChapter = null;
+  state._djBannerBadge = '';
+  state._djBannerText = '';
+  state._djSkipStreak = 0;
+  state._djAutoChaptersSinceSpoken = 0;
+  state._djOpeningHandoff = false;
+  state._djVibeSwitching = false;
+  state._djVibeSwitchFade = 0;
+  state._djTransitionCache = null;
+  flushDjTelemetry();
+  if (typeof syncDjControls === 'function') syncDjControls();
+}
+
+async function switchDjVibe(focusOverride = null, options = {}) {
+  if (!state.djMode) {
+    setDjModeEnabled(true, { skipInitialPlan: true });
+  }
+  if (focusOverride && DJ_FOCUS_MODES.includes(focusOverride)) {
+    state.djFocus = focusOverride;
+    safeStorage.setItem('tss_dj_focus', focusOverride);
+  }
+  if (!state.active) {
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (!state.loading && typeof start === 'function') {
+      if (typeof ensureAutoLevelAudioGraph === 'function'
+          && (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+              || state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim)) {
+        ensureAutoLevelAudioGraph();
+        if (state._audioContext?.state === 'suspended') {
+          try { void state._audioContext.resume(); } catch (_) {}
+        }
+      }
+      await start();
+      if (!state.active && !state.loading) {
+        if (state._audioContext?.state === 'running' && typeof suspendAudioGraph === 'function') {
+          void suspendAudioGraph();
+        }
+        setDjModeEnabled(false);
+      }
+    }
+    return true;
+  }
+  if (state._djOpeningIntroActive) {
+    cancelDjOpeningIntro('vibe-switch');
+    return true;
+  }
+  if (state.loading || state._djVibeSwitching || (state.busy && !state._crossfading)) return false;
+
+  state._djVibeSwitching = true;
+  const ticket = nextDjPlanTicket();
+  state._djPlanningInFlight = true;
+  if (typeof syncDjControls === 'function') syncDjControls();
+  const epoch = state._playbackEpoch;
+  try {
+    const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue?.[state.pos];
+    const reason = options.reason || 'vibe-switch';
+    if (Number.isInteger(currentTi) && reason === 'vibe-switch') {
+      recordDjTrackOutcome(currentTi, 'vibe-switch');
+    }
+    cancelActiveDjVoiceSpeech({ immediate: false });
+    cancelPendingDjVoiceSyntheses();
+    state._djSkipStreak = 0;
+
+    const excludeIndices = [];
+    if (Number.isInteger(currentTi)) excludeIndices.push(currentTi);
+    if (state._djChapter?.tracks) excludeIndices.push(...state._djChapter.tracks);
+
+    const nextChapter = await planNextDjChapter({
+      focus: state.djFocus,
+      reason,
+      excludeIndices,
+      signal: ticket.signal,
+    });
+    if (!nextChapter || !state.active || state._playbackEpoch !== epoch || state._djPlanSeq !== ticket.seq) return false;
+
+    state.playNext = [];
+    applyDjChapterToQueue(nextChapter, { atCurrent: false });
+    state._djPendingChapter = nextChapter;
+    if (state.djCommentaryMode === 'voice') {
+      const synth = preSynthesizeDjChapterVoice(nextChapter);
+      if (synth) {
+        let synthTimer = null;
+        await Promise.race([
+          synth,
+          new Promise(resolve => { synthTimer = setTimeout(resolve, 420); }),
+        ]).finally(() => {
+          if (synthTimer !== null) clearTimeout(synthTimer);
+        });
+      }
+    }
+    if (!state.active || state._playbackEpoch !== epoch || state._djPlanSeq !== ticket.seq) return false;
+
+    state._djVibeSwitchFade = Math.max(2.0, Math.min(4.0, Number(state.crossfadeSeconds) || 2.6));
+    state.manualAction = true;
+    state._manualActionAt = Date.now();
+    await next(false);
+    return true;
+  } finally {
+    ticket.release();
+    if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+    state._djVibeSwitchFade = 0;
+    state._djVibeSwitching = false;
+    if (typeof syncDjControls === 'function') syncDjControls();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  }
+}
+
+async function previewDjVoice() {
+  state._djWorkerRetryAfter = 0;
+  if (state.djCommentaryMode !== 'voice') {
+    setDjCommentaryMode('voice');
+  }
+  const voiceObj = DJ_VOICES.find(v => v.id === state.djVoiceId) || DJ_VOICES[0];
+  const sampleLine = `Hey, it's ${voiceObj.name}. True DJ is locked in and ready to spin.`;
+  const testBtn = typeof document !== 'undefined' ? document.getElementById('tss-dj-voice-test') : null;
+  if (testBtn) {
+    testBtn.disabled = true;
+    testBtn.textContent = state._djWorkerStatus === 'ready' ? 'Synthesizing…' : 'Loading voice…';
+  }
+  let played = false;
+  const cleanupIdlePreview = () => {
+    if (!state.djMode) {
+      terminateDjVoiceWorker();
+      teardownDjVoiceAudioBus();
+      if (!state.active && state._audioContext?.state === 'running' && typeof suspendAudioGraph === 'function') {
+        void suspendAudioGraph();
+      }
+    }
+  };
+  try {
+    const pcm = await synthesizeDjSpeech(sampleLine, voiceObj.id, 60_000);
+    if (!pcm) return false;
+    played = await playDjVoicePcm(pcm, {
+      preview: true,
+      onEnded: cleanupIdlePreview,
+    });
+    return played;
+  } finally {
+    if (!played) cleanupIdlePreview();
+    if (testBtn) {
+      testBtn.disabled = false;
+      testBtn.textContent = 'Preview voice';
+    }
+    if (typeof syncDjControls === 'function') syncDjControls();
+  }
+}
+
+function setDjModeEnabled(enabled, options = {}) {
+  const nextVal = Boolean(enabled);
+  safeStorage.removeItem('tss_dj_mode');
+  if (state.djMode === nextVal) {
+    if (!nextVal && (state._djWorker || state._djMusicBus || state._djVoiceGain)) {
+      cancelActiveDjVoiceSpeech({ immediate: false });
+      terminateDjVoiceWorker();
+      teardownDjVoiceAudioBus();
+    }
+    if (typeof syncDjControls === 'function') syncDjControls();
+    return nextVal;
+  }
+  state.djMode = nextVal;
+  state._djWorkerRetryAfter = 0;
+  cancelInFlightDjPlan();
+  state._djTransitionCache = null;
+
+  if (!nextVal) {
+    cancelDjOpeningIntro('stop');
+    cancelActiveDjVoiceSpeech({ immediate: false });
+    clearDjChapterVoiceState(state._djChapter);
+    clearDjChapterVoiceState(state._djPendingChapter);
+    terminateDjVoiceWorker();
+    teardownDjVoiceAudioBus();
+    state._djChapter = null;
+    state._djPendingChapter = null;
+    state._djBannerBadge = '';
+    state._djBannerText = '';
+    state._djSkipStreak = 0;
+    state._djOpeningHandoff = false;
+    for (const meta of state.meta || []) {
+      if (meta) {
+        delete meta._djChapterId;
+        delete meta._djChapterShort;
+      }
+    }
+    if (Array.isArray(state.queue) && state.queue.length > 0) {
+      const playNextSet = new Set(Array.isArray(state.playNext) ? state.playNext : []);
+      const prevLen = state.queue.length;
+      state.queue = state.queue.filter((ti, idx) => {
+        if (idx <= state.pos || ti === state._deckTrack || playNextSet.has(ti)) return true;
+        const meta = state.meta?.[ti];
+        return !(meta?.isDjDiscovery && !meta.liked);
+      });
+      if (state.queue.length !== prevLen) {
+        if (typeof recountRoundTotal === 'function') recountRoundTotal();
+        if (typeof refreshUpcomingCrossfadePreparation === 'function') refreshUpcomingCrossfadePreparation();
+      }
+    }
+    if ((Number(state.crossfadeSeconds) || 0) <= 0 && typeof setCrossfadeStatus === 'function') {
+      setCrossfadeStatus('off');
+    }
+    if (typeof syncDeckProcessingRouting === 'function') syncDeckProcessingRouting();
+  } else {
+    loadDjTelemetry();
+    if (state.djCommentaryMode === 'voice') {
+      ensureDjVoiceWorker();
+      if (state.active) {
+        ensureDjVoiceAudioBus();
+        if (!state._userPaused && state._audioContext?.state === 'suspended') {
+          try { void state._audioContext.resume(); } catch (_) {}
+        }
+      }
+    } else if ((state.djAutoMix || state.djBassSwap || state.djCueTrim) && state.active && typeof ensureAutoLevelAudioGraph === 'function') {
+      ensureAutoLevelAudioGraph();
+    }
+    if (typeof syncDeckProcessingRouting === 'function') syncDeckProcessingRouting();
+    if (state.active && !state.loading && !options.skipInitialPlan) {
+      if ((state.djAutoMix || state.djCueTrim) && typeof refreshUpcomingCrossfadePreparation === 'function') {
+        refreshUpcomingCrossfadePreparation();
+      }
+      if (state.djCueTrim && Number.isInteger(state._deckTrack) && state.meta?.[state._deckTrack]) {
+        void warmDjTrackWaveform(state.meta[state._deckTrack]);
+      }
+      const epoch = state._playbackEpoch;
+      const ticket = nextDjPlanTicket();
+      state._djPlanningInFlight = true;
+      void (async () => {
+        try {
+          const chapter = await planNextDjChapter({ opening: !state._djChapterHistory?.length, signal: ticket.signal });
+          if (!chapter || !state.active || !state.djMode || state._playbackEpoch !== epoch || state._djPlanSeq !== ticket.seq) return;
+          applyDjChapterToQueue(chapter, { atCurrent: false });
+          if (chapter.isColdOpen) recordDjRecentOpeners(chapter.tracks);
+          state._djPendingChapter = chapter;
+          state._djBannerBadge = chapter.badge;
+          state._djBannerText = `Up next · ${chapter.bannerText}`;
+          if (shouldSpeakForDjChapter(chapter, { advance: false })) preSynthesizeDjChapterVoice(chapter);
+          if (typeof badges === 'function') badges();
+          if (typeof renderList === 'function') renderList();
+          if (typeof syncDjControls === 'function') syncDjControls();
+          if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+        } finally {
+          ticket.release();
+          if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+        }
+      })();
+    }
+  }
+
+  if (typeof renderList === 'function') renderList();
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof updateHub === 'function') updateHub();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return nextVal;
+}
+
+function setDjCommentaryMode(mode) {
+  const nextMode = mode === 'voice' ? 'voice' : 'silent';
+  state.djCommentaryMode = nextMode;
+  safeStorage.setItem('tss_dj_commentary', nextMode);
+  if (nextMode === 'silent') {
+    cancelDjOpeningIntro('silent');
+    cancelActiveDjVoiceSpeech({ immediate: false });
+    cancelPendingDjVoiceSyntheses();
+    terminateDjVoiceWorker();
+    teardownDjVoiceAudioBus();
+  } else if (state.djMode) {
+    state._djWorkerRetryAfter = 0;
+    ensureDjVoiceWorker();
+    if (state.active) {
+      ensureDjVoiceAudioBus();
+      if (!state._userPaused && state._audioContext?.state === 'suspended') {
+        try { void state._audioContext.resume(); } catch (_) {}
+      }
+    }
+    if (state._djPendingChapter && shouldSpeakForDjChapter(state._djPendingChapter, { advance: false })) {
+      preSynthesizeDjChapterVoice(state._djPendingChapter);
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return nextMode;
+}
+
+function setDjTalkFrequency(freq) {
+  const valid = DJ_TALK_FREQ_IDS.has(freq) ? freq : 'every';
+  state.djTalkFrequency = valid;
+  safeStorage.setItem('tss_dj_talk_freq', valid);
+  if (state._djPendingChapter && !state._djPendingChapter.spoken) {
+    if (state.djMode && shouldSpeakForDjChapter(state._djPendingChapter, { advance: false })) {
+      if (!state._djPendingChapter.voicePcm && !state._djPendingChapter.voicePromise) {
+        preSynthesizeDjChapterVoice(state._djPendingChapter);
+      }
+    } else if (!state._djPendingChapter.isColdOpen) {
+      clearDjChapterVoiceState(state._djPendingChapter);
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return valid;
+}
+
+function setDjVoiceModel(modelId) {
+  const valid = DJ_VOICE_MODEL_IDS.has(modelId) ? modelId : 'hq';
+  const changed = state.djVoiceModel !== valid;
+  state.djVoiceModel = valid;
+  safeStorage.setItem('tss_dj_voice_model', valid);
+  if (changed || state._djWorkerStatus === 'fallback') {
+    terminateDjVoiceWorker();
+    if (state.djMode && state.djCommentaryMode === 'voice') {
+      ensureDjVoiceWorker();
+      if (state._djPendingChapter && shouldSpeakForDjChapter(state._djPendingChapter, { advance: false })) {
+        preSynthesizeDjChapterVoice(state._djPendingChapter);
+      }
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return valid;
+}
+
+function setDjVoiceId(voiceId) {
+  const valid = DJ_VOICE_IDS.has(voiceId) ? voiceId : 'am_michael';
+  state.djVoiceId = valid;
+  safeStorage.setItem('tss_dj_voice_id', valid);
+  cancelPendingDjVoiceSyntheses();
+  if (state._djWorker && state.djMode && state.djCommentaryMode === 'voice') {
+    try {
+      state._djWorker.postMessage({
+        type: 'warmup',
+        id: 0,
+        voice: valid,
+        preloadText: djColdOpenLeadLine(valid),
+      });
+    } catch (_) {}
+  }
+  if (state._djPendingChapter) {
+    if (state._djPendingChapter.isColdOpen) {
+      const script = buildDjChapterScript(state._djPendingChapter, {
+        opening: true,
+        reason: state._djPendingChapter.reason,
+      });
+      state._djPendingChapter.bannerText = script.bannerText;
+      state._djPendingChapter.speechText = script.speechText;
+    }
+    clearDjChapterVoiceState(state._djPendingChapter);
+    if (state.djMode && shouldSpeakForDjChapter(state._djPendingChapter, { advance: false })) {
+      preSynthesizeDjChapterVoice(state._djPendingChapter);
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  return valid;
+}
+
+function setDjVoiceVolume(raw) {
+  const num = Number(raw);
+  const clamped = Math.max(0.2, Math.min(1.5, Number.isFinite(num) && num > 0 ? num : 1));
+  state.djVoiceVolume = Math.round(clamped * 100) / 100;
+  safeStorage.setItem('tss_dj_voice_volume', String(state.djVoiceVolume));
+  if (state._djVoiceGain && state._audioContext) {
+    const vParam = state._djVoiceGain.gain;
+    const now = Math.max(0, Number(state._audioContext.currentTime) || 0);
+    if (state._audioContext.state === 'running' && typeof smoothAudioParamTarget === 'function' && typeof vParam?.setTargetAtTime === 'function') {
+      smoothAudioParamTarget(vParam, Number(vParam.value) || 1, state.djVoiceVolume, now, 0.02);
+    } else {
+      setAudioParamImmediately(vParam, state.djVoiceVolume, now);
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  return state.djVoiceVolume;
+}
+
+function setDjFocus(focus, triggerSwitch = false) {
+  const valid = DJ_FOCUS_MODES.includes(focus) ? focus : 'auto';
+  state.djFocus = valid;
+  safeStorage.setItem('tss_dj_focus', valid);
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (triggerSwitch && state.djMode && state.active && !state.loading) {
+    void switchDjVibe(valid);
+  }
+  return valid;
+}
+
+function setDjAutoMix(enabled) {
+  state.djAutoMix = Boolean(enabled);
+  safeStorage.setItem('tss_dj_automix', String(state.djAutoMix));
+  state._djTransitionCache = null;
+  if (state.djMode && state.active) {
+    if (state.djAutoMix && typeof ensureAutoLevelAudioGraph === 'function') {
+      ensureAutoLevelAudioGraph();
+    }
+    if (typeof refreshUpcomingCrossfadePreparation === 'function') {
+      refreshUpcomingCrossfadePreparation();
+    }
+    if (!state.djAutoMix && (Number(state.crossfadeSeconds) || 0) <= 0 && typeof setCrossfadeStatus === 'function') {
+      setCrossfadeStatus('off');
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof updateHub === 'function') updateHub();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return state.djAutoMix;
+}
+
+function setDjBassSwap(enabled) {
+  state.djBassSwap = Boolean(enabled);
+  safeStorage.setItem('tss_dj_bass_swap', String(state.djBassSwap));
+  if (!state.djBassSwap && state._crossfading && state._crossfadeSchedule?.bassSwap && state._audioContext) {
+    const sched = state._crossfadeSchedule;
+    sched.bassSwap = false;
+    const now = Math.max(0, Number(state._audioContext.currentTime) || 0);
+    const curProg = sched.duration > 0 ? Math.max(0, Math.min(1, (now - sched.startTime) / sched.duration)) : 1;
+    const [curOutDb, curInDb] = djBassSwapGains(curProg, sched.bassCross);
+    [
+      [sched.outgoingIndex, curOutDb],
+      [sched.incomingIndex, curInDb],
+    ].forEach(([idx, curDb]) => {
+      const g = state._deckAudioGraphs?.[idx];
+      const param = g?.djBassFilter?.gain;
+      if (!param) return;
+      try {
+        param.cancelScheduledValues(0);
+        param.setValueAtTime(curDb, now);
+        if (typeof param.linearRampToValueAtTime === 'function') {
+          param.linearRampToValueAtTime(0, now + 0.035);
+        } else {
+          param.setValueAtTime(0, now);
+        }
+        g.appliedDjBassGain = 0;
+        g.djBassPreHold = false;
+      } catch (_) {
+        setAudioParamImmediately(param, 0, now);
+        g.appliedDjBassGain = 0;
+      }
+    });
+  } else {
+    if (state.djMode && state.active && state.djBassSwap && typeof ensureAutoLevelAudioGraph === 'function') {
+      ensureAutoLevelAudioGraph();
+    }
+    if (!state._crossfading && typeof syncDeckProcessingRouting === 'function') {
+      syncDeckProcessingRouting();
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return state.djBassSwap;
+}
+
+function setDjCueTrim(enabled) {
+  state.djCueTrim = Boolean(enabled);
+  safeStorage.setItem('tss_dj_cue_trim', String(state.djCueTrim));
+  state._djTransitionCache = null;
+  state._djCueOutBypass = null;
+  if (state.djMode && state.active) {
+    if (state.djCueTrim) {
+      if (typeof ensureAutoLevelAudioGraph === 'function') ensureAutoLevelAudioGraph();
+      if (Number.isInteger(state._deckTrack) && state.meta?.[state._deckTrack]) {
+        void warmDjTrackWaveform(state.meta[state._deckTrack]);
+      }
+      const nextTi = typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : undefined;
+      if (Number.isInteger(nextTi) && state.meta?.[nextTi]) {
+        void warmDjTrackWaveform(state.meta[nextTi]);
+      }
+    }
+    if (typeof refreshUpcomingCrossfadePreparation === 'function') {
+      refreshUpcomingCrossfadePreparation();
+    }
+    if (!state.djAutoMix && !state.djCueTrim && (Number(state.crossfadeSeconds) || 0) <= 0
+        && typeof setCrossfadeStatus === 'function') {
+      setCrossfadeStatus('off');
+    }
+  }
+  if (typeof syncDjControls === 'function') syncDjControls();
+  if (typeof updateHub === 'function') updateHub();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  return state.djCueTrim;
+}
+
+function setDjDiscoveryEnabled(enabled) {
+  state.djDiscoveryEnabled = Boolean(enabled);
+  safeStorage.setItem('tss_dj_discovery', String(state.djDiscoveryEnabled));
+  if (typeof syncDjControls === 'function') syncDjControls();
+  return state.djDiscoveryEnabled;
+}
+
+function syncDjControls() {
+  if (typeof document === 'undefined') return;
+  const djOn = Boolean(state.djMode);
+  const voiceOn = state.djCommentaryMode === 'voice';
+  const isSpeaking = Boolean(djOn && (state._djSpeaking || state._djOpeningIntroActive));
+
+  const hub = document.getElementById('tss-hub');
+  const deckLabel = (hub && typeof hub.querySelector === 'function' ? (hub._deckLabel || (hub._deckLabel = hub.querySelector('.tss-deck-label'))) : null)
+    || (typeof document.querySelector === 'function' ? document.querySelector('.tss-deck-label') : null);
+  const brandText = djOn ? 'True DJ' : 'True Shuffle';
+  if (deckLabel && deckLabel.textContent !== brandText) deckLabel.textContent = brandText;
+  const restoreLabel = document.getElementById('tss-hub-restore')?.querySelector?.('.tss-deck-restore-label');
+  if (restoreLabel && restoreLabel.textContent !== brandText) restoreLabel.textContent = brandText;
+
+  const quickBtn = document.getElementById('tss-hub-dj-toggle');
+  if (quickBtn) {
+    const activeStr = String(djOn);
+    const speakingStr = String(isSpeaking);
+    if (quickBtn.dataset.active !== activeStr) quickBtn.dataset.active = activeStr;
+    if (quickBtn.dataset.speaking !== speakingStr) quickBtn.dataset.speaking = speakingStr;
+    if (quickBtn.getAttribute('aria-pressed') !== activeStr) quickBtn.setAttribute('aria-pressed', activeStr);
+    const label = djOn ? 'Turn off True DJ' : 'Turn on True DJ';
+    const title = djOn
+      ? (isSpeaking ? 'True DJ speaking (click to turn off)' : 'True DJ active (click to turn off)')
+      : 'Turn on True DJ';
+    if (quickBtn.getAttribute('aria-label') !== label) quickBtn.setAttribute('aria-label', label);
+    if (quickBtn.title !== title) quickBtn.title = title;
+  }
+
+  const hubArt = document.getElementById('tss-hub-art');
+  if (hubArt) {
+    const speakingStr = String(isSpeaking);
+    if (hubArt.dataset.djSpeaking !== speakingStr) hubArt.dataset.djSpeaking = speakingStr;
+  }
+
+  const vibeBusy = Boolean(state._djVibeSwitching || state.loading);
+  const vibeBusyStr = String(Boolean(state._djVibeSwitching));
+  const vibeBtn = document.getElementById('tss-dj-vibe-btn');
+  if (vibeBtn) {
+    if (vibeBtn.disabled !== vibeBusy) vibeBtn.disabled = vibeBusy;
+    if (vibeBtn.dataset.switching !== vibeBusyStr) vibeBtn.dataset.switching = vibeBusyStr;
+  }
+  const deckVibeBtn = document.getElementById('tss-hub-dj-vibe');
+  if (deckVibeBtn) {
+    const hideDeckVibe = !(djOn && state.active);
+    if (deckVibeBtn.hidden !== hideDeckVibe) deckVibeBtn.hidden = hideDeckVibe;
+    if (deckVibeBtn.disabled !== vibeBusy) deckVibeBtn.disabled = vibeBusy;
+    if (deckVibeBtn.dataset.switching !== vibeBusyStr) deckVibeBtn.dataset.switching = vibeBusyStr;
+  }
+
+  const djBodyWrap = document.getElementById('tss-dj-body-wrap');
+  if (djBodyWrap) {
+    const offStr = String(!djOn);
+    if (djBodyWrap.dataset.djOff !== offStr) djBodyWrap.dataset.djOff = offStr;
+  }
+
+  const masterToggle = document.getElementById('tss-dj-enabled');
+  if (masterToggle && masterToggle.checked !== djOn) masterToggle.checked = djOn;
+
+  const statusEl = document.getElementById('tss-dj-status');
+  if (statusEl) {
+    let statusText = 'off';
+    let statusKind = 'off';
+    if (djOn) {
+      if (state._djSpeaking || state._djOpeningIntroActive) { statusText = 'speaking'; statusKind = 'active'; }
+      else if (!voiceOn) { statusText = 'silent'; statusKind = 'active'; }
+      else if (state._djWorkerStatus === 'ready') { statusText = 'voice ready'; statusKind = 'active'; }
+      else if (state._djWorkerStatus === 'loading') {
+        statusText = `loading ${state._djWorkerProgress || 0}%`;
+        statusKind = 'loading';
+      } else if (state._djWorkerStatus === 'fallback' || state._djWorkerStatus === 'unavailable') {
+        statusText = 'silent fallback';
+        statusKind = 'fallback';
+      } else {
+        statusText = 'armed';
+        statusKind = 'active';
+      }
+    }
+    if (statusEl.textContent !== statusText) statusEl.textContent = statusText;
+    if (statusEl.dataset.status !== statusKind) statusEl.dataset.status = statusKind;
+  }
+
+  document.querySelectorAll('.tss-dj-commentary-btn').forEach(btn => {
+    const active = btn.dataset.djCommentary === state.djCommentaryMode;
+    const str = String(active);
+    if (btn.dataset.active !== str) btn.dataset.active = str;
+    if (btn.getAttribute('aria-pressed') !== str) btn.setAttribute('aria-pressed', str);
+  });
+
+  const voiceCard = document.getElementById('tss-dj-voice-card');
+  if (voiceCard && voiceCard.hidden !== !voiceOn) voiceCard.hidden = !voiceOn;
+
+  const voiceSelect = document.getElementById('tss-dj-voice-select');
+  if (voiceSelect && voiceSelect.value !== state.djVoiceId) voiceSelect.value = state.djVoiceId;
+
+  const talkFreqSelect = document.getElementById('tss-dj-talk-freq');
+  const activeTalkFreq = DJ_TALK_FREQ_IDS.has(state.djTalkFrequency) ? state.djTalkFrequency : 'every';
+  if (talkFreqSelect && talkFreqSelect.value !== activeTalkFreq) talkFreqSelect.value = activeTalkFreq;
+
+  const voiceModelSelect = document.getElementById('tss-dj-voice-model');
+  const activeModelId = DJ_VOICE_MODEL_IDS.has(state.djVoiceModel) ? state.djVoiceModel : 'hq';
+  if (voiceModelSelect && voiceModelSelect.value !== activeModelId) voiceModelSelect.value = activeModelId;
+
+  const voiceAdvBadge = document.getElementById('tss-dj-voice-adv-badge');
+  if (voiceAdvBadge) {
+    const badgeText = state._djWorkerStatus === 'loading'
+      ? `${state._djWorkerProgress || 0}%`
+      : (activeModelId === 'hq-gpu' ? 'Studio Ultra' : (activeModelId === 'lite' ? 'Fast Lite' : 'Studio HD'));
+    if (voiceAdvBadge.textContent !== badgeText) voiceAdvBadge.textContent = badgeText;
+    const loadingStr = String(state._djWorkerStatus === 'loading');
+    if (voiceAdvBadge.dataset.loading !== loadingStr) voiceAdvBadge.dataset.loading = loadingStr;
+  }
+
+  const voiceVolSlider = document.getElementById('tss-dj-voice-volume');
+  const voiceVolValue = document.getElementById('tss-dj-voice-volume-value');
+  const pct = Math.max(20, Math.min(150, Math.round((Number(state.djVoiceVolume) || 1) * 100)));
+  if (voiceVolSlider) {
+    if (voiceVolSlider.value !== String(pct)) voiceVolSlider.value = String(pct);
+    voiceVolSlider.style?.setProperty?.('--tss-dj-vol-fill', `${((pct - 20) / 130 * 100).toFixed(1)}%`);
+  }
+  if (voiceVolValue && voiceVolValue.textContent !== `${pct}%`) voiceVolValue.textContent = `${pct}%`;
+
+  const modelNote = document.getElementById('tss-dj-voice-model-status');
+  const modelBarWrap = document.getElementById('tss-dj-voice-progress-wrap');
+  const modelBarFill = document.getElementById('tss-dj-voice-progress-fill');
+  if (modelNote) {
+    const modelMeta = djVoiceModelMeta(activeModelId);
+    let note = modelMeta.noteIdle;
+    if (state._djWorkerStatus === 'loading') {
+      note = `Downloading & initializing ${modelMeta.shortLabel} voice… ${state._djWorkerProgress || 0}%`;
+    } else if (state._djWorkerStatus === 'ready') {
+      note = (activeModelId === 'hq-gpu' && state._djWorkerBackend === 'wasm-fallback')
+        ? 'Studio HD voice ready on CPU WASM (WebGPU unavailable in this browser · 0 cloud calls).'
+        : modelMeta.noteReady;
+    } else if (state._djWorkerStatus === 'fallback' || state._djWorkerStatus === 'unavailable') {
+      note = state._djWorkerError || 'Local voice unavailable — True DJ continues silently.';
+    }
+    if (modelNote.textContent !== note) modelNote.textContent = note;
+  }
+  if (modelBarWrap) {
+    const showProgress = voiceOn && state._djWorkerStatus === 'loading';
+    if (modelBarWrap.hidden !== !showProgress) modelBarWrap.hidden = !showProgress;
+  }
+  if (modelBarFill) {
+    modelBarFill.style.width = `${Math.max(4, Math.min(100, Number(state._djWorkerProgress) || 0))}%`;
+  }
+
+  document.querySelectorAll('.tss-dj-focus-pill').forEach(btn => {
+    const active = btn.dataset.djFocus === state.djFocus;
+    const str = String(active);
+    if (btn.dataset.active !== str) btn.dataset.active = str;
+    if (btn.getAttribute('aria-pressed') !== str) btn.setAttribute('aria-pressed', str);
+  });
+
+  const autoMixToggle = document.getElementById('tss-dj-automix');
+  if (autoMixToggle && autoMixToggle.checked !== Boolean(state.djAutoMix)) {
+    autoMixToggle.checked = Boolean(state.djAutoMix);
+  }
+  const bassSwapToggle = document.getElementById('tss-dj-bass-swap');
+  if (bassSwapToggle && bassSwapToggle.checked !== Boolean(state.djBassSwap)) {
+    bassSwapToggle.checked = Boolean(state.djBassSwap);
+  }
+  const cueTrimToggle = document.getElementById('tss-dj-cue-trim');
+  if (cueTrimToggle && cueTrimToggle.checked !== Boolean(state.djCueTrim)) {
+    cueTrimToggle.checked = Boolean(state.djCueTrim);
+  }
+  const discToggle = document.getElementById('tss-dj-discovery');
+  if (discToggle && discToggle.checked !== Boolean(state.djDiscoveryEnabled)) {
+    discToggle.checked = Boolean(state.djDiscoveryEnabled);
+  }
+  const mixAdvBadge = document.getElementById('tss-dj-mix-adv-badge');
+  if (mixAdvBadge) {
+    const enabledCount = (state.djAutoMix ? 1 : 0)
+      + (state.djDiscoveryEnabled ? 1 : 0)
+      + (state.djBassSwap ? 1 : 0)
+      + (state.djCueTrim ? 1 : 0);
+    const mixBadgeText = enabledCount > 0 ? `${enabledCount} on` : 'all off';
+    if (mixAdvBadge.textContent !== mixBadgeText) mixAdvBadge.textContent = mixBadgeText;
+  }
+
+  const pipDoc = state._ownPipWindow?.document;
+  const pipSoundMenu = pipDoc?.getElementById?.('tss-pip-sound-menu');
+  if (pipSoundMenu) {
+    const pipDjBtn = pipDoc.getElementById('tss-pip-dj-toggle');
+    if (pipDjBtn) {
+      const pressed = String(Boolean(state.djMode));
+      if (pipDjBtn.getAttribute('aria-pressed') !== pressed) pipDjBtn.setAttribute('aria-pressed', pressed);
+    }
+    const pipVoiceBtn = pipDoc.getElementById('tss-pip-dj-voice-toggle');
+    if (pipVoiceBtn) {
+      const pressed = String(state.djCommentaryMode === 'voice');
+      if (pipVoiceBtn.getAttribute('aria-pressed') !== pressed) pipVoiceBtn.setAttribute('aria-pressed', pressed);
+    }
+    const pipBassBtn = pipDoc.getElementById('tss-pip-dj-bass-swap');
+    if (pipBassBtn) {
+      const pressed = String(Boolean(state.djBassSwap));
+      if (pipBassBtn.getAttribute('aria-pressed') !== pressed) pipBassBtn.setAttribute('aria-pressed', pressed);
+    }
+    const pipCueBtn = pipDoc.getElementById('tss-pip-dj-cue-trim');
+    if (pipCueBtn) {
+      const pressed = String(Boolean(state.djCueTrim));
+      if (pipCueBtn.getAttribute('aria-pressed') !== pressed) pipCueBtn.setAttribute('aria-pressed', pressed);
+    }
+    const pipTalkSel = pipDoc.getElementById('tss-pip-dj-talk-freq');
+    if (pipTalkSel && pipTalkSel.value !== (state.djTalkFrequency || 'every')) {
+      pipTalkSel.value = state.djTalkFrequency || 'every';
+    }
+    const pipModelSel = pipDoc.getElementById('tss-pip-dj-voice-model');
+    if (pipModelSel && pipModelSel.value !== (state.djVoiceModel || 'hq')) {
+      pipModelSel.value = state.djVoiceModel || 'hq';
+    }
+    const pipVibeBtn = pipDoc.getElementById('tss-pip-dj-vibe');
+    if (pipVibeBtn) {
+      const vibeBusy = Boolean(state._djVibeSwitching || state.loading);
+      if (pipVibeBtn.disabled !== vibeBusy) pipVibeBtn.disabled = vibeBusy;
+    }
+  }
 }
 
 
@@ -2740,7 +8990,7 @@ function setSleepTimer(value, now = Date.now()) {
 // Better SoundCloud Feed's PiP reads scPlayer, not Media Session. An active
 // True Shuffle session owns these controls even while its deck is unavailable.
 function betterFeedPipActive() {
-  return state.active && !state._nativeGuardButtonAction;
+  return state.active && !state._nativeGuardButtonAction && !state._nativeHandoffActive;
 }
 
 function betterFeedPipSound() {
@@ -2779,12 +9029,21 @@ function syncBetterFeedPipWindow() {
 
   try {
     const pipWindow = documentPipApi()?.window;
-    const pipDoc = pipWindow?.document;
+    if (!pipWindow || pipWindow === state._ownPipWindow) return false;
+    const pipDoc = pipWindow.document;
     if (!pipDoc) return false;
 
     const timing = playbackTiming();
     const current = Math.max(0, Number(timing.current) || 0);
     const duration = Math.max(0, Number(timing.duration) || 0);
+    const activeMeta = Number.isInteger(state._deckTrack) ? state.meta?.[state._deckTrack] : null;
+    if (activeMeta?.title) {
+      const pipTitleEl = pipDoc.querySelector('.pip-title');
+      if (pipTitleEl && pipTitleEl.textContent !== String(activeMeta.title)) pipTitleEl.textContent = String(activeMeta.title);
+      const pipArtistEl = pipDoc.querySelector('.pip-artist');
+      const nextArtistText = String(activeMeta.artist || '—');
+      if (pipArtistEl && pipArtistEl.textContent !== nextArtistText) pipArtistEl.textContent = nextArtistText;
+    }
     const timeLabels = pipDoc.querySelectorAll('.pip-time');
     if (timeLabels[0]) timeLabels[0].textContent = formatPlaybackClock(current);
     if (timeLabels[1]) timeLabels[1].textContent = formatPlaybackClock(duration);
@@ -2856,20 +9115,35 @@ function documentPipApi() {
 }
 
 function standardVideoPipSupported() {
-  const prototype = pageWindow.HTMLVideoElement?.prototype;
+  const localPrototype = typeof HTMLVideoElement !== 'undefined' ? HTMLVideoElement?.prototype : null;
+  const prototype = pageWindow?.HTMLVideoElement?.prototype || localPrototype;
   return Boolean(
-    (pageWindow.document?.pictureInPictureEnabled && typeof prototype?.requestPictureInPicture === 'function') ||
-    typeof prototype?.webkitSetPresentationMode === 'function'
+    ((pageWindow?.document?.pictureInPictureEnabled || (typeof document !== 'undefined' && document?.pictureInPictureEnabled))
+      && (typeof prototype?.requestPictureInPicture === 'function' || typeof localPrototype?.requestPictureInPicture === 'function'))
+    || typeof prototype?.webkitSetPresentationMode === 'function'
+    || typeof localPrototype?.webkitSetPresentationMode === 'function'
   );
 }
 
 function ownPipIsOpen() {
   if (state._ownPipMode === 'video') {
     const video = state._videoPip?.video;
-    return Boolean(video && (
-      pageWindow.document?.pictureInPictureElement === video ||
-      video.webkitPresentationMode === 'picture-in-picture'
-    ));
+    if (!video) return false;
+    if (video.webkitPresentationMode === 'picture-in-picture') return true;
+    const rawVideo = video.wrappedJSObject || video;
+    const docs = [typeof document !== 'undefined' ? document : null, pageWindow?.document];
+    try {
+      if (pageWindow?.wrappedJSObject?.document) docs.push(pageWindow.wrappedJSObject.document);
+    } catch (_) {}
+    for (const doc of docs) {
+      try {
+        const el = doc?.pictureInPictureElement;
+        if (el && (el === video || el === rawVideo || (el.wrappedJSObject && el.wrappedJSObject === rawVideo))) {
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
   }
   if (state._ownPipMode === 'inline') return Boolean(state._ownPipHost?.isConnected);
   try {
@@ -2904,9 +9178,21 @@ function pipTransactionIsCurrent(transaction) {
 
 function exitOwnedVideoPip(video) {
   try {
-    if (pageWindow.document?.pictureInPictureElement === video) {
-      void withDeadline(() => pageWindow.document.exitPictureInPicture(), 5000).catch(() => {});
-    } else if (video?.webkitPresentationMode === 'picture-in-picture') {
+    const rawVideo = video?.wrappedJSObject || video;
+    const docs = [pageWindow?.document, typeof document !== 'undefined' ? document : null];
+    try {
+      if (pageWindow?.wrappedJSObject?.document) docs.push(pageWindow.wrappedJSObject.document);
+    } catch (_) {}
+    for (const doc of docs) {
+      try {
+        const el = doc?.pictureInPictureElement;
+        if (el && (el === video || el === rawVideo || (el.wrappedJSObject && el.wrappedJSObject === rawVideo))) {
+          void withDeadline(() => doc.exitPictureInPicture(), 5000).catch(() => {});
+          return;
+        }
+      } catch (_) {}
+    }
+    if (video?.webkitPresentationMode === 'picture-in-picture') {
       video.webkitSetPresentationMode('inline');
     }
   } catch (_) {}
@@ -2922,6 +9208,7 @@ function closeOwnPip() {
   const videoPip = state._videoPip;
   const mode = state._ownPipMode;
   try { state._pipTrackMenuClose?.(); } catch (_) {}
+  try { state._pipSoundMenuClose?.(); } catch (_) {}
   try { state._ownPipCleanup?.(); } catch (_) {}
   state._ownPipWindow = null;
   state._ownPipHost = null;
@@ -2938,21 +9225,35 @@ function closeOwnPip() {
 
 function drawOwnPipWaveform(canvas, meta, current, duration, accent) {
   if (!canvas || !duration) return;
+  const pipCache = typeof WeakMap === 'function'
+    ? (state._pipUiCache instanceof WeakMap ? state._pipUiCache : (state._pipUiCache = new WeakMap()))
+    : null;
+  let canvasMeta = canvas;
+  if (pipCache && (typeof canvas === 'object' || typeof canvas === 'function')) {
+    canvasMeta = pipCache.get(canvas);
+    if (!canvasMeta) {
+      canvasMeta = {};
+      pipCache.set(canvas, canvasMeta);
+    }
+  }
   const rect = canvas.getBoundingClientRect();
   const ratio = Math.max(1, Number(state._ownPipWindow?.devicePixelRatio) || 1);
   const width = Math.max(1, Math.floor(rect.width * ratio));
   const height = Math.max(1, Math.floor(rect.height * ratio));
+  const key = waveformTrackKey(meta);
+  const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+  const playedX = Math.max(0, Math.min(1, current / duration)) * width;
+  const renderKey = `${key}|${heights === DEFAULT_WAVE_HEIGHTS ? 'd' : heights.length}|${width}|${height}|${accent}|${Math.round(playedX * 2)}`;
+  if (canvas.width === width && canvas.height === height && canvasMeta._tssWaveRenderKey === renderKey) return;
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
 
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  const key = waveformTrackKey(meta);
-  const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+  canvasMeta._tssWaveRenderKey = renderKey;
   const barWidth = Math.max(2, Math.round(2 * ratio));
   const gap = Math.max(2, Math.round(2 * ratio));
   const count = Math.max(1, Math.floor(width / (barWidth + gap)));
-  const playedX = Math.max(0, Math.min(1, current / duration)) * width;
 
   ctx.clearRect(0, 0, width, height);
   for (let index = 0; index < count; index++) {
@@ -2988,11 +9289,29 @@ function renderOwnPipQueue(pipDocument) {
   const list = pipDocument.getElementById('tss-pip-queue-list');
   const count = pipDocument.getElementById('tss-pip-queue-count');
   if (!list || !count) return;
+  const pipCache = typeof WeakMap === 'function'
+    ? (state._pipUiCache instanceof WeakMap ? state._pipUiCache : (state._pipUiCache = new WeakMap()))
+    : null;
+  const pipNodeMeta = el => {
+    if (!el || (typeof el !== 'object' && typeof el !== 'function')) return {};
+    if (!pipCache) return el;
+    let entry = pipCache.get(el);
+    if (!entry) {
+      entry = {};
+      pipCache.set(el, entry);
+    }
+    return entry;
+  };
+  const listState = pipNodeMeta(list);
 
   const queueView = pipDocument.getElementById('tss-pip-queue-view');
   const tab = queueView?.dataset.tab === 'history' ? 'history' : 'queue';
   const query = (pipDocument.getElementById('tss-pip-queue-search')?.value || '').trim().toLowerCase();
   const source = tab === 'history' ? [...state.history].reverse() : ownPipQueueOrder();
+  const sourceSlotByTi = new Map();
+  source.forEach((trackIdx, idx) => {
+    if (!sourceSlotByTi.has(trackIdx)) sourceSlotByTi.set(trackIdx, idx);
+  });
   const order = source.filter(ti => {
     const meta = state.meta[ti];
     return meta && (!query || String(meta.title || '').toLowerCase().includes(query) || String(meta.artist || '').toLowerCase().includes(query));
@@ -3001,20 +9320,20 @@ function renderOwnPipQueue(pipDocument) {
   if (count.textContent !== countText) count.textContent = countText;
   const priorityKey = order.map(ti => state.priority[ti] ?? 1).join(',');
   const key = `${state._collectionEpoch}|${tab}|${query}|${currentTi}|${order.join(',')}|${priorityKey}|${state.roundPlayed}|${state.roundTotal}`;
-  const metadata = list._tssQueueMetadata;
+  const metadata = listState._tssQueueMetadata;
   if (list.dataset.key === key && metadata?.length === order.length && order.every((ti, index) => {
     const meta = state.meta[ti], previous = metadata[index];
     return previous.meta === meta && previous.title === meta.title
       && previous.artist === meta.artist && previous.artwork === meta.artwork;
   })) return;
-  list._tssQueueMetadata = order.map(ti => {
+  listState._tssQueueMetadata = order.map(ti => {
     const meta = state.meta[ti];
     return { meta, title: meta.title, artist: meta.artist, artwork: meta.artwork };
   });
   list.dataset.key = key;
-  list.textContent = '';
 
   if (!order.length) {
+    list.textContent = '';
     const empty = pipDocument.createElement('div');
     empty.className = 'tss-pip-queue-empty';
     empty.textContent = query ? 'No matching tracks' : tab === 'history' ? 'Nothing played yet' : 'Queue is empty';
@@ -3022,80 +9341,227 @@ function renderOwnPipQueue(pipDocument) {
     return;
   }
 
+  const previousRows = new Map();
+  if (list.children) {
+    for (const child of Array.from(list.children)) {
+      const childMeta = pipNodeMeta(child);
+      const childTi = Number.isInteger(childMeta._tssPipTi) ? childMeta._tssPipTi : child._tssPipTi;
+      if (Number.isInteger(childTi) && !previousRows.has(childTi)) {
+        previousRows.set(childTi, child);
+      }
+    }
+  }
+
+  const rows = [];
   order.forEach((ti, offset) => {
     const meta = state.meta[ti];
     if (!meta) return;
-    const row = pipDocument.createElement('div');
-    row.className = 'tss-pip-queue-row';
-    row.dataset.current = ti === currentTi ? 'true' : 'false';
-    row.setAttribute('role', 'listitem');
-    row.style.setProperty('--row-index', String(Math.min(offset, 8)));
-
-    const art = pipDocument.createElement('span');
-    art.className = 'tss-pip-queue-art';
-    if (meta.artwork) {
-      const img = pipDocument.createElement('img');
-      img.src = meta.artwork;
-      img.alt = '';
-      img.onerror = () => { img.remove(); art.innerHTML = SVG.note; };
-      art.appendChild(img);
+    const prev = previousRows.get(ti);
+    const prevRecord = prev ? (pipNodeMeta(prev)._tssPipMetaRecord || prev._tssPipMetaRecord) : null;
+    let row = null;
+    if (prev && prevRecord && prevRecord.meta === meta
+        && prevRecord.title === meta.title && prevRecord.artist === meta.artist
+        && prevRecord.artwork === meta.artwork) {
+      row = prev;
+      previousRows.delete(ti);
     } else {
-      art.innerHTML = SVG.note;
+      row = pipDocument.createElement('div');
+      row.className = 'tss-pip-queue-row';
+      row.setAttribute('role', 'listitem');
+
+      const art = pipDocument.createElement('span');
+      art.className = 'tss-pip-queue-art';
+      if (meta.artwork) {
+        const img = pipDocument.createElement('img');
+        img.src = meta.artwork;
+        img.alt = '';
+        img.onerror = () => { img.remove(); art.innerHTML = SVG.note; };
+        art.appendChild(img);
+      } else {
+        art.innerHTML = SVG.note;
+      }
+
+      const copy = pipDocument.createElement('span');
+      copy.className = 'tss-pip-queue-copy';
+      const title = pipDocument.createElement('span');
+      title.className = 'tss-pip-queue-title';
+      title.textContent = meta.title || '—';
+      const artist = pipDocument.createElement('span');
+      artist.className = 'tss-pip-queue-artist';
+      artist.textContent = meta.artist || '—';
+      copy.append(title, artist);
+
+      const number = pipDocument.createElement('span');
+      number.className = 'tss-pip-queue-number';
+
+      const settings = pipDocument.createElement('button');
+      settings.type = 'button';
+      settings.className = 'tss-pip-track-settings';
+      settings.innerHTML = SVG.more;
+      settings.setAttribute('aria-label', `Settings for ${meta.title || 'track'}`);
+      settings.title = 'Track settings';
+      settings.onclick = event => {
+        event.stopPropagation();
+        const rowState = pipNodeMeta(row)._tssPipRowState || row._tssPipRowState;
+        if (rowState) showOwnPipTrackMenu(pipDocument, settings, rowState.ti, rowState.currentTi);
+      };
+
+      row.append(art, copy, number, settings);
+      const createdMeta = pipNodeMeta(row);
+      createdMeta._tssPipNumberEl = number;
+      createdMeta._tssPipMetaRecord = { meta, title: meta.title, artist: meta.artist, artwork: meta.artwork };
+      createdMeta._tssPipTi = ti;
     }
 
-    const copy = pipDocument.createElement('span');
-    copy.className = 'tss-pip-queue-copy';
-    const title = pipDocument.createElement('span');
-    title.className = 'tss-pip-queue-title';
-    title.textContent = meta.title || '—';
-    const artist = pipDocument.createElement('span');
-    artist.className = 'tss-pip-queue-artist';
-    artist.textContent = meta.artist || '—';
-    copy.append(title, artist);
-
-    const number = pipDocument.createElement('span');
-    number.className = 'tss-pip-queue-number';
-    number.textContent = tab === 'history'
-      ? String(offset + 1)
+    const rowMeta = pipNodeMeta(row);
+    const sourceOffset = sourceSlotByTi.get(ti) ?? offset;
+    const numberText = tab === 'history'
+      ? String(sourceOffset + 1)
       : String(Math.min(
         Math.max(1, state.roundTotal || state.queue.length),
-        Math.max(1, state.roundPlayed + offset + 1),
+        Math.max(1, state.roundPlayed + sourceOffset + 1),
       ));
+    rowMeta._tssPipRowState = { ti, currentTi, tab, numberText };
+    row.dataset.current = ti === currentTi ? 'true' : 'false';
+    row.style.setProperty('--row-index', String(Math.min(offset, 8)));
+    const numberEl = rowMeta._tssPipNumberEl || row.children?.[2];
+    const editableSlot = tab === 'queue' && ti !== currentTi
+      && state.queue.includes(ti) && !state.playNext.includes(ti);
+    if (numberEl) {
+      if (editableSlot) {
+        if (numberEl.dataset) numberEl.dataset.editable = 'true';
+        numberEl.title = 'Click to type new queue position';
+        numberEl.setAttribute?.('role', 'button');
+        numberEl.tabIndex = 0;
+        numberEl.setAttribute?.('aria-label', `Queue slot ${numberText}, click to change position`);
+      } else {
+        if (numberEl.dataset) delete numberEl.dataset.editable;
+        numberEl.removeAttribute?.('title');
+        numberEl.removeAttribute?.('role');
+        numberEl.removeAttribute?.('tabindex');
+        numberEl.removeAttribute?.('aria-label');
+      }
+      if (!rowMeta._tssPipSlotBound) {
+        rowMeta._tssPipSlotBound = true;
+        const beginPipSlotEdit = event => {
+          event?.stopPropagation?.();
+          const curState = pipNodeMeta(row)._tssPipRowState || row._tssPipRowState;
+          if (!curState || curState.tab !== 'queue' || curState.ti === curState.currentTi
+              || !state.queue.includes(curState.ti) || state.playNext.includes(curState.ti)) return;
+          if (numberEl.querySelector?.('input')) return;
+          const prevText = curState.numberText || numberEl.textContent || '';
+          const input = pipDocument.createElement('input');
+          input.type = 'text';
+          input.inputMode = 'numeric';
+          input.pattern = '[0-9]*';
+          input.maxLength = 5;
+          input.className = 'tss-pip-slot-input';
+          input.value = prevText;
+          input.setAttribute?.('aria-label', 'Move track to queue slot');
+          if (numberEl.dataset) numberEl.dataset.editing = 'true';
+          numberEl.textContent = '';
+          numberEl.appendChild(input);
+          input.focus?.();
+          input.select?.();
+          let finished = false;
+          const commit = apply => {
+            if (finished) return;
+            finished = true;
+            const rawValue = input.value;
+            if (numberEl.dataset) delete numberEl.dataset.editing;
+            numberEl.textContent = prevText;
+            if (!apply) return;
+            const moved = typeof moveQueueTrackToSlot === 'function'
+              && moveQueueTrackToSlot(curState.ti, rawValue, { basis: 'pip' });
+            if (moved) {
+              delete list.dataset.key;
+              renderOwnPipQueue(pipDocument);
+            }
+          };
+          input.oninput = () => {
+            const cleaned = String(input.value ?? '').replace(/\D+/g, '');
+            if (input.value !== cleaned) input.value = cleaned;
+          };
+          input.onclick = ev => ev?.stopPropagation?.();
+          input.onmousedown = ev => ev?.stopPropagation?.();
+          input.onpointerdown = ev => ev?.stopPropagation?.();
+          input.onkeydown = ev => {
+            ev?.stopPropagation?.();
+            if (ev.key === 'Enter') { ev.preventDefault?.(); commit(true); }
+            else if (ev.key === 'Escape') { ev.preventDefault?.(); commit(false); numberEl.focus?.(); }
+          };
+          input.onblur = () => commit(true);
+        };
+        numberEl.onclick = beginPipSlotEdit;
+        numberEl.onmousedown = ev => {
+          if (numberEl.dataset?.editable === 'true') ev?.stopPropagation?.();
+        };
+        numberEl.onpointerdown = ev => {
+          if (numberEl.dataset?.editable === 'true') ev?.stopPropagation?.();
+        };
+        numberEl.onkeydown = ev => {
+          if (numberEl.dataset?.editable === 'true' && (ev.key === 'Enter' || ev.key === ' ')) {
+            ev.preventDefault?.();
+            beginPipSlotEdit(ev);
+          }
+        };
+      }
+      if (numberEl.dataset?.editing !== 'true' && !numberEl.querySelector?.('input') && numberEl.textContent !== numberText) {
+        numberEl.textContent = numberText;
+      }
+    }
 
-    const settings = pipDocument.createElement('button');
-    settings.type = 'button';
-    settings.className = 'tss-pip-track-settings';
-    settings.innerHTML = SVG.more;
-    settings.setAttribute('aria-label', `Settings for ${meta.title || 'track'}`);
-    settings.title = 'Track settings';
-    settings.onclick = event => {
-      event.stopPropagation();
-      showOwnPipTrackMenu(pipDocument, settings, ti, currentTi);
-    };
-
-    row.append(art, copy, number, settings);
     if (ti !== currentTi) {
       row.dataset.playable = 'true';
       row.setAttribute('role', 'button');
       row.tabIndex = 0;
       row.setAttribute('aria-label', `Play ${meta.title}`);
-      row.onclick = () => { void jumpTo(state.queue.indexOf(ti), ti); };
-      row.onkeydown = event => {
-        if (event.target !== row) return;
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          void jumpTo(state.queue.indexOf(ti), ti);
-        }
-      };
+      row.removeAttribute?.('aria-current');
+      if (!rowMeta._tssPipPlayHandlersBound) {
+        rowMeta._tssPipPlayHandlersBound = true;
+        row.onclick = event => {
+          if (event?.target?.closest?.('.tss-pip-queue-number, .tss-pip-slot-input, .tss-pip-track-settings')) return;
+          const rs = pipNodeMeta(row)._tssPipRowState || row._tssPipRowState;
+          if (rs && rs.ti !== rs.currentTi) void jumpTo(state.queue.indexOf(rs.ti), rs.ti);
+        };
+        row.onkeydown = event => {
+          if (event.target !== row) return;
+          const rs = pipNodeMeta(row)._tssPipRowState || row._tssPipRowState;
+          if (rs && rs.ti !== rs.currentTi && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            void jumpTo(state.queue.indexOf(rs.ti), rs.ti);
+          }
+        };
+      }
     } else {
+      delete row.dataset.playable;
+      row.setAttribute('role', 'listitem');
+      row.tabIndex = -1;
+      row.removeAttribute?.('aria-label');
       row.setAttribute('aria-current', 'true');
     }
-    list.appendChild(row);
+    rows.push(row);
   });
+
+  const wanted = new Set(rows);
+  for (const child of Array.from(list.childNodes || list.children || [])) {
+    if (!wanted.has(child)) child.remove();
+  }
+  let cursor = list.firstChild;
+  for (const row of rows) {
+    if (row === cursor) {
+      cursor = cursor.nextSibling;
+    } else if (typeof list.insertBefore === 'function') {
+      list.insertBefore(row, cursor);
+    } else {
+      list.appendChild(row);
+    }
+  }
 }
 
 function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
   state._pipTrackMenuClose?.();
+  state._pipSoundMenuClose?.();
   const meta = state.meta[ti];
   if (!meta) return;
   const epoch = state._playbackEpoch;
@@ -3129,7 +9595,7 @@ function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
   const playerRect = pipDocument.getElementById('tss-pip-player')?.getBoundingClientRect();
   const anchorRect = anchor.getBoundingClientRect();
   if (playerRect) {
-    menu.style.top = `${Math.max(44, Math.min(playerRect.height - 190, anchorRect.top - playerRect.top - 8))}px`;
+    menu.style.top = `${Math.max(44, Math.min(playerRect.height - 178, anchorRect.top - playerRect.top - 8))}px`;
     menu.style.right = `${Math.max(10, playerRect.right - anchorRect.right)}px`;
   }
 
@@ -3185,12 +9651,14 @@ function showOwnPipTrackMenu(pipDocument, anchor, ti, currentTi) {
 function showOwnPipSoundMenu(pipDocument, anchor) {
   const existing = pipDocument.getElementById('tss-pip-sound-menu');
   if (existing) {
-    existing.remove();
+    if (state._pipSoundMenuClose) state._pipSoundMenuClose();
+    else existing.remove();
     anchor.dataset.active = 'false';
     anchor.setAttribute('aria-pressed', 'false');
     return;
   }
   state._pipTrackMenuClose?.();
+  state._pipSoundMenuClose?.();
   const menu = pipDocument.createElement('section');
   menu.id = 'tss-pip-sound-menu';
   menu.className = 'tss-pip-sound-menu';
@@ -3207,12 +9675,23 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
     <div class="tss-pip-setting-block">
       <div class="tss-pip-setting-label"><span>Crossfade</span><output id="tss-pip-crossfade-readout">off</output></div>
       <input id="tss-pip-crossfade-slider" type="range" min="0" max="12" step="1" aria-label="Crossfade seconds">
-      <div class="tss-pip-segments" role="group" aria-label="Crossfade curve">${['smooth','clean','dj'].map(curve => `<button type="button" data-curve="${curve}" aria-pressed="${state.crossfadeCurve === curve}">${curve}</button>`).join('')}</div>
+      <div class="tss-pip-segments" role="group" aria-label="Crossfade curve">${['smooth','clean','dj','custom'].map(curve => `<button type="button" data-curve="${curve}" aria-pressed="${state.crossfadeCurve === curve}">${curve === 'dj' ? 'DJ' : curve}</button>`).join('')}</div>
     </div>
     <div class="tss-pip-setting-grid">
       <button id="tss-pip-auto-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${state.autoLevel}"><span>Auto level</span><i></i></button>
       <button id="tss-pip-eq-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${state.eqEnabled}"><span>Equalizer</span><i></i></button>
     </div>
+    <div class="tss-pip-setting-grid">
+      <button id="tss-pip-dj-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${Boolean(state.djMode)}"><span>True DJ</span><i></i></button>
+      <button id="tss-pip-dj-voice-toggle" class="tss-pip-setting-toggle" type="button" aria-pressed="${state.djCommentaryMode === 'voice'}"><span>DJ voice</span><i></i></button>
+    </div>
+    <div class="tss-pip-setting-grid">
+      <button id="tss-pip-dj-bass-swap" class="tss-pip-setting-toggle" type="button" aria-pressed="${Boolean(state.djBassSwap)}"><span>DJ bass swap</span><i></i></button>
+      <button id="tss-pip-dj-cue-trim" class="tss-pip-setting-toggle" type="button" aria-pressed="${Boolean(state.djCueTrim)}"><span>DJ cue trim</span><i></i></button>
+    </div>
+    <label class="tss-pip-select-row"><span>DJ talk</span><select id="tss-pip-dj-talk-freq">${(typeof DJ_TALK_FREQUENCIES !== 'undefined' ? DJ_TALK_FREQUENCIES : [{ id: 'every', shortLabel: 'Every set' }, { id: 'relaxed', shortLabel: 'Relaxed' }, { id: 'minimal', shortLabel: 'Minimal' }]).map(f => `<option value="${esc(f.id)}"${(state.djTalkFrequency || 'every') === f.id ? ' selected' : ''}>${esc(f.shortLabel || f.label)}</option>`).join('')}</select></label>
+    <label class="tss-pip-select-row"><span>DJ quality</span><select id="tss-pip-dj-voice-model">${(typeof DJ_VOICE_MODELS !== 'undefined' ? DJ_VOICE_MODELS : [{ id: 'hq', shortLabel: 'Studio HD (CPU)' }, { id: 'hq-gpu', shortLabel: 'Studio Ultra (GPU)' }, { id: 'lite', shortLabel: 'Fast Lite (Low-Spec)' }]).map(m => `<option value="${esc(m.id)}"${(state.djVoiceModel || 'hq') === m.id ? ' selected' : ''}>${esc(m.shortLabel || m.label)}</option>`).join('')}</select></label>
+    <button id="tss-pip-dj-vibe" class="tss-pip-full-eq" type="button">Switch True DJ vibe</button>
     <label class="tss-pip-select-row"><span>EQ preset</span><select id="tss-pip-eq-preset">${eqNames.map(name => `<option value="${esc(name)}"${state.eqPreset === name ? ' selected' : ''}>${esc(name)}</option>`).join('')}</select></label>
     <div class="tss-pip-setting-grid">
       <label class="tss-pip-check-row"><input id="tss-pip-stop-round" type="checkbox"${state.stopAfterRound ? ' checked' : ''}><span>Stop after round</span></label>
@@ -3224,11 +9703,30 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
   anchor.dataset.active = 'true';
   anchor.setAttribute('aria-pressed', 'true');
 
+  let soundRegistration = null;
+  const onSoundDismiss = event => {
+    if (!menu.contains?.(event.target) && !anchor.contains?.(event.target)) close();
+  };
+  const onSoundKeydown = event => {
+    if (event.key === 'Escape') {
+      event.stopPropagation?.();
+      close();
+    }
+  };
   const close = () => {
+    clearTimeout(soundRegistration);
+    pipDocument.removeEventListener?.('pointerdown', onSoundDismiss, true);
+    pipDocument.removeEventListener?.('keydown', onSoundKeydown, true);
     menu.remove();
     anchor.dataset.active = 'false';
     anchor.setAttribute('aria-pressed', 'false');
+    if (state._pipSoundMenuClose === close) state._pipSoundMenuClose = null;
   };
+  state._pipSoundMenuClose = close;
+  soundRegistration = setTimeout(() => {
+    pipDocument.addEventListener?.('pointerdown', onSoundDismiss, true);
+    pipDocument.addEventListener?.('keydown', onSoundKeydown, true);
+  }, 0);
   menu.querySelector('.tss-pip-sound-head button').onclick = close;
   const volume = menu.querySelector('#tss-pip-volume');
   const volumeValue = menu.querySelector('#tss-pip-volume-value');
@@ -3263,6 +9761,9 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
     button.onclick = () => {
       state.crossfadeCurve = button.dataset.curve;
       safeStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      if (state.crossfadeSeconds > 0 && typeof ensureAutoLevelAudioGraph === 'function') {
+        ensureAutoLevelAudioGraph();
+      }
       menu.querySelectorAll('[data-curve]').forEach(option => option.setAttribute('aria-pressed', option === button ? 'true' : 'false'));
       syncCrossfadeControls();
     };
@@ -3270,6 +9771,80 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
 
   const auto = menu.querySelector('#tss-pip-auto-toggle');
   auto.onclick = () => { setAutoLevelEnabled(!state.autoLevel); auto.setAttribute('aria-pressed', String(state.autoLevel)); };
+  const pipDjToggle = menu.querySelector('#tss-pip-dj-toggle');
+  if (pipDjToggle) {
+    pipDjToggle.onclick = () => {
+      const enabling = !state.djMode;
+      const nextDj = typeof setDjModeEnabled === 'function' ? setDjModeEnabled(enabling) : (state.djMode = enabling);
+      pipDjToggle.setAttribute('aria-pressed', String(Boolean(nextDj)));
+      if (enabling && !state.active && !state.loading) {
+        state._userPaused = false;
+        if (typeof ensureAutoLevelAudioGraph === 'function'
+            && (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+                || state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim)) {
+          ensureAutoLevelAudioGraph();
+          if (state._audioContext?.state === 'suspended') {
+            try { void state._audioContext.resume(); } catch (_) {}
+          }
+        }
+        if (typeof start === 'function') {
+          void Promise.resolve(start()).then(() => {
+            if (!state.active && !state.loading && state.djMode && typeof setDjModeEnabled === 'function') {
+              setDjModeEnabled(false);
+            }
+          });
+        }
+      }
+    };
+  }
+  const pipDjVoiceToggle = menu.querySelector('#tss-pip-dj-voice-toggle');
+  if (pipDjVoiceToggle) {
+    pipDjVoiceToggle.onclick = () => {
+      const nextMode = state.djCommentaryMode === 'voice' ? 'silent' : 'voice';
+      if (typeof setDjCommentaryMode === 'function') setDjCommentaryMode(nextMode);
+      else state.djCommentaryMode = nextMode;
+      pipDjVoiceToggle.setAttribute('aria-pressed', String(state.djCommentaryMode === 'voice'));
+    };
+  }
+  const pipDjTalkFreq = menu.querySelector('#tss-pip-dj-talk-freq');
+  if (pipDjTalkFreq) {
+    pipDjTalkFreq.onchange = () => {
+      if (typeof setDjTalkFrequency === 'function') setDjTalkFrequency(pipDjTalkFreq.value);
+      else state.djTalkFrequency = pipDjTalkFreq.value;
+    };
+  }
+  const pipDjVoiceModel = menu.querySelector('#tss-pip-dj-voice-model');
+  if (pipDjVoiceModel) {
+    pipDjVoiceModel.onchange = () => {
+      if (typeof setDjVoiceModel === 'function') setDjVoiceModel(pipDjVoiceModel.value);
+      else state.djVoiceModel = pipDjVoiceModel.value;
+    };
+  }
+  const pipDjBassSwap = menu.querySelector('#tss-pip-dj-bass-swap');
+  if (pipDjBassSwap) {
+    pipDjBassSwap.onclick = () => {
+      const nextVal = !state.djBassSwap;
+      if (typeof setDjBassSwap === 'function') setDjBassSwap(nextVal);
+      else state.djBassSwap = nextVal;
+      pipDjBassSwap.setAttribute('aria-pressed', String(Boolean(state.djBassSwap)));
+    };
+  }
+  const pipDjCueTrim = menu.querySelector('#tss-pip-dj-cue-trim');
+  if (pipDjCueTrim) {
+    pipDjCueTrim.onclick = () => {
+      const nextVal = !state.djCueTrim;
+      if (typeof setDjCueTrim === 'function') setDjCueTrim(nextVal);
+      else state.djCueTrim = nextVal;
+      pipDjCueTrim.setAttribute('aria-pressed', String(Boolean(state.djCueTrim)));
+    };
+  }
+  const pipDjVibeToggle = menu.querySelector('#tss-pip-dj-vibe');
+  if (pipDjVibeToggle) {
+    pipDjVibeToggle.onclick = () => {
+      if (typeof switchDjVibe === 'function') void switchDjVibe();
+      if (pipDjToggle) pipDjToggle.setAttribute('aria-pressed', 'true');
+    };
+  }
   const eqToggle = menu.querySelector('#tss-pip-eq-toggle');
   eqToggle.onclick = () => {
     if (!state.eqEnabled && !ensureAutoLevelAudioGraph()) return;
@@ -3291,7 +9866,13 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
     syncEqualizer();
     eqToggle.setAttribute('aria-pressed', 'true');
   };
-  menu.querySelector('#tss-pip-stop-round').onchange = event => { state.stopAfterRound = event.target.checked; };
+  menu.querySelector('#tss-pip-stop-round').onchange = event => {
+    state.stopAfterRound = event.target.checked;
+    if (state.stopAfterRound) state._nextRoundQueue = null;
+    if (typeof refreshUpcomingCrossfadePreparation === 'function') refreshUpcomingCrossfadePreparation();
+    if (typeof updateHub === 'function') updateHub();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  };
   const sleep = menu.querySelector('#tss-pip-sleep');
   sleep.value = sleepTimerValue();
   sleep.onchange = () => setSleepTimer(sleep.value);
@@ -3303,8 +9884,13 @@ function showOwnPipSoundMenu(pipDocument, anchor) {
 
 function soundCloudLikeButtonState(button) {
   if (!button) return null;
-  const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim();
-  return button.classList.contains('sc-button-selected') || /\bunlike\b/i.test(label);
+  const label = `${button.getAttribute?.('aria-label') || ''} ${button.getAttribute?.('title') || ''}`.trim();
+  const ariaPressed = button.getAttribute?.('aria-pressed');
+  return Boolean(
+    button.classList?.contains?.('sc-button-selected')
+    || ariaPressed === 'true'
+    || /\bunlike\b|\bliked\b/i.test(label)
+  );
 }
 
 function soundCloudPermalinkConflicts(meta, metas = state.meta) {
@@ -3358,9 +9944,11 @@ function boundSoundCloudRow(ti) {
   const matches = row => row && document.body.contains(row) && soundCloudLinkMatches(meta, getLink(row));
   const bound = state.els[ti];
   if (matches(bound)) return bound;
+  if (meta?.isDjDiscovery && !bound && normalizeTrackUrl(location.href) !== wanted) return null;
   for (const link of document.querySelectorAll('a[href]')) {
     if (normalizeTrackUrl(link.href) !== wanted) continue;
-    const row = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound');
+    const row = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound')
+      || link.closest?.('[role="listitem"], article, li');
     if (!matches(row)) continue;
     state.els[ti] = row;
     return row;
@@ -3373,29 +9961,28 @@ function findSoundCloudLikeButton(ti) {
   const wanted = normalizeTrackUrl(meta?.link);
   if (!wanted || soundCloudPermalinkConflicts(meta)) return null;
 
+  const semanticLikeSelector = 'button[aria-label*="Like" i], button[aria-label*="Unlike" i], button[title*="Like" i], button[title*="Unlike" i]';
   const bound = boundSoundCloudRow(ti);
   if (bound) {
-    const button = bound.querySelector('.sc-button-like');
+    const button = bound.querySelector('.sc-button-like') || bound.querySelector?.(semanticLikeSelector);
     if (button) return button;
   }
 
-  const playerLink = document.querySelector('.playbackSoundBadge__titleLink');
-  if (playerLink && soundCloudPlayerMatches(meta)) {
-    const button = playerLink.closest('.playbackSoundBadge')?.querySelector('.playbackSoundBadge__like, .sc-button-like');
+  const playerLink = document.querySelector('.playbackSoundBadge__titleLink')
+    || document.querySelector?.('[class*="playbackSoundBadge"] a[href], .playControls a[href]');
+  if (playerLink && (soundCloudPlayerMatches(meta) || soundCloudLinkMatches(meta, playerLink.href))) {
+    const badgeRoot = playerLink.closest('.playbackSoundBadge') || playerLink.closest?.('[class*="playbackSoundBadge"], .playControls');
+    const button = badgeRoot?.querySelector('.playbackSoundBadge__like, .sc-button-like')
+      || badgeRoot?.querySelector?.(semanticLikeSelector);
     if (button) return button;
   }
 
   if (normalizeTrackUrl(location.href) === wanted && !soundCloudPermalinkConflicts(meta)) {
-    const button = document.querySelector('.listenEngagement__actions .sc-button-like, .soundActions .sc-button-like');
+    const button = document.querySelector('.listenEngagement__actions .sc-button-like, .soundActions .sc-button-like')
+      || document.querySelector?.(`main ${semanticLikeSelector}`);
     if (button) return button;
   }
 
-  for (const link of document.querySelectorAll('a[href]')) {
-    if (normalizeTrackUrl(link.href) !== wanted) continue;
-    const root = link.closest('.trackList__item, .soundList__item, li.sc-list-item, .sound');
-    const button = root && soundCloudLinkMatches(meta, getLink(root)) ? root.querySelector('.sc-button-like') : null;
-    if (button) return button;
-  }
   return null;
 }
 
@@ -3403,12 +9990,16 @@ function currentTrackLikeState(ti, force = false) {
   const now = Date.now();
   const meta = state.meta[ti];
   if (!meta) return { liked: false, available: false };
-  if (!force && state._likeStateTrack === ti && now - state._likeStateLastCheck < 1000) {
+  const curHref = typeof location !== 'undefined' ? String(location.href || '') : '';
+  const cooldownMs = meta.likeAvailable === false ? 5000 : 1000;
+  if (!force && state._likeStateTrack === ti && state._likeStateHref === curHref
+      && now - state._likeStateLastCheck < cooldownMs) {
     return { liked: meta.liked === true, available: meta.likeAvailable === true };
   }
 
   const button = findSoundCloudLikeButton(ti);
   state._likeStateTrack = ti;
+  state._likeStateHref = curHref;
   state._likeStateLastCheck = now;
   meta.likeAvailable = Boolean(button);
   if (button) meta.liked = soundCloudLikeButtonState(button);
@@ -3442,7 +10033,11 @@ async function toggleCurrentTrackLike() {
       meta.liked = actual;
       if (actual !== before) break;
     }
-    return meta.liked !== before;
+    const changed = meta.liked !== before;
+    if (changed && typeof recordDjExplicitSignal === 'function') {
+      recordDjExplicitSignal(ti, meta.liked ? 'like' : 'unlike');
+    }
+    return changed;
   } finally {
     state._likeBusy = false;
     state._likeStateLastCheck = 0;
@@ -3457,7 +10052,7 @@ function ownPipWindowTitle(meta, isPaused) {
 
 function ownPipArtworkSource(url, mode = state.pipArtworkMode) {
   if (!url || !['full', 'focus'].includes(mode)) return url || '';
-  return String(url).replace(/-t\d+x\d+(?=\.(?:jpg|png)(?:$|\?))/i, '-t500x500');
+  return String(url).replace(/-t\d+x\d+(?=\.(?:jpe?g|png|webp)(?:$|\?))/i, '-t500x500');
 }
 
 function ownPipDimensions(mode = state.pipArtworkMode) {
@@ -3477,6 +10072,8 @@ function setOwnPipArtworkMode(mode, pipDocument = state._ownPipWindow?.document)
   const player = pipDocument?.getElementById('tss-pip-player');
   if (player) player.dataset.artworkMode = nextMode;
   if (nextMode === 'focus') {
+    state._pipTrackMenuClose?.();
+    state._pipSoundMenuClose?.();
     const stage = pipDocument?.getElementById('tss-pip-stage');
     const nowView = pipDocument?.getElementById('tss-pip-now-view');
     const queueView = pipDocument?.getElementById('tss-pip-queue-view');
@@ -3543,7 +10140,12 @@ function syncOwnPipWindow() {
       if (state._videoPip) closeOwnPip();
       return false;
     }
-    drawVideoPipFrame(state._videoPip?.canvas);
+    const redrawn = drawVideoPipFrame(state._videoPip?.canvas);
+    if (redrawn) {
+      const videoStream = state._videoPip?.stream;
+      try { videoStream?.requestFrame?.(); } catch (_) {}
+      try { videoStream?.getVideoTracks?.()?.[0]?.requestFrame?.(); } catch (_) {}
+    }
     return true;
   }
   if (!ownPipIsOpen()) {
@@ -3554,6 +10156,19 @@ function syncOwnPipWindow() {
   const pipWindow = state._ownPipWindow;
   const pipDocument = pipWindow.document;
   if (!pipDocument?.getElementById('tss-pip-player')) return false;
+  const pipCache = typeof WeakMap === 'function'
+    ? (state._pipUiCache instanceof WeakMap ? state._pipUiCache : (state._pipUiCache = new WeakMap()))
+    : null;
+  const pipNodeMeta = el => {
+    if (!el || (typeof el !== 'object' && typeof el !== 'function')) return {};
+    if (!pipCache) return el;
+    let entry = pipCache.get(el);
+    if (!entry) {
+      entry = {};
+      pipCache.set(el, entry);
+    }
+    return entry;
+  };
 
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
   const meta = state.meta[currentTi];
@@ -3575,13 +10190,29 @@ function syncOwnPipWindow() {
   const position = pipDocument.getElementById('tss-pip-position');
   const currentTime = pipDocument.getElementById('tss-pip-current');
   const remaining = pipDocument.getElementById('tss-pip-remaining');
-  const titleText = meta?.title || playerTitle() || '—';
-  const artistText = meta?.artist || '—';
+  const openingIntro = Boolean(state.djMode && state._djOpeningIntroActive);
+  const titleText = openingIntro
+    ? 'True DJ'
+    : (meta?.title || playerTitle() || '—');
+  const artistText = openingIntro
+    ? (meta?.title ? `Up first · ${meta.artist && meta.artist !== '—' ? `${meta.artist} · ` : ''}${meta.title}` : 'Setting the vibe')
+    : (meta?.artist || '—');
   const positionText = `${inRound} / ${total}`;
   const currentText = formatPlaybackClock(timing.current);
   const remainingText = `-${formatPlaybackClock(Math.max(0, timing.duration - timing.current))}`;
   if (title && title.textContent !== titleText) title.textContent = titleText;
-  syncOwnPipMarquee(titleViewport, title);
+  const pipStageEl = pipDocument.getElementById('tss-pip-stage');
+  const pipStageView = pipStageEl?.dataset.view || 'player';
+  const marqueeSyncKey = `${titleText}|${pipStageView}|${state.scrollLongTitles}|${state.reduceVisualEffects}|${state.pipArtworkMode}`;
+  if (titleViewport) {
+    const titleViewportMeta = pipNodeMeta(titleViewport);
+    if (titleViewportMeta._tssMarqueeSyncKey !== marqueeSyncKey) {
+      titleViewportMeta._tssMarqueeSyncKey = marqueeSyncKey;
+      syncOwnPipMarquee(titleViewport, title);
+    }
+  } else {
+    syncOwnPipMarquee(titleViewport, title);
+  }
   if (artist && artist.textContent !== artistText) artist.textContent = artistText;
   if (position && position.textContent !== positionText) position.textContent = positionText;
   if (currentTime && currentTime.textContent !== currentText) currentTime.textContent = currentText;
@@ -3599,12 +10230,13 @@ function syncOwnPipWindow() {
 
   const play = pipDocument.getElementById('tss-pip-play');
   if (play) {
+    const playMeta = pipNodeMeta(play);
     const isPaused = paused();
     const icon = isPaused ? SVG.play : SVG.pause;
-    if (play._tssPlayIcon !== icon || play.innerHTML !== play._tssPlayMarkup) {
+    if (playMeta._tssPlayIcon !== icon || play.innerHTML !== playMeta._tssPlayMarkup) {
       play.innerHTML = icon;
-      play._tssPlayIcon = icon;
-      play._tssPlayMarkup = play.innerHTML;
+      playMeta._tssPlayIcon = icon;
+      playMeta._tssPlayMarkup = play.innerHTML;
     }
     const label = isPaused ? 'Play' : 'Pause';
     if (play.getAttribute('aria-label') !== label) play.setAttribute('aria-label', label);
@@ -3612,12 +10244,13 @@ function syncOwnPipWindow() {
 
   const like = pipDocument.getElementById('tss-pip-like');
   if (like) {
+    const likeMeta = pipNodeMeta(like);
     const likeState = currentTrackLikeState(currentTi);
     const icon = likeState.liked ? SVG.heartFilled : SVG.heart;
-    if (like._tssLikeIcon !== icon || like.innerHTML !== like._tssLikeMarkup) {
+    if (likeMeta._tssLikeIcon !== icon || like.innerHTML !== likeMeta._tssLikeMarkup) {
       like.innerHTML = icon;
-      like._tssLikeIcon = icon;
-      like._tssLikeMarkup = like.innerHTML;
+      likeMeta._tssLikeIcon = icon;
+      likeMeta._tssLikeMarkup = like.innerHTML;
     }
     const liked = likeState.liked ? 'true' : 'false';
     const available = likeState.available ? 'true' : 'false';
@@ -3634,6 +10267,28 @@ function syncOwnPipWindow() {
     if (like.title !== title) like.title = title;
   }
 
+  const pipBrand = pipDocument.getElementById('tss-pip-brand');
+  if (pipBrand) {
+    const pipBrandText = state.djMode ? 'True DJ' : 'True Shuffle';
+    if (pipBrand.textContent !== pipBrandText) pipBrand.textContent = pipBrandText;
+  }
+
+  const pipArt = pipDocument.getElementById('tss-pip-art');
+  if (pipArt) {
+    const speaking = String(Boolean(state.djMode && (state._djSpeaking || state._djOpeningIntroActive)));
+    if (pipArt.dataset.djSpeaking !== speaking) pipArt.dataset.djSpeaking = speaking;
+  }
+
+  const pipQuickVibe = pipDocument.getElementById('tss-pip-dj-vibe-quick');
+  if (pipQuickVibe) {
+    const hidePipVibe = !state.djMode;
+    const busyPipVibe = Boolean(state._djVibeSwitching || state.loading);
+    const switchingStr = String(Boolean(state._djVibeSwitching));
+    if (pipQuickVibe.hidden !== hidePipVibe) pipQuickVibe.hidden = hidePipVibe;
+    if (pipQuickVibe.disabled !== busyPipVibe) pipQuickVibe.disabled = busyPipVibe;
+    if (pipQuickVibe.dataset.switching !== switchingStr) pipQuickVibe.dataset.switching = switchingStr;
+  }
+
   const nextRow = pipDocument.getElementById('tss-pip-up-next-row');
   const nextTitle = pipDocument.getElementById('tss-pip-next-title');
   const nextArtist = pipDocument.getElementById('tss-pip-next-artist');
@@ -3644,7 +10299,8 @@ function syncOwnPipWindow() {
   const empty = nextMeta ? 'false' : 'true';
   const nextTitleText = nextMeta?.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle');
   const nextArtistText = nextMeta?.artist || (state.stopAfterRound ? 'Playback will stop' : 'A new round will begin');
-  const nextNumberText = nextMeta ? String(Math.min(total, inRound + 1)) : '—';
+  const nextStartsNewRound = Boolean(nextMeta && !state.playNext?.length && state.queue?.[state.pos + 1] === undefined);
+  const nextNumberText = nextMeta ? (nextStartsNewRound ? '1' : String(Math.min(total, inRound + 1))) : '—';
   if (nextRow && nextRow.dataset.empty !== empty) nextRow.dataset.empty = empty;
   if (nextTitle && nextTitle.textContent !== nextTitleText) nextTitle.textContent = nextTitleText;
   if (nextArtist && nextArtist.textContent !== nextArtistText) nextArtist.textContent = nextArtistText;
@@ -3669,20 +10325,22 @@ function syncOwnPipWindow() {
   const autoLevel = pipDocument.getElementById('tss-pip-auto-level');
   const processing = pipDocument.getElementById('tss-pip-processing');
   const pipState = pipDocument.getElementById('tss-pip-state');
+  const djAutoMixOnly = state.crossfadeSeconds <= 0 && Boolean(state.djMode && (state.djAutoMix || state.djCueTrim));
+  const hasFade = state.crossfadeSeconds > 0 || djAutoMixOnly;
   if (crossfade) {
-    const active = state.crossfadeSeconds > 0 ? 'true' : 'false';
-    const hidden = state.crossfadeSeconds <= 0;
+    const active = hasFade ? 'true' : 'false';
+    const hidden = !hasFade;
     if (crossfade.dataset.active !== active) crossfade.dataset.active = active;
     if (crossfade.hidden !== hidden) crossfade.hidden = hidden;
   }
-  const fadeText = `${state.crossfadeSeconds}s fade`;
+  const fadeText = djAutoMixOnly ? 'auto mix' : `${state.crossfadeSeconds}s fade`;
   if (crossfadeValue && crossfadeValue.textContent !== fadeText) crossfadeValue.textContent = fadeText;
   if (autoLevel) {
     const active = state.autoLevel ? 'true' : 'false';
     if (autoLevel.dataset.active !== active) autoLevel.dataset.active = active;
     if (autoLevel.hidden !== !state.autoLevel) autoLevel.hidden = !state.autoLevel;
   }
-  const processingHidden = state.crossfadeSeconds <= 0 && !state.autoLevel;
+  const processingHidden = !hasFade && !state.autoLevel;
   if (processing && processing.hidden !== processingHidden) processing.hidden = processingHidden;
   if (pipState) {
     const status = state.suspended ? (currentDeckAudio() && !paused() ? 'next unavailable' : 'custom playback unavailable')
@@ -3696,21 +10354,34 @@ function syncOwnPipWindow() {
     if (pipState.hidden !== !status) pipState.hidden = !status;
   }
 
-  if (pipDocument.getElementById('tss-pip-stage')?.dataset.view === 'queue') renderOwnPipQueue(pipDocument);
+  if (pipStageView === 'queue') renderOwnPipQueue(pipDocument);
 
-  drawOwnPipWaveform(
-    pipDocument.getElementById('tss-pip-waveform'),
-    meta,
-    Math.max(0, timing.current),
-    Math.max(0, timing.duration),
-    accent,
-  );
+  if (state.pipArtworkMode !== 'focus' && pipStageView !== 'queue') {
+    drawOwnPipWaveform(
+      pipDocument.getElementById('tss-pip-waveform'),
+      meta,
+      Math.max(0, timing.current),
+      Math.max(0, timing.duration),
+      accent,
+    );
+  }
   return true;
 }
 
 function drawVideoPipFrame(canvas) {
   const ctx = canvas?.getContext?.('2d');
-  if (!ctx) return;
+  if (!ctx) return false;
+  const pipCache = typeof WeakMap === 'function'
+    ? (state._pipUiCache instanceof WeakMap ? state._pipUiCache : (state._pipUiCache = new WeakMap()))
+    : null;
+  let canvasMeta = canvas;
+  if (pipCache && (typeof canvas === 'object' || typeof canvas === 'function')) {
+    canvasMeta = pipCache.get(canvas);
+    if (!canvasMeta) {
+      canvasMeta = {};
+      pipCache.set(canvas, canvasMeta);
+    }
+  }
   const width = canvas.width;
   const height = canvas.height;
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
@@ -3723,6 +10394,15 @@ function drawVideoPipFrame(canvas) {
   const accent = getComputedStyle(document.documentElement).getPropertyValue('--tss-a').trim() || '#aebaf3';
   const key = waveformTrackKey(meta);
   const heights = waveformCache.get(key) || DEFAULT_WAVE_HEIGHTS;
+  const openingIntro = Boolean(state.djMode && state._djOpeningIntroActive);
+  const mainTitle = openingIntro ? 'True DJ' : String(meta.title || playerTitle() || 'Now playing');
+  const subTitle = openingIntro
+    ? (meta.title ? `Up first · ${meta.artist && meta.artist !== '—' ? `${meta.artist} · ` : ''}${meta.title}` : '')
+    : String(meta.artist || '');
+  const nextLine = String(nextMeta.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle'));
+  const frameKey = `${width}x${height}|${Boolean(state.djMode)}|${openingIntro}|${currentTi}|${mainTitle}|${subTitle}|${Math.floor(timing.current * 4)}|${Math.floor(duration)}|${nextTi}|${nextLine}|${accent}|${key}|${heights === DEFAULT_WAVE_HEIGHTS ? 'd' : heights.length}`;
+  if (canvasMeta._tssLastVideoFrameKey === frameKey) return false;
+  canvasMeta._tssLastVideoFrameKey = frameKey;
 
   ctx.fillStyle = '#05080e';
   ctx.fillRect(0, 0, width, height);
@@ -3736,13 +10416,13 @@ function drawVideoPipFrame(canvas) {
   ctx.fillRect(34, 31, 5, 24);
   ctx.fillStyle = 'rgba(255,255,255,.92)';
   ctx.font = '700 17px system-ui, sans-serif';
-  ctx.fillText('TRUE SHUFFLE', 53, 50);
+  ctx.fillText(state.djMode ? 'TRUE DJ' : 'TRUE SHUFFLE', 53, 50);
   ctx.fillStyle = 'rgba(255,255,255,.96)';
   ctx.font = '700 31px system-ui, sans-serif';
-  ctx.fillText(String(meta.title || playerTitle() || 'Now playing').slice(0, 33), 34, 121);
+  ctx.fillText(mainTitle.slice(0, 33), 34, 121);
   ctx.fillStyle = 'rgba(255,255,255,.5)';
   ctx.font = '500 18px system-ui, sans-serif';
-  ctx.fillText(String(meta.artist || '').slice(0, 42), 35, 151);
+  ctx.fillText(subTitle.slice(0, 42), 35, 151);
 
   const waveX = 35, waveY = 187, waveW = width - 70, waveH = 62;
   const count = 96, gap = 3, barW = Math.max(2, (waveW - gap * (count - 1)) / count);
@@ -3763,7 +10443,8 @@ function drawVideoPipFrame(canvas) {
   ctx.fillText('UP NEXT', 35, 316);
   ctx.fillStyle = 'rgba(255,255,255,.78)';
   ctx.font = '600 16px system-ui, sans-serif';
-  ctx.fillText(String(nextMeta.title || (state.stopAfterRound ? 'End of round' : 'Fresh shuffle')).slice(0, 46), 119, 316);
+  ctx.fillText(nextLine.slice(0, 46), 119, 316);
+  return true;
 }
 
 async function openVideoPipFallback(transaction) {
@@ -3818,7 +10499,10 @@ async function openVideoPipFallback(transaction) {
     document.body.append(canvas, video);
     stream = canvas.captureStream(8);
     video.srcObject = stream;
-    drawVideoPipFrame(canvas);
+    if (drawVideoPipFrame(canvas)) {
+      try { stream?.requestFrame?.(); } catch (_) {}
+      try { stream?.getVideoTracks?.()?.[0]?.requestFrame?.(); } catch (_) {}
+    }
     await withDeadline(signal => Promise.resolve(video.play()).then(() => {
       if (signal.aborted || disposed || !pipTransactionIsCurrent(transaction)) {
         video.pause();
@@ -3843,7 +10527,10 @@ async function openVideoPipFallback(transaction) {
     if (disposed || !pipTransactionIsCurrent(transaction)) { dispose(); return false; }
     timer = setInterval(() => {
       if (disposed) return;
-      drawVideoPipFrame(canvas);
+      if (drawVideoPipFrame(canvas)) {
+        try { stream?.requestFrame?.(); } catch (_) {}
+        try { stream?.getVideoTracks?.()?.[0]?.requestFrame?.(); } catch (_) {}
+      }
       syncing = true;
       if (paused() && !video.paused) video.pause();
       else if (!paused() && video.paused && !playPending) {
@@ -3902,6 +10589,8 @@ function openInPagePipFallback() {
     header.addEventListener('pointerdown', event => {
       if (event.target.closest('button')) return;
       event.preventDefault();
+      const pointerId = event.pointerId;
+      try { if (pointerId != null) header.setPointerCapture?.(pointerId); } catch (_) {}
       const rect = host.getBoundingClientRect();
       const startX = event.screenX;
       const startY = event.screenY;
@@ -3920,14 +10609,21 @@ function openInPagePipFallback() {
       const up = () => {
         finishDrag = null;
         header.style.cursor = 'grab';
+        try { if (pointerId != null) header.releasePointerCapture?.(pointerId); } catch (_) {}
         iframe.contentDocument.removeEventListener('pointermove', move);
         iframe.contentDocument.removeEventListener('pointerup', up);
         iframe.contentDocument.removeEventListener('pointercancel', up);
+        window.removeEventListener?.('pointermove', move);
+        window.removeEventListener?.('pointerup', up);
+        window.removeEventListener?.('pointercancel', up);
       };
       finishDrag = up;
       iframe.contentDocument.addEventListener('pointermove', move);
       iframe.contentDocument.addEventListener('pointerup', up);
       iframe.contentDocument.addEventListener('pointercancel', up);
+      window.addEventListener?.('pointermove', move);
+      window.addEventListener?.('pointerup', up);
+      window.addEventListener?.('pointercancel', up);
     });
   }
   showMergeToast('using floating player fallback');
@@ -3951,7 +10647,27 @@ async function openOwnPip() {
     if (documentPip) {
       let pipWindow = null;
       try {
-        pipWindow = await withDeadline(signal => Promise.resolve(documentPip.requestWindow(ownPipDimensions())).then(acquired => {
+        const requestPipWindow = () => {
+          const dims = ownPipDimensions();
+          const retryCloned = err => {
+            if (typeof cloneInto === 'function' && pageWindow) {
+              const msg = String(err?.message || err || '');
+              if (err?.name === 'TypeError' || /permission denied|cross-compartment|xray|clone/i.test(msg)) {
+                return documentPip.requestWindow(cloneInto(dims, pageWindow));
+              }
+            }
+            throw err;
+          };
+          try {
+            const pendingWindow = documentPip.requestWindow(dims);
+            return pendingWindow && typeof pendingWindow.then === 'function'
+              ? Promise.resolve(pendingWindow).catch(retryCloned)
+              : pendingWindow;
+          } catch (xrayError) {
+            return retryCloned(xrayError);
+          }
+        };
+        pipWindow = await withDeadline(signal => Promise.resolve(requestPipWindow()).then(acquired => {
           if (signal.aborted || !pipTransactionIsCurrent(transaction)) {
             try { acquired?.close?.(); } catch (_) {}
             throw new DOMException('PiP cancelled', 'AbortError');
@@ -3992,11 +10708,66 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   const pipDocument = pipWindow.document;
   state._ownPipWindow = pipWindow;
   state._ownPipMode = mode;
+  let resizeRaf = 0;
+  let pipSyncTimer = null;
+  const schedulePipInterval = typeof pipWindow.setInterval === 'function'
+    ? pipWindow.setInterval.bind(pipWindow)
+    : (typeof setInterval === 'function' ? setInterval : null);
+  const clearPipInterval = typeof pipWindow.clearInterval === 'function'
+    ? pipWindow.clearInterval.bind(pipWindow)
+    : (typeof clearInterval === 'function' ? clearInterval : null);
+  const runPipResize = () => {
+    resizeRaf = 0;
+    const titleEl = pipDocument?.getElementById?.('tss-pip-title');
+    if (titleEl) {
+      try { state._pipUiCache?.delete?.(titleEl); } catch (_) {}
+      try { delete titleEl._tssMarqueeSyncKey; } catch (_) {}
+    }
+    syncOwnPipWindow();
+  };
+  const onPipResize = () => {
+    const raf = typeof pipWindow.requestAnimationFrame === 'function'
+      ? pipWindow.requestAnimationFrame.bind(pipWindow)
+      : (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : null);
+    if (!raf) { runPipResize(); return; }
+    if (resizeRaf) return;
+    resizeRaf = raf(runPipResize);
+  };
+  const runPipHeartbeat = () => {
+    if (!state.active || state._ownPipWindow !== pipWindow) return;
+    syncOwnPipWindow();
+    if (!state.busy && state._liveSyncSources?.size && typeof syncLiveQueue === 'function'
+        && Number.isFinite(state._liveSyncLastCheck)) {
+      const pipSyncInterval = LIVE_SYNC_INTERVAL_MS * ((Number(state._liveSyncIdleStreak) || 0) >= 6 ? 3 : 1);
+      if (Date.now() - state._liveSyncLastCheck >= pipSyncInterval) void syncLiveQueue();
+    }
+  };
+  const onPipFocus = () => {
+    syncOwnPipWindow();
+    if (typeof scheduleLiveQueueSync === 'function' && Date.now() - (Number(state._liveSyncLastCheck) || 0) >= 10_000) {
+      scheduleLiveQueueSync(200);
+    }
+  };
   const dispose = () => {
-    pipWindow.removeEventListener('resize', syncOwnPipWindow);
+    if (resizeRaf) {
+      try {
+        const caf = typeof pipWindow.cancelAnimationFrame === 'function'
+          ? pipWindow.cancelAnimationFrame.bind(pipWindow)
+          : (typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : null);
+        caf?.(resizeRaf);
+      } catch (_) {}
+      resizeRaf = 0;
+    }
+    if (pipSyncTimer !== null) {
+      try { clearPipInterval?.(pipSyncTimer); } catch (_) {}
+      pipSyncTimer = null;
+    }
+    pipWindow.removeEventListener('resize', onPipResize);
+    pipWindow.removeEventListener?.('focus', onPipFocus);
     pipWindow.removeEventListener('pagehide', onPageHide);
     if (state._ownPipWindow === pipWindow) {
       state._pipTrackMenuClose?.();
+      state._pipSoundMenuClose?.();
       state._ownPipWindow = null;
       state._ownPipMode = null;
       state._ownPipCleanup = null;
@@ -4010,7 +10781,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   pipDocument.title = 'True Shuffle';
   const style = pipDocument.createElement('style');
   style.textContent = `
-    :root{color-scheme:dark;--accent:#aebaf3;--pip-glass-base:#090a0c;--pip-glass-light:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%);--pip-glass-surface:var(--pip-glass-light),var(--pip-glass-base);--pip-glass-inset:rgba(0,0,0,.08);--pip-menu-surface:var(--pip-glass-light),rgba(9,10,12,.12);--pip-glass-filter:none;--pip-glass-rim:rgba(255,255,255,.12);--pip-glass-edge:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12);--pip-glass-shadow:var(--pip-glass-edge),0 20px 54px rgba(0,0,0,.38);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+    :root{color-scheme:dark;--accent:#aebaf3;--pip-glass-base:#090a0c;--pip-glass-light:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%);--pip-glass-surface:var(--pip-glass-light),var(--pip-glass-base);--pip-glass-inset:rgba(0,0,0,.08);--pip-menu-surface:var(--pip-glass-light),rgba(9,10,12,.12);--pip-glass-filter:none;--pip-glass-rim:rgba(255,255,255,.12);--pip-glass-edge:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12);--pip-glass-shadow:var(--pip-glass-edge),0 1px 2px rgba(0,0,0,.42),0 4px 10px rgba(0,0,0,.26),0 12px 24px rgba(0,0,0,.22),0 24px 48px rgba(0,0,0,.22);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
     *{box-sizing:border-box}
     html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#090a0c;color:#f4f4f4}
     button{font:inherit}
@@ -4059,9 +10830,23 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-stage[data-view="queue"] #tss-pip-queue-view{transform:translateX(0);opacity:1;pointer-events:auto}
     .tss-pip-track{display:grid;grid-template-columns:clamp(96px,28vw,124px) minmax(0,1fr);align-items:center;gap:15px;min-height:96px}
     .tss-pip-art{width:100%;height:auto;aspect-ratio:1;border-radius:12px;overflow:hidden;position:relative;background:rgba(255,255,255,.035);box-shadow:0 9px 24px rgba(0,0,0,.46),0 0 0 1px rgba(255,255,255,.08)}
-    .tss-pip-art img{display:block;width:100%;height:100%;object-fit:cover}
-    .tss-pip-art-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.26)}
+    .tss-pip-art img{display:block;width:100%;height:100%;object-fit:cover;transition:opacity .38s cubic-bezier(.22,1,.36,1),transform .38s cubic-bezier(.22,1,.36,1)}
+    .tss-pip-art-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.26);transition:opacity .38s cubic-bezier(.22,1,.36,1),transform .38s cubic-bezier(.22,1,.36,1)}
     .tss-pip-art-fallback[hidden],.tss-pip-art img[hidden]{display:none}
+    .tss-pip-dj-art{position:absolute;inset:0;z-index:2;display:block;opacity:0;transform:scale(.95);pointer-events:none;transition:opacity .38s cubic-bezier(.22,1,.36,1),transform .38s cubic-bezier(.22,1,.36,1)}
+    .tss-pip-art[data-dj-speaking="true"] .tss-pip-dj-art{opacity:1;transform:scale(1)}
+    .tss-pip-art[data-dj-speaking="true"] img,.tss-pip-art[data-dj-speaking="true"] .tss-pip-art-fallback{opacity:0;transform:scale(.96)}
+    .tss-pip-dj-art .tss-dj-cover-halo{transform-origin:60px 60px}
+    .tss-pip-dj-art .tss-dj-cover-bars rect{transform-origin:60px 63px}
+    @keyframes tssPipDjSpin{to{transform:rotate(360deg)}}
+    @keyframes tssPipDjSpeakA{0%{transform:scaleY(.52)}100%{transform:scaleY(1.18)}}
+    @keyframes tssPipDjSpeakB{0%{transform:scaleY(.62)}100%{transform:scaleY(1.25)}}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-cover-halo{animation:tssPipDjSpin 14s linear infinite}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-bar-1{animation:tssPipDjSpeakA .78s ease-in-out infinite alternate}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-bar-2{animation:tssPipDjSpeakB .62s ease-in-out -.18s infinite alternate}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-bar-3{animation:tssPipDjSpeakA .71s ease-in-out -.32s infinite alternate}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-bar-4{animation:tssPipDjSpeakB .56s ease-in-out -.11s infinite alternate}
+    .tss-pip-art[data-dj-speaking="true"] .tss-dj-bar-5{animation:tssPipDjSpeakA .84s ease-in-out -.24s infinite alternate}
     .tss-pip-title{min-width:0;overflow:hidden;white-space:nowrap;font-size:18px;line-height:1.2;font-weight:720;letter-spacing:-.025em}
     .tss-pip-title-text{display:inline-block;min-width:100%;width:max-content}
     .tss-pip-stage[data-view="player"] .tss-pip-title[data-overflow="true"] .tss-pip-title-text{animation:tssPipMarquee var(--tss-pip-marquee-duration,9s) ease-in-out infinite alternate}
@@ -4071,12 +10856,18 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-wave{margin-top:11px}
     #tss-pip-waveform{display:block;width:100%;height:28px;cursor:pointer}
     .tss-pip-times{display:flex;justify-content:space-between;margin-top:3px;color:rgba(255,255,255,.47);font-size:8px;font-variant-numeric:tabular-nums}
-    .tss-pip-controls{display:flex;align-items:center;justify-content:center;gap:22px;margin:9px 0 11px}
+    .tss-pip-controls{position:relative;display:flex;align-items:center;justify-content:center;gap:22px;margin:9px 0 11px}
     .tss-pip-control{display:flex;align-items:center;justify-content:center;width:39px;height:39px;padding:0;border:1px solid rgba(255,255,255,.10);border-radius:50%;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 3px 9px rgba(0,0,0,.2);color:rgba(255,255,255,.82);cursor:pointer;transition:transform .14s,background .14s,color .14s}
+    .tss-pip-control[hidden]{display:none}
     .tss-pip-control:hover{transform:translateY(-1px);background:rgba(255,255,255,.13);color:#fff}
     .tss-pip-control:active{transform:scale(.96)}
     .tss-pip-control-primary{width:52px;height:52px;background:color-mix(in srgb,var(--accent) 80%,transparent);border-color:color-mix(in srgb,var(--accent),white 18%);color:#101522;box-shadow:0 8px 21px color-mix(in srgb,var(--accent),transparent 72%)}
     .tss-pip-control-primary:hover{background:color-mix(in srgb,var(--accent) 90%,transparent);color:#101522}
+    .tss-pip-vibe-quick{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:33px;height:33px;border-color:color-mix(in srgb,var(--accent),transparent 65%);background:color-mix(in srgb,var(--accent),transparent 88%);color:var(--accent)}
+    .tss-pip-vibe-quick:hover:not(:disabled){transform:translateY(-50%) scale(1.04);background:color-mix(in srgb,var(--accent),transparent 76%);color:#fff}
+    .tss-pip-vibe-quick:active:not(:disabled){transform:translateY(-50%) scale(.96)}
+    .tss-pip-vibe-quick:disabled{opacity:.4;cursor:not-allowed}
+    .tss-pip-vibe-quick[data-switching="true"] svg{animation:tssPipDjSpin .8s linear infinite}
     .tss-pip-control svg{width:15px!important;height:15px!important}
     .tss-pip-control-primary svg{width:17px!important;height:17px!important}
     .tss-pip-up-next{border-top:1px solid rgba(255,255,255,.08);padding-top:9px}
@@ -4103,7 +10894,14 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-queue-art{width:36px;height:36px;border-radius:7px;overflow:hidden;background:rgba(255,255,255,.035);display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.24)}
     .tss-pip-queue-art img{display:block;width:100%;height:100%;object-fit:cover}
     .tss-pip-queue-copy{display:block;min-width:0}.tss-pip-queue-title{display:block;font-size:10px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tss-pip-queue-artist{display:block;margin-top:3px;color:rgba(255,255,255,.35);font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .tss-pip-queue-number{color:rgba(255,255,255,.34);font-size:9px;font-variant-numeric:tabular-nums}
+    .tss-pip-queue-number{color:rgba(255,255,255,.42);font-size:9.5px;font-weight:600;font-variant-numeric:tabular-nums}
+    .tss-pip-queue-number[data-editable="true"]{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:26px;min-height:24px;padding:0 5px;border:1px solid transparent;border-radius:6px;cursor:pointer;box-sizing:border-box;transition:background .14s,border-color .14s,color .14s}
+    .tss-pip-queue-number[data-editable="true"]::before{content:'';position:absolute;inset:-8px -4px}
+    .tss-pip-queue-row:hover .tss-pip-queue-number[data-editable="true"]:not([data-editing="true"]){background:rgba(255,255,255,.055);border-color:rgba(255,255,255,.11);color:rgba(255,255,255,.92)}
+    .tss-pip-queue-number[data-editable="true"]:not([data-editing="true"]):hover,.tss-pip-queue-number[data-editable="true"]:not([data-editing="true"]):focus-visible{background:color-mix(in srgb,var(--accent),transparent 82%);border-color:color-mix(in srgb,var(--accent),transparent 54%);color:#fff;outline:none}
+    .tss-pip-queue-number[data-editing="true"]{padding:0;background:transparent;border-color:transparent}
+    .tss-pip-slot-input{width:36px;height:21px;padding:0 3px;border:1.5px solid var(--accent);border-radius:5px;background:rgba(12,13,18,.96);color:#fff;font:600 9.5px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;text-align:center;font-variant-numeric:tabular-nums;outline:0;box-sizing:border-box;-webkit-user-select:text;user-select:text;-moz-appearance:textfield;appearance:textfield}
+    .tss-pip-slot-input::-webkit-outer-spin-button,.tss-pip-slot-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
     .tss-pip-queue-row[data-current="true"] .tss-pip-queue-number{color:var(--accent)}
     .tss-pip-queue-empty{padding:34px 12px;text-align:center;color:rgba(255,255,255,.25);font-size:10px}
     .tss-pip-track-settings{width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.35);cursor:pointer}
@@ -4120,13 +10918,13 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     .tss-pip-sound-menu input[type="range"]{--fill:0%;width:100%;height:3px;margin:0;appearance:none;border:0;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--fill),rgba(114,130,165,.18) var(--fill));box-shadow:inset 0 1px 2px rgba(3,4,10,.3);cursor:pointer}.tss-pip-sound-menu input[type="range"]::-webkit-slider-thumb{width:12px;height:12px;appearance:none;border:2px solid #fff;border-radius:50%;background:var(--accent);box-shadow:0 2px 7px rgba(0,0,0,.5)}.tss-pip-sound-menu input[type="range"]::-moz-range-thumb{width:9px;height:9px;border:2px solid #fff;border-radius:50%;background:var(--accent)}
     .tss-pip-sound-menu input[type="range"]::-moz-range-track{height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18);box-shadow:inset 0 1px 2px rgba(3,4,10,.3)}
     .tss-pip-sound-menu input[type="range"]::-moz-range-progress{height:3px;border-radius:3px;background:var(--accent)}
-    .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.78);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(0,0,0,.04)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[aria-pressed="true"]{background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:#fff}
+    .tss-pip-setting-block{padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}.tss-pip-setting-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;color:rgba(255,255,255,.78);font-size:9px;font-weight:650}.tss-pip-segments{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;margin-top:10px;padding:2px;border-radius:7px;background:rgba(0,0,0,.04)}.tss-pip-segments button{height:25px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:680;text-transform:capitalize;cursor:pointer}.tss-pip-segments button[data-curve="dj"]{text-transform:uppercase}.tss-pip-segments button[aria-pressed="true"]{background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:#fff}
     .tss-pip-setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.tss-pip-setting-toggle,.tss-pip-check-row,.tss-pip-select-row{min-height:34px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:var(--pip-glass-inset);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);color:rgba(255,255,255,.78);font-size:8px;font-weight:620}.tss-pip-setting-toggle{padding:0 9px;display:flex;align-items:center;justify-content:space-between;cursor:pointer}.tss-pip-setting-toggle i{width:24px;height:14px;padding:2px;border-radius:10px;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 3px rgba(0,0,0,.12)}.tss-pip-setting-toggle i::after{content:'';display:block;width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.78);transition:transform .15s}.tss-pip-setting-toggle[aria-pressed="true"]{color:#fff;border-color:color-mix(in srgb,var(--accent),transparent 68%)}.tss-pip-setting-toggle[aria-pressed="true"] i{background:var(--accent)}.tss-pip-setting-toggle[aria-pressed="true"] i::after{transform:translateX(10px);background:#fff}
     .tss-pip-select-row{margin-top:8px;padding:0 8px;display:flex;align-items:center;justify-content:space-between;gap:6px}.tss-pip-select-row select{max-width:58%;border:0;background:transparent;color:rgba(255,255,255,.78);font:inherit;outline:0;text-align:right}.tss-pip-select-row option{background:#101113}.tss-pip-sleep-row{margin-top:0}.tss-pip-check-row{padding:0 8px;display:flex;align-items:center;gap:6px}.tss-pip-check-row input{accent-color:var(--accent)}.tss-pip-full-eq{width:100%;height:31px;margin-top:8px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:transparent;color:rgba(255,255,255,.72);font-size:8px;font-weight:650;cursor:pointer}.tss-pip-full-eq:hover{background:rgba(255,255,255,.04);color:#fff}
     .tss-pip-stage[data-view="queue"] .tss-pip-queue-row{animation:tssPipRowIn .26s both cubic-bezier(.22,1,.36,1);animation-delay:calc(var(--row-index) * 18ms)}
     @keyframes tssPipMarquee{0%,15%{transform:translateX(0)}85%,100%{transform:translateX(var(--tss-pip-marquee-distance,0))}}
     @keyframes tssPipRowIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}@keyframes tssPipMenuIn{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
-    @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu,.tss-pip-title-text{transition:none!important;animation:none!important}.tss-pip-title{overflow:hidden;text-overflow:ellipsis}}
+    @media(prefers-reduced-motion:reduce){.tss-pip-view,.tss-pip-queue-row,.tss-pip-track-menu,.tss-pip-title-text,.tss-pip-dj-art,.tss-pip-dj-art *,.tss-pip-art img,.tss-pip-art-fallback{transition:none!important;animation:none!important}.tss-pip-title{overflow:hidden;text-overflow:ellipsis}}
     :root[data-tss-reduce-visual-effects="true"]{--pip-menu-surface:var(--pip-glass-surface)}
     :root[data-tss-reduce-visual-effects="true"] *, :root[data-tss-reduce-visual-effects="true"] *::before, :root[data-tss-reduce-visual-effects="true"] *::after{transition:none!important;animation:none!important;scroll-behavior:auto!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
     :root[data-tss-reduce-visual-effects="true"] .tss-pip-control{transform:none!important}
@@ -4139,7 +10937,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     <main id="tss-pip-player">
       <header class="tss-pip-header">
         <div class="tss-pip-brandmark" aria-hidden="true">${SVG.shuffle}</div>
-        <div class="tss-pip-brand">True Shuffle</div>
+        <div id="tss-pip-brand" class="tss-pip-brand">${state.djMode ? 'True DJ' : 'True Shuffle'}</div>
         <div id="tss-pip-state" class="tss-pip-state" hidden></div>
         <div class="tss-pip-live" aria-label="Picture in picture">${SVG.pip}<span>PiP</span></div>
         <button id="tss-pip-like" class="tss-pip-view-toggle" type="button" aria-label="Like current track" aria-pressed="false" data-liked="false" title="Like on SoundCloud">${SVG.heart}</button>
@@ -4151,9 +10949,10 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
       <div id="tss-pip-stage" class="tss-pip-stage" data-view="player">
       <div id="tss-pip-now-view" class="tss-pip-view" aria-hidden="false">
       <section class="tss-pip-track">
-        <div class="tss-pip-art">
+        <div id="tss-pip-art" class="tss-pip-art" data-dj-speaking="false">
           <img id="tss-pip-artwork" alt="" hidden>
           <span id="tss-pip-artwork-fallback" class="tss-pip-art-fallback">${SVG.note}</span>
+          <span id="tss-pip-dj-art" class="tss-pip-dj-art" aria-hidden="true">${SVG.trueDjCover}</span>
         </div>
         <div class="tss-pip-track-copy" style="min-width:0">
           <div id="tss-pip-title" class="tss-pip-title"><span id="tss-pip-title-text" class="tss-pip-title-text">—</span></div>
@@ -4172,6 +10971,7 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
         <button id="tss-pip-prev" class="tss-pip-control" type="button" aria-label="Previous track">${SVG.prev}</button>
         <button id="tss-pip-play" class="tss-pip-control tss-pip-control-primary" type="button" aria-label="Play">${SVG.play}</button>
         <button id="tss-pip-next" class="tss-pip-control" type="button" aria-label="Next track">${SVG.next}</button>
+        <button id="tss-pip-dj-vibe-quick" class="tss-pip-control tss-pip-vibe-quick" type="button"${state.djMode ? '' : ' hidden'} data-switching="false" aria-label="Switch DJ vibe" title="Switch vibe (new DJ set)">${SVG.djVibe}</button>
       </section>
       <section class="tss-pip-up-next">
         <div class="tss-pip-kicker">Up next</div>
@@ -4212,7 +11012,8 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   const viewToggle = pipDocument.getElementById('tss-pip-view-toggle');
   viewToggle.onclick = () => {
     state._pipTrackMenuClose?.();
-    pipDocument.getElementById('tss-pip-sound-menu')?.remove();
+    if (state._pipSoundMenuClose) state._pipSoundMenuClose();
+    else pipDocument.getElementById('tss-pip-sound-menu')?.remove();
     soundButton.dataset.active = 'false';
     soundButton.setAttribute('aria-pressed', 'false');
     const stage = pipDocument.getElementById('tss-pip-stage');
@@ -4233,6 +11034,9 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
       const list = pipDocument.getElementById('tss-pip-queue-list');
       if (list) delete list.dataset.key;
       renderOwnPipQueue(pipDocument);
+      if (typeof scheduleLiveQueueSync === 'function' && Date.now() - (Number(state._liveSyncLastCheck) || 0) >= 10_000) {
+        scheduleLiveQueueSync(150);
+      }
     }
     syncOwnPipMarquee(pipDocument.getElementById('tss-pip-title'), pipDocument.getElementById('tss-pip-title-text'));
   };
@@ -4247,19 +11051,31 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
   };
   pipDocument.getElementById('tss-pip-tab-queue').onclick = () => setPipQueueTab('queue');
   pipDocument.getElementById('tss-pip-tab-history').onclick = () => setPipQueueTab('history');
-  pipDocument.getElementById('tss-pip-queue-search').oninput = () => {
+  const pipSearch = pipDocument.getElementById('tss-pip-queue-search');
+  pipSearch.oninput = () => {
     const list = pipDocument.getElementById('tss-pip-queue-list');
     if (list) delete list.dataset.key;
     renderOwnPipQueue(pipDocument);
   };
+  pipSearch.onfocus = () => {
+    if (typeof scheduleLiveQueueSync === 'function' && Date.now() - (Number(state._liveSyncLastCheck) || 0) >= 10_000) {
+      scheduleLiveQueueSync(150);
+    }
+  };
   pipDocument.getElementById('tss-pip-play').onclick = () => { void toggle(); };
   pipDocument.getElementById('tss-pip-prev').onclick = () => { void prevTrack(); };
   pipDocument.getElementById('tss-pip-next').onclick = () => {
-    if (state.busy) return;
+    if (state.busy && !(state._crossfading && (state._userPaused || state._crossfadePausedByUser))) return;
     state.manualAction = true;
     state._manualActionAt = Date.now();
     void next();
   };
+  const pipQuickVibeBtn = pipDocument.getElementById('tss-pip-dj-vibe-quick');
+  if (pipQuickVibeBtn) {
+    pipQuickVibeBtn.onclick = () => {
+      if (typeof switchDjVibe === 'function') void switchDjVibe();
+    };
+  }
   pipDocument.getElementById('tss-pip-next-settings').onclick = event => {
     event.stopPropagation();
     const ti = Number(event.currentTarget.dataset.ti);
@@ -4291,8 +11107,10 @@ function mountOwnPipWindow(pipWindow, mode = 'document') {
     if (event.key === 'ArrowLeft') seekTo(Math.max(0, progress() - 0.03));
     if (event.key === 'ArrowRight') seekTo(Math.min(1, progress() + 0.03));
   };
-  pipWindow.addEventListener('resize', syncOwnPipWindow);
+  pipWindow.addEventListener('resize', onPipResize);
+  pipWindow.addEventListener?.('focus', onPipFocus);
   if (mode === 'document') pipWindow.addEventListener('pagehide', onPageHide, { once: true });
+  if (schedulePipInterval) pipSyncTimer = schedulePipInterval(runPipHeartbeat, 500);
 
   applyVisualEffects(pipDocument);
   setOwnPipArtworkMode(state.pipArtworkMode, pipDocument);
@@ -4566,8 +11384,19 @@ function syncEqualizer() {
     graph.eqFilters.forEach((filter, index) => {
       const value = state.eqEnabled ? state.eqBands[index] : 0;
       if (graph.appliedEqGains[index] !== value) {
-        filter.gain.cancelScheduledValues?.(0);
-        filter.gain.setTargetAtTime(value, now, 0.025);
+        const eqParam = filter.gain;
+        const t0 = Math.max(0, Number(now) || 0);
+        if (typeof eqParam.cancelAndHoldAtTime === 'function') {
+          eqParam.cancelAndHoldAtTime(t0);
+        } else {
+          const curEq = Number.isFinite(Number(eqParam.value))
+            ? Number(eqParam.value)
+            : (Number.isFinite(Number(graph.appliedEqGains[index])) ? Number(graph.appliedEqGains[index]) : value);
+          eqParam.cancelScheduledValues?.(0);
+          try { eqParam.value = curEq; } catch (_) {}
+          eqParam.setValueAtTime?.(curEq, t0);
+        }
+        eqParam.setTargetAtTime(value, t0, 0.025);
         graph.appliedEqGains[index] = value;
       }
     });
@@ -4602,7 +11431,7 @@ function retireAudioGraph() {
   state._crossfadePending = false;
   for (const graph of state._deckAudioGraphs) {
     if (!graph) continue;
-    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain, graph.mixGain]) {
+    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain, graph.djBassFilter, graph.mixGain]) {
       try { node?.disconnect(); } catch (_) {}
     }
   }
@@ -4621,12 +11450,101 @@ function retireAudioGraph() {
   state._deckGains = [0, 0];
   state._deckIndex = -1;
   state._deckTrack = null;
+  clearTimeout(state._djDuckTimer);
+  state._djDuckTimer = null;
+  clearTimeout(state._djBusTeardownTimer);
+  state._djBusTeardownTimer = null;
+  state._djVoiceFadeOutUntil = 0;
+  if (state._djVoiceSources instanceof Set) {
+    for (const entry of state._djVoiceSources) {
+      try { entry.source.onended = null; } catch (_) {}
+      try { entry.source.stop(); } catch (_) {}
+      try { entry.source.disconnect(); } catch (_) {}
+      try { entry.utteranceGain?.disconnect(); } catch (_) {}
+    }
+    state._djVoiceSources.clear();
+  }
+  if (state._djActiveVoiceSource) {
+    try { state._djActiveVoiceSource.onended = null; } catch (_) {}
+    try { state._djActiveVoiceSource.stop(); } catch (_) {}
+    try { state._djActiveVoiceSource.disconnect(); } catch (_) {}
+    try { state._djActiveVoiceSource._utteranceGain?.disconnect(); } catch (_) {}
+    state._djActiveVoiceSource = null;
+  }
+  try { state._djMusicBus?.disconnect(); } catch (_) {}
+  try { state._djVoiceGain?.disconnect(); } catch (_) {}
+  for (const f of state._djVoiceFilters || []) {
+    try { f?.disconnect(); } catch (_) {}
+  }
+  state._djMusicBus = null;
+  state._djVoiceGain = null;
+  state._djVoiceInput = null;
+  state._djVoiceFilters = null;
+  state._djMusicBusContext = null;
+  state._djMusicBusAppliedGain = 1;
+  state._djDuckRampAnchor = null;
+  state._djSpeaking = false;
+  if (context && state._audioContextStateListener && typeof context.removeEventListener === 'function') {
+    try { context.removeEventListener('statechange', state._audioContextStateListener); } catch (_) {}
+  }
+  state._audioContextStateListener = null;
+  state._audioContextSelfHealInFlight = false;
   state._audioContext = null;
+  state._audioGraphSuspension = null;
   state._audioMaster = null;
   state._audioClipper = null;
   state._appliedMasterGain = null;
   state._audioGraphFailed = false;
   try { void Promise.resolve(context?.close()).catch(() => {}); } catch (_) {}
+}
+
+function maybeSelfHealInterruptedAudioContext(trigger = 'statechange') {
+  const context = state._audioContext;
+  if (!context || typeof context.resume !== 'function') return false;
+  const currentState = String(context.state || '');
+  if (currentState !== 'interrupted' && currentState !== 'suspended') return false;
+  if (!state.active || state._userPaused || state._crossfadePausedByUser
+      || state.suspended || state._audioGraphFailed
+      || state._audioGraphSuspension || state._pendingPlaybackResume) {
+    return false;
+  }
+  const hasPlayingDeck = Array.isArray(state._decks) && state._decks.some((deck, idx) =>
+    Boolean(deck && !deck.paused && !deck.ended && (idx === state._deckIndex || state._crossfading)));
+  if (!hasPlayingDeck) return false;
+  const now = Date.now();
+  if (state._audioContextSelfHealInFlight || now - (Number(state._lastAudioContextSelfHealAt) || 0) < 2500) {
+    return false;
+  }
+  state._lastAudioContextSelfHealAt = now;
+  state._audioContextSelfHealInFlight = true;
+  const stateBefore = currentState;
+  let timer = null;
+  const timeoutPromise = new Promise(resolve => {
+    timer = setTimeout(() => resolve('timeout'), 3000);
+  });
+  void Promise.race([
+    Promise.resolve().then(() => context.resume()).then(() => 'settled', () => 'rejected'),
+    timeoutPromise,
+  ]).then(() => {
+    if (timer) clearTimeout(timer);
+    if (state._audioContext === context) {
+      state._audioContextSelfHealInFlight = false;
+      if (state._userPaused || state._crossfadePausedByUser) {
+        if (typeof suspendAudioGraph === 'function') {
+          void suspendAudioGraph(state._playbackAbort?.signal);
+        }
+        return;
+      }
+      if (context.state === 'running' && typeof recordPlaybackDiagnostic === 'function') {
+        recordPlaybackDiagnostic('audio-context-self-heal', {
+          contextStateBefore: stateBefore,
+          contextStateAfter: 'running',
+          reason: trigger,
+        });
+      }
+    }
+  });
+  return true;
 }
 
 function ensureAutoLevelAudioGraph() {
@@ -4651,7 +11569,12 @@ function ensureAutoLevelAudioGraph() {
   try {
     if (!context) {
       phase = 'create-context';
-      context = new AudioContextCtor();
+      try {
+        context = new AudioContextCtor({ latencyHint: 'playback' });
+      } catch (contextError) {
+        if (!(contextError instanceof TypeError)) throw contextError;
+        context = new AudioContextCtor();
+      }
       phase = 'create-master-nodes';
       const master = context.createGain();
       const clipper = context.createWaveShaper();
@@ -4675,18 +11598,24 @@ function ensureAutoLevelAudioGraph() {
         });
         const analyser = context.createAnalyser();
         const autoGain = context.createGain();
+        const djBassFilter = context.createBiquadFilter();
         const mixGain = context.createGain();
         analyser.fftSize = 2048;
         analyser.smoothingTimeConstant = 0.72;
         autoGain.gain.value = 1;
+        djBassFilter.type = 'lowshelf';
+        djBassFilter.frequency.value = 135;
+        djBassFilter.Q.value = 0.707;
+        djBassFilter.gain.value = 0;
         mixGain.gain.value = state._deckGains[index] || 0;
         mixGain.connect(master);
         return {
-          source: null, sourceAudio: null, eqFilters, analyser, autoGain, mixGain,
+          source: null, sourceAudio: null, eqFilters, analyser, autoGain, djBassFilter, mixGain,
           buffer: new Float32Array(analyser.fftSize),
           smoothedRms: 0, peakRms: 0, measuredPeak: 0, currentGain: 1,
           samples: 0, settled: false, trackKey: '',
           appliedAutoGain: 1, appliedMixGain: state._deckGains[index] || 0,
+          appliedDjBassGain: 0, djBassPreHold: false,
           autoGainMaster: null,
         };
       });
@@ -4694,6 +11623,15 @@ function ensureAutoLevelAudioGraph() {
       state._audioMaster = master;
       state._audioClipper = clipper;
       state._deckAudioGraphs = graphs;
+      if (typeof context.addEventListener === 'function') {
+        const onStateChange = () => {
+          if (state._audioContext === context && typeof maybeSelfHealInterruptedAudioContext === 'function') {
+            maybeSelfHealInterruptedAudioContext('statechange');
+          }
+        };
+        state._audioContextStateListener = onStateChange;
+        try { context.addEventListener('statechange', onStateChange); } catch (_) {}
+      }
       published = true;
     }
     phase = 'bind-media-element-source';
@@ -4707,6 +11645,9 @@ function ensureAutoLevelAudioGraph() {
     });
     phase = 'apply-processing-routing';
     syncEqualizer();
+    if (state.djMode && state.djCommentaryMode === 'voice' && typeof ensureDjVoiceAudioBus === 'function') {
+      ensureDjVoiceAudioBus();
+    }
     if (context.state === 'suspended' && !state._userPaused) void resumeAudioGraph();
     if (created) {
       recordPlaybackDiagnostic('audio-graph-ready', {
@@ -4736,19 +11677,29 @@ function ensureAutoLevelAudioGraph() {
 }
 
 function syncDeckProcessingRouting() {
+  const wantDjBass = Boolean(state.djMode && state.djBassSwap);
   state._deckAudioGraphs.forEach(graph => {
     if (!graph?.source) return;
     // Each new graph starts unrouted; EQ band targets are applied separately.
-    if (graph.routedEq === state.eqEnabled && graph.routedAutoLevel === state.autoLevel) return;
-    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain]) {
-      try { node.disconnect(); } catch (_) {}
+    if (graph.routedEq === state.eqEnabled
+        && graph.routedAutoLevel === state.autoLevel
+        && graph.routedDjBass === wantDjBass) return;
+    for (const node of [graph.source, ...graph.eqFilters, graph.analyser, graph.autoGain, graph.djBassFilter]) {
+      try { node?.disconnect(); } catch (_) {}
     }
 
-    if (!state.eqEnabled && !state.autoLevel) {
+    if (!wantDjBass && graph.djBassFilter && state._audioContext) {
+      setAudioParamImmediately(graph.djBassFilter.gain, 0, state._audioContext.currentTime);
+      graph.appliedDjBassGain = 0;
+      graph.djBassPreHold = false;
+    }
+
+    if (!state.eqEnabled && !state.autoLevel && !wantDjBass) {
       graph.source.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
       graph.routedEq = state.eqEnabled;
       graph.routedAutoLevel = state.autoLevel;
+      graph.routedDjBass = wantDjBass;
       graph.appliedAutoGain = 1;
       return;
     }
@@ -4763,16 +11714,21 @@ function syncDeckProcessingRouting() {
     if (state.autoLevel) {
       tail.connect(graph.analyser);
       graph.analyser.connect(graph.autoGain);
-      graph.autoGain.connect(graph.mixGain);
+      tail = graph.autoGain;
       setAudioParamImmediately(graph.autoGain.gain, graph.currentGain, state._audioContext.currentTime);
       graph.appliedAutoGain = graph.currentGain;
     } else {
-      tail.connect(graph.mixGain);
       setAudioParamImmediately(graph.autoGain.gain, 1, state._audioContext.currentTime);
       graph.appliedAutoGain = 1;
     }
+    if (wantDjBass && graph.djBassFilter) {
+      tail.connect(graph.djBassFilter);
+      tail = graph.djBassFilter;
+    }
+    tail.connect(graph.mixGain);
     graph.routedEq = state.eqEnabled;
     graph.routedAutoLevel = state.autoLevel;
+    graph.routedDjBass = wantDjBass;
   });
 }
 
@@ -4810,6 +11766,7 @@ async function resumeAudioGraph(signal = state._playbackAbort?.signal, diagnosti
     return false;
   };
   if (!isCurrent()) return false;
+  state._audioGraphResumeEpoch = (state._audioGraphResumeEpoch || 0) + 1;
   if (state._audioGraphFailed) return fail('graph-marked-failed');
   const suspension = state._audioGraphSuspension;
   if (suspension?.context === context) {
@@ -4889,6 +11846,7 @@ async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
   if (!context || context.state === 'suspended') return true;
   if (context.state === 'closed') return fail('context-closed');
   const contextStateBefore = context.state;
+  const suspendEpoch = state._audioGraphResumeEpoch || 0;
   const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
   try {
     let suspension = state._audioGraphSuspension;
@@ -4901,7 +11859,8 @@ async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
       suspension.promise.then(clearSuspension, clearSuspension);
     }
     await withDeadline(() => suspension.promise, 5000, signal);
-    const current = !signal?.aborted && state._audioContext === context;
+    const current = !signal?.aborted && state._audioContext === context
+      && (state._audioGraphResumeEpoch || 0) === suspendEpoch;
     if (!current) return false;
     if (context.state !== 'suspended') {
       state._audioGraphFailed = true;
@@ -4915,7 +11874,7 @@ async function suspendAudioGraph(signal = state._playbackAbort?.signal) {
     });
     return true;
   } catch (error) {
-    if (signal?.aborted) return false;
+    if (signal?.aborted || (state._audioGraphResumeEpoch || 0) !== suspendEpoch) return false;
     if (state._audioContext === context) state._audioGraphFailed = true;
     return fail(error?.name === 'TimeoutError' ? 'suspend-timeout' : 'suspend-rejected',
       error, contextStateBefore);
@@ -4978,12 +11937,20 @@ function processAutoLevel() {
       state.playbackVolume,
     );
     graph.autoGainMaster = state.playbackVolume;
-    graph.autoGain.gain.cancelScheduledValues?.(0);
-    graph.autoGain.gain.setTargetAtTime(
-      graph.currentGain,
-      state._audioContext.currentTime,
-      0.08,
-    );
+    const autoParam = graph.autoGain.gain;
+    const autoNow = Math.max(0, Number(state._audioContext.currentTime) || 0);
+    const autoTau = state._crossfading ? 0.28 : 0.1;
+    if (typeof autoParam.cancelAndHoldAtTime === 'function') {
+      autoParam.cancelAndHoldAtTime(autoNow);
+    } else {
+      const curAuto = Number.isFinite(Number(autoParam.value))
+        ? Number(autoParam.value)
+        : (Number.isFinite(Number(graph.appliedAutoGain)) ? Number(graph.appliedAutoGain) : 1);
+      autoParam.cancelScheduledValues?.(0);
+      try { autoParam.value = curAuto; } catch (_) {}
+      autoParam.setValueAtTime?.(curAuto, autoNow);
+    }
+    autoParam.setTargetAtTime(graph.currentGain, autoNow, autoTau);
     graph.appliedAutoGain = graph.currentGain;
     if (graph.trackKey) {
       state._autoLevelCache[graph.trackKey] = {
@@ -5036,6 +12003,10 @@ function soundCloudVolumeModel() {
     }
   }
   if (!webpackRequire?.c) return null;
+  const now = Date.now();
+  if (state._soundCloudVolumeModelCheckedAt && now - state._soundCloudVolumeModelCheckedAt < 60000) {
+    return null;
+  }
 
   for (const cached of Object.values(webpackRequire.c)) {
     const exported = cached?.exports;
@@ -5046,11 +12017,13 @@ function soundCloudVolumeModel() {
           && typeof candidate.getVolume === 'function'
           && typeof candidate.getMuted === 'function'
           && typeof candidate.setVolumeAndMuted === 'function') {
+        state._soundCloudVolumeModelCheckedAt = 0;
         state._soundCloudVolumeModel = candidate;
         return candidate;
       }
     }
   }
+  state._soundCloudVolumeModelCheckedAt = now;
   return null;
 }
 
@@ -5091,7 +12064,6 @@ function setSoundCloudVolume(value) {
   if (model) {
     try {
       model.setVolumeAndMuted({ volume: level, muted: level === 0 });
-      state._lastSoundCloudVolume = level;
       return true;
     } catch (_) {
       state._soundCloudVolumeModel = null;
@@ -5116,7 +12088,6 @@ function setSoundCloudVolume(value) {
   slider.dispatchEvent(new MouseEvent('mousedown', opts));
   document.dispatchEvent(new MouseEvent('mousemove', opts));
   document.dispatchEvent(new MouseEvent('mouseup', opts));
-  state._lastSoundCloudVolume = level;
   return true;
 }
 
@@ -5131,28 +12102,12 @@ function initializePlaybackVolume() {
   }
   if (!Number.isFinite(nativeVolume)) return false;
   state.playbackVolume = nativeVolume;
-  state._lastSoundCloudVolume = nativeVolume;
   state._playbackVolumeStored = true;
   state._playbackVolumeInitialized = true;
   try { safeStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
   syncCrossfadeVolume();
   syncPlaybackVolumeControls();
   return true;
-}
-
-function syncPlaybackVolumeFromSoundCloud() {
-  if (currentDeckAudio()) return;
-  if (!state._playbackVolumeInitialized && !initializePlaybackVolume()) return;
-  const nativeVolume = soundCloudVolume();
-  if (!Number.isFinite(nativeVolume)) return;
-  const changedOutsideHub = state._lastSoundCloudVolume === null
-    || Math.abs(nativeVolume - state._lastSoundCloudVolume) > 0.004;
-  state._lastSoundCloudVolume = nativeVolume;
-  if (!changedOutsideHub || Math.abs(nativeVolume - state.playbackVolume) <= 0.004) return;
-  state.playbackVolume = nativeVolume;
-  try { safeStorage.setItem('tss_playback_volume', String(nativeVolume)); } catch (_) {}
-  syncCrossfadeVolume();
-  syncPlaybackVolumeControls();
 }
 
 function syncCrossfadeVolume() {
@@ -5162,8 +12117,19 @@ function syncCrossfadeVolume() {
     !Number.isFinite(state._appliedMasterGain)
     || Math.abs(state._appliedMasterGain - master) > 0.0001
   )) {
-    state._audioMaster.gain.cancelScheduledValues?.(0);
-    state._audioMaster.gain.setTargetAtTime(master, state._audioContext.currentTime, 0.015);
+    const masterParam = state._audioMaster.gain;
+    const masterNow = Math.max(0, Number(state._audioContext?.currentTime) || 0);
+    if (typeof masterParam.cancelAndHoldAtTime === 'function') {
+      masterParam.cancelAndHoldAtTime(masterNow);
+    } else {
+      const curMaster = Number.isFinite(Number(masterParam.value))
+        ? Number(masterParam.value)
+        : (Number.isFinite(Number(state._appliedMasterGain)) ? Number(state._appliedMasterGain) : master);
+      masterParam.cancelScheduledValues?.(0);
+      try { masterParam.value = curMaster; } catch (_) {}
+      masterParam.setValueAtTime?.(curMaster, masterNow);
+    }
+    masterParam.setTargetAtTime(master, masterNow, 0.02);
     state._appliedMasterGain = master;
   }
   state._decks.forEach((audio, index) => {
@@ -5196,11 +12162,28 @@ function syncCrossfadeVolume() {
         setAudioParamImmediately(graph.mixGain.gain, gain, state._audioContext.currentTime);
         graph.appliedMixGain = gain;
       }
+      if (automatedGain === null && !state._crossfading && !graph.djBassPreHold
+          && graph.djBassFilter && graph.appliedDjBassGain !== 0) {
+        setAudioParamImmediately(graph.djBassFilter.gain, 0, state._audioContext.currentTime);
+        graph.appliedDjBassGain = 0;
+      }
       const targetAutoGain = state.autoLevel ? graph.currentGain : 1;
       if (!Number.isFinite(graph.appliedAutoGain)
           || Math.abs(graph.appliedAutoGain - targetAutoGain) > 0.0001) {
-        graph.autoGain.gain.cancelScheduledValues?.(0);
-        graph.autoGain.gain.setTargetAtTime(targetAutoGain, state._audioContext.currentTime, 0.08);
+        const autoParam = graph.autoGain.gain;
+        const autoNow = Math.max(0, Number(state._audioContext?.currentTime) || 0);
+        const autoTau = state._crossfading ? 0.28 : 0.1;
+        if (typeof autoParam.cancelAndHoldAtTime === 'function') {
+          autoParam.cancelAndHoldAtTime(autoNow);
+        } else {
+          const curAuto = Number.isFinite(Number(autoParam.value))
+            ? Number(autoParam.value)
+            : (Number.isFinite(Number(graph.appliedAutoGain)) ? Number(graph.appliedAutoGain) : 1);
+          autoParam.cancelScheduledValues?.(0);
+          try { autoParam.value = curAuto; } catch (_) {}
+          autoParam.setValueAtTime?.(curAuto, autoNow);
+        }
+        autoParam.setTargetAtTime(targetAutoGain, autoNow, autoTau);
         graph.appliedAutoGain = targetAutoGain;
       }
     } else {
@@ -5242,7 +12225,6 @@ function setPlaybackVolume(value) {
   state._playbackVolumeInitialized = true;
   safeStorage.setItem('tss_playback_volume', String(state.playbackVolume));
   syncCrossfadeVolume();
-  setSoundCloudVolume(state.playbackVolume);
   syncPlaybackVolumeControls();
 }
 
@@ -5271,7 +12253,14 @@ function setCrossfadeSeconds(value) {
   state.crossfadeSeconds = Math.max(0, Math.min(12, Number(value) || 0));
   safeStorage.setItem('tss_crossfade_seconds', String(state.crossfadeSeconds));
   if (state.crossfadeSeconds <= 0) {
-    setCrossfadeStatus('off');
+    if (state.djMode && (state.djAutoMix || state.djCueTrim)) {
+      setCrossfadeStatus('armed');
+    } else {
+      if (state._brandmarkPrefading && typeof syncBrandmarkCrossfade === 'function') {
+        syncBrandmarkCrossfade('cancel-prefade');
+      }
+      setCrossfadeStatus('off');
+    }
   } else {
     setCrossfadeStatus('armed');
     if (previousSeconds <= 0) {
@@ -5299,6 +12288,359 @@ function setCrossfadeStatus(status) {
   if (el.dataset.status !== status) el.dataset.status = status;
 }
 
+function syncBrandmarkCrossfade(phase, { token, durationMs = 0, delayMs = 0, progress = null } = {}) {
+  if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
+  if (phase === 'cancel-prefade' && !state._brandmarkPrefading) {
+    const bm = document.getElementById('tss-deck-brandmark');
+    if (bm?.dataset.prefade) {
+      delete bm.dataset.prefade;
+      delete bm._tssPrefadeAt;
+    }
+    return;
+  }
+  const brandmark = document.getElementById('tss-deck-brandmark');
+  if (!brandmark) {
+    state._brandmarkPrefading = false;
+    return;
+  }
+  const nowPerf = () => (typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now());
+  const instant = typeof motionIsInstant === 'function'
+    ? motionIsInstant()
+    : Boolean(state.reduceVisualEffects || (typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches));
+  const surfaceHidden = () => document.visibilityState === 'hidden';
+
+  if (phase === 'prefade') {
+    if (instant || surfaceHidden() || brandmark.dataset.mixing || brandmark.dataset.prefade === 'true') return;
+    brandmark.dataset.prefade = 'true';
+    brandmark._tssPrefadeAt = nowPerf();
+    state._brandmarkPrefading = true;
+    return;
+  }
+  if (phase === 'cancel-prefade') {
+    state._brandmarkPrefading = false;
+    delete brandmark._tssPrefadeAt;
+    if (brandmark.dataset.prefade) delete brandmark.dataset.prefade;
+    return;
+  }
+
+  const grad = document.getElementById('tss-brandmark-grad');
+  const stopA = document.getElementById('tss-brandmark-stop-a');
+  const stopB = document.getElementById('tss-brandmark-stop-b');
+  if (!grad || !stopA || !stopB) return;
+  const IDLE_ALPHA = 0.86;
+  const DIM_ALPHA = 0.22;
+  const PREFADE_MS = 420;
+  const LEAD_DIM_MS = 240;
+  const ACCENT_OUT_COMPLETE_MS = 240;
+  const ACCENT_OUT_CANCEL_MS = 150;
+  const FEATHER = 4.6;
+  const SPAN = 14 + FEATHER;
+  const ACCENT_RGB = [174, 186, 243];
+  const setWavefront = p => {
+    const clamped = Math.max(0, Math.min(1, Number(p) || 0));
+    brandmark._tssFadeProgress = clamped;
+    const rawX1 = 1 - FEATHER + SPAN * clamped;
+    const x1 = clamped <= 0 || clamped >= 1
+      ? Math.round(rawX1 * 1000) / 1000
+      : Math.round(rawX1 * 50) / 50;
+    const x2 = Math.round((x1 + FEATHER) * 1000) / 1000;
+    const nextX1 = String(x1);
+    const nextX2 = String(x2);
+    if (brandmark._tssGradX1 !== nextX1) {
+      brandmark._tssGradX1 = nextX1;
+      grad.setAttribute('x1', nextX1);
+    }
+    if (brandmark._tssGradX2 !== nextX2) {
+      brandmark._tssGradX2 = nextX2;
+      grad.setAttribute('x2', nextX2);
+    }
+  };
+  const setBaseOpacity = alpha => {
+    const clamped = Math.max(DIM_ALPHA, Math.min(1, Number(alpha) || DIM_ALPHA));
+    brandmark._tssBaseAlpha = clamped;
+    const formatted = String(Math.round(clamped * 200) / 200);
+    if (brandmark._tssStopBOpacity !== formatted) {
+      brandmark._tssStopBOpacity = formatted;
+      stopB.setAttribute('stop-opacity', formatted);
+    }
+  };
+  const resetAccentStop = () => {
+    if (brandmark._tssAccentDrained === false) return;
+    brandmark._tssAccentDrained = false;
+    if (stopA.style) stopA.style.stopColor = 'var(--tss-a,#aebaf3)';
+    stopA.setAttribute('stop-color', '#aebaf3');
+    stopA.setAttribute('stop-opacity', '1');
+  };
+  const setAccentDrain = (strength, [ar, ag, ab]) => {
+    const a = Math.max(0, Math.min(1, Number(strength) || 0));
+    brandmark._tssAccentDrained = true;
+    const alpha = DIM_ALPHA + (1 - DIM_ALPHA) * a;
+    const inv = DIM_ALPHA * (1 - a);
+    const r = Math.round((ar * a + 255 * inv) / alpha);
+    const g = Math.round((ag * a + 255 * inv) / alpha);
+    const b = Math.round((ab * a + 255 * inv) / alpha);
+    const rgb = `rgb(${r},${g},${b})`;
+    const op = String(Math.round(alpha * 200) / 200);
+    if (brandmark._tssDrainColor !== rgb) {
+      brandmark._tssDrainColor = rgb;
+      if (stopA.style) stopA.style.stopColor = rgb;
+      stopA.setAttribute('stop-color', rgb);
+    }
+    if (brandmark._tssDrainOpacity !== op) {
+      brandmark._tssDrainOpacity = op;
+      stopA.setAttribute('stop-opacity', op);
+    }
+  };
+  const estimateCurrentIdleAlpha = atMs => {
+    if (brandmark.dataset.mixing) return brandmark._tssBaseAlpha ?? DIM_ALPHA;
+    if (brandmark.dataset.prefade === 'true') {
+      if (!Number.isFinite(brandmark._tssPrefadeAt)) return DIM_ALPHA;
+      const t = Math.max(0, Math.min(1, (atMs - brandmark._tssPrefadeAt) / PREFADE_MS));
+      return IDLE_ALPHA + (DIM_ALPHA - IDLE_ALPHA) * (1 - Math.pow(1 - t, 3));
+    }
+    return IDLE_ALPHA;
+  };
+  const cancelLoop = () => {
+    if (brandmark._tssFadeRaf != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(brandmark._tssFadeRaf);
+      brandmark._tssFadeRaf = null;
+    }
+    if (brandmark._tssOutroRaf != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(brandmark._tssOutroRaf);
+      brandmark._tssOutroRaf = null;
+    }
+  };
+  const sampleProgress = (atMs, prevMs) => {
+    const timing = brandmark._tssFadeTiming;
+    if (!timing) return brandmark._tssFadeProgress || 0;
+    const context = state._audioContext;
+    if (state._crossfadeSchedule && context && typeof context.state === 'string' && context.state !== 'running'
+        && Number.isFinite(prevMs) && atMs > prevMs) {
+      const dt = atMs - prevMs;
+      timing.startPerf += dt;
+      timing.dimStartPerf += dt;
+    }
+    if (atMs <= timing.startPerf) return timing.baseProgress;
+    const ratio = Math.min(1, (atMs - timing.startPerf) / timing.durationMs);
+    return Math.max(brandmark._tssFadeProgress || 0, timing.baseProgress + (1 - timing.baseProgress) * ratio);
+  };
+  const startLoop = () => {
+    cancelLoop();
+    if (typeof requestAnimationFrame !== 'function' || surfaceHidden()) return;
+    let lastClockMs = nowPerf();
+    const tick = () => {
+      brandmark._tssFadeRaf = null;
+      if (brandmark.dataset.mixing !== 'true' || surfaceHidden()) return;
+      const clockMs = nowPerf();
+      const prevMs = lastClockMs;
+      lastClockMs = clockMs;
+      const timing = brandmark._tssFadeTiming;
+      const p = sampleProgress(clockMs, prevMs);
+      if (timing && (brandmark._tssBaseAlpha ?? DIM_ALPHA) > DIM_ALPHA + 0.001) {
+        const dimT = Math.max(0, Math.min(1, (clockMs - timing.dimStartPerf) / LEAD_DIM_MS));
+        const eased = 1 - Math.pow(1 - dimT, 3);
+        setBaseOpacity(dimT >= 1 ? DIM_ALPHA : timing.startBaseAlpha + (DIM_ALPHA - timing.startBaseAlpha) * eased);
+      }
+      setWavefront(p);
+      if (p < 1 || (brandmark._tssBaseAlpha ?? DIM_ALPHA) > DIM_ALPHA + 0.001) {
+        brandmark._tssFadeRaf = requestAnimationFrame(tick);
+      }
+    };
+    brandmark._tssFadeRaf = requestAnimationFrame(tick);
+  };
+
+  if (phase === 'visibility') {
+    if (surfaceHidden()) {
+      cancelLoop();
+      if (brandmark.dataset.prefade) {
+        state._brandmarkPrefading = false;
+        delete brandmark.dataset.prefade;
+        delete brandmark._tssPrefadeAt;
+      }
+      if (brandmark.dataset.mixing === 'outro') {
+        delete brandmark.dataset.mixing;
+        delete brandmark._tssDrainColor;
+        delete brandmark._tssDrainOpacity;
+        resetAccentStop();
+        setBaseOpacity(DIM_ALPHA);
+        setWavefront(0);
+        brandmark.style.transition = '';
+        brandmark.style.color = '';
+      }
+      return;
+    }
+    if (brandmark.dataset.mixing === 'true' && !instant) {
+      const clockMs = nowPerf();
+      setBaseOpacity(DIM_ALPHA);
+      const p = sampleProgress(clockMs, clockMs);
+      setWavefront(p);
+      if (p < 1) startLoop();
+    }
+    return;
+  }
+  if (phase === 'reset') {
+    cancelLoop();
+    state._brandmarkPrefading = false;
+    delete brandmark._tssFadeToken;
+    delete brandmark._tssFadeTiming;
+    delete brandmark._tssPausedAtPerf;
+    delete brandmark._tssPrefadeAt;
+    delete brandmark._tssDrainColor;
+    delete brandmark._tssDrainOpacity;
+    delete brandmark.dataset.mixing;
+    delete brandmark.dataset.prefade;
+    brandmark.style.transition = '';
+    brandmark.style.color = '';
+    resetAccentStop();
+    setBaseOpacity(DIM_ALPHA);
+    setWavefront(0);
+    return;
+  }
+  if (phase === 'sync-reduced') {
+    if (!instant) return;
+    cancelLoop();
+    state._brandmarkPrefading = false;
+    delete brandmark._tssPrefadeAt;
+    delete brandmark._tssDrainColor;
+    delete brandmark._tssDrainOpacity;
+    delete brandmark.dataset.prefade;
+    if (brandmark.dataset.mixing === 'outro') delete brandmark.dataset.mixing;
+    brandmark.style.transition = '';
+    brandmark.style.color = '';
+    resetAccentStop();
+    setBaseOpacity(DIM_ALPHA);
+    setWavefront(brandmark.dataset.mixing ? 1 : 0);
+    return;
+  }
+  if (phase === 'start') {
+    const startAt = nowPerf();
+    const startBaseAlpha = instant || surfaceHidden() ? DIM_ALPHA : estimateCurrentIdleAlpha(startAt);
+    cancelLoop();
+    state._brandmarkPrefading = false;
+    if (token !== undefined) brandmark._tssFadeToken = token;
+    delete brandmark._tssPausedAtPerf;
+    delete brandmark._tssPrefadeAt;
+    delete brandmark._tssDrainColor;
+    delete brandmark._tssDrainOpacity;
+    delete brandmark.dataset.prefade;
+    const startProgress = Math.max(0, Math.min(1, Number(progress) || 0));
+    brandmark._tssFadeProgress = 0;
+    resetAccentStop();
+    setBaseOpacity(startBaseAlpha);
+    brandmark.style.transition = 'none';
+    brandmark.style.color = '';
+    brandmark.dataset.mixing = 'true';
+    brandmark.style.transition = '';
+    if (instant) {
+      delete brandmark._tssFadeTiming;
+      setBaseOpacity(DIM_ALPHA);
+      setWavefront(1);
+      return;
+    }
+    brandmark._tssFadeTiming = {
+      dimStartPerf: startAt,
+      startBaseAlpha,
+      startPerf: startAt + Math.max(0, Number(delayMs) || 0),
+      durationMs: Math.max(80, Number(durationMs) || 0),
+      baseProgress: startProgress,
+    };
+    setWavefront(startProgress);
+    if (startProgress < 1 || startBaseAlpha > DIM_ALPHA + 0.001) startLoop();
+    return;
+  }
+  if (phase === 'pause') {
+    if (!brandmark.dataset.mixing || brandmark.dataset.mixing === 'outro') return;
+    cancelLoop();
+    brandmark.dataset.mixing = 'paused';
+    brandmark._tssPausedAtPerf = nowPerf();
+    if (Number.isFinite(progress)) setWavefront(progress);
+    return;
+  }
+  if (phase === 'resume') {
+    if (!brandmark.dataset.mixing || brandmark.dataset.mixing === 'outro') return;
+    brandmark.dataset.mixing = 'true';
+    if (brandmark._tssFadeTiming && Number.isFinite(brandmark._tssPausedAtPerf)) {
+      const delta = Math.max(0, nowPerf() - brandmark._tssPausedAtPerf);
+      brandmark._tssFadeTiming.startPerf += delta;
+      brandmark._tssFadeTiming.dimStartPerf += delta;
+    }
+    delete brandmark._tssPausedAtPerf;
+    if (instant) {
+      setBaseOpacity(DIM_ALPHA);
+      setWavefront(1);
+      return;
+    }
+    if ((brandmark._tssFadeProgress || 0) < 1 || (brandmark._tssBaseAlpha ?? DIM_ALPHA) > DIM_ALPHA + 0.001) {
+      startLoop();
+    }
+    return;
+  }
+  if (phase === 'complete' || phase === 'cancel') {
+    if (token !== undefined && brandmark._tssFadeToken !== undefined && brandmark._tssFadeToken !== token) return;
+    if (!brandmark.dataset.mixing && brandmark._tssFadeToken === undefined
+        && brandmark._tssFadeRaf == null && brandmark._tssOutroRaf == null) return;
+    cancelLoop();
+    state._brandmarkPrefading = false;
+    delete brandmark._tssFadeToken;
+    delete brandmark._tssFadeTiming;
+    delete brandmark._tssPausedAtPerf;
+    delete brandmark._tssPrefadeAt;
+    delete brandmark.dataset.prefade;
+    const finishToWhiteFade = () => {
+      delete brandmark.dataset.mixing;
+      delete brandmark._tssDrainColor;
+      delete brandmark._tssDrainOpacity;
+      resetAccentStop();
+      setBaseOpacity(DIM_ALPHA);
+      setWavefront(0);
+      if (instant || surfaceHidden() || typeof requestAnimationFrame !== 'function') {
+        brandmark.style.transition = '';
+        brandmark.style.color = '';
+        return;
+      }
+      brandmark.style.transition = 'none';
+      brandmark.style.color = `rgba(255, 255, 255, ${DIM_ALPHA})`;
+      brandmark._tssOutroRaf = requestAnimationFrame(() => {
+        brandmark._tssOutroRaf = null;
+        if (!brandmark.dataset.mixing) {
+          brandmark.style.transition = '';
+          brandmark.style.color = '';
+        }
+      });
+    };
+    if (instant || surfaceHidden() || typeof requestAnimationFrame !== 'function') {
+      finishToWhiteFade();
+      return;
+    }
+    if (phase === 'complete') setWavefront(1);
+    setBaseOpacity(DIM_ALPHA);
+    brandmark.dataset.mixing = 'outro';
+    const drainDuration = phase === 'complete' ? ACCENT_OUT_COMPLETE_MS : ACCENT_OUT_CANCEL_MS;
+    const drainStart = nowPerf();
+    setAccentDrain(1, ACCENT_RGB);
+    const tickDrain = () => {
+      brandmark._tssOutroRaf = null;
+      if (brandmark.dataset.mixing !== 'outro' || surfaceHidden()) {
+        if (brandmark.dataset.mixing === 'outro') finishToWhiteFade();
+        return;
+      }
+      const clockMs = nowPerf();
+      const t = Math.max(0, Math.min(1, (clockMs - drainStart) / drainDuration));
+      if (t >= 1) {
+        finishToWhiteFade();
+        return;
+      }
+      const eased = 1 - Math.pow(1 - t, 3);
+      setAccentDrain(1 - eased, ACCENT_RGB);
+      brandmark._tssOutroRaf = requestAnimationFrame(tickDrain);
+    };
+    brandmark._tssOutroRaf = requestAnimationFrame(tickDrain);
+  }
+}
+
 function syncCrossfadeControls() {
   const seconds = Math.max(0, Math.min(12, Math.round(state.crossfadeSeconds)));
   const valueText = seconds > 0 ? `${seconds} sec` : 'off';
@@ -5315,21 +12657,78 @@ function syncCrossfadeControls() {
   const readout = document.getElementById('tss-crossfade-seconds');
   if (readout && readout.textContent !== valueText) readout.textContent = valueText;
 
-  document.querySelectorAll('.tss-crossfade-mode').forEach(button => {
+  const modeButtons = card && typeof card.querySelectorAll === 'function'
+    ? (card._modeButtons ||= Array.from(card.querySelectorAll('.tss-crossfade-mode')))
+    : document.querySelectorAll('.tss-crossfade-mode');
+  modeButtons.forEach(button => {
     const active = button.dataset.curve === state.crossfadeCurve;
     const value = active ? 'true' : 'false';
     if (button.dataset.active !== value) button.dataset.active = value;
     if (button.getAttribute('aria-pressed') !== value) button.setAttribute('aria-pressed', value);
+    if (button.dataset.curve === 'custom' && typeof button.setAttribute === 'function') {
+      const presetLabel = state.crossfadePreset || 'S-Curve';
+      const nextTitle = active
+        ? `Custom curve (${presetLabel}) — click to edit`
+        : 'Custom Bézier curve — click to customize';
+      if (button.title !== undefined && button.title !== nextTitle) button.title = nextTitle;
+    }
   });
   const manual = document.getElementById('tss-crossfade-manual');
   if (manual && manual.checked !== state.crossfadeManual) manual.checked = state.crossfadeManual;
+  for (const pipDoc of [typeof document !== 'undefined' ? document : null, state._ownPipWindow?.document]) {
+    const pipMenu = pipDoc?.getElementById?.('tss-pip-sound-menu');
+    if (!pipMenu) continue;
+    const pipSlider = pipMenu.querySelector('#tss-pip-crossfade-slider');
+    if (pipSlider) {
+      if (pipSlider.value !== String(seconds)) pipSlider.value = String(seconds);
+      const pipFill = `${(seconds / 12) * 100}%`;
+      if (pipSlider.style?.getPropertyValue?.('--fill') !== pipFill) pipSlider.style?.setProperty?.('--fill', pipFill);
+    }
+    const pipReadout = pipMenu.querySelector('#tss-pip-crossfade-readout');
+    const pipText = seconds > 0 ? `${seconds}s` : 'off';
+    if (pipReadout && pipReadout.textContent !== pipText) pipReadout.textContent = pipText;
+    pipMenu.querySelectorAll('[data-curve]').forEach(btn => {
+      const pressed = btn.dataset.curve === state.crossfadeCurve ? 'true' : 'false';
+      if (btn.getAttribute('aria-pressed') !== pressed) btn.setAttribute('aria-pressed', pressed);
+    });
+  }
+  if (typeof updateCrossfadeCurvePopup === 'function') updateCrossfadeCurvePopup();
 
+}
+
+function syncFeedLimitControls() {
+  const limit = Math.max(1, Math.min(250, Math.round(Number(state.feedTrackLimit) || 50)));
+  const fill = `${((limit - 1) / 249 * 100).toFixed(1)}%`;
+  const slider = document.getElementById('tss-hub-feed-limit');
+  if (slider) {
+    if (slider.value !== String(limit)) slider.value = String(limit);
+    if (slider.style?.getPropertyValue?.('--tss-feed-limit-fill') !== fill) {
+      slider.style?.setProperty?.('--tss-feed-limit-fill', fill);
+    }
+  }
+  const numberInput = document.getElementById('tss-hub-feed-limit-number');
+  if (numberInput && document.activeElement !== numberInput && numberInput.value !== String(limit)) {
+    numberInput.value = String(limit);
+  }
+}
+
+function setFeedTrackLimit(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return;
+  const clamped = Math.max(1, Math.min(250, Math.round(numeric)));
+  state.feedTrackLimit = clamped;
+  safeStorage.setItem('tss_feed_track_limit', String(clamped));
+  syncFeedLimitControls();
 }
 
 function discoverSoundCloudClientId(excluded = new Set()) {
   const rejected = excluded;
   const usable = id => id && !rejected.has(id);
   if (usable(state._clientId)) return state._clientId;
+  if (usable(state._observedClientId)) {
+    state._clientId = state._observedClientId;
+    return state._clientId;
+  }
   try {
     const entries = performance.getEntriesByType('resource');
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -5339,6 +12738,7 @@ function discoverSoundCloudClientId(excluded = new Set()) {
         const id = url.searchParams.get('client_id');
         if (id && /^[A-Za-z0-9_-]+$/.test(id) && usable(id)) {
           state._clientId = id;
+          if (typeof rememberSoundCloudClientId === 'function') rememberSoundCloudClientId(id, false);
           return id;
         }
       } catch (_) {}
@@ -5349,7 +12749,7 @@ function discoverSoundCloudClientId(excluded = new Set()) {
 
 function syncBrowserNowPlaying() {
   const ti = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue?.[state.pos];
-  const meta = state.active && Number.isInteger(ti) ? state.meta[ti] : null;
+  const meta = state.active && !state._nativeHandoffActive && Number.isInteger(ti) ? state.meta[ti] : null;
 
   if (!meta?.title) {
     state._ctxMenuClose?.();
@@ -5432,33 +12832,165 @@ async function discoverSoundCloudClientIdFromBundle(excluded = new Set(), option
     }
     return existing;
   }
-  const scripts = [...document.scripts]
-    .map(script => script.src)
-    .filter(src => /a-v2\.sndcdn\.com\/assets\/.+\.js/i.test(src))
-    .slice(-8);
-  for (const src of scripts) {
-    try {
-      const response = await fetchSoundCloudResource(src, 'text', {
-        ...options, diagnosticStage: 'client-bundle',
-      });
-      if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
-      const matches = String(response.data || '').matchAll(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9_-]{20,})["']/g);
-      const match = [...matches].find(candidate => !rejected.has(candidate[1]));
-      if (match) {
-        state._clientId = match[1];
-        if (options.diagnosticTrace) {
-          options.diagnosticTrace.clientIdFound = true;
-          options.diagnosticTrace.clientIdSource = 'bundle';
+  const liveBundleUrls = [];
+  const domBundleUrls = [];
+  const seenSrc = new Set();
+  const validBundleUrl = src => /^https?:\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/.+\.js(?:\?|#|$)/i.test(src);
+  if (typeof state !== 'undefined' && Array.isArray(state?._liveSyncBundleUrls)) {
+    for (const raw of state._liveSyncBundleUrls) {
+      const src = String(raw || '');
+      if (!src || seenSrc.has(src) || !validBundleUrl(src)) continue;
+      seenSrc.add(src);
+      liveBundleUrls.push(src);
+    }
+  }
+  for (const script of [...(typeof document !== 'undefined' && document?.scripts ? document.scripts : [])]) {
+    const src = String(script?.src || '');
+    if (!src || seenSrc.has(src) || !validBundleUrl(src)) continue;
+    seenSrc.add(src);
+    domBundleUrls.push(src);
+  }
+  const highSignalRe = /(?:^|[\/._-])(?:config|env|app|main|index|client|bootstrap|vendor|runtime)(?:[\/._-]|$)/i;
+  const orderBundleUrls = urls => [
+    ...urls.filter(src => highSignalRe.test(src)),
+    ...urls.filter(src => !highSignalRe.test(src)),
+  ];
+  // Prioritize freshly harvested live-HTML bundles ahead of Day-0 DOM scripts on 24h+ tabs.
+  const prioritized = [
+    ...orderBundleUrls(liveBundleUrls),
+    ...orderBundleUrls([...domBundleUrls].reverse()),
+  ].slice(0, 24);
+  const bundlePatterns = [
+    /(?:client_id|clientId)[\x22\x27]?\s*[:=]\s*[\x22\x27]([A-Za-z0-9_-]{20,64})[\x22\x27]/g,
+    /[\x22\x27]x-client-id[\x22\x27]\s*[,:]\s*[\x22\x27]([A-Za-z0-9_-]{20,64})[\x22\x27]/gi,
+    /[?&]client_id=([A-Za-z0-9_-]{20,64})(?:[&\x22\x27\x60\s]|$)/g,
+  ];
+  const scanBundleUrls = async urls => {
+    for (const src of urls) {
+      try {
+        const response = await fetchSoundCloudResource(src, 'text', {
+          ...options, diagnosticStage: 'client-bundle',
+        });
+        if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
+        const text = String(response.data || '');
+        for (const pattern of bundlePatterns) {
+          const matches = text.matchAll(pattern);
+          const match = [...matches].find(candidate => !rejected.has(candidate[1]));
+          if (match) {
+            state._clientId = match[1];
+            if (typeof rememberSoundCloudClientId === 'function') rememberSoundCloudClientId(match[1], false);
+            if (options.diagnosticTrace) {
+              options.diagnosticTrace.clientIdFound = true;
+              options.diagnosticTrace.clientIdSource = 'bundle';
+            }
+            return state._clientId;
+          }
         }
-        return state._clientId;
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        recordPlaybackDiagnostic('client-discovery-failed', { error: playbackErrorName(error) });
       }
-    } catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      recordPlaybackDiagnostic('client-discovery-failed', { error: playbackErrorName(error) });
+    }
+    return '';
+  };
+  const discovered = await scanBundleUrls(prioritized);
+  if (discovered) return discovered;
+  if (options.allowHtmlRefresh && rejected.size > 0 && (domBundleUrls.length > 0 || liveBundleUrls.length > 0)
+      && typeof state !== 'undefined' && state) {
+    const refreshNow = Date.now();
+    if (refreshNow - (Number(state._lastBundleHtmlRefreshAt) || 0) >= 60_000) {
+      state._lastBundleHtmlRefreshAt = refreshNow;
+      try {
+        const refreshUrl = new URL('https://soundcloud.com/discover');
+        refreshUrl.searchParams.set('_tss_bundle_sync', String(refreshNow));
+        const htmlRes = await fetchSoundCloudResource(refreshUrl, 'text', {
+          signal: options.signal,
+          cache: 'no-store',
+          credentials: 'omit',
+          headers: { Accept: 'text/html' },
+        });
+        if (options.signal?.aborted) throw new DOMException('Playback canceled', 'AbortError');
+        if (htmlRes?.ok && typeof htmlRes.data === 'string') {
+          const freshUrls = [];
+          const scriptSrcRe = /<script\b[^>]*\bsrc=[\x22\x27](https?:\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/[^\x22\x27\s>]+\.js(?:\?[^\x22\x27\s>]*)?)[\x22\x27]/gi;
+          let m;
+          while ((m = scriptSrcRe.exec(htmlRes.data)) && freshUrls.length < 24) {
+            if (!freshUrls.includes(m[1])) freshUrls.push(m[1]);
+          }
+          if (freshUrls.length) {
+            const combined = [...freshUrls];
+            for (const prev of Array.isArray(state._liveSyncBundleUrls) ? state._liveSyncBundleUrls : []) {
+              if (combined.length >= 24) break;
+              if (prev && !combined.includes(prev)) combined.push(prev);
+            }
+            state._liveSyncBundleUrls = combined;
+            const unseenFresh = orderBundleUrls(freshUrls.filter(src => !seenSrc.has(src))).slice(0, 12);
+            const refreshedId = await scanBundleUrls(unseenFresh);
+            if (refreshedId) return refreshedId;
+          }
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+      }
+    }
+  }
+  if (typeof safeStorage !== 'undefined' && typeof safeStorage?.getItem === 'function') {
+    const storageKey = typeof LAST_GOOD_CLIENT_ID_KEY === 'string' ? LAST_GOOD_CLIENT_ID_KEY : 'tss_last_good_client_id';
+    const persisted = String(safeStorage.getItem(storageKey) || '').trim();
+    if (/^[A-Za-z0-9_-]{16,64}$/.test(persisted) && !rejected.has(persisted)) {
+      state._clientId = persisted;
+      if (options.diagnosticTrace) {
+        options.diagnosticTrace.clientIdFound = true;
+        options.diagnosticTrace.clientIdSource = 'persisted-cache';
+      }
+      return persisted;
     }
   }
   if (options.diagnosticTrace) options.diagnosticTrace.clientIdFound = false;
   return '';
+}
+
+function parseSignedStreamExpiryMs(streamUrl) {
+  if (typeof streamUrl !== 'string' || !streamUrl) return null;
+  const toValidMs = raw => {
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    if (num >= 1_500_000_000 && num <= 9_999_999_999) return Math.round(num * 1000);
+    if (num >= 1_500_000_000_000 && num <= 9_999_999_999_999) return Math.round(num);
+    return null;
+  };
+  try {
+    const parsed = new URL(streamUrl);
+    const params = parsed.searchParams;
+    for (const key of ['Expires', 'expires', 'exp', 'e']) {
+      const direct = params.get(key);
+      if (direct) {
+        const ms = toValidMs(direct);
+        if (ms !== null) return ms;
+      }
+    }
+    const amzDate = params.get('X-Amz-Date') || params.get('x-amz-date');
+    const amzExpires = params.get('X-Amz-Expires') || params.get('x-amz-expires');
+    if (amzDate && amzExpires) {
+      const m = amzDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+      const ttlSec = Number(amzExpires);
+      if (m && Number.isFinite(ttlSec) && ttlSec > 0 && ttlSec <= 604800) {
+        const baseMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+        if (Number.isFinite(baseMs)) return baseMs + Math.round(ttlSec * 1000);
+      }
+    }
+    const cfPolicy = params.get('Policy') || params.get('policy');
+    if (cfPolicy && cfPolicy.length <= 4096 && typeof atob === 'function') {
+      const stdB64 = cfPolicy.replace(/-/g, '+').replace(/_/g, '=').replace(/~/g, '/');
+      const jsonText = atob(stdB64);
+      const epochMatch = jsonText.match(/"AWS:EpochTime"\s*:\s*(\d{10,13})/);
+      if (epochMatch) {
+        const ms = toValidMs(epochMatch[1]);
+        if (ms !== null) return ms;
+      }
+    }
+  } catch (_) {}
+  return null;
 }
 
 async function resolveProgressiveStreams(track, clientId, options = {}) {
@@ -5470,13 +13002,16 @@ async function resolveProgressiveStreams(track, clientId, options = {}) {
         format: { protocol: item?.protocol, mime_type: item?.mimeType },
       }))
       : []);
+  const scoreProgressiveCodec = item => {
+    const hint = `${item?.format?.mime_type || ''} ${item?.preset || ''} ${item?.url || ''}`.toLowerCase();
+    if (/audio\/(mpeg|mp3)|\bmp3\b/.test(hint)) return 3;
+    if (/audio\/mp4|\b(?:mp4a|aac)\b/.test(hint)) return 2;
+    if (/\b(?:ogg|opus|vorbis)\b/.test(hint)) return 0;
+    return 1;
+  };
   const progressive = transcodings
     .filter(item => item?.url && item?.format?.protocol === 'progressive')
-    .sort((a, b) => {
-      const aMpeg = /audio\/(mpeg|mp3)/i.test(a?.format?.mime_type || '') ? 1 : 0;
-      const bMpeg = /audio\/(mpeg|mp3)/i.test(b?.format?.mime_type || '') ? 1 : 0;
-      return bMpeg - aMpeg;
-    });
+    .sort((a, b) => scoreProgressiveCodec(b) - scoreProgressiveCodec(a));
   const urls = [];
   let authFailed = false;
   const diagnosticTrace = options.diagnosticTrace;
@@ -5598,7 +13133,10 @@ function cachedStreamDrmContext(meta, streamUrl) {
   if (!context) return null;
   const expectedId = soundCloudInteger(meta?.soundcloudId ?? meta?.id, 1);
   const actualId = soundCloudInteger(cached.soundcloudId, 1);
-  if (Date.now() - cached.ts >= 30 * 60 * 1000 || !cached.urls?.includes(streamUrl)
+  const now = Date.now();
+  if (now - cached.ts >= 30 * 60 * 1000
+      || (Number.isFinite(cached.expiresAt) && now >= cached.expiresAt)
+      || !cached.urls?.includes(streamUrl)
       || (expectedId !== null && actualId !== expectedId)) {
     throw new DOMException('DRM context unavailable', 'NotSupportedError');
   }
@@ -5606,7 +13144,17 @@ function cachedStreamDrmContext(meta, streamUrl) {
 }
 
 function soundCloudHlsConfig(drmContext = null, options = {}) {
-  const config = { enableWorker: true, lowLatencyMode: false, backBufferLength: 30 };
+  // Disable the shared hls.js Worker so overlapping two-deck lifecycles cannot
+  // retain destroyed Transmuxer instances in workerStore, and cap forward MSE
+  // buffering so backBufferLength actually evicts segments on multi-day runs.
+  const config = {
+    enableWorker: false,
+    lowLatencyMode: false,
+    backBufferLength: 30,
+    maxBufferLength: 20,
+    maxMaxBufferLength: 30,
+    maxBufferSize: 2 * 1000 * 1000,
+  };
   if (!drmContext) return config;
   if (drmContext.keySystem !== 'com.widevine.alpha'
       || typeof drmContext.licenseAuthToken !== 'string' || !drmContext.licenseAuthToken.trim()) {
@@ -5655,8 +13203,12 @@ async function resolveHlsStreamUrls(track, clientId, options = {}) {
       const authorization = track.track_authorization || track.trackAuthorization;
       if (authorization) endpoint.searchParams.set('track_authorization', authorization);
       const quality = `${transcoding.preset || ''} ${transcoding.quality || ''} ${endpoint.pathname}`.toLowerCase();
-      const priority = /aac[_-]?160|160k/.test(quality) ? 0
-        : (/aac[_-]?96|96k/.test(quality) ? 1 : 2);
+      const codecHint = `${transcoding?.format?.mime_type || transcoding?.mimeType || ''} ${quality}`.toLowerCase();
+      const priority = /aac[_-]?160|160k/.test(codecHint) ? 0
+        : /aac[_-]?96|96k/.test(codecHint) ? 1
+          : /\b(?:mp4a|aac)|audio\/mp4/.test(codecHint) ? 2
+            : /\b(?:mpeg|mp3)\b/.test(codecHint) ? 3
+              : /\b(?:ogg|opus|vorbis)\b/.test(codecHint) ? 5 : 4;
       candidates.push({ url: endpoint, priority, encryption });
     } catch (_) {}
   }
@@ -5884,7 +13436,21 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
       ? Math.round(Number(player.bandwidthEstimate)) : 0;
   };
   const onFragmentBuffered = () => {
-    if (!diagnosticTrace || state._deckHlsPlayers[index] !== player) return;
+    if (state._deckHlsPlayers[index] !== player || state._decks[index] !== audio) return;
+    if (audio.paused && audio.buffered?.length > 0) {
+      try {
+        const startPts = Number(audio.buffered.start(0));
+        const endPts = Number(audio.buffered.end(0));
+        const current = Number(audio.currentTime);
+        if (Number.isFinite(startPts) && startPts > 0 && startPts <= 0.25
+            && (!Number.isFinite(current) || current < startPts)
+            && (!Number.isFinite(endPts) || endPts > startPts)) {
+          audio.currentTime = startPts;
+        }
+      } catch (_) {}
+    }
+    audio._tssCheckBufferedReady?.();
+    if (!diagnosticTrace) return;
     diagnosticTrace.hlsBufferedFragmentCount = (Number(diagnosticTrace.hlsBufferedFragmentCount) || 0) + 1;
     if (!diagnosticTrace.hlsFirstFragmentBuffered) {
       diagnosticTrace.hlsFirstFragmentBuffered = true;
@@ -5962,6 +13528,10 @@ async function prepareHlsDeck(audio, index, streamUrl, timeout, signal, isCurren
     return { supported: true, ready: false, player, source: audio.src, failed: true };
   } finally {
     signal?.removeEventListener('abort', abortPreparation);
+    try {
+      if (HlsCtor.Events.MEDIA_ATTACHED) player.off?.(HlsCtor.Events.MEDIA_ATTACHED, onMediaAttached);
+      if (HlsCtor.Events.MANIFEST_PARSED) player.off?.(HlsCtor.Events.MANIFEST_PARSED, onManifestParsed);
+    } catch (_) {}
   }
 }
 
@@ -5990,7 +13560,8 @@ async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurr
   audio._tssDeferAudioGraph = false;
   if (!state._deckAudioGraphs[index]?.source
       && (state._audioContext || state.autoLevel || state.eqEnabled
-        || state.safetyClipper || state.crossfadeSeconds > 0)) {
+        || state.safetyClipper || state.crossfadeSeconds > 0
+        || (state.djMode && (state.djAutoMix || state.djBassSwap || state.djCueTrim || state.djCommentaryMode === 'voice')))) {
     if (!ensureAutoLevelAudioGraph() || state._decks[index] !== audio
         || state._deckAudioGraphs[index]?.sourceAudio !== audio) {
       loaded.ready = false;
@@ -6001,9 +13572,12 @@ async function loadStreamOnDeck(audio, index, streamUrl, timeout, signal, isCurr
 }
 
 function hydrationTrackForPlayback(meta) {
-  const roots = pageWindow.__sc_hydration;
+  const roots = typeof soundCloudHydrationRoots === 'function'
+    ? soundCloudHydrationRoots()
+    : pageWindow.__sc_hydration;
   if (!Array.isArray(roots)) return null;
-  let candidates = state._hydrationTrackCandidates?.get?.(roots);
+  const cachedEntry = state._hydrationTrackCandidates?.get?.(roots);
+  let candidates = cachedEntry?.length === roots.length ? cachedEntry.candidates : null;
   if (!candidates) {
     candidates = [];
     const seen = new WeakSet();
@@ -6018,7 +13592,7 @@ function hydrationTrackForPlayback(meta) {
       }
     }
     if (typeof WeakMap === 'function') {
-      (state._hydrationTrackCandidates ||= new WeakMap()).set(roots, candidates);
+      (state._hydrationTrackCandidates ||= new WeakMap()).set(roots, { length: roots.length, candidates });
     }
   }
   return candidates.find(value => soundCloudTrackMatches(meta, value)) || null;
@@ -6061,7 +13635,8 @@ async function resolveCrossfadeStreams(meta, options = {}) {
   }
   const now = Date.now();
   for (const [cachedKey, value] of state._streamCache) {
-    if (now - value.ts >= 30 * 60 * 1000) state._streamCache.delete(cachedKey);
+    const expiredByClock = Number.isFinite(value?.expiresAt) && now >= value.expiresAt - 60_000;
+    if (now - value.ts >= 30 * 60 * 1000 || expiredByClock) state._streamCache.delete(cachedKey);
   }
   if (options.forceRefresh) state._streamCache.delete(key);
   let cached = state._streamCache.get(key);
@@ -6074,6 +13649,7 @@ async function resolveCrossfadeStreams(meta, options = {}) {
   if (cached?.urls?.length) {
     state._streamCache.delete(key);
     state._streamCache.set(key, cached);
+    if (options.prepStats) options.prepStats.streamSource = 'stream-cache';
     if (diagnosticTrace) {
       diagnosticTrace.streamSource = 'stream-cache';
       for (const url of cached.urls) {
@@ -6106,11 +13682,19 @@ async function resolveCrossfadeStreams(meta, options = {}) {
     let authFailed = false;
     const resolveTrack = async (track, source) => {
       checkCurrent();
+      if (options.prepStats && source) options.prepStats.streamSource = source;
       if (diagnosticTrace && source) diagnosticTrace.streamSource = source;
       if (!soundCloudTrackMatches(meta, track)) return [];
       trackMetadataFound = true;
       if (diagnosticTrace) diagnosticTrace.trackMetadataFound = true;
-      if (!meta.artist || meta.artist === '—') {
+      if (typeof refreshExistingTrackMeta === 'function' && typeof metaFromSoundCloudTrack === 'function') {
+        const freshMeta = metaFromSoundCloudTrack(track, meta.sourcePage, meta.playlistPosition);
+        if (freshMeta && refreshExistingTrackMeta(meta, freshMeta, { fromApi: true })) {
+          if (typeof renderList === 'function') renderList();
+          if (typeof updateHub === 'function') updateHub();
+          if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+        }
+      } else if (!meta.artist || meta.artist === '—') {
         Object.assign(meta, mergeTrackMeta(meta, metaFromSoundCloudTrack(track, meta.sourcePage, meta.playlistPosition)));
       }
       if (syncTrackPlaybackAccess(meta, track)) {
@@ -6182,8 +13766,14 @@ async function resolveCrossfadeStreams(meta, options = {}) {
           (state._staleEmbeddedTracks ||= new WeakSet()).add(meta);
         }
         state._streamCache.delete(key);
+        const urlExpiries = typeof parseSignedStreamExpiryMs === 'function'
+          ? urls.map(u => parseSignedStreamExpiryMs(u)).filter(t => Number.isFinite(t) && t > 0)
+          : [];
+        const expiresAt = urlExpiries.length ? Math.min(...urlExpiries) : null;
         state._streamCache.set(key, {
-          urls, ts: Date.now(), ...(drmContexts?.size ? { drmContexts } : {}),
+          urls, ts: Date.now(),
+          ...(expiresAt !== null ? { expiresAt } : {}),
+          ...(drmContexts?.size ? { drmContexts } : {}),
           soundcloudId: soundCloudInteger(track.id, 1) ?? soundCloudInteger(track.soundcloudId, 1)
             ?? soundCloudInteger(meta.soundcloudId, 1),
         });
@@ -6191,9 +13781,9 @@ async function resolveCrossfadeStreams(meta, options = {}) {
       }
       return urls;
     };
-    // A failed signed stream must refresh its metadata/authorization too,
+    // A failed or audio-replaced track must refresh its metadata/authorization too,
     // not resolve another URL from the same stale page snapshot.
-    const skipEmbedded = Boolean(options.forceRefresh || state._staleEmbeddedTracks?.has?.(meta));
+    const skipEmbedded = Boolean(options.forceRefresh || meta?._audioReplacedAt || state._staleEmbeddedTracks?.has?.(meta));
     const hydrated = skipEmbedded ? null : hydrationTrackForPlayback(meta);
     const embedded = skipEmbedded ? null
       : (hydrated || (Array.isArray(meta.transcodings) && meta.transcodings.length ? meta : null));
@@ -6274,7 +13864,11 @@ async function resolveCrossfadeStreams(meta, options = {}) {
     }
     if (diagnosticTrace) diagnosticTrace.authFailed = true;
     rejected.add(clientId);
-    if (state._clientId === clientId) state._clientId = '';
+    if (!trackMetadataFound && typeof forgetSoundCloudClientId === 'function') {
+      forgetSoundCloudClientId(clientId);
+    } else if (state._clientId === clientId) {
+      state._clientId = '';
+    }
   }
   if (diagnosticTrace) diagnosticTrace.reason = 'authorization-rejected';
   return [];
@@ -6300,6 +13894,7 @@ function resetDeck(audio, index) {
     safely(() => hls.destroy());
   }
   safely(() => audio.pause());
+  safely(() => { if (audio.srcObject) audio.srcObject = null; });
   safely(() => audio.removeAttribute('src'));
   safely(() => audio.load());
   if (Number.isInteger(index)) {
@@ -6307,6 +13902,7 @@ function resetDeck(audio, index) {
     state._deckHlsFailed[index] = false;
     state._deckTracks[index] = null;
     state._deckGains[index] = 0;
+    if (state._deckPrepStats) state._deckPrepStats[index] = null;
     const graph = state._deckAudioGraphs[index];
     if (graph && state._audioContext) {
       const now = state._audioContext.currentTime;
@@ -6318,8 +13914,11 @@ function resetDeck(audio, index) {
       graph.autoGainMaster = null;
       safely(() => setAudioParamImmediately(graph.autoGain.gain, 1, now));
       safely(() => setAudioParamImmediately(graph.mixGain.gain, 0, now));
+      if (graph.djBassFilter) safely(() => setAudioParamImmediately(graph.djBassFilter.gain, 0, now));
       graph.appliedAutoGain = 1;
       graph.appliedMixGain = 0;
+      graph.appliedDjBassGain = 0;
+      graph.djBassPreHold = false;
     }
   }
   safely(() => { audio.volume = state._deckAudioGraphs[index] ? 1 : 0; });
@@ -6347,6 +13946,8 @@ function stopCrossfadeDecks() {
   state._crossfadeStreamWarmup?.controller?.abort();
   state._crossfadeStreamWarmup = null;
   state._crossfadeSchedule = null;
+  state._endedGapMonitor = null;
+  state._handoffAudioMonitor = null;
   state._decks.forEach((audio, index) => resetDeck(audio, index));
   state._deckIndex = -1;
   state._deckTrack = null;
@@ -6435,6 +14036,7 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
     diagnosticTrace.reason = 'checking-audio-graph';
   }
   if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+      || (state.djMode && (state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim))
       || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
     if (!ensureAutoLevelAudioGraph()) {
       if (diagnosticTrace) {
@@ -6443,6 +14045,9 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
         diagnosticTrace.reason = 'audio-graph-unavailable';
       }
       return null;
+    }
+    if (state.djMode && state.djCommentaryMode === 'voice' && typeof ensureDjVoiceAudioBus === 'function') {
+      ensureDjVoiceAudioBus();
     }
   }
   let audio = ensureCrossfadeDecks()[index];
@@ -6473,6 +14078,11 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
   try {
     if (!options.forceRefresh && options.preparedMeta === meta && state._deckTracks[index] === ti
         && audio.currentSrc && audio.readyState >= 2 && !state._deckHlsFailed?.[index]) {
+      const existingPrep = state._deckPrepStats?.[index];
+      if (existingPrep && existingPrep.ti === ti) {
+        existingPrep.reusedReadyDeck = true;
+        existingPrep.token = requestToken;
+      }
       if (state._transitionDiagnostics) recordTransitionDiagnostic('preparation-reused', {
         deckIndex: index, trackIndex: ti, token: requestToken, ready: true, foreground: Boolean(options.foreground),
       });
@@ -6493,18 +14103,36 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
       diagnosticTrace.stage = 'stream-resolution';
       diagnosticTrace.reason = 'resolving-streams';
     }
-    const streamsStartedAt = state._transitionDiagnostics ? performance.now() : 0;
-    let streamUrls = options.resolvedStreamPromise
-      ? await options.resolvedStreamPromise
-      : null;
+    const prepNow = () => typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now() : Date.now();
+    const prepStats = {
+      ti, token: requestToken, reusedReadyDeck: false, preflightAdopted: false,
+      streamSource: '', streamLookupMs: 0, mediaWaitOutcome: '', mediaWaitElapsedMs: 0,
+      preparedAt: Date.now(),
+    };
+    const streamsStartedAt = prepNow();
+    const resolvedPromise = warmup && warmup === state._crossfadeStreamWarmup
+        && warmup.epoch === epoch && warmup.nextTi === ti && warmup.meta === meta
+        && warmup.promise
+      ? warmup.promise : options.resolvedStreamPromise;
+    let streamUrls = resolvedPromise ? await resolvedPromise : null;
+    if (streamUrls?.length && warmup?.streamSource) prepStats.streamSource = warmup.streamSource;
+    if (warmup?.preflightFailedUrl && Array.isArray(streamUrls)) {
+      streamUrls = streamUrls.filter(url => url !== warmup.preflightFailedUrl);
+    }
     if (!streamUrls?.length) {
       streamUrls = await resolveCrossfadeStreams(meta, {
-        ...options, signal: controller.signal, isCurrent: requestIsCurrent,
+        ...options,
+        prepStats,
+        forceRefresh: Boolean(options.forceRefresh || warmup?.preflightFailedUrl),
+        signal: controller.signal,
+        isCurrent: requestIsCurrent,
       });
     }
+    prepStats.streamLookupMs = Math.max(0, Math.round(prepNow() - streamsStartedAt));
     if (state._transitionDiagnostics) recordTransitionDiagnostic('streams-resolved', {
       deckIndex: index, trackIndex: ti, token: requestToken,
-      streamCandidateCount: streamUrls?.length || 0, elapsedMs: performance.now() - streamsStartedAt,
+      streamCandidateCount: streamUrls?.length || 0, elapsedMs: prepNow() - streamsStartedAt,
     });
     if (!requestIsCurrent()) return null;
     if (!streamUrls.length) {
@@ -6522,7 +14150,19 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
       const streamUrl = streamUrls[candidateIndex];
       if (!requestIsCurrent()) return null;
       if (diagnosticTrace) diagnosticTrace.mediaCandidateOrdinal = candidateIndex + 1;
-      const drmContext = cachedStreamDrmContext(meta, streamUrl);
+      let drmContext = null;
+      try {
+        drmContext = cachedStreamDrmContext(meta, streamUrl);
+      } catch (drmError) {
+        if (drmError?.name === 'NotSupportedError') {
+          if (diagnosticTrace) {
+            diagnosticTrace.stage = 'drm-capability';
+            diagnosticTrace.reason = 'drm-token-unavailable';
+          }
+          continue;
+        }
+        throw drmError;
+      }
       audio = resetDeckForStream(audio, index, drmContext);
       if (!audio || !requestIsCurrent()) return null;
       const hlsStream = isHlsStreamUrl(streamUrl);
@@ -6545,7 +14185,10 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
         { preflight, drmContext },
       );
       if (preflight && (loaded.player === preflight.player || preflight.failed)) {
-        if (loaded.player === preflight.player) preflight.adopted = true;
+        if (loaded.player === preflight.player) {
+          preflight.adopted = true;
+          prepStats.preflightAdopted = true;
+        }
         warmup.preflight = null;
       }
       const sourceIsCurrent = loaded.player
@@ -6570,6 +14213,9 @@ async function runCrossfadeDeckPreparation(index, ti, options = {}) {
       const ready = loaded.ready;
       if (ready) {
         if (!deckIsPreviewLimited(meta, audio)) {
+          prepStats.mediaWaitOutcome = audio._tssWaitOutcome || '';
+          prepStats.mediaWaitElapsedMs = Number(audio._tssWaitElapsedMs) || 0;
+          (state._deckPrepStats ||= [null, null])[index] = prepStats;
           if (diagnosticTrace) diagnosticTrace.reason = 'media-ready';
           return audio;
         }
@@ -6710,7 +14356,19 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
       for (const streamUrl of streamUrls) {
         if (!isCurrent()) return null;
         const previousAudio = audio;
-        const drmContext = cachedStreamDrmContext(meta, streamUrl);
+        let drmContext = null;
+        try {
+          drmContext = cachedStreamDrmContext(meta, streamUrl);
+        } catch (drmError) {
+          if (drmError?.name === 'NotSupportedError') {
+            if (diagnosticTrace) {
+              diagnosticTrace.stage = 'drm-capability';
+              diagnosticTrace.reason = 'drm-token-unavailable';
+            }
+            continue;
+          }
+          throw drmError;
+        }
         audio = resetDeckForStream(audio, index, drmContext);
         if (!audio) return null;
         if (recoveryOwner?.deck === previousAudio) recoveryOwner.deck = audio;
@@ -6790,6 +14448,13 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
     if (result === null) return null;
     if (recoveryOutcome === 'pending') recoveryOutcome = result ? 'recovered' : 'recovery-failed';
     reportRecoveryResult(result);
+    if (!result) {
+      const failedPlayer = state._deckHlsPlayers?.[index];
+      if (failedPlayer) {
+        state._deckHlsPlayers[index] = null;
+        try { failedPlayer.destroy(); } catch (_) {}
+      }
+    }
     return result;
   } catch (error) {
     if (!ownsDeck() || state._userPaused) return null;
@@ -6813,16 +14478,24 @@ async function recoverCurrentDeckStream(audio, position, reason = 'unknown', att
       mediaErrorCode: Number(audio.error?.code) || 0,
     });
     reportRecoveryResult(false);
+    const failedPlayer = state._deckHlsPlayers?.[index];
+    if (failedPlayer) {
+      state._deckHlsPlayers[index] = null;
+      try { failedPlayer.destroy(); } catch (_) {}
+    }
     return false;
   }
 }
 async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () => true, diagnosticTrace = null) {
-  const startedAt = diagnosticTrace && typeof performance !== 'undefined' ? performance.now() : 0;
+  const startedAt = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
   const recordState = outcome => {
+    const waitElapsedMs = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+    audio._tssWaitOutcome = outcome;
+    audio._tssWaitElapsedMs = waitElapsedMs;
     if (!diagnosticTrace) return;
     diagnosticTrace.mediaWaitOutcome = outcome;
-    diagnosticTrace.mediaWaitElapsedMs = typeof performance !== 'undefined'
-      ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+    diagnosticTrace.mediaWaitElapsedMs = waitElapsedMs;
     diagnosticTrace.readyState = Number(audio.readyState) || 0;
     diagnosticTrace.networkState = Number(audio.networkState) || 0;
     diagnosticTrace.mediaErrorCode = Number(audio.error?.code) || 0;
@@ -6837,22 +14510,45 @@ async function waitForDeck(audio, timeout = 5000, signal = null, isCurrent = () 
   }
   return new Promise(resolve => {
     let settled = false;
+    const hasBufferedLead = () => {
+      try {
+        const current = Number(audio.currentTime) || 0;
+        for (let i = 0; i < (audio.buffered?.length || 0); i++) {
+          if (audio.buffered.start(i) <= current + 0.05 && audio.buffered.end(i) >= current + 0.25) return true;
+        }
+      } catch (_) {}
+      return false;
+    };
     const finish = outcome => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (audio._tssCheckBufferedReady === onLoadedData) delete audio._tssCheckBufferedReady;
       audio.removeEventListener('canplay', onReady);
+      audio.removeEventListener('loadeddata', onLoadedData);
+      audio.removeEventListener('loadedmetadata', onLoadedData);
+      audio.removeEventListener('progress', onLoadedData);
       audio.removeEventListener('error', onError);
       signal?.removeEventListener('abort', onAbort);
       recordState(outcome);
-      const ready = outcome === 'canplay' || outcome === 'timeout-ready';
+      const ready = outcome === 'canplay' || outcome === 'loadeddata' || outcome === 'timeout-ready';
       resolve(ready && !signal?.aborted && isCurrent());
     };
     const onReady = () => finish('canplay');
+    const onLoadedData = () => {
+      if (audio.readyState < 2 || !hasBufferedLead()) return;
+      Promise.resolve().then(() => {
+        if (!settled && audio.readyState >= 2 && hasBufferedLead()) finish('loadeddata');
+      });
+    };
     const onError = () => finish('error');
     const onAbort = () => finish('aborted');
     const timer = setTimeout(() => finish(audio.readyState >= 2 ? 'timeout-ready' : 'timeout'), timeout);
+    audio._tssCheckBufferedReady = onLoadedData;
     audio.addEventListener('canplay', onReady, { once: true });
+    audio.addEventListener('loadeddata', onLoadedData);
+    audio.addEventListener('loadedmetadata', onLoadedData);
+    audio.addEventListener('progress', onLoadedData);
     audio.addEventListener('error', onError, { once: true });
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted || !isCurrent()) onAbort();
@@ -6864,6 +14560,44 @@ function crossfadeGains(t, curve = state.crossfadeCurve) {
   if (clamped === 0) return [1, 0];
   if (clamped === 1) return [0, 1];
   if (curve === 'clean') return [1 - clamped, clamped];
+  if (curve === 'custom' || (curve && typeof curve === 'object')) {
+    const cfg = curve && typeof curve === 'object' ? curve : state.customCrossfade;
+    const clamp01 = (val, fb) => {
+      const n = Number(val);
+      return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fb;
+    };
+    const sampleBezier = (x, pts, y0, y3) => {
+      const x1 = clamp01(pts?.[0], 0.42);
+      const y1 = clamp01(pts?.[1], y0);
+      const x2 = clamp01(pts?.[2], 0.58);
+      const y2 = clamp01(pts?.[3], y3);
+      let lo = 0, hi = 1, u = x;
+      for (let i = 0; i < 12; i++) {
+        const inv = 1 - u;
+        const bx = 3 * inv * inv * u * x1 + 3 * inv * u * u * x2 + u * u * u - x;
+        if (Math.abs(bx) < 1e-6) break;
+        if (bx < 0) lo = u;
+        else hi = u;
+        const dx = 3 * inv * inv * x1 + 6 * inv * u * (x2 - x1) + 3 * u * u * (1 - x2);
+        if (dx > 1e-5) {
+          const next = u - bx / dx;
+          u = next > lo && next < hi ? next : 0.5 * (lo + hi);
+        } else {
+          u = 0.5 * (lo + hi);
+        }
+      }
+      const inv = 1 - u;
+      const by = inv * inv * inv * y0 + 3 * inv * inv * u * y1 + 3 * inv * u * u * y2 + u * u * u * y3;
+      return Math.max(0, Math.min(1, by));
+    };
+    const incPts = Array.isArray(cfg?.in) && cfg.in.length === 4 ? cfg.in : [0.42, 0, 0.58, 1];
+    const incoming = sampleBezier(clamped, incPts, 0, 1);
+    if (cfg?.mode === 'split' && Array.isArray(cfg.out) && cfg.out.length === 4) {
+      const outgoing = sampleBezier(clamped, cfg.out, 1, 0);
+      return [outgoing, incoming];
+    }
+    return [1 - incoming, incoming];
+  }
 
   const phase = curve === 'dj'
     ? Math.max(0, Math.min(1, 0.5 + (clamped - 0.5) * 1.35))
@@ -6892,8 +14626,10 @@ function setAudioParamImmediately(param, value, now) {
   try {
     // Firefox cannot insert setValueAtTime into an already-running
     // setValueCurveAtTime event. Clear the whole automation timeline first,
-    // including events that started before `now`.
+    // including events that started before `now`, and anchor intrinsic value
+    // immediately so future startTime leads cannot briefly read a stale value.
     param.cancelScheduledValues(0);
+    try { param.value = target; } catch (_) {}
     param.setValueAtTime(target, time);
     return true;
   } catch (_) {
@@ -6905,6 +14641,35 @@ function setAudioParamImmediately(param, value, now) {
     } catch (_) {
       return false;
     }
+  }
+}
+
+function smoothAudioParamTarget(param, value, now, timeConstant = 0.025, fallbackCurrent = value) {
+  if (!param) return false;
+  const target = Number.isFinite(Number(value)) ? Number(value) : 0;
+  const time = Math.max(0, Number(now) || 0);
+  const tau = Math.max(0.005, Number(timeConstant) || 0.025);
+  try {
+    if (typeof param.cancelAndHoldAtTime === 'function' && typeof param.setTargetAtTime === 'function') {
+      param.cancelAndHoldAtTime(time);
+      param.setTargetAtTime(target, time, tau);
+      return true;
+    }
+    const cur = Number.isFinite(Number(param.value))
+      ? Number(param.value)
+      : (Number.isFinite(Number(fallbackCurrent)) ? Number(fallbackCurrent) : target);
+    param.cancelScheduledValues?.(0);
+    try { param.value = cur; } catch (_) {}
+    param.setValueAtTime?.(cur, time);
+    if (typeof param.setTargetAtTime === 'function') {
+      param.setTargetAtTime(target, time, tau);
+      return true;
+    }
+    param.setValueAtTime?.(target, time);
+    try { param.value = target; } catch (_) {}
+    return true;
+  } catch (_) {
+    return setAudioParamImmediately(param, target, time);
   }
 }
 
@@ -6926,11 +14691,79 @@ function crossfadeAutomationPlan(curve) {
   return { times, outgoing, incoming };
 }
 
+const DJ_BASS_SWAP_CUT_DB = -15;
+
+function resolveDjBassSwapCrossover(curve) {
+  let bestT = 0.5;
+  let minDiff = Infinity;
+  for (let i = 4; i <= 44; i++) {
+    const t = i / 48;
+    const [outG, inG] = crossfadeGains(t, curve);
+    const diff = Math.abs(inG - outG);
+    if (diff < minDiff) {
+      minDiff = diff;
+      bestT = t;
+    }
+  }
+  return Math.max(0.24, Math.min(0.76, bestT));
+}
+
+function djBassSwapGains(t, tCross = 0.5) {
+  const clamped = Math.max(0, Math.min(1, Number(t) || 0));
+  const center = Math.max(0.24, Math.min(0.76, Number(tCross) || 0.5));
+  const inStart = Math.max(0.06, center - 0.16);
+  const inEnd = Math.min(0.92, center + 0.08);
+  const outStart = Math.max(0.08, center - 0.08);
+  const outEnd = Math.min(0.95, center + 0.18);
+
+  let inDb = DJ_BASS_SWAP_CUT_DB;
+  if (clamped >= inEnd) inDb = 0;
+  else if (clamped > inStart) {
+    const p = (clamped - inStart) / Math.max(0.01, inEnd - inStart);
+    const s = p * p * (3 - 2 * p);
+    inDb = DJ_BASS_SWAP_CUT_DB * (1 - s);
+  }
+
+  let outDb = 0;
+  if (clamped >= outEnd) outDb = DJ_BASS_SWAP_CUT_DB;
+  else if (clamped > outStart) {
+    const p = (clamped - outStart) / Math.max(0.01, outEnd - outStart);
+    const s = p * p * (3 - 2 * p);
+    outDb = DJ_BASS_SWAP_CUT_DB * s;
+  }
+
+  return [outDb, inDb];
+}
+
+function schedulePairedBassSwap(outBassParam, inBassParam, tCross, startTime, rampDuration, startProgress = 0) {
+  if (!outBassParam || !inBassParam || !(rampDuration > 0)) return;
+  const p0 = Math.max(0, Math.min(1, Number(startProgress) || 0));
+  const steps = 24;
+  outBassParam.cancelScheduledValues(0);
+  inBassParam.cancelScheduledValues(0);
+  const [out0, in0] = djBassSwapGains(p0, tCross);
+  try { outBassParam.value = out0; } catch (_) {}
+  try { inBassParam.value = in0; } catch (_) {}
+  outBassParam.setValueAtTime(out0, startTime);
+  inBassParam.setValueAtTime(in0, startTime);
+  if (p0 >= 1) return;
+  for (let i = 1; i <= steps; i++) {
+    const frac = i / steps;
+    const globalT = p0 + (1 - p0) * frac;
+    const [outDb, inDb] = djBassSwapGains(globalT, tCross);
+    const knotTime = startTime + rampDuration * frac;
+    outBassParam.linearRampToValueAtTime(outDb, knotTime);
+    inBassParam.linearRampToValueAtTime(inDb, knotTime);
+  }
+}
+
 function schedulePairedCrossfade(outParam, inParam, plan, startTime, rampDuration) {
   // Cancelable LINEAR ramps only: active curve events cannot be cancelled
   // safely in Firefox. Pair submissions so neither deck waits for a full curve.
   outParam.cancelScheduledValues(0);
   inParam.cancelScheduledValues(0);
+  try { outParam.value = plan.outgoing[0]; } catch (_) {}
+  try { inParam.value = plan.incoming[0]; } catch (_) {}
   outParam.setValueAtTime(plan.outgoing[0], startTime);
   inParam.setValueAtTime(plan.incoming[0], startTime);
   for (let i = 1; i < plan.times.length; i++) {
@@ -7022,10 +14855,11 @@ function waitForCrossfadeSchedule(schedule, token) {
           }
         }
       }
+      schedule.ensureIncomingBuffer?.();
       if (state._userPaused || state._crossfadePausedByUser) {
         lastClockValue = clockValue;
         lastClockAdvanceAt = Date.now();
-      } else if (clockValue >= schedule.endTime - 0.005) {
+      } else if (clockValue >= schedule.endTime) {
         finish(true);
         return;
       } else if (clockValue > lastClockValue + 0.005) {
@@ -7096,7 +14930,8 @@ function settleScheduledCrossfade() {
     return;
   }
 
-  if (clockValue >= schedule.endTime - 0.005) {
+  schedule.ensureIncomingBuffer?.();
+  if (clockValue >= schedule.endTime) {
     schedule.resolve(true);
     return;
   }
@@ -7137,7 +14972,7 @@ function settleScheduledCrossfade() {
   }
 }
 
-function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
+function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token, curveOverride = null) {
   const duration = Math.max(0.25, seconds);
   const startedAt = Number(incoming.currentTime) || 0;
   const epoch = state._playbackEpoch;
@@ -7146,7 +14981,10 @@ function animateDeckCrossfadeFallback(outgoing, incoming, seconds, token) {
   const incomingIndex = state._decks.indexOf(incoming);
   const outgoingToken = state._deckPrepareTokens[outgoingIndex];
   const incomingToken = state._deckPrepareTokens[incomingIndex];
-  const curve = state.crossfadeCurve;
+  const rawCurve = curveOverride ?? state.crossfadeCurve;
+  const curve = rawCurve === 'custom' && typeof sanitizeCrossfadeCurveConfig === 'function'
+    ? sanitizeCrossfadeCurveConfig(state.customCrossfade)
+    : rawCurve;
   let lastWallAt = Date.now();
   let activeWallMs = 0;
   let wasPaused = Boolean(state._userPaused || state._crossfadePausedByUser);
@@ -7223,7 +15061,13 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
   const context = state._audioContext;
   const wasRunning = context === entryContext && entryWasRunning;
   if (context !== entryContext) anchorAudioTime = Number(context?.currentTime);
+  const djCurve = state.djMode && state.djAutoMix && typeof resolveDjAutoCurveSnapshot === 'function'
+    ? resolveDjAutoCurveSnapshot(state._deckTracks?.[outgoingIndex], state._deckTracks?.[incomingIndex])
+    : null;
   const curve = state.crossfadeCurve;
+  const curveSnapshot = djCurve || (curve === 'custom' && typeof sanitizeCrossfadeCurveConfig === 'function'
+    ? sanitizeCrossfadeCurveConfig(state.customCrossfade)
+    : curve);
   const ownsTransition = () => state.active && state._playbackEpoch === epoch
     && !signal.aborted && state._playbackRequest === foreground && token === state._crossfadeToken
     && state._decks[outgoingIndex] === outgoing && state._decks[incomingIndex] === incoming
@@ -7235,6 +15079,49 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
   let succeeded = false;
   state._crossfading = true;
   state._crossfadePausedByUser = false;
+  const bufferedAhead = audio => {
+    if (!audio?.buffered?.length) return 0;
+    const cur = Math.max(0, Number(audio.currentTime) || 0);
+    for (let i = 0; i < audio.buffered.length; i++) {
+      try {
+        const s = Number(audio.buffered.start(i));
+        const e = Number(audio.buffered.end(i));
+        if (Number.isFinite(s) && Number.isFinite(e) && s <= cur + 0.1 && e > cur) {
+          return Math.max(0, e - cur);
+        }
+      } catch (_) {}
+    }
+    return 0;
+  };
+  const outgoingPlayer = state._deckHlsPlayers?.[outgoingIndex] || null;
+  const incomingPlayer = state._deckHlsPlayers?.[incomingIndex] || null;
+  let quiescedOutgoing = false;
+  let quiescedIncoming = false;
+  if (outgoingPlayer && typeof outgoingPlayer.stopLoad === 'function'
+      && bufferedAhead(outgoing) >= Math.min(outgoingRemaining, windowDuration + 0.5) - 0.05) {
+    try { outgoingPlayer.stopLoad(); quiescedOutgoing = true; } catch (_) {}
+  }
+  const incomingDur = Number(incoming.duration);
+  const incomingRem = Number.isFinite(incomingDur) && incomingDur > 0
+    ? Math.max(0, incomingDur - (Number(incoming.currentTime) || 0))
+    : Infinity;
+  const neededIncomingLead = Math.min(incomingRem, windowDuration + 1.5);
+  if (incomingPlayer && typeof incomingPlayer.stopLoad === 'function'
+      && neededIncomingLead > 0.25 && bufferedAhead(incoming) >= neededIncomingLead - 0.05) {
+    try { incomingPlayer.stopLoad(); quiescedIncoming = true; } catch (_) {}
+  }
+  const ensureIncomingBuffer = () => {
+    if (!quiescedIncoming || state._deckHlsPlayers?.[incomingIndex] !== incomingPlayer
+        || state._decks[incomingIndex] !== incoming) return;
+    const durNow = Number(incoming.duration);
+    const remNow = Number.isFinite(durNow) && durNow > 0
+      ? Math.max(0, durNow - (Number(incoming.currentTime) || 0))
+      : Infinity;
+    if (bufferedAhead(incoming) < Math.min(remNow, 1.25) - 0.05) {
+      quiescedIncoming = false;
+      try { incomingPlayer.startLoad?.(-1); } catch (_) {}
+    }
+  };
   let failureStage = 'crossfade-start';
   let recoveredSchedule = false;
   const startedAt = (diagnosticTrace || state._transitionDiagnostics) && typeof performance !== 'undefined'
@@ -7315,7 +15202,7 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
         anchorMonotonicMs = typeof performance !== 'undefined' && typeof performance.now === 'function'
           ? performance.now() : null;
       }
-      const plan = crossfadeAutomationPlan(curve);
+      const plan = crossfadeAutomationPlan(curveSnapshot);
       const schedulingAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
         ? performance.now() : null;
       let timing = crossfadeAutomationTiming(context, anchorAudioTime, anchorMonotonicMs, windowDuration, schedulingAt);
@@ -7335,17 +15222,42 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
         completed = false;
       } else {
         const { startTime, endTime } = timing;
+        const outGraph = state._deckAudioGraphs[outgoingIndex];
+        const inGraph = state._deckAudioGraphs[incomingIndex];
+        if (outGraph) outGraph.djBassPreHold = false;
+        if (inGraph) inGraph.djBassPreHold = false;
+        const outBassDur = Number.isFinite(outgoing.duration) && outgoing.duration > 0 ? outgoing.duration : Infinity;
+        const inBassDur = Number.isFinite(incoming.duration) && incoming.duration > 0 ? incoming.duration : Infinity;
+        const useBassSwap = Boolean(state.djMode && state.djBassSwap && timing.duration >= 0.8
+          && outBassDur >= 25 && inBassDur >= 25
+          && outGraph?.djBassFilter && inGraph?.djBassFilter);
+        const bassCross = useBassSwap ? resolveDjBassSwapCrossover(curveSnapshot) : 0.5;
         schedule = {
-          token, attemptId: diagnosticTrace?.attemptId, outgoingIndex, incomingIndex, curve,
+          token, attemptId: diagnosticTrace?.attemptId, outgoingIndex, incomingIndex, curve: curveSnapshot,
+          bassSwap: useBassSwap, bassCross,
           startTime, duration: timing.duration, endTime, createdAt: Date.now(),
           lastClockValue: context.currentTime, lastClockAdvanceAt: Date.now(),
           lastIncomingTime: Number(incoming.currentTime) || 0, lastIncomingAdvanceAt: Date.now(),
-          faultRecorded: false,
+          faultRecorded: false, ensureIncomingBuffer,
         };
         state._crossfadeSchedule = schedule;
         failureStage = 'audio-clock-schedule';
-        schedulePairedCrossfade(state._deckAudioGraphs[outgoingIndex].mixGain.gain,
-          state._deckAudioGraphs[incomingIndex].mixGain.gain, plan, startTime, timing.duration);
+        schedulePairedCrossfade(outGraph.mixGain.gain,
+          inGraph.mixGain.gain, plan, startTime, timing.duration);
+        if (useBassSwap) {
+          schedulePairedBassSwap(outGraph.djBassFilter.gain, inGraph.djBassFilter.gain, bassCross, startTime, timing.duration, 0);
+          outGraph.appliedDjBassGain = DJ_BASS_SWAP_CUT_DB;
+          inGraph.appliedDjBassGain = 0;
+        } else {
+          if (outGraph?.djBassFilter) {
+            setAudioParamImmediately(outGraph.djBassFilter.gain, 0, startTime);
+            outGraph.appliedDjBassGain = 0;
+          }
+          if (inGraph?.djBassFilter) {
+            setAudioParamImmediately(inGraph.djBassFilter.gain, 0, startTime);
+            inGraph.appliedDjBassGain = 0;
+          }
+        }
         if (state._transitionDiagnostics) {
           // Sample after BOTH submissions. The monotonic estimate accounts for
           // cached clocks; it does not prove render-thread delivery or output.
@@ -7376,6 +15288,14 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
             progressAlreadyAtSchedule: schedule.incomingClockObservation?.progressAlreadyAtSchedule,
           });
         }
+        if (typeof syncBrandmarkCrossfade === 'function') {
+          syncBrandmarkCrossfade('start', {
+            token,
+            durationMs: timing.duration * 1000,
+            delayMs: Math.max(0, (startTime - (Number(context.currentTime) || startTime)) * 1000),
+            progress: 0,
+          });
+        }
         completed = await waitForCrossfadeSchedule(schedule, token);
       }
     } else {
@@ -7383,7 +15303,10 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
       if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-fallback', {
         outgoingIndex, incomingIndex, token: incomingToken, crossfadeToken: token, duration,
       });
-      completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token);
+      if (typeof syncBrandmarkCrossfade === 'function') {
+        syncBrandmarkCrossfade('start', { token, durationMs: Math.max(250, duration * 1000), delayMs: 0, progress: 0 });
+      }
+      completed = await animateDeckCrossfadeFallback(outgoing, incoming, duration, token, curveSnapshot);
     }
     if (!ownsTransition() || state._userPaused) return null;
     if (!completed) {
@@ -7415,10 +15338,61 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
         }
       }
     }
+    const recoveredInGain = (recoveredSchedule && schedule && typeof scheduledCrossfadeGain === 'function')
+      ? scheduledCrossfadeGain(incomingIndex)
+      : null;
     if (state._crossfadeSchedule === schedule) state._crossfadeSchedule = null;
     const now = context?.currentTime || 0;
-    setAudioParamImmediately(state._deckAudioGraphs[outgoingIndex]?.mixGain.gain, 0, now);
-    setAudioParamImmediately(state._deckAudioGraphs[incomingIndex]?.mixGain.gain, 1, now);
+    const outEndGraph = state._deckAudioGraphs[outgoingIndex];
+    const inEndGraph = state._deckAudioGraphs[incomingIndex];
+    setAudioParamImmediately(outEndGraph?.mixGain.gain, 0, now);
+    if (outEndGraph?.djBassFilter) {
+      setAudioParamImmediately(outEndGraph.djBassFilter.gain, 0, now);
+      outEndGraph.appliedDjBassGain = 0;
+      outEndGraph.djBassPreHold = false;
+    }
+    const inParam = inEndGraph?.mixGain.gain;
+    const inBassParam = inEndGraph?.djBassFilter?.gain;
+    if (recoveredSchedule && context?.state === 'running'
+        && inParam && typeof inParam.linearRampToValueAtTime === 'function') {
+      try {
+        const rawCurIn = Number.isFinite(recoveredInGain)
+          ? recoveredInGain
+          : (Number.isFinite(Number(inParam.value)) && Number(inParam.value) >= 0 && Number(inParam.value) <= 1
+            ? Number(inParam.value)
+            : (Number(state._deckGains[incomingIndex]) || 0));
+        const curIn = Math.max(0, Math.min(1, rawCurIn));
+        inParam.cancelScheduledValues(0);
+        try { inParam.value = curIn; } catch (_) {}
+        inParam.setValueAtTime(curIn, now);
+        inParam.linearRampToValueAtTime(1, now + 0.018);
+        inEndGraph.appliedMixGain = 1;
+      } catch (_) {
+        setAudioParamImmediately(inParam, 1, now);
+      }
+      if (schedule?.bassSwap && inBassParam && typeof inBassParam.linearRampToValueAtTime === 'function') {
+        try {
+          const curElapsed = Math.max(0, now - schedule.startTime);
+          const curProg = schedule.duration > 0 ? Math.max(0, Math.min(1, curElapsed / schedule.duration)) : 1;
+          const [, curInBass] = djBassSwapGains(curProg, schedule.bassCross);
+          inBassParam.cancelScheduledValues(0);
+          try { inBassParam.value = curInBass; } catch (_) {}
+          inBassParam.setValueAtTime(curInBass, now);
+          inBassParam.linearRampToValueAtTime(0, now + 0.024);
+        } catch (_) {
+          setAudioParamImmediately(inBassParam, 0, now);
+        }
+      } else if (inBassParam) {
+        setAudioParamImmediately(inBassParam, 0, now);
+      }
+    } else {
+      setAudioParamImmediately(inParam, 1, now);
+      if (inBassParam) setAudioParamImmediately(inBassParam, 0, now);
+    }
+    if (inEndGraph) {
+      inEndGraph.appliedDjBassGain = 0;
+      inEndGraph.djBassPreHold = false;
+    }
     outgoing.pause();
     state._deckGains[outgoingIndex] = 0;
     state._deckGains[incomingIndex] = 1;
@@ -7457,6 +15431,16 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
     reportHandoffFailure(failureStage, 'handoff-exception', error);
     return false;
   } finally {
+    if (quiescedIncoming && state._deckHlsPlayers?.[incomingIndex] === incomingPlayer
+        && state._decks[incomingIndex] === incoming && !incoming.ended) {
+      try { incomingPlayer.startLoad?.(-1); } catch (_) {}
+    }
+    if (!succeeded && quiescedOutgoing && state._deckHlsPlayers?.[outgoingIndex] === outgoingPlayer
+        && state._decks[outgoingIndex] === outgoing && !outgoing.ended) {
+      try { outgoingPlayer.startLoad?.(-1); } catch (_) {}
+    }
+    if (state._deckAudioGraphs?.[outgoingIndex]) state._deckAudioGraphs[outgoingIndex].djBassPreHold = false;
+    if (state._deckAudioGraphs?.[incomingIndex]) state._deckAudioGraphs[incomingIndex].djBassPreHold = false;
     if (ownsTransition()) {
       if (state._crossfadeSchedule === schedule) {
         schedule?.resolve?.(false);
@@ -7464,7 +15448,13 @@ async function animateDeckCrossfade(outgoing, incoming, seconds, token, diagnost
       }
       state._crossfading = false;
       state._crossfadePausedByUser = Boolean(state._userPaused);
+      if (typeof syncDeckProcessingRouting === 'function') syncDeckProcessingRouting();
       try { setCrossfadeStatus(succeeded ? 'ready' : 'fallback'); } catch (_) {}
+      if (typeof syncBrandmarkCrossfade === 'function') {
+        syncBrandmarkCrossfade(succeeded ? 'complete' : 'cancel', { token });
+      }
+    } else if (typeof syncBrandmarkCrossfade === 'function') {
+      syncBrandmarkCrossfade('cancel', { token });
     }
   }
 }
@@ -7487,13 +15477,16 @@ function preflightCrossfadeHls(record, streamUrls) {
       || (record.isCurrent && !record.isCurrent())) return;
   const streamUrl = streamUrls.find(isHlsStreamUrl);
   if (!streamUrl) return;
-  const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
+  const configuredFadeSeconds = Number(state.crossfadeSeconds) > 0
+    ? Number(state.crossfadeSeconds)
+    : (state.djMode && state.djAutoMix ? 4.5 : 0);
   const currentAudio = state._decks[state._deckIndex];
   const mediaDuration = Number(currentAudio?.duration);
   const currentDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
     ? mediaDuration : Number(state.meta[record.currentTi]?.durationMs) / 1000;
+  const preflightMaxDuration = Math.max(25, configuredFadeSeconds * 3 + 6);
   if (configuredFadeSeconds <= 0 || !Number.isFinite(currentDuration)
-      || currentDuration <= 0 || currentDuration > configuredFadeSeconds * 2) return;
+      || currentDuration <= 0 || currentDuration > preflightMaxDuration) return;
   const HlsCtor = hlsJsConstructor();
   let supported = false;
   try { supported = Boolean(HlsCtor?.isSupported()); } catch (_) {}
@@ -7502,12 +15495,14 @@ function preflightCrossfadeHls(record, streamUrls) {
   try {
     const drmContext = cachedStreamDrmContext(record.meta, streamUrl);
     if (drmContext) return;
+    const entryFadeBudget = Math.min(configuredFadeSeconds, currentDuration / 2);
+    const soloHeadroom = currentDuration - entryFadeBudget * 2;
     player = new HlsCtor({
       ...soundCloudHlsConfig(drmContext, {
         signal: record.controller.signal,
         isCurrent: () => !record.isCurrent || record.isCurrent(),
       }),
-      startFragPrefetch: true,
+      startFragPrefetch: !state._crossfading || soloHeadroom < 1.5,
     });
     const preflight = {
       player, streamUrl, failed: false, adopted: false,
@@ -7520,7 +15515,30 @@ function preflightCrossfadeHls(record, streamUrls) {
     preflight.onError = (_event, data) => {
       if (record.preflight !== preflight || preflight.adopted || !data?.fatal) return;
       preflight.failed = true;
+      record.preflightFailedUrl = streamUrl;
+      if (typeof normalizeTrackUrl === 'function') {
+        state._streamCache?.delete?.(normalizeTrackUrl(record.meta?.link));
+      }
       destroyCrossfadePreflight(record);
+      if (!record.retriedAfterPreflightFailure && state._crossfadeStreamWarmup === record
+          && !record.controller.signal.aborted && (!record.isCurrent || record.isCurrent())
+          && typeof resolveCrossfadeStreams === 'function') {
+        record.retriedAfterPreflightFailure = true;
+        record.promise = Promise.resolve().then(() => resolveCrossfadeStreams(record.meta, {
+          forceRefresh: true,
+          signal: record.controller.signal,
+          isCurrent: () => !record.isCurrent || record.isCurrent(),
+        })).then(freshUrls => {
+          if (freshUrls?.length) {
+            record.preflightFailedUrl = null;
+            if (state._crossfadeStreamWarmup === record && !record.controller.signal.aborted
+                && (!record.isCurrent || record.isCurrent())) {
+              preflightCrossfadeHls(record, freshUrls);
+            }
+          }
+          return freshUrls || [];
+        }).catch(() => []);
+      }
     };
     player.on(HlsCtor.Events.ERROR, preflight.onError);
     record.preflight = preflight;
@@ -7540,6 +15558,7 @@ function warmUpcomingCrossfadeStreams() {
   destroyCrossfadePreflight(state._crossfadeStreamWarmup);
   state._crossfadeStreamWarmup?.controller?.abort();
   state._crossfadeStreamWarmup = null;
+  if (typeof ensureNextRoundPreview === 'function') ensureNextRoundPreview();
   const nextTi = upcomingTrackIndex();
   if (!state.active || !Number.isInteger(state._deckTrack) || nextTi === undefined) return;
   const meta = state.meta[nextTi];
@@ -7565,10 +15584,13 @@ function warmUpcomingCrossfadeStreams() {
   };
   if (sessionSignal?.aborted) abort();
   else sessionSignal?.addEventListener('abort', abort, { once: true });
+  const warmupPrepStats = { streamSource: '' };
   record.promise = Promise.resolve().then(() => resolveCrossfadeStreams(meta, {
+    prepStats: warmupPrepStats,
     signal: controller.signal,
     isCurrent: () => record.isCurrent(),
   })).then(urls => {
+    record.streamSource = warmupPrepStats.streamSource || '';
     if (state._transitionDiagnostics) recordTransitionDiagnostic('streams-resolved', {
       trackIndex: nextTi, token: record.token, detached: true,
       streamCandidateCount: urls.length, elapsedMs: performance.now() - streamsStartedAt,
@@ -7581,13 +15603,15 @@ function warmUpcomingCrossfadeStreams() {
   });
 }
 
-async function prefetchUpcomingCrossfadeTrack() {
+async function prefetchUpcomingCrossfadeTrack(options = {}) {
   if (!state.active || state._crossfading) return;
+  const forceRefresh = Boolean(options?.forceRefresh);
+  if (typeof ensureNextRoundPreview === 'function') ensureNextRoundPreview();
   const nextTi = upcomingTrackIndex();
   if (nextTi === undefined) return;
   const standby = state._deckIndex === 0 ? 1 : 0;
   const preparation = state._deckPreparations?.[standby];
-  if (crossfadePreparationMatches(preparation, standby, nextTi)
+  if (!forceRefresh && crossfadePreparationMatches(preparation, standby, nextTi)
       && preparation.pending && (!preparation.isCurrent || preparation.isCurrent())) {
     return preparation.promise;
   }
@@ -7596,17 +15620,27 @@ async function prefetchUpcomingCrossfadeTrack() {
   const isCurrent = () => requestToken === state._crossfadePrefetchToken
     && state.active && !state._crossfading && standby !== state._deckIndex
     && upcomingTrackIndex() === nextTi;
-  if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
+  const fadeActive = state.crossfadeSeconds > 0 || Boolean(state.djMode && (state.djAutoMix || state.djCueTrim));
+  if (state.djMode && (state.djAutoMix || state.djCueTrim) && typeof warmDjTrackWaveform === 'function') {
+    if (Number.isInteger(state._deckTrack) && state.meta?.[state._deckTrack]) {
+      void warmDjTrackWaveform(state.meta[state._deckTrack]);
+    }
+    if (state.meta?.[nextTi]) {
+      void warmDjTrackWaveform(state.meta[nextTi]);
+    }
+  }
+  if (fadeActive) setCrossfadeStatus('loading');
   let audio = null;
   let warmup = null;
   try {
-    warmup = state._crossfadeStreamWarmup;
-    const resolvedStreamPromise = warmup?.epoch === state._playbackEpoch
+    warmup = forceRefresh ? null : state._crossfadeStreamWarmup;
+    const resolvedStreamPromise = !forceRefresh && warmup?.epoch === state._playbackEpoch
       && warmup.currentTi === state._deckTrack && warmup.nextTi === nextTi
       && warmup.meta === state.meta[nextTi] && upcomingTrackIndex() === nextTi
       ? warmup.promise : null;
     audio = await prepareCrossfadeDeck(standby, nextTi, {
       diagnosticTrace, isCurrent, warmup,
+      ...(forceRefresh ? { forceRefresh: true } : {}),
       ...(resolvedStreamPromise ? { resolvedStreamPromise } : {}),
     });
   } catch (error) {
@@ -7640,9 +15674,18 @@ async function prefetchUpcomingCrossfadeTrack() {
       result: audio ? 'ready' : 'not-ready',
     });
   }
-  if (state.crossfadeSeconds > 0) setCrossfadeStatus(audio ? 'ready' : 'fallback');
+  if (fadeActive) setCrossfadeStatus(audio ? 'ready' : 'fallback');
   if (audio) void state._watcherTick?.();
   return audio;
+}
+
+function crossfadePreparationPending(index, ti, audio = state._decks[index]) {
+  const prep = state._deckPreparations?.[index];
+  return Boolean(
+    prep?.pending && prep.epoch === state._playbackEpoch
+    && prep.index === index && prep.ti === ti
+    && prep.audio === audio && !prep.controller?.signal?.aborted,
+  );
 }
 
 function upcomingCrossfadeDeckReady() {
@@ -7651,7 +15694,9 @@ function upcomingCrossfadeDeckReady() {
   const standby = state._deckIndex === 0 ? 1 : 0;
   const audio = state._decks[standby];
   return Boolean(audio && state._deckTracks[standby] === nextTi
-    && audio.readyState >= 2 && !state._deckHlsFailed?.[standby]);
+    && audio.readyState >= 2 && !state._deckHlsFailed?.[standby]
+    && !(typeof crossfadePreparationPending === 'function'
+      && crossfadePreparationPending(standby, nextTi, audio)));
 }
 
 function currentPendingPlaybackTrack() {
@@ -7679,16 +15724,80 @@ function promotePendingPlayNext() {
   return ti;
 }
 
+function ensureNextRoundPreview() {
+  if (state.stopAfterRound
+      || (state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)
+      || !Array.isArray(state.queue) || state.queue.length === 0
+      || state.pos < state.queue.length - 3) {
+    state._nextRoundQueue = null;
+    return null;
+  }
+  const anchorTi = state.queue[state.queue.length - 1];
+  if (typeof trackAvailable !== 'function' || typeof buildBalancedRound !== 'function') return null;
+  const aliveIndices = [...Array(state.meta.length).keys()].filter(trackAvailable);
+  if (!aliveIndices.length) {
+    state._nextRoundQueue = null;
+    return null;
+  }
+  const existing = state._nextRoundQueue;
+  if (existing && existing.epoch === state._playbackEpoch && existing.anchorTi === anchorTi
+      && existing.aliveCount === aliveIndices.length
+      && Array.isArray(existing.queue) && existing.queue.length > 0
+      && trackAvailable(existing.queue[0])) {
+    return existing.queue;
+  }
+  const nextQueue = buildBalancedRound(aliveIndices, anchorTi);
+  if (!Array.isArray(nextQueue) || !nextQueue.length) {
+    state._nextRoundQueue = null;
+    return null;
+  }
+  state._nextRoundQueue = {
+    epoch: state._playbackEpoch,
+    anchorTi,
+    aliveCount: aliveIndices.length,
+    queue: nextQueue,
+  };
+  return nextQueue;
+}
+
 function upcomingTrackIndex() {
   if (state.playNext.length) return state.playNext[0];
   const pending = currentPendingPlaybackTrack();
-  return pending && state._deckTrack !== pending.ti ? pending.ti : state.queue[state.pos + 1];
+  if (pending && state._deckTrack !== pending.ti) return pending.ti;
+  const queuedNext = state.queue[state.pos + 1];
+  if (queuedNext !== undefined) return queuedNext;
+  if (!state.stopAfterRound && state._nextRoundQueue?.epoch === state._playbackEpoch
+      && Array.isArray(state._nextRoundQueue.queue) && state._nextRoundQueue.queue.length > 0) {
+    return state._nextRoundQueue.queue[0];
+  }
+  return undefined;
 }
 
-function refreshUpcomingCrossfadePreparation() {
+function upcomingTrackIndexAtOffset(offset = 0) {
+  if (!Number.isInteger(offset) || offset < 0) return undefined;
+  if (offset === 0) return upcomingTrackIndex();
+  if (state.playNext.length > offset) return state.playNext[offset];
+  const pending = currentPendingPlaybackTrack();
+  const hasPendingUnstarted = Boolean(pending && state._deckTrack !== pending.ti);
+  const queueIdx = state.pos + (hasPendingUnstarted ? 0 : 1) + (offset - state.playNext.length);
+  if (queueIdx >= 0 && queueIdx < state.queue.length) return state.queue[queueIdx];
+  if (state.stopAfterRound
+      || (state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)) {
+    return undefined;
+  }
+  const preview = typeof ensureNextRoundPreview === 'function'
+    ? ensureNextRoundPreview()
+    : (state._nextRoundQueue?.epoch === state._playbackEpoch
+      && Array.isArray(state._nextRoundQueue.queue) ? state._nextRoundQueue.queue : null);
+  return preview?.[queueIdx - state.queue.length];
+}
+
+function refreshUpcomingCrossfadePreparation(options = {}) {
+  const forceStandbyReset = Boolean(options?.forceStandbyReset);
+  if (typeof ensureNextRoundPreview === 'function') ensureNextRoundPreview();
   const nextTi = upcomingTrackIndex();
   const warmup = state._crossfadeStreamWarmup;
-  const warmupMatches = warmup && !warmup.controller.signal.aborted
+  const warmupMatches = !forceStandbyReset && warmup && !warmup.controller.signal.aborted
     && warmup.epoch === state._playbackEpoch && warmup.currentTi === state._deckTrack
     && warmup.nextTi === nextTi && warmup.meta === state.meta[nextTi];
   // Both decks belong to a running fade. Queue changes may retire stale
@@ -7707,7 +15816,7 @@ function refreshUpcomingCrossfadePreparation() {
   const standby = state._deckIndex === 0 ? 1 : 0;
   if (standby < 0 || standby >= state._decks.length || standby === state._deckIndex) return;
   const preparation = state._deckPreparations?.[standby];
-  if (crossfadePreparationMatches(preparation, standby, nextTi)
+  if (!forceStandbyReset && crossfadePreparationMatches(preparation, standby, nextTi)
       && (preparation.pending || upcomingCrossfadeDeckReady())) return;
 
   state._crossfadePrefetchToken++;
@@ -7715,7 +15824,8 @@ function refreshUpcomingCrossfadePreparation() {
   state._deckPrepareAborts?.[standby]?.abort();
   if (state._deckTracks[standby] !== null) resetDeck(state._decks[standby], standby);
   if (state.active && currentDeckAudio()) {
-    void prefetchUpcomingCrossfadeTrack().catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
+    void prefetchUpcomingCrossfadeTrack({ forceRefresh: forceStandbyReset })
+      .catch(error => recordPlaybackDiagnostic('prefetch-failed', { errorName: playbackErrorName(error) }));
   }
 }
 
@@ -7872,6 +15982,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
     return false;
   }
   if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+      || (state.djMode && (state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim))
       || state._audioContext?.state === 'closed' || state._audioGraphFailed) {
     if (!ensureAutoLevelAudioGraph()) {
       if (diagnosticTrace) {
@@ -7882,28 +15993,55 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
       }
       return false;
     }
+    if (state.djMode && state.djCommentaryMode === 'voice' && typeof ensureDjVoiceAudioBus === 'function') {
+      ensureDjVoiceAudioBus();
+    }
   }
+  const handoffMonoNow = () => typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now() : Date.now();
+  const transitionEntryAt = handoffMonoNow();
   const outgoing = currentDeckAudio();
   const outgoingIndex = state._deckIndex;
   const outgoingTrack = state._deckTrack;
   const outgoingMeta = state.meta[outgoingTrack];
   const outgoingToken = state._deckPrepareTokens[outgoingIndex];
   const outgoingSource = outgoing?.src;
+  const outgoingTimeAtEntry = Number(outgoing?.currentTime) || 0;
+  const outgoingDurationAtEntry = Number(outgoing?.duration) > 0
+    ? Number(outgoing.duration) : (Number(outgoingMeta?.durationMs) / 1000 || 0);
   const incomingIndex = outgoingIndex === 0 ? 1 : 0;
-  if (state.crossfadeSeconds > 0) setCrossfadeStatus('loading');
+  const incomingCandidate = state._decks[incomingIndex];
+  const standbyReadyOnEntry = Boolean(incomingCandidate
+    && state._deckTracks[incomingIndex] === ti
+    && incomingCandidate.readyState >= 2
+    && !state._deckHlsFailed?.[incomingIndex]
+    && !(typeof crossfadePreparationPending === 'function'
+      && crossfadePreparationPending(incomingIndex, ti, incomingCandidate)));
+  const fadeActive = state.crossfadeSeconds > 0 || Boolean(state.djMode && (state.djAutoMix || state.djCueTrim));
+  if (fadeActive) setCrossfadeStatus('loading');
   let incoming = null;
   let canMix = false;
   let incomingBaselineTime = null;
+  let foregroundPrepMs = 0;
+  let graphResumeMs = 0;
+  let playCallMs = 0;
+  let bufferedStartPts = null;
   let ownsIncoming = isCurrent;
-  const deferPaused = () => {
-    if (isCurrent() && state._userPaused) state._pendingPlaybackTrack = { ti, countPlay, epoch };
+  const deferPaused = position => {
+    if (isCurrent() && state._userPaused) {
+      state._pendingPlaybackTrack = Number.isFinite(position)
+        ? { ti, countPlay, epoch, position }
+        : { ti, countPlay, epoch };
+    }
     return null;
   };
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!isCurrent()) return null;
     const prepareOptions = { forceRefresh: attempt > 0, signal, isCurrent, foreground: true };
     if (diagnosticTrace) prepareOptions.diagnosticTrace = diagnosticTrace;
+    const prepCallStart = handoffMonoNow();
     incoming = await prepareCrossfadeDeck(incomingIndex, ti, prepareOptions);
+    foregroundPrepMs += Math.max(0, Math.round(handoffMonoNow() - prepCallStart));
     if (!isCurrent()) return null;
     if (state._userPaused) return deferPaused();
     if (!incoming) {
@@ -7928,9 +16066,60 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
     canMix = Boolean(outgoing && state._decks[outgoingIndex] === outgoing
       && !outgoing.paused && !outgoing.ended && !outgoing.seeking
       && outgoing.readyState >= 2 && requestedFade > 0);
-    incoming.currentTime = 0;
-    state._deckGains[incomingIndex] = canMix ? 0 : 1;
+    // Avoid forcing an MSE seek to 0 on freshly buffered HLS streams: seeking
+    // flushes decoded preroll frames and can land before AAC priming startPts,
+    // stalling the incoming track in media-waiting while a short bumper fades out.
+    const hlsIncoming = Boolean(state._deckHlsPlayers?.[incomingIndex]);
+    const currentIncomingTime = Number(incoming.currentTime);
+    if (incoming.buffered?.length > 0) {
+      try {
+        const sampledPts = Number(incoming.buffered.start(0));
+        if (Number.isFinite(sampledPts)) bufferedStartPts = sampledPts;
+      } catch (_) {}
+    }
+    const desiredCueInSec = (!state._pendingPlaybackTrack || !Number.isFinite(state._pendingPlaybackTrack.position))
+      && typeof resolveDjCueInSeconds === 'function'
+      ? resolveDjCueInSeconds(ti, incoming, requestedFade)
+      : 0;
+    if (desiredCueInSec >= 0.45) {
+      if (!Number.isFinite(currentIncomingTime) || Math.abs(currentIncomingTime - desiredCueInSec) > 0.08) {
+        incoming.currentTime = desiredCueInSec;
+      }
+    } else if (!Number.isFinite(currentIncomingTime) || currentIncomingTime > 0.25
+        || (!hlsIncoming && currentIncomingTime > 0.001)) {
+      incoming.currentTime = 0;
+    } else if (hlsIncoming && Number.isFinite(bufferedStartPts) && bufferedStartPts > 0 && bufferedStartPts <= 0.25
+        && currentIncomingTime < bufferedStartPts) {
+      incoming.currentTime = bufferedStartPts;
+    }
+    const incomingGraph = state._deckAudioGraphs?.[incomingIndex];
+    if (incomingGraph?.djBassFilter && state._audioContext) {
+      const nowAudio = Math.max(0, Number(state._audioContext.currentTime) || 0);
+      const outBassPreDur = Number.isFinite(outgoing?.duration) && outgoing.duration > 0
+        ? outgoing.duration
+        : (Number(outgoingMeta?.durationMs) / 1000 || Infinity);
+      const inBassPreDur = Number.isFinite(incoming?.duration) && incoming.duration > 0
+        ? incoming.duration
+        : (Number(meta?.durationMs) / 1000 || Infinity);
+      if (canMix && state.djMode && state.djBassSwap && requestedFade >= 0.8
+          && outBassPreDur >= 25 && inBassPreDur >= 25) {
+        incomingGraph.djBassPreHold = true;
+        setAudioParamImmediately(incomingGraph.djBassFilter.gain, DJ_BASS_SWAP_CUT_DB, nowAudio);
+        incomingGraph.appliedDjBassGain = DJ_BASS_SWAP_CUT_DB;
+      } else {
+        incomingGraph.djBassPreHold = false;
+        setAudioParamImmediately(incomingGraph.djBassFilter.gain, 0, nowAudio);
+        incomingGraph.appliedDjBassGain = 0;
+      }
+    }
+    const holdUnmixedForRollIn = !canMix && Boolean(
+      incomingGraph?.mixGain?.gain
+      && typeof incomingGraph.mixGain.gain.linearRampToValueAtTime === 'function'
+    );
+    state._deckGains[incomingIndex] = (canMix || holdUnmixedForRollIn) ? 0 : 1;
     syncCrossfadeVolume();
+    state._nativePlayUnlocked = false;
+    state._nativeHandoffActive = false;
     pauseSoundCloudTransport();
     pauseSoundCloud();
     try {
@@ -7938,15 +16127,50 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
         diagnosticTrace.stage = 'audio-context-resume';
         diagnosticTrace.reason = 'resume-pending';
       }
+      const resumeStart = handoffMonoNow();
       const resumed = await resumeAudioGraph(signal, diagnosticTrace);
+      graphResumeMs = Math.max(0, Math.round(handoffMonoNow() - resumeStart));
       if (!ownsIncoming()) return null;
       if (state._userPaused) return deferPaused();
       if (!resumed) {
         if (diagnosticTrace) diagnosticTrace.reason = 'audio-context-resume-failed';
         throw new Error('Audio graph did not resume');
       }
+      if (incoming.seeking && typeof incoming.addEventListener === 'function') {
+        await new Promise(resolve => {
+          let seekSettled = false;
+          const finishSeekWait = () => {
+            if (seekSettled) return;
+            seekSettled = true;
+            clearTimeout(seekTimer);
+            incoming.removeEventListener('seeked', finishSeekWait);
+            signal?.removeEventListener('abort', finishSeekWait);
+            resolve();
+          };
+          const seekTimer = setTimeout(finishSeekWait, 90);
+          incoming.addEventListener('seeked', finishSeekWait, { once: true });
+          signal?.removeEventListener('abort', finishSeekWait, { once: true });
+          if (!incoming.seeking || signal?.aborted) finishSeekWait();
+        });
+        if (!ownsIncoming()) return null;
+        if (state._userPaused) return deferPaused();
+      }
+      if (!canMix && state._audioContext?.state === 'running') {
+        const unmixedInParam = state._deckAudioGraphs?.[incomingIndex]?.mixGain?.gain;
+        if (unmixedInParam && typeof unmixedInParam.linearRampToValueAtTime === 'function') {
+          try {
+            const holdStart = Math.max(0, Number(state._audioContext.currentTime) || 0);
+            unmixedInParam.cancelScheduledValues(0);
+            try { unmixedInParam.value = 0; } catch (_) {}
+            unmixedInParam.setValueAtTime(0, holdStart);
+            state._deckAudioGraphs[incomingIndex].appliedMixGain = 0;
+          } catch (_) {}
+        }
+      }
       if (state._transitionDiagnostics) incomingBaselineTime = incoming.currentTime;
+      const playStart = handoffMonoNow();
       const played = await playDeckWithDeadline(incoming, incomingIndex, signal, ownsIncoming, diagnosticTrace);
+      playCallMs = Math.max(0, Math.round(handoffMonoNow() - playStart));
       if (!ownsIncoming()) return null;
       if (state._userPaused) return deferPaused();
       if (!played) return null;
@@ -7974,18 +16198,132 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   }
   if (!isCurrent()) return null;
   if (!incoming) {
-    if (state.crossfadeSeconds > 0) setCrossfadeStatus('fallback');
+    if (fadeActive) setCrossfadeStatus('fallback');
     return false;
   }
   if (state._userPaused) return deferPaused();
   const token = ++state._crossfadeToken;
-  if (outgoingIndex >= 0 && !canMix) {
-    state._deckGains[outgoingIndex] = 0;
+  if (canMix && (!outgoing || state._decks[outgoingIndex] !== outgoing
+      || outgoing.paused || outgoing.ended || outgoing.seeking || outgoing.readyState < 2)) {
+    canMix = false;
+  }
+  if (!canMix) {
+    const openingRollIn = Boolean(state._djOpeningHandoff);
+    state._djOpeningHandoff = false;
+    if (outgoingIndex >= 0) state._deckGains[outgoingIndex] = 0;
     state._deckGains[incomingIndex] = 1;
+    const unmixedGraph = state._deckAudioGraphs?.[incomingIndex];
+    if (unmixedGraph?.djBassFilter && state._audioContext) {
+      unmixedGraph.djBassPreHold = false;
+      setAudioParamImmediately(unmixedGraph.djBassFilter.gain, 0, state._audioContext.currentTime);
+      unmixedGraph.appliedDjBassGain = 0;
+    }
+    const unmixedParam = unmixedGraph?.mixGain?.gain;
+    if (state._audioContext?.state === 'running'
+        && unmixedParam && typeof unmixedParam.linearRampToValueAtTime === 'function') {
+      try {
+        const rampStart = Math.max(0, Number(state._audioContext.currentTime) || 0);
+        const rampSec = openingRollIn ? 0.55 : 0.018;
+        unmixedParam.cancelScheduledValues(0);
+        try { unmixedParam.value = 0; } catch (_) {}
+        unmixedParam.setValueAtTime(0, rampStart);
+        unmixedParam.linearRampToValueAtTime(1, rampStart + rampSec);
+        unmixedGraph.appliedMixGain = 1;
+      } catch (_) {}
+    }
     syncCrossfadeVolume();
+  }
+  const handoffCompletedAt = handoffMonoNow();
+  const endedMonitor = state._endedGapMonitor?.epoch === epoch ? state._endedGapMonitor : null;
+  state._endedGapMonitor = null;
+  const prepStats = state._deckPrepStats?.[incomingIndex]?.ti === ti ? state._deckPrepStats[incomingIndex] : null;
+  const fadeWin = state._fadeWindowObservation?.epoch === epoch
+      && state._fadeWindowObservation.trackIndex === outgoingTrack
+      && state._fadeWindowObservation.token === outgoingToken
+    ? state._fadeWindowObservation : null;
+  const incomingDurSec = Number(incoming.duration) > 0
+    ? Number(incoming.duration) : (Number(meta?.durationMs) / 1000 || 0);
+  const effectiveOutDur = outgoingDurationAtEntry || endedMonitor?.outgoingDuration || 0;
+  const prePlaySilenceMs = (!canMix && endedMonitor)
+    ? Math.max(0, Math.round(handoffCompletedAt - endedMonitor.startedAt)) : 0;
+  const watcherPickupMs = endedMonitor
+    ? Math.max(0, Math.round((endedMonitor.watcherEnteredAt ?? transitionEntryAt) - endedMonitor.startedAt)) : 0;
+  const handoffSummary = {
+    trackIndex: ti,
+    outgoingIndex,
+    incomingIndex,
+    token: state._deckPrepareTokens[incomingIndex],
+    outgoingDuration: effectiveOutDur > 0 ? Math.round(effectiveOutDur * 1000) / 1000 : undefined,
+    incomingDuration: incomingDurSec > 0 ? Math.round(incomingDurSec * 1000) / 1000 : undefined,
+    crossfadeSeconds: Number(state.crossfadeSeconds) || 0,
+    crossfadeDuration: canMix ? Number(requestedFade) || 0 : 0,
+    watcherPickupMs,
+    foregroundPrepMs,
+    streamLookupMs: prepStats?.streamLookupMs ?? 0,
+    mediaWaitElapsedMs: prepStats?.mediaWaitElapsedMs ?? (Number(incoming._tssWaitElapsedMs) || 0),
+    graphResumeMs,
+    playElapsedMs: playCallMs,
+    streamSource: prepStats?.streamSource || (prepStats?.reusedReadyDeck ? 'reused-standby' : 'unknown'),
+    mediaWaitOutcome: prepStats?.mediaWaitOutcome || incoming._tssWaitOutcome || 'unknown',
+    preflightAdopted: Boolean(prepStats?.preflightAdopted),
+    reusedReadyDeck: Boolean(prepStats?.reusedReadyDeck || standbyReadyOnEntry),
+    standbyReadyAtWindow: fadeWin ? Boolean(fadeWin.standbyReady) : standbyReadyOnEntry,
+    standbyReadyAtEnd: endedMonitor ? Boolean(endedMonitor.standbyReadyAtEnd) : standbyReadyOnEntry,
+    bufferedStartPts: Number.isFinite(bufferedStartPts) ? bufferedStartPts : undefined,
+    visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : undefined,
+  };
+  if (prePlaySilenceMs >= 1000) {
+    const streamMs = handoffSummary.streamLookupMs || 0;
+    const waitMs = handoffSummary.mediaWaitElapsedMs || 0;
+    const prePlayReason = watcherPickupMs >= Math.max(500, foregroundPrepMs)
+      ? 'watcher-end-pickup-delayed'
+      : (foregroundPrepMs >= 500 && streamMs >= Math.max(500, waitMs)
+        ? 'stream-lookup-delayed'
+        : (foregroundPrepMs >= 500
+          ? (handoffSummary.mediaWaitOutcome === 'timeout-ready' ? 'wait-for-deck-timeout-ready' : 'hls-buffer-wait-delayed')
+          : (graphResumeMs + playCallMs >= 500
+            ? 'play-or-graph-resume-delayed'
+            : (!handoffSummary.standbyReadyAtEnd ? 'standby-not-ready-at-end' : 'unmixed-handoff-delayed'))));
+    recordPlaybackDiagnostic('transition-silence-gap', {
+      ...handoffSummary,
+      failureStage: effectiveOutDur > 0 && effectiveOutDur <= 25 ? 'bumper-natural-end' : 'track-natural-end',
+      failureReason: prePlayReason,
+      reason: prePlayReason,
+      silenceGapMs: prePlaySilenceMs,
+    });
+  }
+  if (outgoingTimeAtEntry > 0 || endedMonitor) {
+    const startBase = Number(incoming.currentTime) || 0;
+    state._handoffAudioMonitor = {
+      epoch,
+      deck: incoming,
+      deckIndex: incomingIndex,
+      prepareToken: state._deckPrepareTokens[incomingIndex],
+      outgoingDeck: canMix ? outgoing : null,
+      outgoingIndex: canMix ? outgoingIndex : -1,
+      outgoingToken: canMix ? outgoingToken : null,
+      playFulfilledAt: handoffCompletedAt,
+      baselineTime: startBase,
+      lastTime: startBase,
+      lastAdvanceAt: handoffCompletedAt,
+      firstAdvanceAt: null,
+      prePlaySilenceMs,
+      silentSince: canMix ? null : (endedMonitor ? endedMonitor.startedAt : handoffCompletedAt),
+      summary: handoffSummary,
+      faultRecorded: prePlaySilenceMs >= 1000,
+    };
+  } else {
+    state._handoffAudioMonitor = null;
   }
   state._deckIndex = incomingIndex;
   state._deckTrack = ti;
+  if (typeof syncBrowserNowPlaying === 'function') syncBrowserNowPlaying();
+  if (typeof syncOwnPipWindow === 'function' && typeof ownPipIsOpen === 'function' && ownPipIsOpen()) {
+    syncOwnPipWindow();
+  }
+  if (state.djMode && typeof onDjTrackTransitionStart === 'function') {
+    onDjTrackTransitionStart(ti);
+  }
   installBetterFeedPipBridge();
   if (canMix) {
     warmUpcomingCrossfadeStreams();
@@ -7996,9 +16334,14 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
       state._crossfadeStreamWarmup = null;
     };
     if (!ownsIncoming() || state._crossfadeToken !== token) { cleanupFailedWarmup(); return null; }
-    if (state._userPaused) { cleanupFailedWarmup(); return deferPaused(); }
+    if (mixed !== true && state._userPaused) {
+      cleanupFailedWarmup();
+      if (outgoing && outgoing !== incoming && state._decks[outgoingIndex] === outgoing) resetDeck(outgoing, outgoingIndex);
+      return deferPaused(Number(incoming?.currentTime) || 0);
+    }
     if (mixed !== true) {
       cleanupFailedWarmup();
+      if (typeof cancelActiveDjVoiceSpeech === 'function') cancelActiveDjVoiceSpeech({ immediate: false });
       // A failed overlap must not strand the old deck behind a silent incoming
       // owner. Never revive it after Stop or a newer request/preparation.
       if (ownsIncoming() && state._crossfadeToken === token) {
@@ -8029,7 +16372,10 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
   });
   if (!ownsIncoming()) return null;
   if (outgoing && outgoing !== incoming && state._decks[outgoingIndex] === outgoing) resetDeck(outgoing, outgoingIndex);
-  if (state.crossfadeSeconds > 0) setCrossfadeStatus('ready');
+  if (state._userPaused && !incoming.paused) {
+    try { incoming.pause(); } catch (_) {}
+  }
+  if (fadeActive) setCrossfadeStatus('ready');
   state._pendingPlaybackTrack = null;
   state.lastTitle = meta?.title || '';
   state.lastProgress = 0;
@@ -8054,6 +16400,7 @@ async function playWithCrossfadeDeck(ti, countPlay, requestedFade, diagnosticTra
 function trackPlayed(ti) {
   state.stats.played++;
   state.stats.playCounts[ti] = (state.stats.playCounts[ti] || 0) + 1;
+  if (typeof recordDjTrackImpression === 'function') recordDjTrackImpression(ti);
 }
 
 function finalizeLeavingCurrentTrack(ti) {
@@ -8077,14 +16424,33 @@ function consumeCurrentQueueTrack() {
   state.queue.splice(state.pos, 1);
   state.roundPlayed = Math.min(state.roundTotal, state.roundPlayed + 1);
   finalizeLeavingCurrentTrack(justPlayed);
+  const playedEl = state.els?.[justPlayed];
+  if (playedEl && playedEl.nodeType === 1
+      && typeof document !== 'undefined' && document?.body?.contains
+      && !document.body.contains(playedEl)) {
+    state.els[justPlayed] = null;
+  }
 
   const remaining = state.queue.length - state.pos;
   if (!state.stopAfterRound && remaining <= 0) {
     const aliveIndices = [...Array(state.meta.length).keys()].filter(trackAvailable);
-    state.queue = buildBalancedRound(aliveIndices, justPlayed);
+    const preview = state._nextRoundQueue;
+    const previewValid = Boolean(
+      preview
+      && preview.epoch === state._playbackEpoch
+      && preview.anchorTi === justPlayed
+      && Array.isArray(preview.queue)
+      && preview.queue.length > 0
+      && preview.aliveCount === aliveIndices.length
+      && preview.queue.every(ti => trackAvailable(ti)),
+    );
+    state.queue = previewValid ? preview.queue.slice() : buildBalancedRound(aliveIndices, justPlayed);
+    state._nextRoundQueue = null;
     state.pos = 0;
     state.roundPlayed = 0;
     state.roundTotal = state.queue.length;
+  } else if (state.stopAfterRound || remaining > 3) {
+    state._nextRoundQueue = null;
   }
 
   if (state.playNext.length > 0) {
@@ -8113,15 +16479,31 @@ function currentPageTrackElements() {
 
   // Likes cards lack a stable list-item class; locate them by action controls.
   if (isLikedTracksPage()) {
-    for (const control of document.querySelectorAll('.soundActions .sc-button-more, button[title="More"]')) {
-      const card = control.closest('.sound');
+    for (const control of document.querySelectorAll('.soundActions .sc-button-more, button[title="More"], button[aria-label*="More" i]')) {
+      const card = control.closest('.sound') || control.closest?.('[role="listitem"], article');
       if (card && getLink(card)) elements.push(card);
+    }
+  }
+
+  if (elements.length === 0) {
+    const ownedSelector = typeof TSS_OWNED_MUTATION_SELECTOR === 'string'
+      ? `${TSS_OWNED_MUTATION_SELECTOR}, header, nav, footer, .playControls`
+      : '#tss-hub, #tss-sidebar, header, nav, footer, .playControls';
+    for (const candidate of document.querySelectorAll('main [role="listitem"], main article, [role="list"] > [role="listitem"]')) {
+      if (candidate.closest?.(ownedSelector)) continue;
+      if (candidate.querySelector?.('[role="listitem"], article')) continue;
+      if (getLink(candidate)) elements.push(candidate);
     }
   }
 
   const seen = new Set();
   return elements.filter(el => {
-    const id = trackCacheKey(getMeta(el)) || el;
+    const meta = getMeta(el);
+    if (typeof isSoundCloudTrackUrl === 'function' && meta?.link
+        && /^https?:\/\/soundcloud\.com\//i.test(meta.link) && !isSoundCloudTrackUrl(meta.link)) {
+      return false;
+    }
+    const id = trackCacheKey(meta) || el;
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
@@ -8172,7 +16554,7 @@ function cancelCollectionRequest() {
   finishCollectionRequest(request);
 }
 
-async function loadTracks(request = null) {
+async function loadTracks(request = null, snapshotPromise = null) {
   const sourcePage = request?.sourcePage || location.href;
   const currentRequest = () => !request || collectionRequestCurrent(request);
   const pause = ms => request ? withDeadline(() => wait(ms), ms + 1000, request.signal) : wait(ms);
@@ -8188,6 +16570,23 @@ async function loadTracks(request = null) {
       if (id && !seen.has(id)) seen.set(id, el);
     }
   };
+
+  if (typeof collectPageCollectionSilently === 'function' && snapshotPromise !== null) {
+    collect();
+    const initialEls = preserveScrolledLikes ? [...seen.values()] : current;
+    const silentCollection = await collectPageCollectionSilently(
+      sourcePage,
+      request,
+      initialEls,
+      snapshotPromise,
+    );
+    if (!currentRequest()) return [];
+    if (silentCollection) {
+      const result = [...initialEls];
+      result._tssSilentCollection = silentCollection;
+      return result;
+    }
+  }
 
   for (let i = 0; i < 20; i++) {
     collect();
@@ -8221,7 +16620,12 @@ function bindCurrentPageElements(pageEls) {
 
 function trackAvailable(ti) {
   const meta = state.meta[ti];
-  return Boolean(meta && !meta.unavailable && (meta.sourcePage || state.els[ti]));
+  if (!meta || meta.unavailable || !(meta.sourcePage || state.els[ti])) return false;
+  if (meta.isDjDiscovery && !state.djMode && !meta.liked
+      && state._deckTrack !== ti && !state.playNext?.includes(ti)) {
+    return false;
+  }
+  return true;
 }
 
 
@@ -8229,140 +16633,190 @@ function trackAvailable(ti) {
 async function playAt(idx, countPlay = true, attemptedCustomTracks = null, priorFailedCandidates = 0) {
   const epoch = state._playbackEpoch;
   const request = state._playbackRequest;
-  const meta = state.meta[idx];
-  const isCurrent = () => state.active && epoch === state._playbackEpoch
-    && state._playbackRequest === request && state.meta[idx] === meta;
-  if (!isCurrent() || !meta || !trackAvailable(idx)) return null;
-  state._pendingPlaybackTrack = { ti: idx, countPlay, epoch };
-  if (state._userPaused) return null;
-  clearTimeout(state._customPlaybackRetryTimer);
-  state._customPlaybackRetryTimer = null;
-  const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(idx) : null;
   priorFailedCandidates = Math.max(0, Number(priorFailedCandidates) || 0);
-  const requestedFade = currentDeckAudio()
-    ? (state._crossfadePending
-      ? Math.min(state.crossfadeSeconds, Number(state._crossfadePending) || state.crossfadeSeconds)
-      : (state.crossfadeManual ? state.crossfadeSeconds : 0))
-    : 0;
-  const custom = await playWithCrossfadeDeck(idx, countPlay, requestedFade, diagnosticTrace);
-  if (!isCurrent() || state._userPaused || custom === null) return null;
-  if (custom) {
-    if (state._diagnosticBuild) {
-      const precedingFailedCandidates = priorFailedCandidates + (attemptedCustomTracks?.size || 0);
-      recordPlaybackDiagnostic('custom-start-succeeded', {
-        ...(customStartDiagnosticDetails(diagnosticTrace, 'started') || {}),
-        trackIndex: idx,
-        deckIndex: state._deckIndex,
-        startedVia: 'custom-deck',
-        outcome: 'started',
-        precedingFailedCandidates,
-      });
-      if (precedingFailedCandidates) {
-        recordPlaybackDiagnostic('custom-start-recovered', {
-          attemptId: diagnosticTrace?.attemptId,
-          trackIndex: idx,
+  let attempted = attemptedCustomTracks;
+  let candidateIdx = idx;
+
+  while (true) {
+    const meta = state.meta[candidateIdx];
+    const isCurrent = () => state.active && epoch === state._playbackEpoch
+      && state._playbackRequest === request && state.meta[candidateIdx] === meta;
+    if (!isCurrent() || !meta || !trackAvailable(candidateIdx)) return null;
+    state._pendingPlaybackTrack = { ti: candidateIdx, countPlay, epoch };
+    if (state._userPaused) return null;
+    clearTimeout(state._customPlaybackRetryTimer);
+    state._customPlaybackRetryTimer = null;
+    const diagnosticTrace = state._diagnosticBuild ? createCustomStartTrace(candidateIdx) : null;
+    const pendingFade = Number(state._crossfadePending);
+    const minFadeSec = typeof CROSSFADE_MIN_DURATION_SECONDS === 'number' ? CROSSFADE_MIN_DURATION_SECONDS : 0.25;
+    const vibeSwitchFade = Number(state._djVibeSwitchFade);
+    const hasVibeSwitchFade = Number.isFinite(vibeSwitchFade) && vibeSwitchFade > 0;
+    const baseAutoFadeSec = state.djMode && state.djAutoMix && typeof resolveDjAutoFadeSeconds === 'function'
+      ? resolveDjAutoFadeSeconds(state._deckTrack, candidateIdx)
+      : state.crossfadeSeconds;
+    const effectiveCrossfadeSec = hasVibeSwitchFade
+      ? vibeSwitchFade
+      : (baseAutoFadeSec > 0
+        ? baseAutoFadeSec
+        : (state.djMode && state.djCueTrim && state._crossfadePending ? 0.45 : 0));
+    const guardedPendingFade = Number.isFinite(pendingFade) && pendingFade > minFadeSec + 0.06
+      ? pendingFade - 0.045
+      : (pendingFade || effectiveCrossfadeSec);
+    const requestedFade = currentDeckAudio()
+      ? (state._crossfadePending
+        ? Math.min(effectiveCrossfadeSec, guardedPendingFade)
+        : ((state.crossfadeManual || hasVibeSwitchFade) ? effectiveCrossfadeSec : 0))
+      : 0;
+    const custom = await playWithCrossfadeDeck(candidateIdx, countPlay, requestedFade, diagnosticTrace);
+    if (!isCurrent() || state._userPaused || custom === null) return null;
+    if (custom) {
+      if (state._diagnosticBuild) {
+        const precedingFailedCandidates = priorFailedCandidates + (attempted?.size || 0);
+        recordPlaybackDiagnostic('custom-start-succeeded', {
+          ...(customStartDiagnosticDetails(diagnosticTrace, 'started') || {}),
+          trackIndex: candidateIdx,
+          deckIndex: state._deckIndex,
           startedVia: 'custom-deck',
+          outcome: 'started',
           precedingFailedCandidates,
         });
+        if (precedingFailedCandidates) {
+          recordPlaybackDiagnostic('custom-start-recovered', {
+            attemptId: diagnosticTrace?.attemptId,
+            trackIndex: candidateIdx,
+            startedVia: 'custom-deck',
+            precedingFailedCandidates,
+          });
+        }
+      }
+      return true;
+    }
+    attempted ||= new Set();
+    attempted.add(candidateIdx);
+    const currentQueueIndex = state.queue.indexOf(candidateIdx, state.pos);
+    if (currentQueueIndex === state.pos && state.queue.length - state.pos > 1) {
+      state.queue.splice(currentQueueIndex, 1);
+      state.queue.push(candidateIdx);
+    }
+    let replacement;
+    for (let qi = state.pos; qi < state.queue.length; qi++) {
+      const ti = state.queue[qi];
+      if (trackAvailable(ti) && !attempted.has(ti)) {
+        replacement = ti;
+        break;
       }
     }
-    return true;
-  }
-  const attempted = attemptedCustomTracks || new Set();
-  attempted.add(idx);
-  const currentQueueIndex = state.queue.indexOf(idx, state.pos);
-  if (currentQueueIndex === state.pos && state.queue.length - state.pos > 1) {
-    state.queue.splice(currentQueueIndex, 1);
-    state.queue.push(idx);
-  }
-  const replacement = state.queue.slice(state.pos).find(ti => trackAvailable(ti) && !attempted.has(ti));
-  if (state._diagnosticBuild) {
-    const details = {
-      trackIndex: idx,
-      attempted: attempted.size,
-      priorFailedCandidates,
-      passExhausted: replacement === undefined,
-      queuePosition: state.pos,
-      queueLength: state.queue.length,
-    };
-    if (diagnosticTrace) Object.assign(details, customStartDiagnosticDetails(diagnosticTrace));
-    recordPlaybackDiagnostic(
-      replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
-      details,
-    );
-  } else {
-    recordPlaybackDiagnostic(
-      replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
-      { trackIndex: idx, attempted: attempted.size },
-    );
-  }
-  if (replacement !== undefined) {
-    const replacementIndex = state.queue.indexOf(replacement, state.pos);
-    if (replacementIndex > state.pos) {
-      state.queue.splice(replacementIndex, 1);
-      state.queue.splice(state.pos, 0, replacement);
-    }
-    return playAt(replacement, countPlay, attempted, priorFailedCandidates);
-  }
-  state._pendingPlaybackTrack = { ti: state.queue[state.pos], countPlay, epoch };
-  setCrossfadeStatus('fallback');
-  state.suspended = true;
-  showMergeToast('Custom playback unavailable — retrying shortly');
-  updateHub();
-  clearTimeout(state._customPlaybackRetryTimer);
-  if (state._diagnosticBuild) {
-    recordPlaybackDiagnostic('custom-retry-scheduled', {
-      trackIndex: state.queue[state.pos] ?? null,
-      attempted: attempted.size,
-      delayMs: 5000,
-      priorFailedCandidates: priorFailedCandidates + attempted.size,
-      queuePosition: state.pos,
-      queueLength: state.queue.length,
-    });
-  }
-  const timer = setTimeout(() => {
-    if (!isCurrent() || state._customPlaybackRetryTimer !== timer) return;
-    state._customPlaybackRetryTimer = null;
-    const retryTrack = state.queue[state.pos];
     if (state._diagnosticBuild) {
-      recordPlaybackDiagnostic('custom-retry-fired', {
-        trackIndex: retryTrack ?? null,
+      const details = {
+        trackIndex: candidateIdx,
+        attempted: attempted.size,
+        priorFailedCandidates,
+        passExhausted: replacement === undefined,
         queuePosition: state.pos,
         queueLength: state.queue.length,
+      };
+      if (diagnosticTrace) Object.assign(details, customStartDiagnosticDetails(diagnosticTrace));
+      recordPlaybackDiagnostic(
+        replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
+        details,
+      );
+    } else {
+      recordPlaybackDiagnostic(
+        replacement === undefined ? 'custom-start-exhausted' : 'custom-start-candidate-failed',
+        { trackIndex: candidateIdx, attempted: attempted.size },
+      );
+    }
+    if (replacement !== undefined) {
+      const replacementIndex = state.queue.indexOf(replacement, state.pos);
+      if (replacementIndex > state.pos) {
+        state.queue.splice(replacementIndex, 1);
+        state.queue.splice(state.pos, 0, replacement);
+      }
+      candidateIdx = replacement;
+      continue;
+    }
+    const isRetryCurrent = () => state.active && epoch === state._playbackEpoch
+      && state._playbackRequest === request;
+    state._pendingPlaybackTrack = { ti: state.queue[state.pos], countPlay, epoch };
+    setCrossfadeStatus('fallback');
+    state.suspended = true;
+    showMergeToast('Custom playback unavailable — retrying shortly');
+    updateHub();
+    clearTimeout(state._customPlaybackRetryTimer);
+    if (state._diagnosticBuild) {
+      recordPlaybackDiagnostic('custom-retry-scheduled', {
+        trackIndex: state.queue[state.pos] ?? null,
+        attempted: attempted.size,
+        delayMs: 5000,
         priorFailedCandidates: priorFailedCandidates + attempted.size,
-        busy: Boolean(state.busy),
-        userPaused: Boolean(state._userPaused),
+        queuePosition: state.pos,
+        queueLength: state.queue.length,
       });
     }
-    if (state.busy || state._userPaused) {
+    const timer = setTimeout(() => {
+      if (!isRetryCurrent() || state._customPlaybackRetryTimer !== timer) return;
+      state._customPlaybackRetryTimer = null;
+      const retryTrack = state.queue[state.pos];
       if (state._diagnosticBuild) {
-        recordPlaybackDiagnostic('custom-retry-skipped', {
-          reason: state.busy ? 'busy' : 'user-paused',
-          priorFailedCandidates: priorFailedCandidates + attempted.size,
+        recordPlaybackDiagnostic('custom-retry-fired', {
           trackIndex: retryTrack ?? null,
-        });
-      }
-      return;
-    }
-    if (retryTrack === undefined) {
-      if (state._diagnosticBuild) {
-        recordPlaybackDiagnostic('custom-retry-skipped', {
-          reason: 'empty-queue',
+          queuePosition: state.pos,
+          queueLength: state.queue.length,
           priorFailedCandidates: priorFailedCandidates + attempted.size,
+          busy: Boolean(state.busy),
+          userPaused: Boolean(state._userPaused),
         });
       }
-      return;
-    }
-    state.suspended = false;
-    void runPlaybackOperation('automatic retry', () =>
-      playAt(retryTrack, countPlay, null, priorFailedCandidates + attempted.size));
-  }, 5000);
-  state._customPlaybackRetryTimer = timer;
-  return false;
+      if (state.busy || state._userPaused) {
+        if (state._diagnosticBuild) {
+          recordPlaybackDiagnostic('custom-retry-skipped', {
+            reason: state.busy ? 'busy' : 'user-paused',
+            priorFailedCandidates: priorFailedCandidates + attempted.size,
+            trackIndex: retryTrack ?? null,
+          });
+        }
+        return;
+      }
+      if (retryTrack === undefined) {
+        if (state._diagnosticBuild) {
+          recordPlaybackDiagnostic('custom-retry-skipped', {
+            reason: 'empty-queue',
+            priorFailedCandidates: priorFailedCandidates + attempted.size,
+          });
+        }
+        return;
+      }
+      state.suspended = false;
+      void runPlaybackOperation('automatic retry', () =>
+        playAt(retryTrack, countPlay, null, priorFailedCandidates + attempted.size));
+    }, 5000);
+    state._customPlaybackRetryTimer = timer;
+    return false;
+  }
 }
 
 async function next(fromWatcher = false) {
   if (!state.active || (fromWatcher && state._userPaused)) return;
+  if (!fromWatcher && state._djOpeningIntroActive && typeof cancelDjOpeningIntro === 'function') {
+    cancelDjOpeningIntro('skip-intro');
+    return;
+  }
+  if (!fromWatcher && state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (state._pendingPlaybackTrack?.ti === state._deckTrack) state._pendingPlaybackTrack = null;
+    state._playbackRequest = null;
+    state.busy = false;
+  }
   if (state.busy) {
     if (!fromWatcher && state._playbackRequest?.pending) {
       const ti = currentPendingPlaybackTrack()?.ti
@@ -8375,7 +16829,12 @@ async function next(fromWatcher = false) {
   const pending = currentPendingPlaybackTrack();
   if (fromWatcher && pending && state._customPlaybackRetryTimer) return;
   if (fromWatcher && state.manualAction) { state.manualAction = false; return; }
-  if (!fromWatcher) state._userPaused = false;
+  if (!fromWatcher) {
+    state._userPaused = false;
+    if (!state._djVibeSwitching && typeof cancelActiveDjVoiceSpeech === 'function') {
+      cancelActiveDjVoiceSpeech({ immediate: false });
+    }
+  }
   return runPlaybackOperation('next', async isCurrent => {
     if (pending) {
       const ti = promotePendingPlayNext();
@@ -8412,6 +16871,30 @@ async function next(fromWatcher = false) {
         return;
       }
     }
+    if (justPlayed !== undefined && !state._djVibeSwitching && typeof recordDjTrackOutcome === 'function') {
+      const djOutcome = recordDjTrackOutcome(justPlayed, fromWatcher ? 'natural-end' : 'manual-skip');
+      if (djOutcome?.shouldRecalibrate && state.djMode
+          && typeof planNextDjChapter === 'function' && typeof applyDjChapterToQueue === 'function') {
+        state._djSkipStreak = 0;
+        const recalibrated = await planNextDjChapter({
+          reason: 'skip-recalibrate',
+          excludeIndices: [justPlayed, ...(state._djChapter?.tracks || [])],
+          signal: state._playbackAbort?.signal,
+        });
+        if (!isCurrent()) return;
+        if (recalibrated) {
+          if (state._djPendingChapter && state._djPendingChapter !== recalibrated
+              && typeof clearDjChapterVoiceState === 'function') {
+            clearDjChapterVoiceState(state._djPendingChapter);
+          }
+          applyDjChapterToQueue(recalibrated, { atCurrent: false });
+          state._djPendingChapter = recalibrated;
+          if (state.djCommentaryMode === 'voice' && typeof preSynthesizeDjChapterVoice === 'function') {
+            preSynthesizeDjChapterVoice(recalibrated);
+          }
+        }
+      }
+    }
     consumeCurrentQueueTrack();
     if (state.pos >= state.queue.length) { stop(); renderList(); return; }
     await playAt(state.queue[state.pos]);
@@ -8422,7 +16905,24 @@ async function next(fromWatcher = false) {
 }
 
 async function prevTrack() {
-  if (!state.active || state.busy) return;
+  if (!state.active) return;
+  if (state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (state._pendingPlaybackTrack?.ti === state._deckTrack) state._pendingPlaybackTrack = null;
+    state._playbackRequest = null;
+    state.busy = false;
+  }
+  if (state.busy) return;
   let historyIndex;
   try {
     if (currentSec() > 3 || !state.history.length) { seekTo(0); return; }
@@ -8439,6 +16939,7 @@ async function prevTrack() {
     state._userPaused = false;
     state.manualAction = true;
     state._manualActionAt = Date.now();
+    if (typeof cancelActiveDjVoiceSpeech === 'function') cancelActiveDjVoiceSpeech({ immediate: false });
     const prevTi = state.history.splice(historyIndex, 1)[0];
     const current = state.queue[state.pos];
     finalizeLeavingCurrentTrack(current);
@@ -8473,7 +16974,10 @@ function moveSelectedTrackToCurrent(ti) {
   }
 
   const targetIndex = state.queue.indexOf(ti);
-  if (targetIndex !== -1) state.queue.splice(targetIndex, 1);
+  if (targetIndex !== -1) {
+    state.queue.splice(targetIndex, 1);
+    if (targetIndex < state.pos) state.pos--;
+  }
   state.queue.splice(state.pos, 0, ti);
   recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
@@ -8489,8 +16993,27 @@ function removePlayNextOccurrences(ti) {
 }
 
 async function jumpTo(qi, ti) {
-  if (!state.active || state.busy || !trackAvailable(ti)) return;
+  if (!state.active || !trackAvailable(ti)) return;
+  if (state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (state._pendingPlaybackTrack?.ti === state._deckTrack) state._pendingPlaybackTrack = null;
+    state._playbackRequest = null;
+    state.busy = false;
+  }
+  if (state.busy) return;
   state._userPaused = false;
+  if (typeof cancelActiveDjVoiceSpeech === 'function') cancelActiveDjVoiceSpeech({ immediate: false });
+  if (typeof recordDjExplicitSignal === 'function') recordDjExplicitSignal(ti, 'jump-to');
   return runPlaybackOperation('jump', async isCurrent => {
     state.manualAction = true;
     state._manualActionAt = Date.now();
@@ -8509,6 +17032,7 @@ function queueNext(ti) {
   const currentTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.queue[state.pos];
   if (!trackAvailable(ti) || ti === currentTi || state.playNext.includes(ti)) return false;
   state.playNext.push(ti);
+  if (typeof recordDjExplicitSignal === 'function') recordDjExplicitSignal(ti, 'play-next');
   recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   renderList();
@@ -8526,6 +17050,7 @@ function removeTrackFromUpcoming(ti) {
 
   state.playNext = remainingPlayNext;
   if (qi !== -1) state.queue.splice(qi, 1);
+  if (typeof recordDjExplicitSignal === 'function') recordDjExplicitSignal(ti, 'queue-remove');
   recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   if (qi !== -1) badges();
@@ -8535,36 +17060,224 @@ function removeTrackFromUpcoming(ti) {
 
 function removeFromQueue(qi) {
   if (qi === state.pos) return;
+  const removedTi = state.queue[qi];
   state.queue.splice(qi, 1);
   if (qi < state.pos) state.pos--;
+  if (removedTi !== undefined && typeof recordDjExplicitSignal === 'function') {
+    recordDjExplicitSignal(removedTi, 'queue-remove');
+  }
   recountRoundTotal();
   refreshUpcomingCrossfadePreparation();
   badges();
   renderList();
 }
 
+function extractSoundCloudSecretToken(url) {
+  if (typeof url !== 'string' || !url.trim()) return '';
+  try {
+    const parsed = new URL(url, 'https://soundcloud.com');
+    const fromQuery = String(parsed.searchParams.get('secret_token') || '').trim();
+    if (/^s-[A-Za-z0-9_-]+$/i.test(fromQuery)) return fromQuery;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (/^s-[A-Za-z0-9_-]+$/i.test(parts[i])) return parts[i];
+    }
+  } catch (_) {}
+  const match = url.match(/\/(s-[A-Za-z0-9_-]+)(?:[/?#]|$)/i);
+  return match ? match[1] : '';
+}
+
+function rememberLiveSoundCloudBundleUrlsFromHtml(html) {
+  if (typeof state === 'undefined' || !state || typeof html !== 'string' || !html) return;
+  const freshUrls = [];
+  const scriptSrcRe = /<script\b[^>]*\bsrc=[\x22\x27](https?:\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/[^\x22\x27\s>]+\.js(?:\?[^\x22\x27\s>]*)?)[\x22\x27]/gi;
+  let match;
+  while ((match = scriptSrcRe.exec(html)) && freshUrls.length < 24) {
+    if (!freshUrls.includes(match[1])) freshUrls.push(match[1]);
+  }
+  if (!freshUrls.length) return;
+  const combined = [...freshUrls];
+  for (const prev of Array.isArray(state._liveSyncBundleUrls) ? state._liveSyncBundleUrls : []) {
+    if (combined.length >= 24) break;
+    if (prev && !combined.includes(prev)) combined.push(prev);
+  }
+  state._liveSyncBundleUrls = combined;
+}
+
+function domVisiblePlaylistTrackCount(sourcePage) {
+  if (typeof document === 'undefined' || typeof document?.querySelector !== 'function') return null;
+  if (typeof location === 'undefined' || typeof playlistBase !== 'function') return null;
+  if (playlistBase(String(location?.href || '')) !== playlistBase(String(sourcePage || ''))) return null;
+  const countNode = document.querySelector(
+    '.genericTrackCount__title, .playlistTrackCount, [data-testid*="track-count" i], [class*="genericTrackCount__title"]',
+  );
+  const rawText = String(countNode?.textContent || '').replace(/[,\s]/g, '');
+  if (/^\d+$/.test(rawText)) {
+    const parsed = soundCloudInteger(rawText, 0);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+// Sign-out-safe SoundCloud API v2 JSON helper: uses optional OAuth token with
+// credentials: 'omit' when signed in, and transparently retries unauthenticated
+// if an expired/signed-out oauth_token cookie returns 401/403.
+async function fetchSoundCloudApiJson(url, options = {}) {
+  const signal = options.signal || null;
+  const oauthToken = options.allowOAuth !== false && typeof readSoundCloudOAuthToken === 'function'
+    ? readSoundCloudOAuthToken()
+    : '';
+  if (oauthToken) {
+    const authed = await fetchSoundCloudResource(url, 'json', {
+      signal,
+      credentials: 'omit',
+      headers: { Authorization: `OAuth ${oauthToken}` },
+    });
+    if (signal?.aborted) return authed;
+    if (authed.status !== 401 && authed.status !== 403) return authed;
+  }
+  return fetchSoundCloudResource(url, 'json', { signal, credentials: 'omit' });
+}
+
+async function fetchPlaylistTracksByIdFromApi(playlistId, sourcePage, signal = null) {
+  const numericId = soundCloudInteger(playlistId, 1);
+  const byId = new Map();
+  if (numericId === null || typeof discoverSoundCloudClientIdFromBundle !== 'function') return byId;
+  const secretToken = extractSoundCloudSecretToken(sourcePage);
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  for (let attempt = 0; attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const endpoint = new URL(`https://api-v2.soundcloud.com/playlists/${numericId}`);
+      endpoint.searchParams.set('representation', 'full');
+      endpoint.searchParams.set('client_id', clientId);
+      if (secretToken) endpoint.searchParams.set('secret_token', secretToken);
+      const response = await fetchSoundCloudApiJson(endpoint, { signal });
+      if (signal?.aborted) return byId;
+      if ((response.status === 401 || response.status === 403) && attempt < 2) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: true, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      if (!response.ok || !Array.isArray(response.data?.tracks)) return byId;
+      for (const track of response.data.tracks) {
+        const trackId = soundCloudInteger(track?.id, 1);
+        if (trackId !== null) byId.set(trackId, track);
+      }
+      return byId;
+    } catch (_) {
+      return byId;
+    }
+  }
+  return byId;
+}
+
+async function fetchLivePlaylistSnapshotViaApi(sourcePage, signal = null) {
+  if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) return null;
+  if (typeof discoverSoundCloudClientIdFromBundle !== 'function') return null;
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  if (!clientId || signal?.aborted) return null;
+  const cleanUrl = String(sourcePage).split(/[?#]/)[0].replace(/\/+$/, '');
+  for (let attempt = 0; attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const endpoint = new URL('https://api-v2.soundcloud.com/resolve');
+      endpoint.searchParams.set('url', cleanUrl);
+      endpoint.searchParams.set('client_id', clientId);
+      const response = await fetchSoundCloudApiJson(endpoint, { signal });
+      if (signal?.aborted) return null;
+      if ((response.status === 401 || response.status === 403) && attempt < 2) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: true, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      const data = response?.data;
+      if (!response?.ok || data?.kind !== 'playlist' || !Array.isArray(data?.tracks)) return null;
+      const rawTracks = data.tracks;
+      const tracks = rawTracks.filter(track => soundCloudInteger(track?.id, 1) !== null);
+      const trackCount = soundCloudInteger(data.track_count ?? data.trackCount);
+      if (!tracks.length && !(trackCount === 0 && rawTracks.length === 0)) return null;
+      return {
+        id: data.id || null,
+        trackCount,
+        complete: trackCount !== null && rawTracks.length === tracks.length && tracks.length === trackCount,
+        tracks,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+  return null;
+}
+
 async function fetchLivePlaylistSnapshot(sourcePage, signal = null) {
   if (!/soundcloud\.com\/[^/]+\/sets\//.test(sourcePage || '')) return null;
+  let htmlSnapshot = null;
   try {
     const requestUrl = new URL(sourcePage);
     requestUrl.searchParams.set('_tss_live_sync', String(Date.now()));
     const response = await fetchSoundCloudResource(requestUrl, 'text', {
       signal,
       cache: 'no-store',
-      credentials: 'include',
+      credentials: 'omit',
       headers: { Accept: 'text/html' },
     });
-    if (!response.ok) return null;
-    return playlistSnapshotFromHtml(response.data, sourcePage);
+    if (response.ok && typeof response.data === 'string') {
+      if (typeof rememberLiveSoundCloudBundleUrlsFromHtml === 'function') {
+        rememberLiveSoundCloudBundleUrlsFromHtml(response.data);
+      } else if (typeof state !== 'undefined' && state) {
+        const scriptSrcRe = /<script\b[^>]*\bsrc=[\x22\x27](https?:\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/[^\x22\x27\s>]+\.js(?:\?[^\x22\x27\s>]*)?)[\x22\x27]/gi;
+        const freshUrls = [];
+        let m;
+        while ((m = scriptSrcRe.exec(response.data)) && freshUrls.length < 24) {
+          if (!freshUrls.includes(m[1])) freshUrls.push(m[1]);
+        }
+        if (freshUrls.length) state._liveSyncBundleUrls = freshUrls;
+      }
+      htmlSnapshot = playlistSnapshotFromHtml(response.data, sourcePage);
+    }
   } catch (_) {
+    htmlSnapshot = null;
+  }
+  if (signal?.aborted) return null;
+  if (!htmlSnapshot) {
+    if (typeof fetchLivePlaylistSnapshotViaApi === 'function') {
+      return fetchLivePlaylistSnapshotViaApi(sourcePage, signal);
+    }
     return null;
   }
+  if (typeof domVisiblePlaylistTrackCount === 'function' && typeof fetchLivePlaylistSnapshotViaApi === 'function') {
+    const domCount = domVisiblePlaylistTrackCount(sourcePage);
+    const snapCount = htmlSnapshot.trackCount ?? htmlSnapshot.tracks.length;
+    if (domCount !== null && domCount !== snapCount) {
+      const apiSnapshot = await fetchLivePlaylistSnapshotViaApi(sourcePage, signal);
+      if (apiSnapshot?.tracks) return apiSnapshot;
+    }
+  }
+  return htmlSnapshot;
 }
 
 function mergeTrackMeta(primary, fallback) {
   if (!primary) return fallback ? { ...fallback } : null;
   const merged = { ...primary };
+  const primaryArtist = typeof merged.artist === 'string' ? merged.artist.trim() : '';
+  const fallbackArtist = typeof fallback?.artist === 'string' ? fallback.artist.trim() : '';
+  if (fallback?.domMultiArtist && fallbackArtist.includes(', ')
+      && primaryArtist && primaryArtist !== '—' && !primaryArtist.includes(', ')
+      && fallbackArtist.toLowerCase().includes(primaryArtist.toLowerCase())) {
+    merged.artist = fallbackArtist;
+    merged.domMultiArtist = true;
+  }
   for (const [key, value] of Object.entries(fallback || {})) {
+    if (key === 'domMultiArtist') continue;
     const current = merged[key];
     if (current == null || (typeof current === 'string' && (!current.trim() || current.trim() === '—'))
         || (Array.isArray(current) && !current.length)) {
@@ -8574,21 +17287,280 @@ function mergeTrackMeta(primary, fallback) {
   return merged;
 }
 
+function hasSoundCloudAudioReplacement(existing, fresh) {
+  if (!existing || !fresh || typeof existing !== 'object' || typeof fresh !== 'object') return false;
+  const oldMedia = typeof existing.mediaSignature === 'string' ? existing.mediaSignature.trim() : '';
+  const newMedia = typeof fresh.mediaSignature === 'string' ? fresh.mediaSignature.trim() : '';
+  const mediaChanged = Boolean(oldMedia && newMedia && newMedia !== oldMedia);
+
+  const oldWave = typeof existing.waveform === 'string' ? existing.waveform.trim() : '';
+  const newWave = typeof fresh.waveform === 'string' ? fresh.waveform.trim() : '';
+  const waveformChanged = Boolean(oldWave && newWave && newWave !== oldWave);
+
+  const oldMod = typeof existing.lastModified === 'string' ? existing.lastModified.trim() : '';
+  const newMod = typeof fresh.lastModified === 'string' ? fresh.lastModified.trim() : '';
+  const lastModifiedChanged = Boolean(oldMod && newMod && newMod !== oldMod);
+
+  const oldDur = Number(existing.durationMs);
+  const newDur = Number(fresh.durationMs);
+  const hadApiBaseline = Boolean(existing._metaRefreshedAt || oldMedia || oldMod || oldWave);
+  const durThresholdMs = hadApiBaseline ? 50 : 1500;
+  const durationChanged = Number.isFinite(oldDur) && oldDur > 0 && Number.isFinite(newDur) && newDur > 0
+    && Math.abs(newDur - oldDur) >= durThresholdMs;
+
+  return Boolean(mediaChanged || waveformChanged || lastModifiedChanged || durationChanged);
+}
+
+function invalidateReplacedTrackCaches(meta) {
+  if (!meta || typeof meta !== 'object') return;
+  meta._audioReplacedAt = Date.now();
+  if (typeof state !== 'undefined' && state && typeof WeakSet === 'function') {
+    (state._staleEmbeddedTracks ||= new WeakSet()).add(meta);
+  }
+  const normLink = typeof normalizeTrackUrl === 'function' ? normalizeTrackUrl(meta.link) : '';
+  const scId = typeof soundCloudInteger === 'function' ? soundCloudInteger(meta.soundcloudId, 1) : null;
+  if (typeof state !== 'undefined' && state?._streamCache instanceof Map) {
+    if (normLink) state._streamCache.delete(normLink);
+    if (scId !== null) {
+      for (const [cachedKey, cachedVal] of [...state._streamCache.entries()]) {
+        const cachedId = typeof soundCloudInteger === 'function'
+          ? soundCloudInteger(cachedVal?.soundcloudId, 1)
+          : Number(cachedVal?.soundcloudId);
+        if (cachedId === scId) state._streamCache.delete(cachedKey);
+      }
+    }
+  }
+  const waveKey = typeof waveformTrackKey === 'function' ? waveformTrackKey(meta) : '';
+  if (waveKey) {
+    if (typeof waveformCache !== 'undefined' && waveformCache instanceof Map) waveformCache.delete(waveKey);
+    if (typeof state !== 'undefined' && state?._djWaveformFeatures instanceof Map) {
+      state._djWaveformFeatures.delete(waveKey);
+    }
+  }
+  if (typeof state !== 'undefined' && state?._autoLevelCache && typeof state._autoLevelCache === 'object') {
+    const candidateIdentities = new Set();
+    const tid = typeof trackId === 'function' ? trackId(meta) : '';
+    if (tid) candidateIdentities.add(tid);
+    if (normLink) candidateIdentities.add(normLink);
+    if (candidateIdentities.size) {
+      let removedAutoLevel = false;
+      for (const cacheKey of Object.keys(state._autoLevelCache)) {
+        try {
+          const parsedKey = JSON.parse(cacheKey);
+          const idPart = Array.isArray(parsedKey) ? String(parsedKey[0] || '') : '';
+          const normIdPart = typeof normalizeTrackUrl === 'function' && /^https?:\/\//i.test(idPart)
+            ? normalizeTrackUrl(idPart)
+            : idPart;
+          if (candidateIdentities.has(idPart) || (normIdPart && candidateIdentities.has(normIdPart))) {
+            delete state._autoLevelCache[cacheKey];
+            removedAutoLevel = true;
+          }
+        } catch (_) {}
+      }
+      if (removedAutoLevel && typeof saveAutoLevelCacheSoon === 'function') saveAutoLevelCacheSoon();
+    }
+  }
+}
+
+function refreshExistingTrackMeta(existing, fresh, options = {}) {
+  if (!existing || !fresh || typeof existing !== 'object' || typeof fresh !== 'object') return false;
+  const fromApi = options.fromApi === true;
+  const hasAuthoritativeApiMeta = !fromApi && Number(existing._metaRefreshedAt) > 0;
+  let visibleChanged = false;
+
+  for (const [key, value] of Object.entries(fresh)) {
+    if (key === 'liked') {
+      if (existing.liked === null && typeof value === 'boolean') existing.liked = value;
+      continue;
+    }
+    if (key === 'sourcePage' || key === 'playlistPosition' || key === 'unavailable'
+        || key === 'removedFromPlaylist' || key === 'isDjDiscovery'
+        || key === 'transcodings' || key === 'trackAuthorization'
+        || key === 'hls_aac_160_url' || key === 'hls_aac_96_url'
+        || key === 'lastModified' || key === 'mediaSignature'
+        || key === 'access' || key === 'policy'
+        || key === 'customPlaybackUnavailable' || key === 'customPlaybackReason') {
+      continue;
+    }
+    const current = existing[key];
+    if (current == null || (typeof current === 'string' && (!current.trim() || current.trim() === '—'))
+        || (Array.isArray(current) && !current.length)) {
+      if (value != null && (!(typeof value === 'string') || (value.trim() && value.trim() !== '—'))
+          && (!Array.isArray(value) || value.length)) {
+        existing[key] = value;
+      }
+    }
+  }
+
+  const existingHasTitle = typeof existing.title === 'string' && Boolean(existing.title.trim()) && existing.title.trim() !== '—';
+  if (typeof fresh.title === 'string' && fresh.title.trim() && fresh.title.trim() !== '—'
+      && fresh.title !== existing.title
+      && !(hasAuthoritativeApiMeta && existingHasTitle)) {
+    existing.title = fresh.title;
+    delete existing._camelotKey;
+    visibleChanged = true;
+  }
+
+  const existingHasArtist = typeof existing.artist === 'string' && Boolean(existing.artist.trim()) && existing.artist.trim() !== '—';
+  const wasDomMultiArtist = Boolean(existing.domMultiArtist);
+  if (fresh.domMultiArtist) existing.domMultiArtist = true;
+  else if (!fromApi && existing.domMultiArtist && typeof fresh.artist === 'string' && fresh.artist.trim() && fresh.artist.trim() !== '—') {
+    delete existing.domMultiArtist;
+  }
+  if (typeof fresh.artist === 'string' && fresh.artist.trim() && fresh.artist.trim() !== '—'
+      && fresh.artist !== existing.artist) {
+    const upgradingToCollabByline = !fromApi && (
+      Boolean(fresh.domMultiArtist)
+      || wasDomMultiArtist
+      || (existingHasArtist
+        && fresh.artist.includes(', ')
+        && !existing.artist.includes(', ')
+        && fresh.artist.toLowerCase().includes(existing.artist.toLowerCase()))
+    );
+    const keepCollabByline = fromApi && typeof existing.artist === 'string'
+      && existing.artist.includes(', ')
+      && !fresh.artist.includes(', ')
+      && existing.artist.toLowerCase().includes(fresh.artist.toLowerCase());
+    if ((!hasAuthoritativeApiMeta || upgradingToCollabByline) && !keepCollabByline) {
+      existing.artist = fresh.artist;
+      visibleChanged = true;
+    }
+  }
+
+  const existingHasArtwork = typeof existing.artwork === 'string' && Boolean(existing.artwork.trim());
+  const freshHasArtwork = typeof fresh.artwork === 'string' && Boolean(fresh.artwork.trim());
+  if (freshHasArtwork && fresh.artwork !== existing.artwork
+      && !(hasAuthoritativeApiMeta && existingHasArtwork)) {
+    existing.artwork = fresh.artwork;
+    visibleChanged = true;
+  } else if (fromApi && existingHasArtwork && !freshHasArtwork && Object.prototype.hasOwnProperty.call(fresh, 'artwork')) {
+    existing.artwork = null;
+    visibleChanged = true;
+  }
+
+  if (typeof fresh.link === 'string' && fresh.link.trim() && typeof normalizeTrackUrl === 'function') {
+    const oldNorm = normalizeTrackUrl(existing.link);
+    const newNorm = normalizeTrackUrl(fresh.link);
+    const oldBase = oldNorm.replace(/\/s-[a-z0-9_-]+$/i, '');
+    const newBase = newNorm.replace(/\/s-[a-z0-9_-]+$/i, '');
+    const oldSecret = typeof extractSoundCloudSecretToken === 'function'
+      ? extractSoundCloudSecretToken(existing.link || '')
+      : '';
+    const newSecret = typeof extractSoundCloudSecretToken === 'function'
+      ? extractSoundCloudSecretToken(fresh.link || '')
+      : '';
+    const allowDomLinkUpdate = !hasAuthoritativeApiMeta || !oldNorm
+      || (newBase === oldBase && !oldSecret && Boolean(newSecret));
+    if (allowDomLinkUpdate && newNorm && (!oldNorm
+        || (newBase !== oldBase && (fromApi || !oldSecret || Boolean(newSecret)))
+        || (newBase === oldBase && !oldSecret && Boolean(newSecret)))) {
+      existing.link = fresh.link;
+      if (oldNorm && normalizeTrackUrl(existing.link) !== oldNorm) {
+        if (typeof state !== 'undefined' && state?._streamCache instanceof Map) {
+          state._streamCache.delete(oldNorm);
+        }
+        visibleChanged = true;
+      }
+    }
+  }
+
+  if (fromApi) {
+    const audioReplaced = typeof hasSoundCloudAudioReplacement === 'function'
+      && hasSoundCloudAudioReplacement(existing, fresh);
+    if (typeof fresh.artistLink === 'string' && fresh.artistLink.trim() && fresh.artistLink !== existing.artistLink) {
+      existing.artistLink = fresh.artistLink;
+    }
+    if (typeof fresh.waveform === 'string' && fresh.waveform.trim() && fresh.waveform !== existing.waveform) {
+      existing.waveform = fresh.waveform;
+    } else if (audioReplaced && !fresh.waveform) {
+      existing.waveform = null;
+    }
+    if (Number.isFinite(fresh.durationMs) && fresh.durationMs > 0 && fresh.durationMs !== existing.durationMs) {
+      existing.durationMs = fresh.durationMs;
+    }
+    if (typeof fresh.lastModified === 'string' && fresh.lastModified.trim()
+        && fresh.lastModified.trim() !== existing.lastModified) {
+      existing.lastModified = fresh.lastModified.trim();
+    }
+    if (typeof fresh.mediaSignature === 'string' && fresh.mediaSignature.trim()
+        && fresh.mediaSignature.trim() !== existing.mediaSignature) {
+      existing.mediaSignature = fresh.mediaSignature.trim();
+    }
+    if (typeof fresh.genre === 'string' && fresh.genre.trim() && fresh.genre !== existing.genre) {
+      existing.genre = fresh.genre;
+    }
+    if (Array.isArray(fresh.tags) && fresh.tags.length) {
+      existing.tags = fresh.tags;
+    }
+    if (Number.isFinite(fresh.bpm) && fresh.bpm > 0 && fresh.bpm !== existing.bpm) {
+      existing.bpm = fresh.bpm;
+    }
+    if (typeof fresh.keySignature === 'string' && fresh.keySignature.trim() && fresh.keySignature !== existing.keySignature) {
+      existing.keySignature = fresh.keySignature;
+      delete existing._camelotKey;
+    }
+    if (audioReplaced) {
+      if (Array.isArray(fresh.transcodings)) {
+        existing.transcodings = fresh.transcodings.map(item => (item && typeof item === 'object' ? { ...item } : item));
+      }
+      if ('trackAuthorization' in fresh) existing.trackAuthorization = fresh.trackAuthorization || null;
+      if ('hls_aac_160_url' in fresh) existing.hls_aac_160_url = fresh.hls_aac_160_url || null;
+      if ('hls_aac_96_url' in fresh) existing.hls_aac_96_url = fresh.hls_aac_96_url || null;
+      if (typeof fresh.access === 'string' && fresh.access) existing.access = fresh.access;
+      else if ('access' in fresh && fresh.access == null) delete existing.access;
+      if (typeof fresh.policy === 'string' && fresh.policy) existing.policy = fresh.policy;
+      else if ('policy' in fresh && fresh.policy == null) delete existing.policy;
+      if (fresh.customPlaybackUnavailable) {
+        existing.customPlaybackUnavailable = true;
+        existing.customPlaybackReason = fresh.customPlaybackReason || 'preview-only';
+      } else {
+        delete existing.customPlaybackUnavailable;
+        delete existing.customPlaybackReason;
+      }
+      if (typeof invalidateReplacedTrackCaches === 'function') {
+        invalidateReplacedTrackCaches(existing);
+      } else {
+        existing._audioReplacedAt = Date.now();
+      }
+      visibleChanged = true;
+    }
+    existing._metaRefreshedAt = Date.now();
+  }
+
+  return visibleChanged;
+}
+
 async function resolveLiveTrackMeta(track, sourcePage, playlistPosition = null, signal = null) {
   const hydrated = metaFromSoundCloudTrack(track, sourcePage, playlistPosition);
   if (hydrated?.artist && hydrated.artist !== '—') return hydrated;
 
   const id = soundCloudInteger(track?.id, 1);
   if (id === null) return hydrated;
-  const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
-  if (!clientId || signal?.aborted) return hydrated;
-  try {
-    const response = await fetchSoundCloudResource(`https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`, 'json', { signal });
-    if (!response.ok || signal?.aborted || !soundCloudTrackMatches(track, response.data)) return hydrated;
-    return mergeTrackMeta(hydrated, metaFromSoundCloudTrack(response.data, sourcePage, playlistPosition));
-  } catch (_) {
-    return hydrated;
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  for (let attempt = 0; attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const trackUrl = `https://api-v2.soundcloud.com/tracks/${id}?client_id=${encodeURIComponent(clientId)}`;
+      const response = typeof fetchSoundCloudApiJson === 'function'
+        ? await fetchSoundCloudApiJson(trackUrl, { signal })
+        : await fetchSoundCloudResource(trackUrl, 'json', { signal });
+      if (signal?.aborted) return hydrated;
+      if ((response.status === 401 || response.status === 403) && attempt < 2) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: true, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      if (!response.ok || !soundCloudTrackMatches(track, response.data)) return hydrated;
+      return mergeTrackMeta(hydrated, metaFromSoundCloudTrack(response.data, sourcePage, playlistPosition));
+    } catch (_) {
+      return hydrated;
+    }
   }
+  return hydrated;
 }
 
 async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas = [], signal = null) {
@@ -8613,17 +17585,31 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas 
   });
 
   if (unresolvedIds.length) {
-    const clientId = await discoverSoundCloudClientIdFromBundle(new Set(), { signal });
+    const rejectedClients = new Set();
+    let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
     if (clientId) {
-      for (let start = 0; start < unresolvedIds.length; start += 50) {
+      for (let start = 0; start < unresolvedIds.length && clientId; start += 50) {
         if (signal?.aborted) break;
         const ids = unresolvedIds.slice(start, start + 50);
         try {
           const endpoint = new URL('https://api-v2.soundcloud.com/tracks');
           endpoint.searchParams.set('ids', ids.join(','));
           endpoint.searchParams.set('client_id', clientId);
-          const response = await fetchSoundCloudResource(endpoint, 'json', { signal });
-          if (!response.ok || signal?.aborted) continue;
+          const response = typeof fetchSoundCloudApiJson === 'function'
+            ? await fetchSoundCloudApiJson(endpoint, { signal })
+            : await fetchSoundCloudResource(endpoint, 'json', { signal });
+          if (signal?.aborted) break;
+          if ((response.status === 401 || response.status === 403) && rejectedClients.size < 3) {
+            rejectedClients.add(clientId);
+            if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+            else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = '';
+            clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+              signal, bundleOnly: true, allowHtmlRefresh: true,
+            });
+            start -= 50;
+            continue;
+          }
+          if (!response.ok) continue;
           const tracks = response.data;
           if (!Array.isArray(tracks)) continue;
           tracks.forEach(track => {
@@ -8639,6 +17625,25 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas 
         } catch (_) {}
       }
     }
+    const stillUnresolved = unresolvedIds.filter(id => {
+      const m = resolvedById.get(id);
+      return !m?.artist || m.artist === '—';
+    });
+    if (stillUnresolved.length && !signal?.aborted
+        && typeof fetchPlaylistTracksByIdFromApi === 'function'
+        && soundCloudInteger(snapshot?.id, 1) !== null) {
+      const playlistTracks = await fetchPlaylistTracksByIdFromApi(snapshot.id, sourcePage, signal);
+      for (const id of stillUnresolved) {
+        const apiTrack = playlistTracks.get(id);
+        const position = positionsById.get(id);
+        if (!apiTrack || !position) continue;
+        const meta = metaFromSoundCloudTrack(apiTrack, sourcePage, position);
+        if (meta) {
+          const existing = existingMetas[matchingTrackIndex(existingIndex, apiTrack)];
+          resolvedById.set(id, mergeTrackMeta(existing, mergeTrackMeta(resolvedById.get(id), meta)));
+        }
+      }
+    }
   }
 
   return snapshot.tracks
@@ -8646,7 +17651,401 @@ async function resolvePlaylistSnapshotMetas(snapshot, sourcePage, existingMetas 
     .filter(Boolean);
 }
 
+function isSoundCloudTrackUrl(url) {
+  const parts = soundCloudPathParts(url);
+  if (!parts || parts.length < 2) return false;
+  const reservedFirst = new Set([
+    'you', 'stream', 'feed', 'discover', 'search', 'charts', 'pages',
+    'settings', 'messages', 'notifications', 'upload', 'terms-of-use', 'people',
+  ]);
+  const reservedSecond = new Set([
+    'sets', 'likes', 'tracks', 'reposts', 'albums', 'playlists',
+    'followers', 'following', 'comments', 'recommended', 'spotlight',
+  ]);
+  return !reservedFirst.has(parts[0].toLowerCase()) && !reservedSecond.has(parts[1].toLowerCase());
+}
+
+function readSoundCloudOAuthToken() {
+  try {
+    const rawCookie = typeof document?.cookie === 'string' ? document.cookie : '';
+    const match = rawCookie.match(/(?:^|;\s*)oauth_token=([^;]+)/);
+    return match ? decodeURIComponent(match[1].trim()) : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function resolveCurrentSoundCloudUserSlug(sourcePage, signal = null) {
+  const parts = soundCloudPathParts(sourcePage);
+  if (!parts || parts.length !== 2) return null;
+  const kind = parts[1].toLowerCase();
+  if (!['likes', 'tracks', 'reposts'].includes(kind)) return null;
+  let slug = parts[0];
+  if (slug.toLowerCase() === 'you') {
+    const reserved = new Set([
+      'you', 'stream', 'discover', 'library', 'messages', 'notifications',
+      'settings', 'upload', 'search', 'charts', 'pages', 'terms-of-use', 'feed',
+    ]);
+    const findSlugInDom = () => {
+      if (typeof document?.querySelectorAll !== 'function') return '';
+      const navLinks = [
+        ...document.querySelectorAll('.header__userNav a[href], a.header__userNavItem[href], a.header__userNavUsernameButton[href], .userNav a[href], a.userNav__Button[href]'),
+      ];
+      for (const link of navLinks) {
+        const linkParts = soundCloudPathParts(link.getAttribute?.('href') || link.href || '');
+        if (linkParts?.length >= 1 && !reserved.has(linkParts[0].toLowerCase())) {
+          return linkParts[0];
+        }
+      }
+      return '';
+    };
+    slug = findSlugInDom();
+    for (let retry = 0; !slug && retry < 15 && !signal?.aborted; retry++) {
+      await withDeadline(() => wait(120), 500, signal).catch(() => {});
+      slug = findSlugInDom();
+    }
+  }
+  return slug && slug.toLowerCase() !== 'you' ? { slug, kind } : null;
+}
+
+function hydrationUserIdForSlug(slug) {
+  const roots = typeof soundCloudHydrationRoots === 'function'
+    ? soundCloudHydrationRoots()
+    : pageWindow?.__sc_hydration;
+  if (!Array.isArray(roots) || !slug) return null;
+  const wantedUrl = normalizeTrackUrl(`https://soundcloud.com/${slug}`);
+  for (const entry of roots) {
+    const data = entry?.data || entry;
+    if (!data || typeof data !== 'object') continue;
+    if (entry?.hydratable !== 'user' && data.kind !== 'user') continue;
+    const candidateUrl = normalizeTrackUrl(data.permalink_url || data.permalinkUrl || (data.permalink ? `https://soundcloud.com/${data.permalink}` : ''));
+    const id = soundCloudInteger(data.id, 1);
+    if (id !== null && candidateUrl === wantedUrl) return id;
+  }
+  return null;
+}
+
+function maybeReportDomSelectorDrift(sourcePage, hydratedCount, pageEls) {
+  if (!hydratedCount || (Array.isArray(pageEls) && pageEls.length > 0)) return;
+  if (typeof recordPlaybackDiagnostic !== 'function' || typeof state === 'undefined' || !state) return;
+  if (typeof document !== 'undefined' && document?.readyState && document.readyState !== 'complete') return;
+  const activeUrl = typeof location !== 'undefined' ? String(location?.href || '') : '';
+  const base = typeof playlistBase === 'function' ? playlistBase(sourcePage) : String(sourcePage || '');
+  if (!base || (typeof playlistBase === 'function' && playlistBase(activeUrl) !== base)) return;
+  const reported = state._domDriftReportedPages || (state._domDriftReportedPages = new Set());
+  if (reported.has(base)) return;
+  if (reported.size >= 32) reported.delete(reported.values().next().value);
+  reported.add(base);
+  const parts = typeof soundCloudPathParts === 'function' ? soundCloudPathParts(sourcePage) : null;
+  const pageKind = /\/sets\//i.test(base) ? 'playlist'
+    : (parts?.[1] === 'likes' ? 'likes'
+      : (parts?.[1] === 'reposts' ? 'reposts'
+        : (parts?.[1] === 'tracks' ? 'user-tracks'
+          : (parts?.length === 1 && ['feed', 'stream'].includes(String(parts[0]).toLowerCase()) ? 'feed' : 'other'))));
+  recordPlaybackDiagnostic('dom-selector-drift', {
+    pageKind,
+    hydratedCount: Number(hydratedCount) || 0,
+    domCount: 0,
+    reason: 'dom-rows-empty',
+  });
+}
+
+async function finalizeSilentTrackCollection(rawTracks, sourcePage, pageEls = [], signal = null, defaultLiked = null) {
+  if (!rawTracks.length || signal?.aborted) return null;
+  const domByLink = new Map();
+  for (const el of pageEls) {
+    const meta = getMeta(el);
+    const key = trackCacheKey(meta);
+    if (!key) continue;
+    const previous = domByLink.get(key);
+    domByLink.set(key, { el: previous?.el || el, meta: mergeTrackMeta(previous?.meta, meta) });
+  }
+  const dom = [...domByLink.values()];
+  const domMeta = dom.map(item => item.meta);
+  const domIndex = trackIdentityIndex(domMeta);
+  const rows = soundCloudRowsByLink(pageEls);
+
+  const resolvedMetas = await resolvePlaylistSnapshotMetas(
+    { complete: true, trackCount: rawTracks.length, tracks: rawTracks },
+    sourcePage,
+    domMeta,
+    signal,
+  );
+  if (signal?.aborted || !resolvedMetas.length) return null;
+
+  const collectedMetas = [];
+  const seenKeys = new Set();
+  for (const meta of resolvedMetas) {
+    if (defaultLiked !== null && meta.liked === null) meta.liked = defaultLiked;
+    const key = trackCacheKey(meta);
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    meta.playlistPosition = collectedMetas.length + 1;
+    collectedMetas.push(meta);
+  }
+  if (!collectedMetas.length) return null;
+  if (typeof maybeReportDomSelectorDrift === 'function') {
+    maybeReportDomSelectorDrift(sourcePage, collectedMetas.length, pageEls);
+  }
+
+  const snapshotIndex = trackIdentityIndex(collectedMetas);
+  const resolved = [];
+  for (const meta of collectedMetas) {
+    const matching = soundCloudPermalinkConflicts(meta, snapshotIndex)
+      ? null : dom[matchingTrackIndex(domIndex, meta)];
+    const merged = mergeTrackMeta(matching?.meta, meta);
+    merged.sourcePage = sourcePage;
+    merged.playlistPosition = meta.playlistPosition;
+    if (meta.soundcloudId != null) merged.soundcloudId = meta.soundcloudId;
+    resolved.push({ el: matchingSoundCloudRow(meta, rows, snapshotIndex), meta: merged });
+  }
+  return { els: resolved.map(item => item.el), meta: resolved.map(item => item.meta), complete: true };
+}
+
+async function fetchSilentFeedCollection(sourcePage, pageEls = [], signal = null) {
+  const parts = soundCloudPathParts(sourcePage);
+  if (!parts || parts.length !== 1 || !['feed', 'stream'].includes(parts[0].toLowerCase())) return null;
+  const oauthToken = readSoundCloudOAuthToken();
+  if (!oauthToken) return null;
+
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  if (!clientId || signal?.aborted) return null;
+
+  let nextUrl = 'https://api-v2.soundcloud.com/stream?limit=100&linked_partitioning=1&promoted_playlist=true';
+  try {
+    const entries = typeof performance?.getEntriesByType === 'function' ? performance.getEntriesByType('resource') : [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const candidate = String(entries[i]?.name || '');
+      if (!/^https:\/\/api-v2\.soundcloud\.com\/stream(?:\?|$)/i.test(candidate)) continue;
+      const parsed = new URL(candidate);
+      parsed.searchParams.delete('offset');
+      parsed.searchParams.set('limit', '100');
+      parsed.searchParams.set('linked_partitioning', '1');
+      nextUrl = parsed.toString();
+      break;
+    }
+  } catch (_) {}
+  const rawTracks = [];
+  const seenIds = new Set();
+  const pushTrack = track => {
+    const id = soundCloudInteger(track?.id, 1);
+    if (id === null || seenIds.has(id)) return;
+    seenIds.add(id);
+    rawTracks.push(track);
+  };
+
+  const maxTracks = Math.max(1, Math.min(250, Math.round(Number(state.feedTrackLimit) || 50)));
+  for (let page = 0; page < 6 && nextUrl && rawTracks.length < maxTracks; page++) {
+    if (signal?.aborted) return null;
+    let response;
+    try {
+      const endpoint = new URL(nextUrl);
+      if (endpoint.protocol !== 'https:' || endpoint.hostname !== 'api-v2.soundcloud.com'
+          || endpoint.username || endpoint.password || endpoint.port) {
+        if (page === 0) return null;
+        break;
+      }
+      endpoint.searchParams.set('client_id', clientId);
+      response = await fetchSoundCloudResource(endpoint, 'json', {
+        signal,
+        credentials: 'omit',
+        headers: { Authorization: `OAuth ${oauthToken}` },
+      });
+    } catch (_) {
+      if (page === 0) return null;
+      break;
+    }
+    if (signal?.aborted) return null;
+    if (response?.status === 401 || response?.status === 403) {
+      if (page === 0 && rejectedClients.size < 1) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (typeof state !== 'undefined' && state?._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: true, allowHtmlRefresh: true,
+        });
+        if (clientId) { page--; continue; }
+      }
+      return null;
+    }
+    if (!response?.ok || !Array.isArray(response.data?.collection)) {
+      if (page === 0) return null;
+      break;
+    }
+    for (const item of response.data.collection) {
+      if (rawTracks.length >= maxTracks) break;
+      if (item?.kind === 'track') {
+        pushTrack(item);
+      } else if (item?.track && (item.track.kind === 'track' || soundCloudInteger(item.track.id, 1) !== null)) {
+        pushTrack(item.track);
+      }
+    }
+    nextUrl = typeof response.data?.next_href === 'string' && response.data.next_href.trim()
+      ? response.data.next_href.trim()
+      : null;
+  }
+
+  const feedResult = await finalizeSilentTrackCollection(rawTracks, sourcePage, pageEls, signal, null);
+  if (feedResult) state._loadedFeedLimit = maxTracks;
+  return feedResult;
+}
+
+async function fetchSilentUserCollection(sourcePage, pageEls = [], signal = null) {
+  const resolvedUser = await resolveCurrentSoundCloudUserSlug(sourcePage, signal);
+  if (!resolvedUser || signal?.aborted) return null;
+  const { slug, kind } = resolvedUser;
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  if (!clientId || signal?.aborted) return null;
+
+  let userId = hydrationUserIdForSlug(slug);
+  for (let attempt = 0; userId === null && attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const profileUrl = `https://soundcloud.com/${encodeURIComponent(slug)}`;
+      const res = await fetchSoundCloudResource(
+        `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(profileUrl)}&client_id=${encodeURIComponent(clientId)}`,
+        'json',
+        { signal },
+      );
+      if (signal?.aborted) return null;
+      if (res.status === 401 || res.status === 403) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (state._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: attempt >= 1, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      userId = soundCloudInteger(res.data?.id, 1);
+      break;
+    } catch (_) {
+      return null;
+    }
+  }
+  if (userId === null || !clientId || signal?.aborted) return null;
+  if (state._liveSyncUserIds instanceof Map) {
+    if (state._liveSyncUserIds.size >= 32) state._liveSyncUserIds.delete(state._liveSyncUserIds.keys().next().value);
+    state._liveSyncUserIds.set(slug.toLowerCase(), userId);
+  }
+
+  let nextUrl = kind === 'likes'
+    ? `https://api-v2.soundcloud.com/users/${userId}/track_likes?limit=200&linked_partitioning=1`
+    : kind === 'tracks'
+      ? `https://api-v2.soundcloud.com/users/${userId}/tracks?representation=&limit=200&linked_partitioning=1`
+      : `https://api-v2.soundcloud.com/stream/users/${userId}/reposts?limit=200&linked_partitioning=1`;
+
+  const rawTracks = [];
+  for (let page = 0; page < 25 && nextUrl; page++) {
+    if (signal?.aborted) return null;
+    let response;
+    try {
+      const endpoint = new URL(nextUrl);
+      if (endpoint.protocol !== 'https:' || endpoint.hostname !== 'api-v2.soundcloud.com'
+          || endpoint.username || endpoint.password || endpoint.port) {
+        if (page === 0) return null;
+        break;
+      }
+      endpoint.searchParams.set('client_id', clientId);
+      response = typeof fetchSoundCloudApiJson === 'function'
+        ? await fetchSoundCloudApiJson(endpoint, { signal })
+        : await fetchSoundCloudResource(endpoint, 'json', { signal });
+    } catch (_) {
+      if (page === 0) return null;
+      break;
+    }
+    if (signal?.aborted) return null;
+    if ((response?.status === 401 || response?.status === 403) && page === 0 && rejectedClients.size < 3) {
+      rejectedClients.add(clientId);
+      if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+      else if (state._clientId === clientId) state._clientId = '';
+      clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+        signal, bundleOnly: true, allowHtmlRefresh: true,
+      });
+      if (clientId) { page--; continue; }
+      return null;
+    }
+    if (!response?.ok || !Array.isArray(response.data?.collection)) {
+      if (page === 0) return null;
+      break;
+    }
+    for (const item of response.data.collection) {
+      const track = item?.kind === 'track'
+        ? item
+        : (item?.track && (item.track.kind === 'track' || soundCloudInteger(item.track.id, 1) !== null) ? item.track : null);
+      if (track && soundCloudInteger(track.id, 1) !== null) rawTracks.push(track);
+    }
+    nextUrl = typeof response.data?.next_href === 'string' && response.data.next_href.trim()
+      ? response.data.next_href.trim()
+      : null;
+  }
+
+  return finalizeSilentTrackCollection(rawTracks, sourcePage, pageEls, signal, kind === 'likes' ? true : null);
+}
+
+async function collectPageCollectionSilently(pageUrl, request, initialEls = [], snapshotPromise = null) {
+  const signal = request?.signal || null;
+  const currentRequest = () => !request || collectionRequestCurrent(request);
+
+  if (/soundcloud\.com\/[^/]+\/sets\//.test(pageUrl || '')) {
+    const snapshot = await (snapshotPromise || fetchLivePlaylistSnapshot(pageUrl, signal));
+    if (!currentRequest()) return null;
+    if (snapshot?.complete) {
+      const silentCollection = await completePlaylistCollection(
+        pageUrl,
+        initialEls,
+        Promise.resolve(snapshot),
+        signal,
+      );
+      if (!currentRequest()) return null;
+      const uniqueSnapshotIds = new Set(snapshot.tracks.map(track => Number(track.id)).filter(Number.isFinite));
+      const resolvedIds = new Set(
+        silentCollection.meta
+          .map(meta => Number(meta?.soundcloudId))
+          .filter(id => Number.isFinite(id) && uniqueSnapshotIds.has(id)),
+      );
+      const batchResolutionSucceeded = uniqueSnapshotIds.size === 0
+        || silentCollection.complete
+        || (uniqueSnapshotIds.size <= 5 ? resolvedIds.size > 0 : resolvedIds.size > 5);
+      if (batchResolutionSucceeded && (resolvedIds.size > 0 || snapshot.trackCount === 0)) {
+        if (!silentCollection.complete) {
+          const unresolvable = state._liveSyncUnresolvable || (state._liveSyncUnresolvable = new Map());
+          const failedAt = Date.now();
+          for (const id of uniqueSnapshotIds) {
+            if (!resolvedIds.has(id)) {
+              unresolvable.delete(id);
+              unresolvable.set(id, failedAt);
+            }
+          }
+          while (unresolvable.size > 512) unresolvable.delete(unresolvable.keys().next().value);
+        }
+        return silentCollection;
+      }
+    }
+    return null;
+  }
+
+  const silentFeedCollection = await fetchSilentFeedCollection(pageUrl, initialEls, signal);
+  if (!currentRequest()) return null;
+  if (silentFeedCollection?.complete && silentFeedCollection.meta.length > 0) {
+    return silentFeedCollection;
+  }
+
+  const silentUserCollection = await fetchSilentUserCollection(pageUrl, initialEls, signal);
+  if (!currentRequest()) return null;
+  if (silentUserCollection?.complete && silentUserCollection.meta.length > 0) {
+    return silentUserCollection;
+  }
+  return null;
+}
+
 async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise = null, signal = null) {
+  if (pageEls?._tssSilentCollection) {
+    const preResolved = pageEls._tssSilentCollection;
+    delete pageEls._tssSilentCollection;
+    return preResolved;
+  }
   const domByLink = new Map();
   for (const el of pageEls) {
     const meta = getMeta(el);
@@ -8684,10 +18083,15 @@ async function completePlaylistCollection(sourcePage, pageEls, snapshotPromise =
   // A complete identity snapshot is authoritative; counts of rendered rows are not.
   if (!complete) {
     for (const [key, item] of domByLink) {
-      if (!resolved.has(key)) resolved.set(key, item);
+      if (!resolved.has(key) && matchingTrackIndex(snapshotIndex, item.meta) === undefined) {
+        resolved.set(key, item);
+      }
     }
   }
   const result = [...resolved.values()];
+  if (result.length && typeof maybeReportDomSelectorDrift === 'function') {
+    maybeReportDomSelectorDrift(sourcePage, result.length, pageEls);
+  }
   return { els: result.map(item => item.el), meta: result.map(item => item.meta), complete };
 }
 
@@ -8700,6 +18104,8 @@ function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
   for (const meta of metas) {
     if (!trackCacheKey(meta) || matchingTrackIndex(identities, meta) !== undefined) continue;
     const ti = state.meta.length;
+    meta._liveAddedAt = Date.now();
+    meta._metaRefreshedAt = Date.now();
     state.meta.push(meta);
     indexTrackMeta(identities, meta, ti);
     state.els.push(matchingSoundCloudRow(meta, rows, identities));
@@ -8716,6 +18122,7 @@ function applyLiveQueueTracks(metas, pageEls = [], notify = true) {
   badges();
   renderList();
   updateHub();
+  if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
   if (notify) showMergeToast(`${added.length} new track${added.length === 1 ? '' : 's'} added to this round`);
   return added.length;
 }
@@ -8728,7 +18135,11 @@ function registerLiveQueueSource(sourcePage, indices) {
     members = new Set();
     state._liveSyncSources.set(source, members);
   }
-  for (const ti of indices) members.add(ti);
+  for (const ti of indices) {
+    members.add(ti);
+    if (state.meta?.[ti]?.isDjDiscovery) delete state.meta[ti].isDjDiscovery;
+  }
+  state._liveSyncIdleStreak = 0;
 }
 
 function reviveRemovedQueueTrack(ti) {
@@ -8792,6 +18203,11 @@ function reconcileLivePlaylistSnapshot(snapshot, sourcePage, pageEls = []) {
     const el = matchingSoundCloudRow(meta, rows, identities);
     if (el || soundCloudPermalinkConflicts(meta, identities)) state.els[ti] = el;
     else if (state.els[ti]?.nodeType === 1 && !document.body.contains(state.els[ti])) state.els[ti] = null;
+    if (el && typeof getMeta === 'function' && typeof refreshExistingTrackMeta === 'function') {
+      if (refreshExistingTrackMeta(meta, getMeta(el), { fromApi: false })) {
+        state._liveSyncDomMetaUpdated = true;
+      }
+    }
   });
 
   recountRoundTotal();
@@ -8805,57 +18221,581 @@ function showLiveSyncResult(added, removed) {
   if (parts.length) showMergeToast(`${parts.join(', ')} in this round`);
 }
 
+async function fetchLiveUserCollectionSnapshot(sourcePage, signal = null) {
+  if (typeof resolveCurrentSoundCloudUserSlug !== 'function'
+      || typeof discoverSoundCloudClientIdFromBundle !== 'function') {
+    return null;
+  }
+  const resolvedUser = await resolveCurrentSoundCloudUserSlug(sourcePage, signal);
+  if (!resolvedUser || signal?.aborted) return null;
+  const { slug, kind } = resolvedUser;
+  const rejectedClients = new Set();
+  let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+  if (!clientId || signal?.aborted) return null;
+
+  const cachedMap = state?._liveSyncUserIds instanceof Map ? state._liveSyncUserIds : null;
+  let userId = cachedMap?.get(slug.toLowerCase()) ?? hydrationUserIdForSlug(slug);
+  for (let attempt = 0; userId === null && attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const profileUrl = `https://soundcloud.com/${encodeURIComponent(slug)}`;
+      const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(profileUrl)}&client_id=${encodeURIComponent(clientId)}`;
+      const res = typeof fetchSoundCloudApiJson === 'function'
+        ? await fetchSoundCloudApiJson(resolveUrl, { signal })
+        : await fetchSoundCloudResource(resolveUrl, 'json', { signal });
+      if (signal?.aborted) return null;
+      if (res.status === 401 || res.status === 403) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (state._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: attempt >= 1, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      userId = soundCloudInteger(res.data?.id, 1);
+      break;
+    } catch (_) {
+      return null;
+    }
+  }
+  if (userId === null || !clientId || signal?.aborted) return null;
+  if (cachedMap) {
+    if (cachedMap.size >= 32) cachedMap.delete(cachedMap.keys().next().value);
+    cachedMap.set(slug.toLowerCase(), userId);
+  }
+
+  const baseUrl = kind === 'likes'
+    ? `https://api-v2.soundcloud.com/users/${userId}/track_likes?limit=200&linked_partitioning=1`
+    : kind === 'tracks'
+      ? `https://api-v2.soundcloud.com/users/${userId}/tracks?representation=&limit=200&linked_partitioning=1`
+      : `https://api-v2.soundcloud.com/stream/users/${userId}/reposts?limit=200&linked_partitioning=1`;
+
+  for (let attempt = 0; attempt < 3 && clientId && !signal?.aborted; attempt++) {
+    try {
+      const endpoint = new URL(baseUrl);
+      endpoint.searchParams.set('client_id', clientId);
+      const response = typeof fetchSoundCloudApiJson === 'function'
+        ? await fetchSoundCloudApiJson(endpoint, { signal })
+        : await fetchSoundCloudResource(endpoint, 'json', { signal });
+      if (signal?.aborted) return null;
+      if ((response?.status === 401 || response?.status === 403) && attempt < 2) {
+        rejectedClients.add(clientId);
+        if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+        else if (state._clientId === clientId) state._clientId = '';
+        clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+          signal, bundleOnly: true, allowHtmlRefresh: true,
+        });
+        continue;
+      }
+      if (!response?.ok || !Array.isArray(response.data?.collection)) return null;
+      const tracks = [];
+      const seen = new Set();
+      for (const item of response.data.collection) {
+        const track = item?.kind === 'track'
+          ? item
+          : (item?.track && (item.track.kind === 'track' || soundCloudInteger(item.track.id, 1) !== null) ? item.track : null);
+        const id = soundCloudInteger(track?.id, 1);
+        if (id === null || seen.has(id)) continue;
+        seen.add(id);
+        tracks.push(track);
+      }
+      const hasNext = Boolean(typeof response.data?.next_href === 'string' && response.data.next_href.trim());
+      return {
+        id: null,
+        trackCount: hasNext ? null : tracks.length,
+        complete: !hasNext,
+        tracks,
+        defaultLiked: kind === 'likes' ? true : null,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+  return null;
+}
+
 async function syncLiveQueue(options) {
   options = options || {};
   const sources = state._liveSyncSources;
   const epoch = state._playbackEpoch;
   const signal = state._playbackAbort.signal;
   const routeEpoch = state._routeEpoch || 0;
-  if (!state.active || state.loading || state.busy || state.suspended || !sources.size) return 0;
+  const requestedForce = Boolean(options.force || state._liveSyncPendingForce);
+  if (!state.active || state.suspended || !sources.size) return 0;
   if (state._liveSyncInFlight) return 0;
+  if (state.loading || state.busy || state._crossfading || state._collectionRequest) {
+    if (requestedForce) {
+      state._liveSyncPendingForce = true;
+      if (typeof scheduleLiveQueueSync === 'function') scheduleLiveQueueSync(300);
+    }
+    return 0;
+  }
 
   const now = Date.now();
-  if (!options.force && now - state._liveSyncLastCheck < LIVE_SYNC_INTERVAL_MS) return 0;
+  const pipOpen = typeof ownPipIsOpen === 'function' && ownPipIsOpen();
+  const idleStreak = Number(state._liveSyncIdleStreak) || 0;
+  const effectiveInterval = LIVE_SYNC_INTERVAL_MS * (idleStreak >= 6 ? (pipOpen ? 3 : 12) : 1);
+  const deferred = state._liveSyncDeferredResults;
+  const hasValidDeferred = Boolean(
+    deferred && deferred.sources === sources && deferred.epoch === epoch
+    && deferred.routeEpoch === routeEpoch && now - deferred.at < 60_000,
+  );
+  if (!hasValidDeferred && state._liveSyncDeferredResults) state._liveSyncDeferredResults = null;
+  const forced = requestedForce || Boolean(hasValidDeferred && deferred.forced);
+  if (!forced && !hasValidDeferred && now - state._liveSyncLastCheck < effectiveInterval) return 0;
+  state._liveSyncPendingForce = false;
+  if (forced) state._liveSyncIdleStreak = 0;
+  const previousLastCheck = state._liveSyncLastCheck;
   state._liveSyncInFlight = true;
   state._liveSyncLastCheck = now;
-  const currentQueue = () => state.active && !state.suspended && !state.loading && !state.busy
+  const sessionValid = () => state.active && !state.suspended && !state.loading
     && state._liveSyncSources === sources && state._playbackEpoch === epoch && !signal.aborted
     && (state._routeEpoch || 0) === routeEpoch;
+  const canMutateQueue = () => sessionValid() && !state.busy && !state._crossfading && !state._collectionRequest;
   try {
-    const snapshots = await Promise.all([...sources.keys()]
-      .filter(sourcePage => /soundcloud\.com\/[^/]+\/sets\//.test(sourcePage))
-      .map(async sourcePage => {
-        try {
-          return { sourcePage, snapshot: await fetchLivePlaylistSnapshot(sourcePage, signal) };
-        } catch (_) {
-          return { sourcePage, snapshot: null };
-        }
-      }));
-    if (!currentQueue()) return 0;
+    const unresolvable = state._liveSyncUnresolvable || (state._liveSyncUnresolvable = new Map());
+    const hasActiveCooldown = id => {
+      const failedAt = unresolvable.get(id);
+      return failedAt !== undefined && now - failedAt < 300_000;
+    };
+    const knownIds = new Set();
+    const knownMetaById = new Map();
+    for (const meta of state.meta) {
+      const id = Number(meta?.soundcloudId);
+      if (!Number.isFinite(id)) continue;
+      knownIds.add(id);
+      knownMetaById.set(id, meta);
+    }
+    let resolved;
+    let refreshedExisting;
+    let updates;
 
-    const knownIds = new Set(state.meta.map(meta => Number(meta?.soundcloudId)));
-    const resolved = new Map();
-    const updates = snapshots.filter(({ snapshot }) => Array.isArray(snapshot?.tracks));
-    for (const { sourcePage, snapshot } of updates) {
-      for (let index = 0; index < snapshot.tracks.length; index++) {
-        const track = snapshot.tracks[index];
-        const id = Number(track.id);
-        if (!Number.isFinite(id) || knownIds.has(id) || resolved.has(id)) continue;
-        let meta = null;
-        try {
-          meta = await resolveLiveTrackMeta(track, sourcePage, index + 1, signal);
-        } catch (_) {}
-        if (!currentQueue()) return 0;
-        if (meta) resolved.set(id, meta);
+    if (hasValidDeferred) {
+      state._liveSyncDeferredResults = null;
+      updates = deferred.updates;
+      resolved = deferred.resolved;
+      refreshedExisting = deferred.refreshedExisting instanceof Map ? deferred.refreshedExisting : new Map();
+    } else {
+      const isPlaylistSource = sourcePage => /soundcloud\.com\/[^/]+\/sets\//.test(sourcePage);
+      const isUserCollectionSource = sourcePage => typeof fetchLiveUserCollectionSnapshot === 'function'
+        && /^https?:\/\/soundcloud\.com\/[^/]+\/(?:tracks|likes|reposts)(?:\/|$)/i.test(sourcePage);
+      const snapshots = await Promise.all([...sources.keys()]
+        .filter(sourcePage => isPlaylistSource(sourcePage) || isUserCollectionSource(sourcePage))
+        .map(async sourcePage => {
+          try {
+            const snapshot = isPlaylistSource(sourcePage)
+              ? await fetchLivePlaylistSnapshot(sourcePage, signal)
+              : await fetchLiveUserCollectionSnapshot(sourcePage, signal);
+            return { sourcePage, snapshot };
+          } catch (_) {
+            return { sourcePage, snapshot: null };
+          }
+        }));
+      if (!sessionValid()) return 0;
+
+      resolved = new Map();
+      refreshedExisting = new Map();
+      const existingCandidates = [];
+      const existingCandidateIds = new Set();
+      updates = snapshots.filter(({ snapshot }) => Array.isArray(snapshot?.tracks));
+      if (!updates.length) {
+        if (!canMutateQueue()) {
+          state._liveSyncLastCheck = previousLastCheck;
+          if (forced) state._liveSyncPendingForce = true;
+          if (typeof scheduleLiveQueueSync === 'function') scheduleLiveQueueSync(300);
+          return 0;
+        }
+        const pageSource = playlistBase(location.href);
+        if (sources.has(pageSource) && typeof currentPageTrackElements === 'function' && typeof bindCurrentPageElements === 'function') {
+          const visibleEls = currentPageTrackElements();
+          if (visibleEls.length) {
+            bindCurrentPageElements(visibleEls);
+            badges();
+          }
+        }
+        return 0;
+      }
+      for (const { sourcePage, snapshot } of updates) {
+        const pendingBatch = [];
+        for (let index = 0; index < snapshot.tracks.length; index++) {
+          const track = snapshot.tracks[index];
+          const id = Number(track.id);
+          if (!Number.isFinite(id)) continue;
+          if (knownIds.has(id)) {
+            if (typeof metaFromSoundCloudTrack === 'function') {
+              const hydratedExisting = !refreshedExisting.has(id)
+                ? metaFromSoundCloudTrack(track, sourcePage, index + 1)
+                : null;
+              if (hydratedExisting) {
+                refreshedExisting.set(id, hydratedExisting);
+              }
+              if (!existingCandidateIds.has(id)) {
+                existingCandidateIds.add(id);
+                existingCandidates.push({
+                  id,
+                  sourcePage,
+                  snapshot,
+                  position: index + 1,
+                  isStub: !hydratedExisting && !refreshedExisting.has(id),
+                });
+              }
+            }
+            continue;
+          }
+          if (resolved.has(id)) continue;
+          if (!forced && hasActiveCooldown(id)) continue;
+          pendingBatch.push({ track, id, position: index + 1 });
+        }
+        const batchedById = new Map();
+        if (pendingBatch.length > 1
+            && typeof fetchSoundCloudResource === 'function'
+            && typeof discoverSoundCloudClientIdFromBundle === 'function'
+            && typeof metaFromSoundCloudTrack === 'function'
+            && typeof soundCloudInteger === 'function') {
+          const stubIds = pendingBatch
+            .filter(({ track, position }) => {
+              const hydrated = metaFromSoundCloudTrack(track, sourcePage, position);
+              return !hydrated?.artist || hydrated.artist === '—';
+            })
+            .map(({ id }) => soundCloudInteger(id, 1))
+            .filter(id => id !== null);
+          if (stubIds.length > 1) {
+            const rejectedClients = new Set();
+            let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+            for (let start = 0; start < stubIds.length && clientId && !signal?.aborted; start += 50) {
+              const ids = stubIds.slice(start, start + 50);
+              try {
+                const endpoint = new URL('https://api-v2.soundcloud.com/tracks');
+                endpoint.searchParams.set('ids', ids.join(','));
+                endpoint.searchParams.set('client_id', clientId);
+                const response = typeof fetchSoundCloudApiJson === 'function'
+                  ? await fetchSoundCloudApiJson(endpoint, { signal })
+                  : await fetchSoundCloudResource(endpoint, 'json', { signal });
+                if (!sessionValid()) return 0;
+                if ((response.status === 401 || response.status === 403) && rejectedClients.size < 3) {
+                  rejectedClients.add(clientId);
+                  if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+                  else if (state._clientId === clientId) state._clientId = '';
+                  clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+                    signal, bundleOnly: true, allowHtmlRefresh: true,
+                  });
+                  start -= 50;
+                  continue;
+                }
+                if (response.ok && Array.isArray(response.data)) {
+                  for (const apiTrack of response.data) {
+                    const apiId = Number(apiTrack?.id);
+                    if (Number.isFinite(apiId)) batchedById.set(apiId, apiTrack);
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+        let playlistTracksFallback = null;
+        for (const { track, id, position } of pendingBatch) {
+          let meta = null;
+          try {
+            const apiTrack = batchedById.get(id);
+            if (apiTrack && typeof soundCloudTrackMatches === 'function' && soundCloudTrackMatches(track, apiTrack)) {
+              const hydrated = metaFromSoundCloudTrack(track, sourcePage, position);
+              meta = mergeTrackMeta(hydrated, metaFromSoundCloudTrack(apiTrack, sourcePage, position));
+            } else {
+              meta = await resolveLiveTrackMeta(track, sourcePage, position, signal);
+            }
+            if ((!meta || !meta.artist || meta.artist === '—')
+                && typeof fetchPlaylistTracksByIdFromApi === 'function'
+                && typeof soundCloudInteger === 'function'
+                && soundCloudInteger(snapshot?.id, 1) !== null) {
+              if (playlistTracksFallback === null) {
+                playlistTracksFallback = await fetchPlaylistTracksByIdFromApi(snapshot.id, sourcePage, signal);
+              }
+              const plTrack = playlistTracksFallback.get(id);
+              if (plTrack && typeof metaFromSoundCloudTrack === 'function') {
+                const hydrated = metaFromSoundCloudTrack(track, sourcePage, position);
+                meta = mergeTrackMeta(hydrated, metaFromSoundCloudTrack(plTrack, sourcePage, position));
+              }
+            }
+            if (meta && snapshot.defaultLiked !== undefined && snapshot.defaultLiked !== null && meta.liked === null) {
+              meta.liked = snapshot.defaultLiked;
+            }
+          } catch (_) {}
+          if (!sessionValid()) return 0;
+          if (meta) {
+            unresolvable.delete(id);
+            resolved.set(id, meta);
+          } else {
+            unresolvable.delete(id);
+            unresolvable.set(id, now);
+            for (const [failedId, failedAt] of unresolvable) {
+              if (now - failedAt >= 300_000 && failedId !== id) unresolvable.delete(failedId);
+            }
+            while (unresolvable.size > 512) unresolvable.delete(unresolvable.keys().next().value);
+          }
+        }
+      }
+
+      if (existingCandidates.length
+          && typeof refreshExistingTrackMeta === 'function'
+          && typeof metaFromSoundCloudTrack === 'function'
+          && typeof discoverSoundCloudClientIdFromBundle === 'function'
+          && typeof soundCloudInteger === 'function'
+          && (typeof fetchSoundCloudApiJson === 'function' || typeof fetchSoundCloudResource === 'function')) {
+        const sweepInterval = pipOpen ? 30_000 : (idleStreak >= 6 ? 120_000 : 60_000);
+        const dueForSweep = forced || now - (Number(state._liveSyncLastMetaSweepAt) || 0) >= sweepInterval;
+        const maxRefresh = forced ? 100 : 50;
+        const candidatesToRefresh = [];
+        const selectedCandidateIds = new Set();
+        const activeRefreshIds = new Set();
+        for (const tiCandidate of [
+          state._deckTrack,
+          state.current,
+          typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : null,
+        ]) {
+          if (Number.isInteger(tiCandidate) && state.meta?.[tiCandidate]) {
+            const activeScId = Number(state.meta[tiCandidate].soundcloudId);
+            if (Number.isFinite(activeScId)) activeRefreshIds.add(activeScId);
+          }
+        }
+
+        for (const entry of existingCandidates) {
+          if (candidatesToRefresh.length >= maxRefresh) break;
+          if (!activeRefreshIds.has(entry.id) || selectedCandidateIds.has(entry.id)) continue;
+          const knownMeta = knownMetaById.get(entry.id);
+          const refreshedAt = Number(knownMeta?._metaRefreshedAt) || 0;
+          if (forced || now - refreshedAt >= 20_000) {
+            selectedCandidateIds.add(entry.id);
+            candidatesToRefresh.push(entry);
+          }
+        }
+
+        const liveAddedLimit = Math.min(maxRefresh, candidatesToRefresh.length + 20);
+        for (const entry of existingCandidates) {
+          if (candidatesToRefresh.length >= liveAddedLimit) break;
+          if (selectedCandidateIds.has(entry.id)) continue;
+          const knownMeta = knownMetaById.get(entry.id);
+          const liveAddedAt = Number(knownMeta?._liveAddedAt) || 0;
+          const refreshedAt = Number(knownMeta?._metaRefreshedAt) || 0;
+          if (liveAddedAt > 0 && now - liveAddedAt <= 2 * 60 * 60 * 1000
+              && (forced || now - refreshedAt >= 30_000)) {
+            selectedCandidateIds.add(entry.id);
+            candidatesToRefresh.push(entry);
+          }
+        }
+
+        if (dueForSweep && candidatesToRefresh.length < maxRefresh) {
+          state._liveSyncLastMetaSweepAt = now;
+          for (const entry of existingCandidates) {
+            if (candidatesToRefresh.length >= maxRefresh) break;
+            if (selectedCandidateIds.has(entry.id)) continue;
+            if (!entry.isStub && entry.position <= 5) {
+              selectedCandidateIds.add(entry.id);
+              candidatesToRefresh.push(entry);
+            }
+          }
+          const tailStart = Math.max(0, existingCandidates.length - 20);
+          for (let i = tailStart; i < existingCandidates.length && candidatesToRefresh.length < maxRefresh; i++) {
+            const entry = existingCandidates[i];
+            if (selectedCandidateIds.has(entry.id)) continue;
+            selectedCandidateIds.add(entry.id);
+            candidatesToRefresh.push(entry);
+          }
+        }
+
+        const stubLimit = dueForSweep ? Math.max(candidatesToRefresh.length, maxRefresh - 15) : maxRefresh;
+        if (candidatesToRefresh.length < stubLimit && existingCandidates.length > 0) {
+          let stubCursor = (Number(state._liveSyncStubCursor) || 0) % existingCandidates.length;
+          let stubScanned = 0;
+          while (stubScanned < existingCandidates.length && candidatesToRefresh.length < stubLimit) {
+            const entry = existingCandidates[stubCursor];
+            stubCursor = (stubCursor + 1) % existingCandidates.length;
+            stubScanned++;
+            if (selectedCandidateIds.has(entry.id)) continue;
+            const knownMeta = knownMetaById.get(entry.id);
+            const refreshedAt = Number(knownMeta?._metaRefreshedAt) || 0;
+            if (entry.isStub && (!knownMeta?.artist || knownMeta.artist === '—')
+                && (forced || now - refreshedAt >= 45_000)) {
+              selectedCandidateIds.add(entry.id);
+              candidatesToRefresh.push(entry);
+            }
+          }
+          state._liveSyncStubCursor = stubCursor;
+        }
+
+        if (dueForSweep && candidatesToRefresh.length < maxRefresh && existingCandidates.length > 0) {
+          let cursor = (Number(state._liveSyncMetaCursor) || 0) % existingCandidates.length;
+          let scanned = 0;
+          while (scanned < existingCandidates.length && candidatesToRefresh.length < maxRefresh) {
+            const entry = existingCandidates[cursor];
+            cursor = (cursor + 1) % existingCandidates.length;
+            scanned++;
+            if (selectedCandidateIds.has(entry.id)) continue;
+            selectedCandidateIds.add(entry.id);
+            candidatesToRefresh.push(entry);
+          }
+          state._liveSyncMetaCursor = cursor;
+        }
+
+        if (candidatesToRefresh.length) {
+          const candidatesToRefreshById = new Map(candidatesToRefresh.map(entry => [entry.id, entry]));
+          const candidateApiIds = candidatesToRefresh
+            .map(entry => soundCloudInteger(entry.id, 1))
+            .filter(id => id !== null);
+          const apiReturnedIds = new Set();
+          const rejectedClients = new Set();
+          let clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, { signal });
+          for (let start = 0; start < candidateApiIds.length && clientId && !signal?.aborted; start += 50) {
+            const ids = candidateApiIds.slice(start, start + 50);
+            try {
+              const endpoint = new URL('https://api-v2.soundcloud.com/tracks');
+              endpoint.searchParams.set('ids', ids.join(','));
+              endpoint.searchParams.set('client_id', clientId);
+              const response = typeof fetchSoundCloudApiJson === 'function'
+                ? await fetchSoundCloudApiJson(endpoint, { signal })
+                : await fetchSoundCloudResource(endpoint, 'json', { signal });
+              if (!sessionValid()) return 0;
+              if ((response.status === 401 || response.status === 403) && rejectedClients.size < 3) {
+                rejectedClients.add(clientId);
+                if (typeof forgetSoundCloudClientId === 'function') forgetSoundCloudClientId(clientId);
+                else if (state._clientId === clientId) state._clientId = '';
+                clientId = await discoverSoundCloudClientIdFromBundle(rejectedClients, {
+                  signal, bundleOnly: true, allowHtmlRefresh: true,
+                });
+                start -= 50;
+                continue;
+              }
+              if (response.ok && Array.isArray(response.data)) {
+                for (const apiTrack of response.data) {
+                  const apiId = Number(apiTrack?.id);
+                  const entry = candidatesToRefreshById.get(apiId);
+                  if (!entry) continue;
+                  apiReturnedIds.add(apiId);
+                  const freshMeta = metaFromSoundCloudTrack(apiTrack, entry.sourcePage, entry.position);
+                  if (freshMeta) refreshedExisting.set(apiId, freshMeta);
+                }
+              }
+            } catch (_) {}
+          }
+
+          const missingPrivatePlaylists = new Map();
+          for (const entry of candidatesToRefresh) {
+            if (apiReturnedIds.has(entry.id)) continue;
+            const plId = soundCloudInteger(entry.snapshot?.id, 1);
+            if (plId !== null && !missingPrivatePlaylists.has(plId)) {
+              missingPrivatePlaylists.set(plId, entry);
+            }
+          }
+          if (missingPrivatePlaylists.size && !signal?.aborted
+              && typeof fetchPlaylistTracksByIdFromApi === 'function'
+              && (forced || now - (Number(state._liveSyncLastPlaylistMetaFallbackAt) || 0) >= 120_000)) {
+            state._liveSyncLastPlaylistMetaFallbackAt = now;
+            for (const [plId, entry] of missingPrivatePlaylists) {
+              if (!sessionValid()) return 0;
+              const plPositions = new Map();
+              if (Array.isArray(entry.snapshot?.tracks)) {
+                entry.snapshot.tracks.forEach((tr, idx) => {
+                  const tid = Number(tr?.id);
+                  if (Number.isFinite(tid) && !plPositions.has(tid)) plPositions.set(tid, idx + 1);
+                });
+              }
+              const playlistTracks = await fetchPlaylistTracksByIdFromApi(plId, entry.sourcePage, signal);
+              if (!sessionValid()) return 0;
+              if (playlistTracks instanceof Map) {
+                for (const [trackIdKey, plTrack] of playlistTracks) {
+                  if (!knownIds.has(trackIdKey)) continue;
+                  const freshMeta = metaFromSoundCloudTrack(
+                    plTrack,
+                    entry.sourcePage,
+                    plPositions.get(trackIdKey) || null,
+                  );
+                  if (freshMeta) refreshedExisting.set(trackIdKey, freshMeta);
+                }
+              }
+            }
+          }
+
+          for (const entry of candidatesToRefresh) {
+            const knownMeta = knownMetaById.get(entry.id);
+            if (knownMeta) knownMeta._metaRefreshedAt = now;
+          }
+        }
       }
     }
-    const unchanged = !options.force && resolved.size === 0 && updates.length > 0
+
+    if (!canMutateQueue()) {
+      state._liveSyncDeferredResults = {
+        epoch, routeEpoch, sources, at: Date.now(), updates, resolved, refreshedExisting, forced,
+      };
+      state._liveSyncLastCheck = previousLastCheck;
+      if (forced) state._liveSyncPendingForce = true;
+      if (typeof scheduleLiveQueueSync === 'function') scheduleLiveQueueSync(300);
+      return 0;
+    }
+
+    let hasMetadataDiff = false;
+    if (refreshedExisting instanceof Map && refreshedExisting.size) {
+      for (const [id, freshMeta] of refreshedExisting) {
+        const existingMeta = knownMetaById.get(id);
+        if (!existingMeta || !freshMeta) continue;
+        if (typeof freshMeta.title === 'string' && freshMeta.title.trim() && freshMeta.title.trim() !== '—'
+            && freshMeta.title !== existingMeta.title) {
+          hasMetadataDiff = true;
+          break;
+        }
+        const fromApiMeta = freshMeta.soundcloudId != null;
+        if (typeof freshMeta.artist === 'string' && freshMeta.artist.trim() && freshMeta.artist.trim() !== '—'
+            && freshMeta.artist !== existingMeta.artist) {
+          const keepCollabByline = fromApiMeta && typeof existingMeta.artist === 'string'
+            && existingMeta.artist.includes(', ')
+            && !freshMeta.artist.includes(', ')
+            && existingMeta.artist.toLowerCase().includes(freshMeta.artist.toLowerCase());
+          if (!keepCollabByline) {
+            hasMetadataDiff = true;
+            break;
+          }
+        }
+        const nextArtwork = typeof freshMeta.artwork === 'string' && freshMeta.artwork.trim() ? freshMeta.artwork : null;
+        const prevArtwork = typeof existingMeta.artwork === 'string' && existingMeta.artwork.trim() ? existingMeta.artwork : null;
+        if (nextArtwork !== prevArtwork && (nextArtwork || (fromApiMeta && Object.prototype.hasOwnProperty.call(freshMeta, 'artwork')))) {
+          hasMetadataDiff = true;
+          break;
+        }
+        if (typeof freshMeta.link === 'string' && freshMeta.link.trim() && typeof normalizeTrackUrl === 'function') {
+          const oldNorm = normalizeTrackUrl(existingMeta.link);
+          const newNorm = normalizeTrackUrl(freshMeta.link);
+          const oldBase = oldNorm.replace(/\/s-[a-z0-9_-]+$/i, '');
+          const newBase = newNorm.replace(/\/s-[a-z0-9_-]+$/i, '');
+          const oldSecret = typeof extractSoundCloudSecretToken === 'function'
+            ? extractSoundCloudSecretToken(existingMeta.link || '')
+            : '';
+          const newSecret = typeof extractSoundCloudSecretToken === 'function'
+            ? extractSoundCloudSecretToken(freshMeta.link || '')
+            : '';
+          if (newNorm && (!oldNorm || newBase !== oldBase || (newBase === oldBase && !oldSecret && Boolean(newSecret)))) {
+            hasMetadataDiff = true;
+            break;
+          }
+        }
+        if (typeof hasSoundCloudAudioReplacement === 'function'
+            && hasSoundCloudAudioReplacement(existingMeta, freshMeta)) {
+          hasMetadataDiff = true;
+          break;
+        }
+      }
+    }
+
+    const accountedId = id => knownIds.has(id) || (!forced && hasActiveCooldown(id));
+    const unchanged = !forced && resolved.size === 0 && !hasMetadataDiff && updates.length > 0
       && updates.every(({ sourcePage, snapshot }) => {
         const signature = `${Boolean(snapshot.complete)}:${snapshot.tracks.map(track => Number(track.id)).join(',')}`;
         return state._liveSyncSignatures?.get?.(sourcePage) === signature
-          && snapshot.tracks.every(track => knownIds.has(Number(track.id)));
+          && snapshot.tracks.every(track => accountedId(Number(track.id)));
       });
-    if (unchanged) return 0;
+    if (unchanged) {
+      state._liveSyncIdleStreak = idleStreak + 1;
+      return 0;
+    }
+    state._liveSyncIdleStreak = 0;
 
     const pageSource = playlistBase(location.href);
     const pageEls = sources.has(pageSource)
@@ -8867,6 +18807,22 @@ async function syncLiveQueue(options) {
       const id = Number(meta?.soundcloudId);
       if (Number.isFinite(id)) existingById.set(id, ti);
     });
+    let metaUpdatedCount = 0;
+    const replacedAudioTis = new Set();
+    if (refreshedExisting instanceof Map && typeof refreshExistingTrackMeta === 'function') {
+      for (const [id, freshMeta] of refreshedExisting) {
+        const ti = existingById.get(id);
+        if (ti === undefined || !freshMeta) continue;
+        const prevReplacedAt = Number(state.meta[ti]?._audioReplacedAt) || 0;
+        if (refreshExistingTrackMeta(state.meta[ti], freshMeta, { fromApi: true })) {
+          metaUpdatedCount++;
+          indexTrackMeta(identities, state.meta[ti], ti);
+        }
+        if ((Number(state.meta[ti]?._audioReplacedAt) || 0) > prevReplacedAt) {
+          replacedAudioTis.add(ti);
+        }
+      }
+    }
     const metas = [];
     for (const [id, meta] of resolved) {
       if (!meta || existingById.has(id)) continue;
@@ -8883,6 +18839,7 @@ async function syncLiveQueue(options) {
       }
     }
     const firstNewIndex = state.meta.length;
+    const roundTotalBefore = state.roundTotal;
     const added = applyLiveQueueTracks(metas, pageEls, false);
     for (let ti = firstNewIndex; ti < state.meta.length; ti++) {
       existingById.set(Number(state.meta[ti].soundcloudId), ti);
@@ -8894,24 +18851,47 @@ async function syncLiveQueue(options) {
       const members = sources.get(sourcePage);
       for (const track of snapshot.tracks) {
         const ti = existingById.get(Number(track.id));
-        if (ti !== undefined) members.add(ti);
+        if (ti !== undefined) {
+          members.add(ti);
+          if (state.meta?.[ti]?.isDjDiscovery) delete state.meta[ti].isDjDiscovery;
+        }
       }
     }
     let removed = 0;
+    state._liveSyncDomMetaUpdated = false;
     for (const { sourcePage, snapshot } of updates) {
       removed += reconcileLivePlaylistSnapshot(snapshot, sourcePage, sourcePage === pageSource ? pageEls : []);
     }
+    const anyMetaUpdated = metaUpdatedCount > 0 || Boolean(state._liveSyncDomMetaUpdated);
+    state._liveSyncDomMetaUpdated = false;
     const signatures = state._liveSyncSignatures || (state._liveSyncSignatures = new Map());
     for (const { sourcePage, snapshot } of updates) {
-      if (snapshot.tracks.every(track => existingById.has(Number(track.id)))) {
+      if (snapshot.tracks.every(track => existingById.has(Number(track.id)) || unresolvable.has(Number(track.id)))) {
         signatures.set(sourcePage, `${Boolean(snapshot.complete)}:${snapshot.tracks.map(track => Number(track.id)).join(',')}`);
       } else {
         signatures.delete(sourcePage);
       }
     }
-    if (removed) {
+    const standbyIdx = state._deckIndex === 0 ? 1 : 0;
+    const nextUpTi = typeof upcomingTrackIndex === 'function' ? upcomingTrackIndex() : undefined;
+    const standbyTi = state._deckTracks?.[standbyIdx];
+    const warmupTi = state._crossfadeStreamWarmup?.nextTi;
+    const upcomingAudioReplaced = replacedAudioTis.size > 0
+      && (replacedAudioTis.has(nextUpTi) || replacedAudioTis.has(standbyTi) || replacedAudioTis.has(warmupTi));
+    if (upcomingAudioReplaced) {
+      refreshUpcomingCrossfadePreparation({ forceStandbyReset: true });
+    } else if (removed) {
       refreshUpcomingCrossfadePreparation();
+    }
+    if (replacedAudioTis.size) {
+      const activeTi = Number.isInteger(state._deckTrack) ? state._deckTrack : state.current;
+      if (replacedAudioTis.has(activeTi) && typeof loadTrackWaveform === 'function') {
+        void loadTrackWaveform(state.meta[activeTi]);
+      }
+    }
+    if (added || removed || anyMetaUpdated || state.roundTotal !== roundTotalBefore) {
       updateHub();
+      if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
     }
     if (updates.length) {
       badges();
@@ -8925,9 +18905,17 @@ async function syncLiveQueue(options) {
 }
 
 function resetLiveQueueSync() {
-  if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
+  clearTimeout(state._liveSyncTimer);
   state._liveSyncSources = new Map();
   state._liveSyncSignatures = new Map();
+  state._liveSyncUnresolvable = new Map();
+  state._liveSyncPendingForce = false;
+  state._liveSyncDeferredResults = null;
+  state._liveSyncMetaCursor = 0;
+  state._liveSyncStubCursor = 0;
+  state._liveSyncLastMetaSweepAt = 0;
+  state._liveSyncLastPlaylistMetaFallbackAt = 0;
+  state._liveSyncIdleStreak = 0;
   state._liveSyncInFlight = false;
   state._liveSyncLastCheck = 0;
   state._liveSyncTimer = null;
@@ -8935,6 +18923,22 @@ function resetLiveQueueSync() {
 
 async function mergeCurrentPage() {
   if (!state.active) { showMergeToast(-1); return; }
+  if (state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (state._pendingPlaybackTrack?.ti === state._deckTrack) state._pendingPlaybackTrack = null;
+    state._playbackRequest = null;
+    state.busy = false;
+  }
   if (state.loading || state.busy) return;
   const btn = document.getElementById('tss-merge-btn');
   const pageUrl = playlistBase(location.href);
@@ -8942,7 +18946,7 @@ async function mergeCurrentPage() {
   if (btn) { btn.style.opacity = '0.35'; btn.style.pointerEvents = 'none'; }
   try {
     const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
-    const pageEls = await loadTracks(request);
+    const pageEls = await loadTracks(request, snapshotPromise);
     if (!collectionRequestCurrent(request) || !state.active) return;
     const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
     if (!collectionRequestCurrent(request) || !state.active) return;
@@ -8955,7 +18959,8 @@ async function mergeCurrentPage() {
       if (ti !== undefined) {
         if (collection.els[index]) state.els[ti] = collection.els[index];
         const previous = state.meta[ti];
-        Object.assign(previous, mergeTrackMeta(previous, meta));
+        if (typeof refreshExistingTrackMeta === 'function') refreshExistingTrackMeta(previous, meta, { fromApi: true });
+        else Object.assign(previous, mergeTrackMeta(previous, meta));
         if (playlistBase(previous.sourcePage || '') === pageUrl) {
           state.meta[ti].playlistPosition = meta.playlistPosition;
         }
@@ -8999,7 +19004,24 @@ async function mergeCurrentPage() {
 }
 
 async function reshuffleCurrentPage() {
-  if (!validPage() || state.loading || state.busy) return;
+  if (!validPage() || state.loading) return;
+  if (state.busy && state._crossfading && (state._userPaused || state._crossfadePausedByUser)) {
+    state._crossfadeToken++;
+    state._crossfading = false;
+    state._crossfadePausedByUser = false;
+    const pausedSchedule = state._crossfadeSchedule;
+    state._crossfadeSchedule = null;
+    pausedSchedule?.resolve?.(false);
+    const activeIdx = state._deckIndex;
+    state._decks?.forEach((d, idx) => {
+      if (d && idx !== activeIdx && state._deckTracks?.[idx] !== null && typeof resetDeck === 'function') resetDeck(d, idx);
+    });
+    if (activeIdx >= 0 && state._deckGains) state._deckGains[activeIdx] = 1;
+    if (state._pendingPlaybackTrack?.ti === state._deckTrack) state._pendingPlaybackTrack = null;
+    state._playbackRequest = null;
+    state.busy = false;
+  }
+  if (state.busy) return;
 
   if (!state.active) {
     await start();
@@ -9015,13 +19037,25 @@ async function reshuffleCurrentPage() {
 
   setLoading(true);
   const pageUrl = location.href.split(/[?#]/)[0];
-  const samePlaylist = playlistBase(pageUrl) === playlistBase(state.playlistUrl)
-    || state._liveSyncSources.has(playlistBase(pageUrl));
+  const feedLimitChanged = /\/(?:feed|stream)$/i.test(playlistBase(pageUrl))
+    && Number.isInteger(state._loadedFeedLimit)
+    && state._loadedFeedLimit !== state.feedTrackLimit;
+  const samePlaylist = !feedLimitChanged && (
+    playlistBase(pageUrl) === playlistBase(state.playlistUrl)
+    || state._liveSyncSources.has(playlistBase(pageUrl))
+  );
   let request = null;
   let acceptedEpoch = null;
 
   try {
     if (samePlaylist && !state.suspended) {
+      const syncEpoch = state._playbackEpoch;
+      const syncRoute = state._routeEpoch || 0;
+      if (typeof syncLiveQueue === 'function' && state._liveSyncSources?.size) {
+        try { await syncLiveQueue({ force: true }); } catch (_) {}
+        if (!state.active || state.suspended || state._playbackEpoch !== syncEpoch
+            || (state._routeEpoch || 0) !== syncRoute) return;
+      }
       const alive = [...Array(state.meta.length).keys()].filter(trackAvailable);
       const currentTi = state.queue[state.pos];
       if (!alive.length || currentTi === undefined) {
@@ -9038,19 +19072,52 @@ async function reshuffleCurrentPage() {
       state.roundPlayed = 0;
       state.roundTotal = state.queue.length;
       state.suspended = false;
+      if (state._djPendingChapter) {
+        if (typeof clearDjChapterVoiceState === 'function') clearDjChapterVoiceState(state._djPendingChapter);
+        state._djPendingChapter = null;
+      }
+      if (state.djMode && typeof planNextDjChapter === 'function' && typeof applyDjChapterToQueue === 'function') {
+        const reshuffleEpoch = state._playbackEpoch;
+        const ticket = typeof nextDjPlanTicket === 'function'
+          ? nextDjPlanTicket()
+          : { seq: state._djPlanSeq, signal: state._playbackAbort?.signal, release() {} };
+        state._djPlanningInFlight = true;
+        try {
+          const upcoming = await planNextDjChapter({ excludeIndices: [currentTi], signal: ticket.signal });
+          if (!state.active || state._playbackEpoch !== reshuffleEpoch || state._djPlanSeq !== ticket.seq) return;
+          if (upcoming) {
+            if (state._djPendingChapter && state._djPendingChapter !== upcoming
+                && typeof clearDjChapterVoiceState === 'function') {
+              clearDjChapterVoiceState(state._djPendingChapter);
+            }
+            applyDjChapterToQueue(upcoming, { atCurrent: false });
+            state._djPendingChapter = upcoming;
+            if (state.djCommentaryMode === 'voice' && typeof preSynthesizeDjChapterVoice === 'function') {
+              preSynthesizeDjChapterVoice(upcoming);
+            }
+          }
+        } finally {
+          ticket.release();
+          if (state._djPlanSeq === ticket.seq) state._djPlanningInFlight = false;
+        }
+      }
       refreshUpcomingCrossfadePreparation();
       badges();
       renderList();
       updateHub();
+      if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
       showMergeToast(`${Math.max(0, state.queue.length - 1)} upcoming tracks reshuffled`);
       return;
     }
 
     request = beginCollectionRequest(pageUrl, true, true);
     state._userPaused = false;
+    if (state.djMode && state.djCommentaryMode === 'voice' && typeof ensureDjVoiceWorker === 'function') {
+      ensureDjVoiceWorker();
+    }
     updateHub();
     const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
-    const pageEls = await loadTracks(request);
+    const pageEls = await loadTracks(request, snapshotPromise);
     if (!collectionRequestCurrent(request) || !state.active) return;
     const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
     if (!collectionRequestCurrent(request) || !state.active) return;
@@ -9094,8 +19161,19 @@ async function reshuffleCurrentPage() {
       playCounts: {},
     };
 
+    if (state.djMode && typeof initializeDjSessionOnStart === 'function') {
+      await initializeDjSessionOnStart(acceptedEpoch);
+      if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
+    }
+
     startWatcher();
-    await runPlaybackOperation('replace queue', () => playAt(state.queue[0]));
+    await runPlaybackOperation('replace queue', async () => {
+      if (state.djMode && typeof runDjOpeningIntro === 'function') {
+        await runDjOpeningIntro(acceptedEpoch);
+        if (!state.active || state._playbackEpoch !== acceptedEpoch) return null;
+      }
+      return playAt(state.queue[0]);
+    });
     if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
     badges();
     renderList();
@@ -9110,129 +19188,6 @@ async function reshuffleCurrentPage() {
   }
 }
 
-function remapCachedQueue(cache, meta) {
-  const identities = trackIdentityIndex(meta);
-  const cachedMeta = Array.isArray(cache.meta) ? cache.meta : null;
-  const cachedKeys = cachedMeta ? cachedMeta.map(trackCacheKey) : cache.metaKeys;
-  const remapOld = oldTi => cachedMeta
-    ? matchingTrackIndex(identities, cachedMeta[oldTi]) : identities.byKey.get(cachedKeys[oldTi]);
-  const available = ti => ti !== undefined && !meta[ti].unavailable;
-  const cachedPos = Math.max(0, Number(cache.pos) || 0);
-  const prefix = cache.queue.slice(0, cachedPos).map(remapOld).filter(ti => ti !== undefined);
-  const remainingSet = new Set(cache.queue.slice(cachedPos).map(remapOld).filter(available));
-  const remaining = [...remainingSet];
-  const cachedIndices = new Set(cachedKeys.map((_, ti) => remapOld(ti)));
-  const extras = fisherYates(meta.map((_, ti) => ti).filter(ti => available(ti)
-    && (!cachedIndices.has(ti)
-      || (meta[ti]._restoreUpcoming && !meta[ti].removedFromPlaylist && !remainingSet.has(ti)))));
-  const currentTi = remaining[0];
-  const upcoming = remaining.slice(1).concat(extras);
-  const finalQueue = prefix.concat(currentTi === undefined
-    ? spaceDuplicateTitles(upcoming, meta)
-    : [currentTi, ...spaceDuplicateTitles(upcoming, meta, currentTi)]);
-  const playNext = [...new Set((cache.playNext || []).map(remapOld).filter(available))]
-    .filter(ti => ti !== finalQueue[prefix.length]);
-  if (finalQueue.length <= prefix.length && !playNext.length) return null;
-  if (finalQueue.length <= prefix.length) finalQueue.push(playNext.shift());
-  const history = (cache.history || []).map(remapOld).filter(ti => ti !== undefined);
-  const priority = {};
-  for (const [key, weight] of Object.entries(cache.priority || {})) {
-    const ti = remapOld(+key);
-    if (ti !== undefined) priority[ti] = weight;
-  }
-  const roundPlayed = Math.max(0, Number(cache.roundPlayed) || 0);
-  const scheduled = new Set(finalQueue.slice(prefix.length));
-  return {
-    queue: finalQueue, pos: prefix.length, history, priority, playNext, roundPlayed,
-    roundTotal: roundPlayed + finalQueue.length - prefix.length + playNext.filter(ti => !scheduled.has(ti)).length,
-  };
-}
-
-function saveQueueSessionCache() {
-  try {
-    if (state.queue[state.pos] === undefined && !state.playNext.length) {
-      sessionStorage.removeItem('tss_queue_cache');
-      return false;
-    }
-    sessionStorage.setItem('tss_queue_cache', JSON.stringify({
-      queue: state.queue, pos: state.pos, history: state.history, priority: state.priority,
-      playNext: state.playNext, playlistUrl: state.playlistUrl, ts: Date.now(),
-      meta: state.meta, metaKeys: state.meta.map(trackCacheKey),
-      sources: [...state._liveSyncSources].map(([sourcePage, members]) => [sourcePage, [...members]]),
-      roundPlayed: state.roundPlayed, roundTotal: state.roundTotal,
-    }));
-    return true;
-  } catch (_) { return false; }
-}
-
-function restoreQueueSessionCache(cache, collection, pageUrl) {
-  if (!Array.isArray(cache.meta) || !Array.isArray(cache.sources)) return remapCachedQueue(cache, state.meta);
-  const meta = cache.meta.map(item => {
-    const restored = { ...item };
-    const legacyReason = restored.nativePlaybackReason;
-    const reason = restored.customPlaybackReason || legacyReason;
-    const capabilityUnavailable = restored.customPlaybackUnavailable || restored.requiresNativePlayback;
-    delete restored.requiresNativePlayback;
-    delete restored.nativePlaybackReason;
-    if (capabilityUnavailable && ['preview-only', 'preview-limited', 'access-restricted', 'hls-mse-unavailable'].includes(reason)) {
-      restored.customPlaybackUnavailable = true;
-      restored.customPlaybackReason = reason;
-    } else {
-      delete restored.customPlaybackUnavailable;
-      delete restored.customPlaybackReason;
-    }
-    return restored;
-  });
-  const identities = trackIdentityIndex(meta);
-  const els = meta.map(() => null);
-  const pageMembers = new Set();
-  collection.meta.forEach((item, index) => {
-    let ti = matchingTrackIndex(identities, item);
-    if (ti === undefined) {
-      ti = meta.length;
-      meta.push(item);
-      els.push(null);
-    } else {
-      meta[ti] = mergeTrackMeta(meta[ti], item);
-      if (playlistBase(meta[ti].sourcePage || '') === pageUrl) meta[ti].playlistPosition = item.playlistPosition;
-      delete meta[ti].removedFromPlaylist;
-      delete meta[ti].unavailable;
-    }
-    indexTrackMeta(identities, meta[ti], ti);
-    els[ti] = collection.els[index] || null;
-    pageMembers.add(ti);
-  });
-  els.forEach((el, ti) => {
-    if (el && soundCloudPermalinkConflicts(meta[ti], identities)) els[ti] = null;
-  });
-  const sources = new Map(cache.sources.map(([sourcePage, members]) => [sourcePage, new Set(members.filter(ti => meta[ti]))]));
-  if (collection.complete) sources.set(pageUrl, pageMembers);
-  else {
-    const retained = sources.get(pageUrl) || new Set();
-    for (const ti of pageMembers) retained.add(ti);
-    sources.set(pageUrl, retained);
-  }
-  const allMembers = new Set();
-  for (const members of sources.values()) for (const ti of members) allMembers.add(ti);
-  const cachedUpcoming = new Set(cache.queue.slice(Math.max(0, Number(cache.pos) || 0)).concat(cache.playNext || []));
-  meta.forEach((item, ti) => {
-    if (allMembers.has(ti)) return;
-    item.removedFromPlaylist = true;
-    item.unavailable = true;
-    if (cachedUpcoming.has(ti)) item._restoreUpcoming = true;
-  });
-  const restored = remapCachedQueue(cache, meta);
-  if (!restored) return null;
-  for (let qi = restored.pos; qi < restored.queue.length; qi++) {
-    delete meta[restored.queue[qi]]._restoreUpcoming;
-  }
-  for (const ti of restored.playNext) delete meta[ti]._restoreUpcoming;
-  state.meta = meta;
-  state.els = els;
-  state._liveSyncSources = sources;
-  return restored;
-}
-
 async function start() {
   if (!validPage()) return;
   if (state.active || state.loading) {
@@ -9241,6 +19196,8 @@ async function start() {
     return;
   }
   state._userPaused = false;
+  state._nativePlayUnlocked = false;
+  state._nativeHandoffActive = false;
   invalidatePlaybackSession();
   resetLiveQueueSync();
   const pageUrl = playlistBase(location.href);
@@ -9249,9 +19206,12 @@ async function start() {
   try {
     pauseSoundCloudTransport();
     pauseSoundCloud();
+    if (state.djMode && state.djCommentaryMode === 'voice' && typeof ensureDjVoiceWorker === 'function') {
+      ensureDjVoiceWorker();
+    }
     updateHub();
     const snapshotPromise = fetchLivePlaylistSnapshot(pageUrl, request.signal);
-    const pageEls = await loadTracks(request);
+    const pageEls = await loadTracks(request, snapshotPromise);
     if (!collectionRequestCurrent(request)) return;
     const collection = await completePlaylistCollection(pageUrl, pageEls, snapshotPromise, request.signal);
     if (!collectionRequestCurrent(request)) return;
@@ -9261,28 +19221,13 @@ async function start() {
     state.els = collection.els;
     state.meta = collection.meta;
     registerLiveQueueSource(pageUrl, state.meta.map((_, ti) => ti));
-    let cached = null;
-    try {
-      const raw = sessionStorage.getItem('tss_queue_cache');
-      const cache = raw ? JSON.parse(raw) : null;
-      if (cache && Date.now() - (cache.ts || 0) < 30 * 60 * 1000
-          && playlistBase(cache.playlistUrl || '') === pageUrl
-          && Array.isArray(cache.queue) && cache.queue.length && Array.isArray(cache.metaKeys)) {
-        cached = restoreQueueSessionCache(cache, collection, pageUrl);
-        if (cached) sessionStorage.removeItem('tss_queue_cache');
-      }
-    } catch (_) {}
-    if (cached) {
-      Object.assign(state, cached);
-    } else {
-      state.priority = {};
-      state.queue = buildReshuffledQueue(state.meta.map((_, ti) => ti).filter(trackAvailable));
-      state.pos = 0;
-      state.history = [];
-      state.playNext = [];
-      state.roundPlayed = 0;
-      state.roundTotal = state.queue.length;
-    }
+    state.priority = {};
+    state.queue = buildReshuffledQueue(state.meta.map((_, ti) => ti).filter(trackAvailable));
+    state.pos = 0;
+    state.history = [];
+    state.playNext = [];
+    state.roundPlayed = 0;
+    state.roundTotal = state.queue.length;
     if (state.queue[state.pos] === undefined) return;
     state.skipCounts = {};
     state.roundStarts = {};
@@ -9305,9 +19250,17 @@ async function start() {
     }
     state._savedStats = null;
     state._lifetimeBase = { played: state.stats.played, elapsed: state.stats.elapsed, playCounts: { ...state.stats.playCounts } };
-    await runPlaybackOperation('start', () => {
+    if (state.djMode && typeof initializeDjSessionOnStart === 'function') {
+      await initializeDjSessionOnStart(acceptedEpoch);
+      if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
+    }
+    await runPlaybackOperation('start', async () => {
       initializePlaybackVolume();
       startWatcher();
+      if (state.djMode && typeof runDjOpeningIntro === 'function') {
+        await runDjOpeningIntro(acceptedEpoch);
+        if (!state.active || state._playbackEpoch !== acceptedEpoch) return null;
+      }
       return playAt(state.queue[state.pos]);
     });
     if (!state.active || state._playbackEpoch !== acceptedEpoch) return;
@@ -9329,6 +19282,8 @@ function stop() {
   state.busy = false;
   state.loading = false;
   state._userPaused = true;
+  state._nativePlayUnlocked = true;
+  state._nativeHandoffActive = false;
   state._pendingPlaybackTrack = null;
   state._playbackRequest = null;
   state.sleepTimer = null;
@@ -9345,6 +19300,9 @@ function stop() {
   safely(pauseSoundCloudTransport);
   safely(pauseSoundCloud);
   safely(stopCrossfadeDecks);
+  safely(() => { if (typeof cleanupDjSessionOnStop === 'function') cleanupDjSessionOnStop(); });
+  safely(() => { if (state.djMode && typeof setDjModeEnabled === 'function') setDjModeEnabled(false); });
+  safely(() => { if (typeof syncBrandmarkCrossfade === 'function') syncBrandmarkCrossfade('reset'); });
   safely(syncBrowserNowPlaying);
   safely(resetLiveQueueSync);
   safely(() => {
@@ -9369,6 +19327,8 @@ function stop() {
     _trackCounts: Object.entries(state.stats.playCounts).map(([ti, count]) => [trackCacheKey(state.meta[ti]), count])
       .filter(([key]) => key !== null),
   };
+  if (Array.isArray(state.els)) state.els = [];
+  if (Array.isArray(state._deckPreparations)) state._deckPreparations = [];
   safely(saveLifetimeStats);
   safely(updateHub);
 }
@@ -9417,18 +19377,187 @@ function startWatcher() {
     return false;
   };
 
-  const resetEndGuard = async () => {
-    if (!watcherIsCurrent()) return;
+  const resetEndGuard = () => {
     endpointTicks = 0;
-    if (!state.active) { nearEnd = false; return; }
-    for (let i = 0; i < 10; i++) {
-      if (progress() < 0.1) break;
-      await wait(100);
-      if (!watcherIsCurrent()) return;
-    }
     nearEnd = false;
   };
 
+
+  const watcherMonoNow = () => typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now() : Date.now();
+  const noteOutgoingEndedGap = () => {
+    if (!state.active || state._userPaused || state.suspended || state.manualAction) return;
+    if (state.stopAfterRound && state.pos >= state.queue.length - 1 && !state.playNext?.length) return;
+    if (state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1) return;
+    const endedDeck = currentDeckAudio();
+    const endedIdx = state._deckIndex;
+    const endedTok = endedIdx >= 0 ? state._deckPrepareTokens?.[endedIdx] : null;
+    if (!endedDeck || (state._endedGapMonitor?.epoch === state._playbackEpoch
+        && state._endedGapMonitor.outgoingDeck === endedDeck
+        && state._endedGapMonitor.outgoingToken === endedTok)) return;
+    const dur = Number(endedDeck.duration) > 0
+      ? Number(endedDeck.duration) : (Number(state.meta[state._deckTrack]?.durationMs) / 1000 || 0);
+    state._endedGapMonitor = {
+      epoch: state._playbackEpoch,
+      startedAt: watcherMonoNow(),
+      watcherEnteredAt: null,
+      outgoingDeck: endedDeck,
+      outgoingIndex: endedIdx,
+      outgoingToken: endedTok,
+      outgoingTrack: state._deckTrack,
+      outgoingDuration: dur,
+      standbyReadyAtEnd: typeof upcomingCrossfadeDeckReady === 'function' ? upcomingCrossfadeDeckReady() : false,
+      faultRecorded: false,
+    };
+  };
+  const checkTransitionSilenceMonitors = () => {
+    if (!state.active || state._userPaused || state.suspended || state.manualAction) {
+      state._endedGapMonitor = null;
+      state._handoffAudioMonitor = null;
+      return;
+    }
+    const now = watcherMonoNow();
+    const endedGap = state._endedGapMonitor;
+    if (endedGap) {
+      if (endedGap.epoch !== state._playbackEpoch) {
+        state._endedGapMonitor = null;
+      } else {
+        const active = currentDeckAudio();
+        if (active && active !== endedGap.outgoingDeck && !active.paused && !active.ended) {
+          state._endedGapMonitor = null;
+        } else if (!endedGap.faultRecorded && !state._customPlaybackRetryTimer && now - endedGap.startedAt >= 2000) {
+          endedGap.faultRecorded = true;
+          const reason = state.busy ? 'preparation-stalled-after-end' : 'watcher-end-pickup-delayed';
+          recordPlaybackDiagnostic('transition-silence-gap', {
+            trackIndex: endedGap.outgoingTrack,
+            outgoingIndex: endedGap.outgoingIndex,
+            outgoingDuration: endedGap.outgoingDuration > 0 ? Math.round(endedGap.outgoingDuration * 1000) / 1000 : undefined,
+            crossfadeSeconds: Number(state.crossfadeSeconds) || 0,
+            standbyReadyAtEnd: Boolean(endedGap.standbyReadyAtEnd),
+            silenceGapMs: Math.round(now - endedGap.startedAt),
+            watcherPickupMs: endedGap.watcherEnteredAt !== null
+              ? Math.max(0, Math.round(endedGap.watcherEnteredAt - endedGap.startedAt))
+              : Math.round(now - endedGap.startedAt),
+            failureStage: endedGap.outgoingDuration > 0 && endedGap.outgoingDuration <= 25
+              ? 'bumper-natural-end' : 'track-natural-end',
+            failureReason: reason,
+            reason,
+            visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : undefined,
+          });
+        }
+      }
+    }
+    const handoff = state._handoffAudioMonitor;
+    if (!handoff) return;
+    if (handoff.epoch !== state._playbackEpoch
+        || state._decks?.[handoff.deckIndex] !== handoff.deck
+        || state._deckPrepareTokens?.[handoff.deckIndex] !== handoff.prepareToken) {
+      state._handoffAudioMonitor = null;
+      return;
+    }
+    const outgoingAudible = Boolean(handoff.outgoingDeck
+      && state._decks?.[handoff.outgoingIndex] === handoff.outgoingDeck
+      && state._deckPrepareTokens?.[handoff.outgoingIndex] === handoff.outgoingToken
+      && !handoff.outgoingDeck.paused && !handoff.outgoingDeck.ended
+      && (state._crossfading || (state._deckGains?.[handoff.outgoingIndex] || 0) > 0.02));
+    if (!outgoingAudible && handoff.silentSince === null) handoff.silentSince = now;
+    const incTime = Number(handoff.deck.currentTime) || 0;
+    if (incTime > handoff.lastTime + 0.03) {
+      const prevAdvanceAt = handoff.lastAdvanceAt;
+      handoff.lastTime = incTime;
+      handoff.lastAdvanceAt = now;
+      if (handoff.firstAdvanceAt === null && incTime >= handoff.baselineTime + 0.04) {
+        const overshootMs = !handoff.faultRecorded
+          ? Math.max(0, Math.min(250, (incTime - (handoff.baselineTime + 0.04)) * 1000))
+          : 0;
+        const effectiveAdvanceAt = Math.max(handoff.playFulfilledAt, now - overshootMs);
+        handoff.firstAdvanceAt = effectiveAdvanceAt;
+        const incomingAdvanceDelayMs = Math.max(0, Math.round(effectiveAdvanceAt - handoff.playFulfilledAt));
+        const postOutSilenceMs = handoff.silentSince !== null ? Math.max(0, effectiveAdvanceAt - handoff.silentSince) : 0;
+        const totalGapMs = Math.round(Math.max(handoff.prePlaySilenceMs || 0, postOutSilenceMs));
+        if (totalGapMs >= 1000 && !handoff.faultRecorded) {
+          handoff.faultRecorded = true;
+          const reason = incomingAdvanceDelayMs >= 1000 ? 'incoming-decoder-clock-frozen' : 'unmixed-handoff-delayed';
+          recordPlaybackDiagnostic('transition-silence-gap', {
+            ...handoff.summary,
+            failureStage: (handoff.summary.outgoingDuration || 0) > 0 && handoff.summary.outgoingDuration <= 25
+              ? 'bumper-exit-stall' : 'crossfade-exit-stall',
+            failureReason: reason,
+            reason,
+            silenceGapMs: totalGapMs,
+            incomingAdvanceDelayMs,
+          });
+        } else if (handoff.faultRecorded && state._transitionDiagnostics) {
+          recordTransitionDiagnostic('transition-gap-recovered', {
+            trackIndex: handoff.summary.trackIndex,
+            incomingIndex: handoff.deckIndex,
+            silenceGapMs: totalGapMs,
+            incomingAdvanceDelayMs,
+          });
+        } else if (state._transitionDiagnostics && (handoff.summary.outgoingDuration || 0) > 0
+            && handoff.summary.outgoingDuration <= 25) {
+          recordTransitionDiagnostic('bumper-handoff', {
+            ...handoff.summary,
+            silenceGapMs: totalGapMs,
+            incomingAdvanceDelayMs,
+          });
+        }
+      } else if (handoff.faultRecorded && now - prevAdvanceAt >= 1000 && state._transitionDiagnostics) {
+        recordTransitionDiagnostic('transition-gap-recovered', {
+          trackIndex: handoff.summary.trackIndex,
+          incomingIndex: handoff.deckIndex,
+          silenceGapMs: Math.round(now - prevAdvanceAt),
+          incomingAdvanceDelayMs: Math.max(0, Math.round(now - handoff.playFulfilledAt)),
+        });
+      }
+      if (handoff.firstAdvanceAt !== null && !outgoingAudible
+          && now - handoff.playFulfilledAt >= Math.max(1500, (handoff.summary.crossfadeDuration || 0) * 1000 + 500)) {
+        state._handoffAudioMonitor = null;
+      }
+      return;
+    }
+    if (!outgoingAudible) {
+      const silentMs = Math.round(Math.max(
+        handoff.prePlaySilenceMs || 0,
+        now - (handoff.firstAdvanceAt !== null ? handoff.lastAdvanceAt : (handoff.silentSince ?? handoff.playFulfilledAt)),
+      ));
+      if (silentMs >= 1200 && !handoff.faultRecorded) {
+        handoff.faultRecorded = true;
+        let bufferedAhead = 0;
+        try {
+          for (let i = 0; i < (handoff.deck.buffered?.length || 0); i++) {
+            if (handoff.deck.buffered.start(i) <= incTime + 0.1) {
+              bufferedAhead = Math.max(bufferedAhead, handoff.deck.buffered.end(i) - incTime);
+            }
+          }
+        } catch (_) {}
+        const reason = handoff.deck.paused
+          ? 'incoming-paused-after-handoff'
+          : (handoff.deck.seeking
+            ? 'incoming-stuck-seeking'
+            : (handoff.firstAdvanceAt !== null
+              ? 'incoming-mid-handoff-stall'
+              : (bufferedAhead < 0.1 ? 'incoming-buffer-starved' : 'incoming-decoder-clock-frozen')));
+        recordPlaybackDiagnostic('transition-silence-gap', {
+          ...handoff.summary,
+          failureStage: (handoff.summary.outgoingDuration || 0) > 0 && handoff.summary.outgoingDuration <= 25
+            ? 'bumper-exit-stall' : 'crossfade-exit-stall',
+          failureReason: reason,
+          reason,
+          silenceGapMs: silentMs,
+          incomingAdvanceDelayMs: handoff.firstAdvanceAt !== null
+            ? Math.max(0, Math.round(handoff.firstAdvanceAt - handoff.playFulfilledAt)) : undefined,
+          incomingCurrentTime: Math.round(incTime * 1000) / 1000,
+          bufferedAhead: Math.round(bufferedAhead * 1000) / 1000,
+          readyState: Number(handoff.deck.readyState) || 0,
+          networkState: Number(handoff.deck.networkState) || 0,
+          incomingPaused: Boolean(handoff.deck.paused),
+          seeking: Boolean(handoff.deck.seeking),
+        });
+      }
+    }
+    if (now - handoff.playFulfilledAt >= 15000) state._handoffAudioMonitor = null;
+  };
 
   const advanceAtNaturalEnd = async () => {
     if (!watcherIsCurrent() || state._userPaused || state.busy || nearEnd) return;
@@ -9437,6 +19566,10 @@ function startWatcher() {
       refreshPlayBtn();
       updateHub();
       return;
+    }
+    noteOutgoingEndedGap();
+    if (state._endedGapMonitor?.epoch === state._playbackEpoch && state._endedGapMonitor.watcherEnteredAt === null) {
+      state._endedGapMonitor.watcherEnteredAt = watcherMonoNow();
     }
     nearEnd = true;
     if (state._transitionDiagnostics) recordTransitionDiagnostic('natural-end', {
@@ -9448,17 +19581,17 @@ function startWatcher() {
     try {
       await next(true);
     } finally {
-      if (watcherIsCurrent()) await resetEndGuard();
+      if (watcherIsCurrent()) resetEndGuard();
     }
   };
 
   const onMediaEnded = e => {
     if (e.target?.tagName !== 'AUDIO' || e.target !== currentDeckAudio()) return;
+    noteOutgoingEndedGap();
     void advanceAtNaturalEnd();
   };
   state._endedHandler = onMediaEnded;
   document.addEventListener('ended', onMediaEnded, true);
-
   const tick = async () => {
     if (!watcherIsCurrent()) return;
     if (state._transitionDiagnostics) {
@@ -9479,7 +19612,10 @@ function startWatcher() {
     }
     if (checkSleepTimerDeadline()) return;
     if (!state.busy && Number.isFinite(state._liveSyncLastCheck)
-        && Date.now() - state._liveSyncLastCheck >= LIVE_SYNC_INTERVAL_MS) {
+        && Date.now() - state._liveSyncLastCheck
+          >= LIVE_SYNC_INTERVAL_MS * ((Number(state._liveSyncIdleStreak) || 0) >= 6
+            ? (typeof ownPipIsOpen === 'function' && ownPipIsOpen() ? 3 : 12)
+            : 1)) {
       void syncLiveQueue();
     }
 
@@ -9490,6 +19626,7 @@ function startWatcher() {
     // Worker ticks continue in background tabs and release next() as soon as
     // Web Audio's independent clock reaches the end of the scheduled fade.
     settleScheduledCrossfade();
+    checkTransitionSilenceMonitors();
 
     // Equal track titles can hide a transition; expire the guard before the next end.
     if (state.manualAction && Date.now() - state._manualActionAt > 3000) {
@@ -9498,24 +19635,32 @@ function startWatcher() {
 
     if (++uiTicks >= 6) {
       uiTicks = 0;
-      syncPlaybackVolumeFromSoundCloud();
       updateHub();
       syncOwnPipWindow();
       syncBetterFeedPipWindow();
     }
 
     if (Number.isInteger(state._deckTrack)) {
+      if (typeof maybeSelfHealInterruptedAudioContext === 'function') {
+        maybeSelfHealInterruptedAudioContext('watcher');
+      }
       syncCrossfadeVolume();
       processAutoLevel();
     }
 
-    if (state.busy) return;
+    if (state.busy) {
+      if (!state._crossfading && state._brandmarkPrefading && typeof syncBrandmarkCrossfade === 'function') {
+        syncBrandmarkCrossfade('cancel-prefade');
+      }
+      return;
+    }
 
     const pending = currentPendingPlaybackTrack();
     const timing = playbackTiming();
     const p      = timing.duration ? timing.current / timing.duration : 0;
 
     if (timing.ended) {
+      noteOutgoingEndedGap();
       await advanceAtNaturalEnd();
       return;
     }
@@ -9523,43 +19668,193 @@ function startWatcher() {
     const remainingSeconds = timing.duration > 0
       ? Math.max(0, timing.duration - timing.current)
       : Infinity;
-    const configuredFadeSeconds = Number(state.crossfadeSeconds) || 0;
+    const rawFadeSeconds = (state.djMode && state.djAutoMix && typeof resolveDjAutoFadeSeconds === 'function')
+      ? resolveDjAutoFadeSeconds(state._deckTrack, upcomingTrackIndex())
+      : (Number(state.crossfadeSeconds) || 0);
+    const cueOutTrimSeconds = (state.djMode && state.djCueTrim && typeof resolveDjCueOutTrimSeconds === 'function')
+      ? resolveDjCueOutTrimSeconds(state._deckTrack, timing.duration, rawFadeSeconds)
+      : 0;
+    const configuredFadeSeconds = rawFadeSeconds > 0
+      ? rawFadeSeconds
+      : (cueOutTrimSeconds > 0 ? 0.45 : 0);
+    const cueRemainingSeconds = Number.isFinite(remainingSeconds)
+      ? Math.max(0, remainingSeconds - cueOutTrimSeconds)
+      : Infinity;
+    const djProgressStarted = timing.duration > 0 && timing.duration < 15
+      ? timing.current > 0.15
+      : timing.current > 1;
+    if (state.djMode && !state._crossfading && !pending && !state._userPaused
+        && djProgressStarted && typeof maybePrepareUpcomingDjChapter === 'function') {
+      void maybePrepareUpcomingDjChapter(cueRemainingSeconds);
+      if (typeof maybeSpeakDjPreTransition === 'function') {
+        maybeSpeakDjPreTransition(cueRemainingSeconds, configuredFadeSeconds);
+      }
+    }
+    if (typeof ensureNextRoundPreview === 'function' && !state.busy && !state._crossfading) {
+      ensureNextRoundPreview();
+    }
+    const standbyCheckTi = !state._crossfading && !pending && !state._userPaused && !paused()
+      && Number.isInteger(state._deckTrack) && typeof upcomingTrackIndex === 'function'
+      ? upcomingTrackIndex()
+      : undefined;
+    const prewarmHorizon = Math.max(45, configuredFadeSeconds * 4 + 20);
+    if (standbyCheckTi !== undefined && !state.busy && Number.isFinite(cueRemainingSeconds)
+        && cueRemainingSeconds > 0.5 && cueRemainingSeconds <= prewarmHorizon
+        && typeof prefetchUpcomingCrossfadeTrack === 'function') {
+      const standbyIndex = state._deckIndex === 0 ? 1 : 0;
+      const preparation = state._deckPreparations?.[standbyIndex];
+      const matchingPrep = typeof crossfadePreparationMatches === 'function'
+        && crossfadePreparationMatches(preparation, standbyIndex, standbyCheckTi);
+      const prepPending = Boolean(matchingPrep && preparation?.pending);
+      if (!prepPending) {
+        const nowMs = Date.now();
+        const prepStats = state._deckPrepStats?.[standbyIndex];
+        const preparedAt = prepStats?.ti === standbyCheckTi ? (Number(prepStats.preparedAt) || 0) : 0;
+        const deckAudioReady = typeof upcomingCrossfadeDeckReady === 'function' && upcomingCrossfadeDeckReady();
+        const checkMeta = state.meta?.[standbyCheckTi];
+        const checkKey = checkMeta && typeof normalizeTrackUrl === 'function'
+          ? normalizeTrackUrl(checkMeta.link) : '';
+        const cachedCheck = checkKey && typeof state._streamCache?.get === 'function'
+          ? state._streamCache.get(checkKey) : null;
+        const streamExpiringSoon = Boolean(
+          cachedCheck
+          && Number.isFinite(cachedCheck.expiresAt)
+          && nowMs >= cachedCheck.expiresAt - 90_000,
+        );
+        const prepStale = Boolean(
+          deckAudioReady
+          && ((preparedAt > 0 && nowMs - preparedAt >= 20 * 60 * 1000) || streamExpiringSoon),
+        );
+        const hlsFailed = Boolean(state._deckHlsFailed?.[standbyIndex]);
+        if (!deckAudioReady || hlsFailed || prepStale) {
+          const guardKind = prepStale ? 'stale' : (hlsFailed ? 'hls-failed' : 'missing');
+          const guardKey = `${state._playbackEpoch}:${state._deckTrack}:${standbyCheckTi}:${guardKind}`;
+          const recentGuard = state._standbyGuardKey === guardKey
+            && nowMs - (Number(state._standbyGuardAt) || 0) < 15_000;
+          if (!recentGuard) {
+            state._standbyGuardKey = guardKey;
+            state._standbyGuardAt = nowMs;
+            void prefetchUpcomingCrossfadeTrack({ forceRefresh: prepStale || hlsFailed })
+              .catch(error => recordPlaybackDiagnostic?.('prefetch-failed', {
+                errorName: typeof playbackErrorName === 'function' ? playbackErrorName(error) : String(error),
+              }));
+          }
+        }
+      }
+    }
     const fadeDeck = currentDeckAudio();
-    const automaticFadeEligible = configuredFadeSeconds > 0
+    if (configuredFadeSeconds > 0 && !state._crossfading && !pending && !state._userPaused
+        && cueRemainingSeconds > configuredFadeSeconds + 0.5
+        && cueRemainingSeconds <= Math.max(180, configuredFadeSeconds * 6 + 30)
+        && typeof resolveCrossfadeStreams === 'function' && typeof state._streamCache?.get === 'function'
+        && upcomingCrossfadeDeckReady()) {
+      const nextTi = upcomingTrackIndex();
+      const standbyIndex = state._deckIndex === 0 ? 1 : 0;
+      const standbyDuration = Number(state._decks[standbyIndex]?.duration);
+      const upcomingSeconds = Number.isFinite(standbyDuration) && standbyDuration > 0
+        ? standbyDuration : Number(state.meta[nextTi]?.durationMs) / 1000;
+      const preflightLimit = Math.max(25, configuredFadeSeconds * 3 + 6);
+      if (Number.isFinite(upcomingSeconds) && upcomingSeconds > 0 && upcomingSeconds <= preflightLimit) {
+        const queuedOffset = offset => typeof upcomingTrackIndexAtOffset === 'function'
+          ? upcomingTrackIndexAtOffset(offset)
+          : (state.playNext.length > offset
+            ? state.playNext[offset]
+            : state.queue[state.pos + 1 + (offset - state.playNext.length)]);
+        const secondTi = queuedOffset(1);
+        const secondMeta = secondTi !== undefined ? state.meta[secondTi] : null;
+        const secondDuration = Number(secondMeta?.durationMs) / 1000;
+        const candidateIndices = Number.isFinite(secondDuration) && secondDuration > 0 && secondDuration <= preflightLimit
+          ? [secondTi, queuedOffset(2)]
+          : [secondTi];
+        const nowMs = Date.now();
+        for (const afterNextTi of candidateIndices) {
+          const afterMeta = afterNextTi !== undefined ? state.meta[afterNextTi] : null;
+          const afterKey = afterMeta && typeof normalizeTrackUrl === 'function'
+            ? normalizeTrackUrl(afterMeta.link) : '';
+          if (!afterKey) continue;
+          const cachedAfter = state._streamCache.get(afterKey);
+          const freshAfter = Boolean(
+            cachedAfter?.urls?.length
+            && nowMs - cachedAfter.ts < 8 * 60 * 1000
+            && (!Number.isFinite(cachedAfter.expiresAt) || nowMs < cachedAfter.expiresAt - 60_000),
+          );
+          if (freshAfter) continue;
+          const warmToken = `${state._playbackEpoch}:${state._deckTrack}:${nextTi}:${afterKey}`;
+          const recentAttempt = state._postBumperWarmToken === warmToken
+            && nowMs - (Number(state._postBumperWarmAt) || 0) < 30_000;
+          if (!recentAttempt && !state._postBumperWarmInFlight) {
+            state._postBumperWarmToken = warmToken;
+            state._postBumperWarmAt = nowMs;
+            state._postBumperWarmInFlight = true;
+            const warmEpoch = state._playbackEpoch;
+            const warmSignal = state._playbackAbort?.signal;
+            void Promise.resolve().then(() => resolveCrossfadeStreams(afterMeta, {
+              signal: warmSignal,
+              isCurrent: () => state.active && state._playbackEpoch === warmEpoch && !warmSignal?.aborted,
+            })).catch(() => {}).finally(() => {
+              if (state._playbackEpoch === warmEpoch) state._postBumperWarmInFlight = false;
+            });
+          }
+          break;
+        }
+      }
+    }
+    const automaticFadeBaseEligible = configuredFadeSeconds > 0
       && Number.isInteger(state._deckTrack)
       && !state._crossfading
       && !pending
       && !nearEnd
       && !state._userPaused
       && !paused()
-      && !(state.stopAfterRound && state.pos >= state.queue.length - 1)
+      && !(state.stopAfterRound && state.pos >= state.queue.length - 1 && !state.playNext?.length)
       && !(state.sleepTimer?.type === 'tracks' && state.sleepTimer.remaining <= 1)
       && timing.current > 0
-      && remainingSeconds > 0.05
-      && remainingSeconds <= configuredFadeSeconds
       && !fadeDeck?.seeking
       && (fadeDeck?.readyState ?? 0) >= 2;
+    const resolveEffectiveFadeSeconds = () => {
+      const nextTi = upcomingTrackIndex();
+      const standbyIndex = state._deckIndex === 0 ? 1 : 0;
+      const mediaDuration = Number(state._decks[standbyIndex]?.duration);
+      const incomingDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
+        ? mediaDuration : Number(state.meta[nextTi]?.durationMs) / 1000;
+      if (Number.isFinite(incomingDuration) && incomingDuration > 0) {
+        const fadeBudget = Math.min(configuredFadeSeconds, incomingDuration / 2);
+        return fadeBudget >= CROSSFADE_MIN_DURATION_SECONDS ? fadeBudget : 0;
+      }
+      return configuredFadeSeconds;
+    };
+    if (typeof syncBrandmarkCrossfade === 'function' && !state._crossfading) {
+      let wantPrefade = false;
+      if (automaticFadeBaseEligible && remainingSeconds > 0.05
+          && cueRemainingSeconds <= configuredFadeSeconds + 0.65 && upcomingCrossfadeDeckReady()) {
+        const upcomingFade = resolveEffectiveFadeSeconds();
+        wantPrefade = upcomingFade > 0 && cueRemainingSeconds <= upcomingFade + 0.65;
+      }
+      if (wantPrefade !== Boolean(state._brandmarkPrefading)) {
+        syncBrandmarkCrossfade(wantPrefade ? 'prefade' : 'cancel-prefade');
+      }
+    }
+    const automaticFadeEligible = automaticFadeBaseEligible
+      && remainingSeconds > 0.05
+      && cueRemainingSeconds <= configuredFadeSeconds;
     let standbyReady = false;
     let effectiveFadeSeconds = configuredFadeSeconds;
     if (automaticFadeEligible) {
       standbyReady = upcomingCrossfadeDeckReady();
-      if (standbyReady) {
-        const nextTi = upcomingTrackIndex();
-        const standbyIndex = state._deckIndex === 0 ? 1 : 0;
-        const mediaDuration = Number(state._decks[standbyIndex]?.duration);
-        const incomingDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
-          ? mediaDuration : Number(state.meta[nextTi]?.durationMs) / 1000;
-        if (Number.isFinite(incomingDuration) && incomingDuration > 0) {
-          const fadeBudget = Math.min(configuredFadeSeconds, incomingDuration / 2);
-          effectiveFadeSeconds = fadeBudget >= CROSSFADE_MIN_DURATION_SECONDS ? fadeBudget : 0;
-        }
-      }
+      if (standbyReady) effectiveFadeSeconds = resolveEffectiveFadeSeconds();
     }
-    if (state._transitionDiagnostics && automaticFadeEligible
+    if (automaticFadeEligible
         && (fadeWindowTrack !== state._deckTrack || fadeWindowToken !== state._deckPrepareTokens[state._deckIndex])) {
       fadeWindowTrack = state._deckTrack;
       fadeWindowToken = state._deckPrepareTokens[state._deckIndex];
-      recordTransitionDiagnostic('fade-window', {
+      state._fadeWindowObservation = {
+        epoch: state._playbackEpoch,
+        trackIndex: state._deckTrack,
+        token: fadeWindowToken,
+        standbyReady,
+        at: watcherMonoNow(),
+      };
+      if (state._transitionDiagnostics) recordTransitionDiagnostic('fade-window', {
         trackIndex: state._deckTrack, deckIndex: state._deckIndex, token: fadeWindowToken,
         remainingMs: remainingSeconds * 1000, ready: standbyReady, crossfadeSeconds: configuredFadeSeconds,
         crossfadeDuration: effectiveFadeSeconds,
@@ -9567,7 +19862,7 @@ function startWatcher() {
       });
     }
     const shouldCrossfade = automaticFadeEligible && standbyReady
-      && remainingSeconds <= effectiveFadeSeconds;
+      && cueRemainingSeconds <= effectiveFadeSeconds;
     if (shouldCrossfade) {
       nearEnd = true;
       state._crossfadePending = remainingSeconds;
@@ -9576,7 +19871,7 @@ function startWatcher() {
       } finally {
         if (watcherIsCurrent()) {
           state._crossfadePending = false;
-          await resetEndGuard();
+          resetEndGuard();
         }
       }
       return;
@@ -9693,6 +19988,7 @@ function startWatcher() {
   let fallbackInterval = null;
   let heartbeatTimer = null;
   let lastHeartbeat = Date.now();
+  let lastSupervisorAt = lastHeartbeat;
   let closed = false;
   const cleanup = () => {
     if (closed) return;
@@ -9728,7 +20024,15 @@ function startWatcher() {
   };
   const superviseWorker = () => {
     if (!watcherIsCurrent()) { cleanup(); return; }
-    if (Date.now() - lastHeartbeat >= 3000) { startFallback(); return; }
+    const now = Date.now();
+    const supervisorElapsed = now - lastSupervisorAt;
+    lastSupervisorAt = now;
+    if (supervisorElapsed >= 6000) {
+      lastHeartbeat = now;
+      heartbeatTimer = setTimeout(superviseWorker, 2000);
+      return;
+    }
+    if (now - lastHeartbeat >= 3000) { startFallback(); return; }
     heartbeatTimer = setTimeout(superviseWorker, 2000);
   };
   worker = mkWorker();
@@ -9786,6 +20090,12 @@ function badges() {
   };
   if (retainedTi !== undefined) annotate(retainedTi, state.pos);
   state.queue.forEach(annotate);
+  for (let ti = 0; ti < state.els.length; ti++) {
+    const el = state.els[ti];
+    if (el && el.nodeType === 1 && !document.body.contains(el) && state.meta[ti]?.sourcePage) {
+      state.els[ti] = null;
+    }
+  }
   stale.forEach(badge => badge.remove());
 }
 
@@ -9805,7 +20115,15 @@ function tickPlayTime(now = Date.now()) {
     const totalMs = (state._playTimeRemainderMs || 0) + elapsedMs;
     const wholeSeconds = Math.floor(totalMs / 1000);
     state._playTimeRemainderMs = totalMs - wholeSeconds * 1000;
-    if (wholeSeconds > 0) state.stats.elapsed = (state.stats.elapsed || 0) + wholeSeconds;
+    if (wholeSeconds > 0) {
+      state.stats.elapsed = (state.stats.elapsed || 0) + wholeSeconds;
+      const lastSaveAt = Number(state._lifetimeLastCheckpointAt) || 0;
+      if (Number.isFinite(currentAt) && currentAt - lastSaveAt >= 300_000
+          && typeof carryLifetimeStats === 'function' && typeof saveLifetimeStats === 'function') {
+        state._lifetimeLastCheckpointAt = currentAt;
+        saveLifetimeStats();
+      }
+    }
   }
 
   checkSleepTimerDeadline(currentAt);
@@ -9850,9 +20168,10 @@ function renderStats() {
   const ltEl = overlay.querySelector('#tss-stats-lifetime');
   if (ltEl) {
     const lt = loadLifetimeStats();
+    const pending = state._lifetimePending || { played: 0, elapsed: 0 };
     const base = state._lifetimeBase || { played: 0, elapsed: 0 };
-    const totalPlayed  = (lt.played  || 0) + Math.max(0, (state.stats.played  || 0) - (base.played  || 0));
-    const totalElapsed = (lt.elapsed || 0) + Math.max(0, (state.stats.elapsed || 0) - (base.elapsed || 0));
+    const totalPlayed  = (lt.played  || 0) + (pending.played  || 0) + Math.max(0, (state.stats.played  || 0) - (base.played  || 0));
+    const totalElapsed = (lt.elapsed || 0) + (pending.elapsed || 0) + Math.max(0, (state.stats.elapsed || 0) - (base.elapsed || 0));
     const text = `${totalPlayed} tracks / ${fmtTime(totalElapsed)}`;
     if (ltEl.textContent !== text) ltEl.textContent = text;
   }
@@ -9881,9 +20200,15 @@ function renderStats() {
       </div>`;
   }).join('') : '<div class="tss-stats-empty">No listening data yet</div>';
   if (list._tssStatsMarkup === markup && list.innerHTML === list._tssStatsRendered) return;
+  const focusedPriorityTi = list.contains?.(document.activeElement)
+    ? document.activeElement?.getAttribute?.('data-ti')
+    : null;
   list.innerHTML = markup;
   list._tssStatsMarkup = markup;
   list._tssStatsRendered = list.innerHTML;
+  if (focusedPriorityTi !== null && focusedPriorityTi !== undefined) {
+    list.querySelector(`[data-ti="${focusedPriorityTi}"]`)?.focus?.({ preventScroll: true });
+  }
 
   list.querySelectorAll('[data-ti]').forEach(btn => {
     btn.onclick = e => {
@@ -9900,15 +20225,24 @@ function renderStats() {
     };
   });
 }
-setInterval(renderStats, 1000);
 
 function showStats() {
   const existing = document.getElementById('tss-stats-overlay');
-  if (existing) { existing.remove(); return; }
-  closeEqualizer();
+  if (existing) {
+    if (typeof existing._tssClose === 'function') existing._tssClose();
+    else existing.remove();
+    return;
+  }
+  const opener = document.activeElement;
+  closeEqualizer({ instant: true, restoreFocus: false });
+  if (typeof closeCrossfadeCurveEditor === 'function') {
+    closeCrossfadeCurveEditor({ instant: true, restoreFocus: false });
+  }
+  if (typeof settleClosingModals === 'function') settleClosingModals();
 
   const overlay = document.createElement('div');
   overlay.id = 'tss-stats-overlay';
+  overlay.className = 'tss-stats-surface';
   overlay.style.cssText = `
     position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
     padding:0; z-index:999999;
@@ -9952,12 +20286,51 @@ function showStats() {
   `;
 
   document.body.appendChild(overlay);
+  if (typeof animateModalOpen === 'function') animateModalOpen(overlay, null);
   renderStats();
+  let statsTimer = null;
+  if (typeof setInterval === 'function') {
+    statsTimer = setInterval(() => {
+      if (!overlay.isConnected || document.getElementById('tss-stats-overlay') !== overlay) {
+        if (statsTimer !== null && typeof clearInterval === 'function') clearInterval(statsTimer);
+        statsTimer = null;
+        return;
+      }
+      renderStats();
+    }, 1000);
+  }
 
-  const close = () => {
-    overlay.remove();
-    document.getElementById('tss-hub-stats')?.focus({ preventScroll: true });
+  let closed = false;
+  const close = options => {
+    if (closed) return;
+    closed = true;
+    if (statsTimer !== null && typeof clearInterval === 'function') {
+      clearInterval(statsTimer);
+      statsTimer = null;
+    }
+    overlay._tssCancelDrag?.();
+    overlay._tssCancelDrag = null;
+    overlay._tssClose = null;
+    overlay.onkeydown = null;
+    const plainOpts = options && typeof options === 'object' && typeof options.type !== 'string' ? options : null;
+    if (plainOpts?.restoreFocus !== false) {
+      if (opener && opener !== document.body && opener.isConnected && typeof opener.focus === 'function') {
+        opener.focus({ preventScroll: true });
+      } else {
+        document.getElementById('tss-hub-stats')?.focus({ preventScroll: true });
+      }
+    }
+    if (typeof animateModalClose === 'function') {
+      animateModalClose(overlay, false, {
+        instant: plainOpts?.instant === true,
+        surfaceClass: 'tss-stats-surface',
+        centered: overlay.style?.transform !== 'none',
+      });
+    } else {
+      overlay.remove();
+    }
   };
+  overlay._tssClose = close;
   document.getElementById('tss-stats-close').onclick = close;
   overlay.onkeydown = event => {
     if (event.key !== 'Escape' || event.defaultPrevented) return;
@@ -9984,6 +20357,17 @@ function showStats() {
   header.onmousedown = e => {
     if (e.target.closest('#tss-stats-close')) return;
     e.preventDefault();
+    overlay._tssCancelDrag?.();
+    if (overlay._tssModalTimer != null) {
+      if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+      overlay._tssModalTimer = null;
+    }
+    if (overlay.dataset?.modalAnimating) delete overlay.dataset.modalAnimating;
+    if (overlay._tssModalAnim) {
+      overlay._tssModalAnim.onfinish = null;
+      try { overlay._tssModalAnim.cancel(); } catch (_) {}
+      overlay._tssModalAnim = null;
+    }
     const rect  = overlay.getBoundingClientRect();
     overlay.style.transform = 'none';
     overlay.style.left = rect.left + 'px';
@@ -9994,7 +20378,12 @@ function showStats() {
       overlay.style.left = Math.max(0, Math.min(window.innerWidth  - overlay.offsetWidth,  origL + (ev.clientX - startX))) + 'px';
       overlay.style.top  = Math.max(0, Math.min(window.innerHeight - overlay.offsetHeight, origT + (ev.clientY - startY))) + 'px';
     };
-    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+    const up = () => {
+      overlay._tssCancelDrag = null;
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    overlay._tssCancelDrag = up;
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup',   up);
   };
@@ -10063,13 +20452,251 @@ function renderEqualizerGraph() {
   });
 }
 
-function closeEqualizer() {
+function modalMotionIsInstant(options) {
+  const plainOpts = options && typeof options === 'object' && typeof options.type !== 'string' ? options : null;
+  return Boolean(
+    plainOpts?.instant === true
+    || state.reduceVisualEffects
+    || (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+    || (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+  );
+}
+
+function settleClosingModals(documentLike = document) {
+  if (!documentLike?.querySelectorAll) return;
+  for (const node of documentLike.querySelectorAll('[data-modal-closing="true"]')) {
+    if (node._tssModalTimer != null) {
+      if (typeof clearTimeout === 'function') clearTimeout(node._tssModalTimer);
+      node._tssModalTimer = null;
+    }
+    if (node._tssModalAnim) {
+      node._tssModalAnim.onfinish = null;
+      try { node._tssModalAnim.cancel(); } catch (_) {}
+      node._tssModalAnim = null;
+    }
+    node.onclick = null;
+    node.remove();
+  }
+}
+
+function animateModalOpen(overlay, backdrop = null, { centered = true } = {}) {
+  if (!overlay) return;
+  if (modalMotionIsInstant() || typeof overlay.animate !== 'function') return;
+  const startTransform = centered ? 'translate(-50%, calc(-50% + 10px)) scale(0.95)' : 'translateY(10px) scale(0.95)';
+  const endTransform = centered ? 'translate(-50%, -50%) scale(1)' : 'translateY(0px) scale(1)';
+  if (overlay.dataset) overlay.dataset.modalAnimating = 'true';
+  const anim = overlay.animate(
+    [
+      { opacity: 0, transform: startTransform },
+      { opacity: 1, transform: endTransform },
+    ],
+    { duration: 200, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'both' }
+  );
+  overlay._tssModalAnim = anim;
+  const finishOpen = () => {
+    if (overlay._tssModalTimer != null) {
+      if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+      overlay._tssModalTimer = null;
+    }
+    if (overlay.dataset?.modalAnimating) delete overlay.dataset.modalAnimating;
+    if (overlay._tssModalAnim !== anim) return;
+    overlay._tssModalAnim = null;
+    anim.onfinish = null;
+    try { anim.cancel(); } catch (_) {}
+  };
+  anim.onfinish = finishOpen;
+  if (typeof setTimeout === 'function') {
+    overlay._tssModalTimer = setTimeout(finishOpen, 260);
+  }
+  if (backdrop && typeof backdrop.animate === 'function') {
+    if (backdrop.dataset) backdrop.dataset.modalAnimating = 'true';
+    const bAnim = backdrop.animate(
+      [{ opacity: 0 }, { opacity: 1 }],
+      { duration: 180, easing: 'ease-out', fill: 'both' }
+    );
+    backdrop._tssModalAnim = bAnim;
+    const finishBackdropOpen = () => {
+      if (backdrop._tssModalTimer != null) {
+        if (typeof clearTimeout === 'function') clearTimeout(backdrop._tssModalTimer);
+        backdrop._tssModalTimer = null;
+      }
+      if (backdrop.dataset?.modalAnimating) delete backdrop.dataset.modalAnimating;
+      if (backdrop._tssModalAnim !== bAnim) return;
+      backdrop._tssModalAnim = null;
+      bAnim.onfinish = null;
+      try { bAnim.cancel(); } catch (_) {}
+    };
+    bAnim.onfinish = finishBackdropOpen;
+    if (typeof setTimeout === 'function') {
+      backdrop._tssModalTimer = setTimeout(finishBackdropOpen, 240);
+    }
+  }
+}
+
+function animateModalClose(overlay, removeBackdrop = false, options = {}) {
+  const backdrop = removeBackdrop ? document.getElementById('tss-modal-backdrop') : null;
+  if (backdrop) backdrop.onclick = null;
+  if (!overlay) {
+    if (backdrop) {
+      if (backdrop._tssModalTimer != null) {
+        if (typeof clearTimeout === 'function') clearTimeout(backdrop._tssModalTimer);
+        backdrop._tssModalTimer = null;
+      }
+      if (backdrop.dataset?.modalAnimating) delete backdrop.dataset.modalAnimating;
+      if (backdrop._tssModalAnim) {
+        backdrop._tssModalAnim.onfinish = null;
+        try { backdrop._tssModalAnim.cancel(); } catch (_) {}
+        backdrop._tssModalAnim = null;
+      }
+      backdrop.remove();
+    }
+    return;
+  }
+  const plainOpts = options && typeof options === 'object' && typeof options.type !== 'string' ? options : null;
+  const centered = plainOpts?.centered !== false;
+  const surfaceClass = plainOpts?.surfaceClass || 'tss-modal-surface';
+  if (overlay._tssModalTimer != null) {
+    if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+    overlay._tssModalTimer = null;
+  }
+  if (overlay.dataset?.modalAnimating) delete overlay.dataset.modalAnimating;
+  if (backdrop?._tssModalTimer != null) {
+    if (typeof clearTimeout === 'function') clearTimeout(backdrop._tssModalTimer);
+    backdrop._tssModalTimer = null;
+  }
+  if (backdrop?.dataset?.modalAnimating) delete backdrop.dataset.modalAnimating;
+  if (modalMotionIsInstant(plainOpts) || typeof overlay.animate !== 'function') {
+    if (overlay._tssModalAnim) {
+      overlay._tssModalAnim.onfinish = null;
+      try { overlay._tssModalAnim.cancel(); } catch (_) {}
+      overlay._tssModalAnim = null;
+    }
+    overlay.remove();
+    if (backdrop) {
+      if (backdrop._tssModalAnim) {
+        backdrop._tssModalAnim.onfinish = null;
+        try { backdrop._tssModalAnim.cancel(); } catch (_) {}
+        backdrop._tssModalAnim = null;
+      }
+      backdrop.remove();
+    }
+    return;
+  }
+  let startFrame = { opacity: 1, transform: centered ? 'translate(-50%, -50%) scale(1)' : 'translateY(0px) scale(1)' };
+  if (overlay._tssModalAnim) {
+    if (typeof getComputedStyle === 'function') {
+      const cs = getComputedStyle(overlay);
+      if (cs?.transform && cs.transform !== 'none') {
+        startFrame = { opacity: cs.opacity ?? 1, transform: cs.transform };
+      }
+    }
+    overlay._tssModalAnim.onfinish = null;
+    try { overlay._tssModalAnim.cancel(); } catch (_) {}
+    overlay._tssModalAnim = null;
+  }
+  overlay.removeAttribute('id');
+  if (!String(overlay.className || '').split(/\s+/).includes(surfaceClass)) {
+    overlay.className = `${overlay.className || ''} ${surfaceClass}`.trim();
+  }
+  overlay.dataset.modalClosing = 'true';
+  overlay.inert = true;
+  overlay.setAttribute('aria-hidden', 'true');
+  if (overlay.style) overlay.style.pointerEvents = 'none';
+  const endTransform = centered ? 'translate(-50%, calc(-50% + 8px)) scale(0.955)' : 'translateY(8px) scale(0.955)';
+  const anim = overlay.animate(
+    [startFrame, { opacity: 0, transform: endTransform }],
+    { duration: 155, easing: 'cubic-bezier(0.32, 0, 0.15, 1)', fill: 'forwards' }
+  );
+  overlay._tssModalAnim = anim;
+  const finishClose = () => {
+    if (overlay._tssModalTimer != null) {
+      if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+      overlay._tssModalTimer = null;
+    }
+    if (overlay._tssModalAnim) {
+      overlay._tssModalAnim.onfinish = null;
+      try { overlay._tssModalAnim.cancel(); } catch (_) {}
+      overlay._tssModalAnim = null;
+    }
+    overlay.remove();
+  };
+  anim.onfinish = finishClose;
+  if (typeof setTimeout === 'function') {
+    overlay._tssModalTimer = setTimeout(finishClose, 220);
+  }
+  if (backdrop) {
+    let bStart = { opacity: 1 };
+    if (backdrop._tssModalAnim) {
+      if (typeof getComputedStyle === 'function') {
+        const bcs = getComputedStyle(backdrop);
+        if (bcs?.opacity !== undefined && bcs.opacity !== '') bStart = { opacity: bcs.opacity };
+      }
+      backdrop._tssModalAnim.onfinish = null;
+      try { backdrop._tssModalAnim.cancel(); } catch (_) {}
+      backdrop._tssModalAnim = null;
+    }
+    backdrop.removeAttribute('id');
+    if (!String(backdrop.className || '').split(/\s+/).includes('tss-modal-backdrop')) {
+      backdrop.className = `${backdrop.className || ''} tss-modal-backdrop`.trim();
+    }
+    backdrop.dataset.modalClosing = 'true';
+    if (backdrop.style) backdrop.style.pointerEvents = 'none';
+    if (typeof backdrop.animate === 'function') {
+      const bAnim = backdrop.animate(
+        [bStart, { opacity: 0 }],
+        { duration: 155, easing: 'cubic-bezier(0.32, 0, 0.15, 1)', fill: 'forwards' }
+      );
+      backdrop._tssModalAnim = bAnim;
+      const finishBackdropClose = () => {
+        if (backdrop._tssModalTimer != null) {
+          if (typeof clearTimeout === 'function') clearTimeout(backdrop._tssModalTimer);
+          backdrop._tssModalTimer = null;
+        }
+        if (backdrop._tssModalAnim) {
+          backdrop._tssModalAnim.onfinish = null;
+          try { backdrop._tssModalAnim.cancel(); } catch (_) {}
+          backdrop._tssModalAnim = null;
+        }
+        backdrop.remove();
+      };
+      bAnim.onfinish = finishBackdropClose;
+      if (typeof setTimeout === 'function') {
+        backdrop._tssModalTimer = setTimeout(finishBackdropClose, 220);
+      }
+    } else {
+      backdrop.remove();
+    }
+  }
+}
+
+function closeEqualizer(options) {
   const overlay = document.getElementById('tss-eq-overlay');
+  const plainOpts = options && typeof options === 'object' && typeof options.type !== 'string' ? options : null;
   overlay?._cancelDrag?.();
   if (overlay?._onKeydown) document.removeEventListener('keydown', overlay._onKeydown);
-  overlay?.remove();
-  document.getElementById('tss-modal-backdrop')?.remove();
-  if (overlay?._opener?.isConnected) overlay._opener.focus({ preventScroll: true });
+  const opener = overlay?._opener;
+  if (overlay) {
+    overlay._cancelDrag = null;
+    overlay._onKeydown = null;
+    overlay._opener = null;
+  }
+  if (plainOpts?.restoreFocus !== false) {
+    if (opener?.isConnected && typeof opener.focus === 'function') opener.focus({ preventScroll: true });
+    else if (overlay && typeof overlay.contains === 'function' && overlay.contains(document.activeElement)) {
+      document.activeElement?.blur?.();
+    }
+  }
+  const removeBackdrop = !document.getElementById('tss-cf-overlay');
+  if (typeof animateModalClose === 'function') {
+    animateModalClose(overlay, removeBackdrop, plainOpts || {});
+  } else {
+    overlay?.remove();
+    if (removeBackdrop) {
+      const backdrop = document.getElementById('tss-modal-backdrop');
+      if (backdrop) { backdrop.onclick = null; backdrop.remove(); }
+    }
+  }
 }
 
 function setEqualizerBand(index, value) {
@@ -10104,14 +20731,29 @@ function updateEqualizerPopup() {
 function showEqualizer() {
   const existing = document.getElementById('tss-eq-overlay');
   if (existing) { closeEqualizer(); return; }
-  document.getElementById('tss-stats-overlay')?.remove();
+  const opener = document.activeElement;
+  if (typeof closeCrossfadeCurveEditor === 'function') {
+    closeCrossfadeCurveEditor({ instant: true, restoreFocus: false });
+  }
+  const statsOverlay = document.getElementById('tss-stats-overlay');
+  if (statsOverlay) {
+    if (typeof statsOverlay._tssClose === 'function') statsOverlay._tssClose({ instant: true, restoreFocus: false });
+    else statsOverlay.remove();
+  }
+  if (typeof settleClosingModals === 'function') settleClosingModals();
 
-  const backdrop = document.createElement('div');
-  backdrop.id = 'tss-modal-backdrop';
-  document.body.appendChild(backdrop);
+  let backdrop = document.getElementById('tss-modal-backdrop');
+  const backdropCreated = !backdrop;
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'tss-modal-backdrop';
+    backdrop.className = 'tss-modal-backdrop';
+    document.body.appendChild(backdrop);
+  }
 
   const overlay = document.createElement('div');
   overlay.id = 'tss-eq-overlay';
+  overlay.className = 'tss-modal-surface';
   overlay.innerHTML = `
     <div class="tss-eq-head">
       <div>
@@ -10166,7 +20808,7 @@ function showEqualizer() {
       <div class="tss-eq-footer"><span>Drag points to fine-tune</span><button id="tss-eq-reset" type="button">Reset</button></div>
     </div>
   `;
-  overlay._opener = document.activeElement;
+  overlay._opener = opener;
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-label', 'Equalizer');
   document.body.appendChild(overlay);
@@ -10247,11 +20889,17 @@ function showEqualizer() {
     presets.dataset.signature = '';
     updateEqualizerPopup();
   };
+  const closeEqSaveRow = () => {
+    const hadFocus = typeof saveRow.contains === 'function' && saveRow.contains(document.activeElement);
+    saveRow.dataset.open = 'false';
+    saveError.textContent = '';
+    if (hadFocus) overlay.querySelector('#tss-eq-save-open')?.focus?.({ preventScroll: true });
+  };
   overlay.querySelector('#tss-eq-save-confirm').onclick = savePreset;
-  overlay.querySelector('#tss-eq-save-cancel').onclick = () => { saveRow.dataset.open = 'false'; saveError.textContent = ''; };
+  overlay.querySelector('#tss-eq-save-cancel').onclick = closeEqSaveRow;
   saveName.onkeydown = event => {
     if (event.key === 'Enter') { event.preventDefault(); savePreset(); }
-    if (event.key === 'Escape') { event.stopPropagation(); saveRow.dataset.open = 'false'; }
+    if (event.key === 'Escape') { event.stopPropagation(); closeEqSaveRow(); }
   };
   overlay.querySelector('#tss-eq-reset').onclick = () => {
     if (!ensureAutoLevelAudioGraph()) return;
@@ -10267,35 +20915,60 @@ function showEqualizer() {
   let draggingBand = null;
   let draggingPoint = null;
   let draggingPointerId = null;
+  let dragRect = null;
   const valueFromPointer = event => {
-    const rect = svg.getBoundingClientRect();
-    const y = (event.clientY - rect.top) * (230 / rect.height);
+    const rect = dragRect || svg.getBoundingClientRect();
+    const height = rect.height || 230;
+    const y = (event.clientY - rect.top) * (230 / height);
     return Math.round(((107.5 - y) / 82.5) * 12);
   };
   const move = event => {
     if (draggingBand === null) return;
+    if (draggingPointerId !== null && event.pointerId !== undefined && event.pointerId !== draggingPointerId) return;
     event.preventDefault();
     setEqualizerBand(draggingBand, valueFromPointer(event));
   };
-  const up = () => {
+  const up = event => {
+    if (event && event.type !== 'blur' && draggingPointerId !== null
+        && event.pointerId !== undefined && event.pointerId !== draggingPointerId) {
+      return;
+    }
     if (draggingPoint && draggingPointerId !== null && typeof draggingPoint.releasePointerCapture === 'function') {
       try { draggingPoint.releasePointerCapture(draggingPointerId); } catch (_) {}
     }
     draggingBand = null;
     draggingPoint = null;
     draggingPointerId = null;
+    dragRect = null;
     document.removeEventListener('pointermove', move);
     document.removeEventListener('pointerup', up);
     document.removeEventListener('pointercancel', up);
     window.removeEventListener('blur', up);
   };
-  overlay._cancelDrag = up;
+  overlay._cancelDrag = () => up();
   overlay.querySelectorAll('.tss-eq-point-hit').forEach(point => {
     point.onpointerdown = event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      if (draggingBand !== null && draggingPointerId !== null
+          && event.pointerId !== undefined && event.pointerId !== draggingPointerId) {
+        return;
+      }
       event.preventDefault();
+      if (draggingBand !== null) up();
+      if (overlay._tssModalTimer != null) {
+        if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+        overlay._tssModalTimer = null;
+      }
+      if (overlay.dataset?.modalAnimating) delete overlay.dataset.modalAnimating;
+      if (overlay._tssModalAnim) {
+        overlay._tssModalAnim.onfinish = null;
+        try { overlay._tssModalAnim.cancel(); } catch (_) {}
+        overlay._tssModalAnim = null;
+      }
       draggingBand = Number(point.dataset.band);
       draggingPoint = point;
       draggingPointerId = event.pointerId;
+      dragRect = svg.getBoundingClientRect();
       if (typeof point.setPointerCapture === 'function') {
         try { point.setPointerCapture(event.pointerId); } catch (_) {}
       }
@@ -10321,8 +20994,780 @@ function showEqualizer() {
     closeEqualizer();
   };
   document.addEventListener('keydown', overlay._onKeydown);
+  if (typeof animateModalOpen === 'function') animateModalOpen(overlay, backdropCreated ? backdrop : null);
   updateEqualizerPopup();
   overlay.querySelector('#tss-eq-close').focus({ preventScroll: true });
+}
+
+function crossfadePresetName(cfg = state.customCrossfade) {
+  const current = sanitizeCrossfadeCurveConfig(cfg);
+  const near = (a, b) => Math.abs(a - b) <= 0.002;
+  const matches = candidate => {
+    const normalized = sanitizeCrossfadeCurveConfig(candidate);
+    if (normalized.mode !== current.mode) return false;
+    if (!normalized.in.every((val, idx) => near(val, current.in[idx]))) return false;
+    return normalized.mode !== 'split' || normalized.out.every((val, idx) => near(val, current.out[idx]));
+  };
+  for (const name of Object.keys(CF_TEMPLATES)) {
+    if (matches(CF_TEMPLATES[name])) return name;
+  }
+  for (const name of Object.keys(state.customCfPresets || {})) {
+    if (Object.prototype.hasOwnProperty.call(state.customCfPresets, name) && matches(state.customCfPresets[name])) {
+      return name;
+    }
+  }
+  return 'Custom';
+}
+
+function updateCrossfadePersistenceStatus() {
+  const overlay = document.getElementById('tss-cf-overlay');
+  const error = overlay?._els?.saveError || overlay?.querySelector('#tss-cf-save-error');
+  if (!error) return;
+  if (state._cfSaveFailed) {
+    const saveRow = overlay._els?.saveRow || overlay.querySelector('#tss-cf-save-row');
+    if (saveRow) saveRow.dataset.open = 'true';
+    error.textContent = 'Preset changes are unsaved. Try again before leaving this page.';
+    error.dataset.persistence = 'true';
+  } else if (error.dataset.persistence === 'true') {
+    error.textContent = '';
+    delete error.dataset.persistence;
+  }
+}
+
+function flushCrossfadePersistence() {
+  if (state._cfPersistTimer !== null) {
+    clearTimeout(state._cfPersistTimer);
+    state._cfPersistTimer = null;
+  }
+  const customPresets = sanitizeCustomCfPresets(state.customCfPresets);
+  state.customCfPresets = customPresets;
+  state.customCrossfade = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+  const mirrorSaved = safeStorage.setItem('tss_cf_custom_presets', JSON.stringify(customPresets));
+  if (state._cfCustomPresetsPending) {
+    let saved = false;
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(CUSTOM_CF_PRESETS_KEY, { __tssCfPresets: 1, presets: customPresets });
+        saved = true;
+      } else if (typeof GM_getValue !== 'function') {
+        saved = mirrorSaved;
+      }
+    } catch (_) {}
+    state._cfCustomPresetsPending = !saved;
+    state._cfSaveFailed = !saved;
+  }
+  safeStorage.setItem('tss_cf_custom_curve', JSON.stringify(state.customCrossfade));
+  safeStorage.setItem('tss_cf_preset', state.crossfadePreset || 'Custom');
+  safeStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+  updateCrossfadePersistenceStatus();
+  return !state._cfCustomPresetsPending;
+}
+
+function persistCrossfadeCurve({ customPresets = false, immediate = false } = {}) {
+  state._cfCustomPresetsPending = Boolean(state._cfCustomPresetsPending || customPresets);
+  if (state._cfPersistTimer !== null) {
+    clearTimeout(state._cfPersistTimer);
+    state._cfPersistTimer = null;
+  }
+  if (immediate) return flushCrossfadePersistence();
+  state._cfPersistTimer = setTimeout(flushCrossfadePersistence, 180);
+  return true;
+}
+
+function renderCrossfadePresetButtons() {
+  const overlay = document.getElementById('tss-cf-overlay');
+  const container = overlay?._els?.presets || overlay?.querySelector('.tss-cf-presets');
+  if (!container) return;
+  const customKeys = Object.keys(state.customCfPresets || {});
+  const signature = JSON.stringify(customKeys);
+  if (container.dataset.signature === signature) return;
+  const builtIns = Object.keys(CF_TEMPLATES).map(name => {
+    const tip = typeof CF_TEMPLATE_TOOLTIPS === 'object' && CF_TEMPLATE_TOOLTIPS?.[name]
+      ? ` title="${esc(CF_TEMPLATE_TOOLTIPS[name])}"`
+      : '';
+    return `<button type="button" class="tss-eq-preset tss-cf-preset" data-preset="${esc(name)}"${tip}>${esc(name)}</button>`;
+  }).join('');
+  const custom = customKeys.map(name => {
+    const modeLabel = state.customCfPresets?.[name]?.mode === 'split' ? 'Split curve' : 'Linked curve';
+    return `
+    <span class="tss-eq-custom-preset">
+      <button type="button" class="tss-eq-preset tss-cf-preset" data-preset="${esc(name)}" title="${esc(`Saved preset (${modeLabel})`)}">${esc(name)}</button>
+      <button type="button" class="tss-eq-preset-remove" data-remove-cf-preset="${esc(name)}" title="Delete ${esc(name)} preset" aria-label="Delete ${esc(name)} preset">${SVG.close}</button>
+    </span>
+  `;
+  }).join('');
+  container.innerHTML = `${builtIns}${custom}<button type="button" id="tss-cf-save-open" title="Save current curve as a preset">+ Save preset</button>`;
+  container.dataset.signature = signature;
+  if (overlay?._els && typeof container.querySelectorAll === 'function') {
+    overlay._els.presetButtons = Array.from(container.querySelectorAll('.tss-cf-preset'));
+  }
+}
+
+function crossfadeCurveGraphPaths(cfg = state.customCrossfade) {
+  const normalized = sanitizeCrossfadeCurveConfig(cfg);
+  const toX = val => Math.round((46 + val * 450) * 100) / 100;
+  const toY = val => Math.round((192 - val * 172) * 100) / 100;
+  const inP1 = { x: toX(normalized.in[0]), y: toY(normalized.in[1]) };
+  const inP2 = { x: toX(normalized.in[2]), y: toY(normalized.in[3]) };
+  const outP1 = { x: toX(normalized.out[0]), y: toY(normalized.out[1]) };
+  const outP2 = { x: toX(normalized.out[2]), y: toY(normalized.out[3]) };
+  const inLine = `M 46 192 C ${inP1.x} ${inP1.y}, ${inP2.x} ${inP2.y}, 496 20`;
+  const outLine = `M 46 20 C ${outP1.x} ${outP1.y}, ${outP2.x} ${outP2.y}, 496 192`;
+  return {
+    normalized,
+    toX,
+    toY,
+    inP1,
+    inP2,
+    outP1,
+    outP2,
+    inLine,
+    inArea: `${inLine} L 496 192 L 46 192 Z`,
+    outLine,
+    outArea: `${outLine} L 496 192 L 46 192 Z`,
+  };
+}
+
+function stopCrossfadePreview(overlay = document.getElementById('tss-cf-overlay'), { render = true } = {}) {
+  if (!overlay) return;
+  const wasActive = Boolean(overlay._previewActive || overlay._previewRaf != null);
+  if (overlay._previewRaf != null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(overlay._previewRaf);
+  }
+  overlay._previewRaf = null;
+  overlay._previewActive = false;
+  if (!render) return;
+  const playhead = overlay._els?.playhead || overlay.querySelector('#tss-cf-playhead');
+  if (playhead) playhead.setAttribute('hidden', '');
+  const button = overlay._els?.previewBtn || overlay.querySelector('#tss-cf-preview');
+  if (button) {
+    button.dataset.active = 'false';
+    button.setAttribute('aria-pressed', 'false');
+    button.textContent = 'Preview';
+  }
+  if (wasActive) renderCrossfadeCurveGraph();
+}
+
+function renderCrossfadeCurveGraph(activeHandle = null, playheadProgress = null) {
+  const overlay = document.getElementById('tss-cf-overlay');
+  if (!overlay) return;
+  const els = overlay._els || null;
+  const graph = crossfadeCurveGraphPaths(state.customCrossfade);
+  const { normalized, toX, toY, inP1, inP2, outP1, outP2 } = graph;
+  const isSplit = normalized.mode === 'split';
+
+  const outArea = els ? els.outArea : overlay.querySelector('#tss-cf-out-area');
+  const outCurve = els ? els.outCurve : overlay.querySelector('#tss-cf-out-curve');
+  const inArea = els ? els.inArea : overlay.querySelector('#tss-cf-in-area');
+  const inCurve = els ? els.inCurve : overlay.querySelector('#tss-cf-in-curve');
+  if (outArea) outArea.setAttribute('d', graph.outArea);
+  if (outCurve) outCurve.setAttribute('d', graph.outLine);
+  if (inArea) inArea.setAttribute('d', graph.inArea);
+  if (inCurve) inCurve.setAttribute('d', graph.inLine);
+
+  const setLineEl = (el, x1, y1, x2, y2) => {
+    if (!el) return;
+    el.setAttribute('x1', String(x1));
+    el.setAttribute('y1', String(y1));
+    el.setAttribute('x2', String(x2));
+    el.setAttribute('y2', String(y2));
+  };
+  setLineEl(els ? els.tanIn1 : overlay.querySelector('#tss-cf-tan-in-1'), 46, 192, inP1.x, inP1.y);
+  setLineEl(els ? els.tanIn2 : overlay.querySelector('#tss-cf-tan-in-2'), 496, 20, inP2.x, inP2.y);
+  setLineEl(els ? els.tanOut1 : overlay.querySelector('#tss-cf-tan-out-1'), 46, 20, outP1.x, outP1.y);
+  setLineEl(els ? els.tanOut2 : overlay.querySelector('#tss-cf-tan-out-2'), 496, 192, outP2.x, outP2.y);
+
+  const outGroup = els ? els.outGroup : overlay.querySelector('#tss-cf-out-handles');
+  if (outGroup) {
+    if (isSplit) outGroup.removeAttribute('hidden');
+    else outGroup.setAttribute('hidden', '');
+  }
+
+  const coords = {
+    'in-1': { pt: inP1, raw: [normalized.in[0], normalized.in[1]], label: 'Incoming start' },
+    'in-2': { pt: inP2, raw: [normalized.in[2], normalized.in[3]], label: 'Incoming end' },
+    'out-1': { pt: outP1, raw: [normalized.out[0], normalized.out[1]], label: 'Outgoing start' },
+    'out-2': { pt: outP2, raw: [normalized.out[2], normalized.out[3]], label: 'Outgoing end' },
+  };
+  Object.entries(coords).forEach(([id, info]) => {
+    const circles = els?.handles?.[id] || overlay.querySelectorAll(`.tss-cf-point[data-handle="${id}"]`);
+    circles.forEach(circle => {
+      circle.setAttribute('cx', String(info.pt.x));
+      circle.setAttribute('cy', String(info.pt.y));
+      if (circle.classList?.contains?.('tss-cf-point-hit') || circle.getAttribute('role') === 'slider') {
+        const pctT = Math.round(info.raw[0] * 100);
+        const pctV = Math.round(info.raw[1] * 100);
+        circle.setAttribute('aria-valuenow', String(pctV));
+        circle.setAttribute('aria-valuetext', `${pctT}% time, ${pctV}% volume`);
+      }
+    });
+  });
+
+  const seconds = Math.max(0, Math.min(12, Math.round(Number(state.crossfadeSeconds) || 0)));
+  if (overlay._lastTickSeconds !== seconds) {
+    overlay._lastTickSeconds = seconds;
+    for (let idx = 0; idx < 5; idx++) {
+      const tick = els?.ticks ? els.ticks[idx] : overlay.querySelector(`#tss-cf-tick-${idx}`);
+      if (!tick) continue;
+      if (seconds > 0) {
+        const val = Math.round((seconds * idx / 4) * 100) / 100;
+        tick.textContent = `${val}s`;
+      } else {
+        tick.textContent = `${idx * 25}%`;
+      }
+    }
+  }
+
+  const readout = els ? els.readout : overlay.querySelector('#tss-cf-readout');
+  if (Number.isFinite(playheadProgress)) {
+    const p = Math.max(0, Math.min(1, playheadProgress));
+    const [outGain, inGain] = crossfadeGains(p, normalized);
+    const px = toX(p);
+    const playhead = els ? els.playhead : overlay.querySelector('#tss-cf-playhead');
+    if (playhead) playhead.removeAttribute('hidden');
+    setLineEl(els ? els.playheadLine : overlay.querySelector('#tss-cf-playhead-line'), px, 20, px, 192);
+    const outDot = els ? els.playheadOut : overlay.querySelector('#tss-cf-playhead-out');
+    const inDot = els ? els.playheadIn : overlay.querySelector('#tss-cf-playhead-in');
+    if (outDot) { outDot.setAttribute('cx', String(px)); outDot.setAttribute('cy', String(toY(outGain))); }
+    if (inDot) { inDot.setAttribute('cx', String(px)); inDot.setAttribute('cy', String(toY(inGain))); }
+    if (readout) {
+      const previewSec = seconds > 0 ? seconds : 4;
+      const tSec = (p * previewSec).toFixed(1);
+      readout.textContent = `${tSec}s / ${previewSec}s · Out ${Math.round(outGain * 100)}% · In ${Math.round(inGain * 100)}%`;
+    }
+  } else if (readout) {
+    if (activeHandle && coords[activeHandle]) {
+      const info = coords[activeHandle];
+      const timeLabel = seconds > 0
+        ? `${(info.raw[0] * seconds).toFixed(1)}s`
+        : `${Math.round(info.raw[0] * 100)}%`;
+      readout.textContent = `${info.label} · ${timeLabel} · ${Math.round(info.raw[1] * 100)}%`;
+    } else {
+      const modeText = isSplit ? 'Split Out / In' : 'Linked';
+      const presetText = state.crossfadePreset || crossfadePresetName(normalized);
+      readout.textContent = `${modeText} · ${presetText}`;
+    }
+  }
+}
+
+function setCrossfadeCurveHandle(handleId, xVal, yVal) {
+  const current = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+  const cx = Math.round(Math.max(0, Math.min(1, Number(xVal) || 0)) * 1000) / 1000;
+  const cy = Math.round(Math.max(0, Math.min(1, Number(yVal) || 0)) * 1000) / 1000;
+  if (handleId === 'in-1') { current.in[0] = cx; current.in[1] = cy; }
+  else if (handleId === 'in-2') { current.in[2] = cx; current.in[3] = cy; }
+  else if (handleId === 'out-1') { current.mode = 'split'; current.out[0] = cx; current.out[1] = cy; }
+  else if (handleId === 'out-2') { current.mode = 'split'; current.out[2] = cx; current.out[3] = cy; }
+  else return;
+  const prevCurve = state.crossfadeCurve;
+  const prevPreset = state.crossfadePreset;
+  const prevMode = state.customCrossfade?.mode;
+  state.customCrossfade = sanitizeCrossfadeCurveConfig(current);
+  state.crossfadePreset = crossfadePresetName(state.customCrossfade);
+  state.crossfadeCurve = 'custom';
+  if (state.crossfadeSeconds > 0
+      && (prevCurve !== 'custom' || (!state._audioContext && !state._audioGraphFailed))
+      && typeof ensureAutoLevelAudioGraph === 'function') {
+    ensureAutoLevelAudioGraph();
+  }
+  persistCrossfadeCurve();
+  const overlay = document.getElementById('tss-cf-overlay');
+  if (prevCurve !== 'custom' || prevPreset !== state.crossfadePreset || prevMode !== state.customCrossfade.mode) {
+    if (overlay) overlay._activeHandle = handleId;
+    syncCrossfadeControls();
+    if (overlay) overlay._activeHandle = null;
+    else renderCrossfadeCurveGraph(handleId);
+  } else {
+    renderCrossfadeCurveGraph(handleId);
+  }
+}
+
+function resetCrossfadeCurveHandle(handleId) {
+  const def = CF_TEMPLATES['S-Curve'];
+  if (handleId === 'in-1') setCrossfadeCurveHandle('in-1', def.in[0], def.in[1]);
+  else if (handleId === 'in-2') setCrossfadeCurveHandle('in-2', def.in[2], def.in[3]);
+  else if (handleId === 'out-1') setCrossfadeCurveHandle('out-1', def.out[0], def.out[1]);
+  else if (handleId === 'out-2') setCrossfadeCurveHandle('out-2', def.out[2], def.out[3]);
+}
+
+function updateCrossfadeCurvePopup() {
+  const overlay = document.getElementById('tss-cf-overlay');
+  if (!overlay) return;
+  renderCrossfadePresetButtons();
+  updateCrossfadePersistenceStatus();
+  const els = overlay._els || null;
+  const split = els ? els.split : overlay.querySelector('#tss-cf-split');
+  const isSplit = state.customCrossfade?.mode === 'split';
+  if (split && split.checked !== isSplit) split.checked = isSplit;
+  const activePreset = state.crossfadePreset || crossfadePresetName(state.customCrossfade);
+  const presetButtons = els?.presetButtons || overlay.querySelectorAll('.tss-cf-preset');
+  presetButtons.forEach(button => {
+    const val = String(button.dataset.preset === activePreset);
+    if (button.dataset.active !== val) {
+      button.dataset.active = val;
+      if (typeof button.setAttribute === 'function') button.setAttribute('aria-pressed', val);
+    }
+  });
+  if (!overlay._previewActive) renderCrossfadeCurveGraph(overlay._activeHandle || null);
+}
+
+function closeCrossfadeCurveEditor(options) {
+  const overlay = document.getElementById('tss-cf-overlay');
+  const plainOpts = options && typeof options === 'object' && typeof options.type !== 'string' ? options : null;
+  if (overlay) stopCrossfadePreview(overlay, { render: false });
+  overlay?._cancelDrag?.();
+  if (overlay?._onKeydown) document.removeEventListener('keydown', overlay._onKeydown);
+  if (state._cfPersistTimer !== null) flushCrossfadePersistence();
+  const opener = overlay?._opener;
+  if (overlay) {
+    overlay._cancelDrag = null;
+    overlay._onKeydown = null;
+    overlay._opener = null;
+    overlay._els = null;
+  }
+  if (plainOpts?.restoreFocus !== false) {
+    if (opener?.isConnected && typeof opener.focus === 'function') opener.focus({ preventScroll: true });
+    else if (overlay && typeof overlay.contains === 'function' && overlay.contains(document.activeElement)) {
+      document.activeElement?.blur?.();
+    }
+  }
+  const removeBackdrop = !document.getElementById('tss-eq-overlay');
+  if (typeof animateModalClose === 'function') {
+    animateModalClose(overlay, removeBackdrop, plainOpts || {});
+  } else {
+    overlay?.remove();
+    if (removeBackdrop) {
+      const backdrop = document.getElementById('tss-modal-backdrop');
+      if (backdrop) { backdrop.onclick = null; backdrop.remove(); }
+    }
+  }
+}
+
+function showCrossfadeCurveEditor() {
+  const existing = document.getElementById('tss-cf-overlay');
+  if (existing) { closeCrossfadeCurveEditor(); return; }
+  const opener = document.activeElement;
+  closeEqualizer({ instant: true, restoreFocus: false });
+  const statsOverlay = document.getElementById('tss-stats-overlay');
+  if (statsOverlay) {
+    if (typeof statsOverlay._tssClose === 'function') statsOverlay._tssClose({ instant: true, restoreFocus: false });
+    else statsOverlay.remove();
+  }
+  if (typeof settleClosingModals === 'function') settleClosingModals();
+
+  state.customCrossfade = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+  state.crossfadePreset = crossfadePresetName(state.customCrossfade);
+
+  let backdrop = document.getElementById('tss-modal-backdrop');
+  const backdropCreated = !backdrop;
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'tss-modal-backdrop';
+    backdrop.className = 'tss-modal-backdrop';
+    document.body.appendChild(backdrop);
+  }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tss-cf-overlay';
+  overlay.className = 'tss-modal-surface';
+  overlay.innerHTML = `
+    <div class="tss-eq-head">
+      <div>
+        <div class="tss-eq-kicker">True Shuffle</div>
+        <div class="tss-eq-title">Custom crossfade curve</div>
+      </div>
+      <div class="tss-eq-head-actions">
+        <button id="tss-cf-preview" type="button" data-active="false" aria-pressed="false" title="Preview transition timing">Preview</button>
+        <button id="tss-cf-close" class="tss-stats-close" type="button" aria-label="Close crossfade curve editor">${SVG.close}</button>
+      </div>
+    </div>
+    <div class="tss-eq-body">
+      <div class="tss-eq-presets tss-cf-presets" role="group" aria-label="Crossfade curve presets">
+        ${Object.keys(CF_TEMPLATES).map(name => {
+          const tip = typeof CF_TEMPLATE_TOOLTIPS === 'object' && CF_TEMPLATE_TOOLTIPS?.[name]
+            ? ` title="${esc(CF_TEMPLATE_TOOLTIPS[name])}"`
+            : '';
+          return `<button type="button" class="tss-eq-preset tss-cf-preset" data-preset="${esc(name)}"${tip}>${esc(name)}</button>`;
+        }).join('')}
+      </div>
+      <div id="tss-cf-save-row" data-open="false">
+        <label class="tss-eq-save-field"><span>Preset name</span><input id="tss-cf-save-name" type="text" maxlength="24" autocomplete="off" placeholder="My transition"></label>
+        <button id="tss-cf-save-confirm" type="button">Save</button>
+        <button id="tss-cf-save-cancel" type="button" aria-label="Cancel saving preset">${SVG.close}</button>
+        <span id="tss-cf-save-error" role="alert"></span>
+      </div>
+      <div class="tss-cf-legend">
+        <div class="tss-cf-legend-items">
+          <span class="tss-cf-legend-item tss-cf-legend-out"><i aria-hidden="true"></i>Outgoing track</span>
+          <span class="tss-cf-legend-item tss-cf-legend-in"><i aria-hidden="true"></i>Incoming track</span>
+        </div>
+        <span id="tss-cf-readout" class="tss-cf-readout" aria-live="polite">Linked · S-Curve</span>
+      </div>
+      <div class="tss-eq-graph-wrap tss-cf-graph-wrap">
+        <svg id="tss-cf-graph" class="tss-eq-graph tss-cf-graph" viewBox="0 0 520 232" role="group" aria-label="Custom crossfade Bézier curve editor">
+          <defs>
+            <linearGradient id="tss-cf-in-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#aebaf3" stop-opacity=".22"/>
+              <stop offset="100%" stop-color="#aebaf3" stop-opacity=".02"/>
+            </linearGradient>
+            <linearGradient id="tss-cf-out-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#e5ecfb" stop-opacity=".10"/>
+              <stop offset="100%" stop-color="#e5ecfb" stop-opacity=".01"/>
+            </linearGradient>
+          </defs>
+          <g class="tss-eq-grid" aria-hidden="true">
+            <line x1="46" y1="20" x2="46" y2="192"/><line x1="158.5" y1="20" x2="158.5" y2="192"/>
+            <line x1="271" y1="20" x2="271" y2="192"/><line x1="383.5" y1="20" x2="383.5" y2="192"/>
+            <line x1="496" y1="20" x2="496" y2="192"/>
+            <line x1="46" y1="20" x2="496" y2="20"/>
+            <line class="tss-eq-zero" x1="46" y1="106" x2="496" y2="106"/>
+            <line x1="46" y1="192" x2="496" y2="192"/>
+          </g>
+          <path id="tss-cf-out-area" fill="url(#tss-cf-out-fill)" aria-hidden="true"/>
+          <path id="tss-cf-in-area" fill="url(#tss-cf-in-fill)" aria-hidden="true"/>
+          <path id="tss-cf-out-curve" fill="none" stroke="rgba(229,236,251,.72)" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"/>
+          <path id="tss-cf-in-curve" fill="none" stroke="var(--tss-a,#aebaf3)" stroke-width="3" stroke-linecap="round" aria-hidden="true"/>
+          <g aria-hidden="true">
+            <circle cx="46" cy="20" r="3" fill="rgba(229,236,251,.76)"/>
+            <circle cx="496" cy="192" r="3" fill="rgba(229,236,251,.52)"/>
+            <circle cx="46" cy="192" r="3" fill="var(--tss-a,#aebaf3)"/>
+            <circle cx="496" cy="20" r="3" fill="var(--tss-a,#aebaf3)"/>
+          </g>
+          <g id="tss-cf-playhead" hidden aria-hidden="true">
+            <line id="tss-cf-playhead-line" x1="46" y1="20" x2="46" y2="192" stroke="rgba(255,255,255,.52)" stroke-width="1.4" stroke-dasharray="3 3"/>
+            <circle id="tss-cf-playhead-out" cx="46" cy="20" r="4" fill="#eef3ff" stroke="rgba(9,10,12,.9)" stroke-width="1.5"/>
+            <circle id="tss-cf-playhead-in" cx="46" cy="192" r="4.5" fill="var(--tss-a,#aebaf3)" stroke="#fff" stroke-width="1.5"/>
+          </g>
+          <g id="tss-cf-out-handles" hidden>
+            <line id="tss-cf-tan-out-1" class="tss-cf-tangent tss-cf-tangent-out" x1="46" y1="20" x2="235" y2="20" aria-hidden="true"/>
+            <line id="tss-cf-tan-out-2" class="tss-cf-tangent tss-cf-tangent-out" x1="496" y1="192" x2="307" y2="192" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-visible tss-cf-point-out" data-handle="out-1" cx="235" cy="20" r="5" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-hit" data-handle="out-1" cx="235" cy="20" r="17" tabindex="0" role="slider" aria-label="Outgoing curve start handle" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"/>
+            <circle class="tss-cf-point tss-cf-point-visible tss-cf-point-out" data-handle="out-2" cx="307" cy="192" r="5" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-hit" data-handle="out-2" cx="307" cy="192" r="17" tabindex="0" role="slider" aria-label="Outgoing curve end handle" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"/>
+          </g>
+          <g id="tss-cf-in-handles">
+            <line id="tss-cf-tan-in-1" class="tss-cf-tangent tss-cf-tangent-in" x1="46" y1="192" x2="235" y2="192" aria-hidden="true"/>
+            <line id="tss-cf-tan-in-2" class="tss-cf-tangent tss-cf-tangent-in" x1="496" y1="20" x2="307" y2="20" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-visible tss-cf-point-in" data-handle="in-1" cx="235" cy="192" r="5.5" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-hit" data-handle="in-1" cx="235" cy="192" r="17" tabindex="0" role="slider" aria-label="Incoming curve start handle" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"/>
+            <circle class="tss-cf-point tss-cf-point-visible tss-cf-point-in" data-handle="in-2" cx="307" cy="20" r="5.5" aria-hidden="true"/>
+            <circle class="tss-cf-point tss-cf-point-hit" data-handle="in-2" cx="307" cy="20" r="17" tabindex="0" role="slider" aria-label="Incoming curve end handle" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"/>
+          </g>
+          <text class="tss-eq-axis-label" x="4" y="24">100%</text>
+          <text class="tss-eq-axis-label" x="9" y="109">50%</text>
+          <text class="tss-eq-axis-label" x="15" y="195">0%</text>
+          <text id="tss-cf-tick-0" class="tss-eq-frequency" x="46" y="218" text-anchor="middle">0%</text>
+          <text id="tss-cf-tick-1" class="tss-eq-frequency" x="158.5" y="218" text-anchor="middle">25%</text>
+          <text id="tss-cf-tick-2" class="tss-eq-frequency" x="271" y="218" text-anchor="middle">50%</text>
+          <text id="tss-cf-tick-3" class="tss-eq-frequency" x="383.5" y="218" text-anchor="middle">75%</text>
+          <text id="tss-cf-tick-4" class="tss-eq-frequency" x="496" y="218" text-anchor="middle">100%</text>
+        </svg>
+      </div>
+      <label class="tss-eq-safety tss-cf-split-row" for="tss-cf-split">
+        <span><strong>Split Outgoing &amp; Incoming</strong><small id="tss-cf-split-help">Shape fade-out and fade-in independently for DJ overlaps or radio dips. When off, both curves stay balanced.</small></span>
+        <input id="tss-cf-split" type="checkbox" aria-describedby="tss-cf-split-help">
+      </label>
+      <div class="tss-eq-footer"><span>Drag handles to shape handoff · double-click handle to reset</span><button id="tss-cf-reset" type="button">Reset</button></div>
+    </div>
+  `;
+  overlay._opener = opener;
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-label', 'Custom crossfade curve');
+  document.body.appendChild(overlay);
+  overlay._els = {
+    outArea: overlay.querySelector('#tss-cf-out-area'),
+    outCurve: overlay.querySelector('#tss-cf-out-curve'),
+    inArea: overlay.querySelector('#tss-cf-in-area'),
+    inCurve: overlay.querySelector('#tss-cf-in-curve'),
+    tanIn1: overlay.querySelector('#tss-cf-tan-in-1'),
+    tanIn2: overlay.querySelector('#tss-cf-tan-in-2'),
+    tanOut1: overlay.querySelector('#tss-cf-tan-out-1'),
+    tanOut2: overlay.querySelector('#tss-cf-tan-out-2'),
+    outGroup: overlay.querySelector('#tss-cf-out-handles'),
+    handles: {
+      'in-1': Array.from(overlay.querySelectorAll('.tss-cf-point[data-handle="in-1"]')),
+      'in-2': Array.from(overlay.querySelectorAll('.tss-cf-point[data-handle="in-2"]')),
+      'out-1': Array.from(overlay.querySelectorAll('.tss-cf-point[data-handle="out-1"]')),
+      'out-2': Array.from(overlay.querySelectorAll('.tss-cf-point[data-handle="out-2"]')),
+    },
+    ticks: [0, 1, 2, 3, 4].map(idx => overlay.querySelector(`#tss-cf-tick-${idx}`)),
+    readout: overlay.querySelector('#tss-cf-readout'),
+    playhead: overlay.querySelector('#tss-cf-playhead'),
+    playheadLine: overlay.querySelector('#tss-cf-playhead-line'),
+    playheadOut: overlay.querySelector('#tss-cf-playhead-out'),
+    playheadIn: overlay.querySelector('#tss-cf-playhead-in'),
+    previewBtn: overlay.querySelector('#tss-cf-preview'),
+    split: overlay.querySelector('#tss-cf-split'),
+    presets: overlay.querySelector('.tss-cf-presets'),
+    presetButtons: null,
+    saveRow: overlay.querySelector('#tss-cf-save-row'),
+    saveError: overlay.querySelector('#tss-cf-save-error'),
+  };
+
+  backdrop.onclick = closeCrossfadeCurveEditor;
+  overlay.querySelector('#tss-cf-close').onclick = closeCrossfadeCurveEditor;
+
+  const previewBtn = overlay.querySelector('#tss-cf-preview');
+  previewBtn.onclick = () => {
+    if (overlay._previewActive) {
+      stopCrossfadePreview(overlay);
+      return;
+    }
+    overlay._previewActive = true;
+    previewBtn.dataset.active = 'true';
+    previewBtn.setAttribute('aria-pressed', 'true');
+    previewBtn.textContent = 'Stop';
+    const instant = typeof motionIsInstant === 'function' ? motionIsInstant() : Boolean(state.reduceVisualEffects);
+    if (instant || typeof requestAnimationFrame !== 'function') {
+      renderCrossfadeCurveGraph(null, 0.5);
+      return;
+    }
+    const nowPerf = () => (typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now());
+    const previewSeconds = state.crossfadeSeconds > 0 ? state.crossfadeSeconds : 4;
+    const durationMs = Math.max(400, previewSeconds * 1000);
+    const startAt = nowPerf();
+    const step = () => {
+      overlay._previewRaf = null;
+      if (!overlay.isConnected || !overlay._previewActive || document.visibilityState === 'hidden') {
+        stopCrossfadePreview(overlay);
+        return;
+      }
+      const p = Math.max(0, Math.min(1, (nowPerf() - startAt) / durationMs));
+      renderCrossfadeCurveGraph(null, p);
+      if (p >= 1) {
+        stopCrossfadePreview(overlay);
+        return;
+      }
+      overlay._previewRaf = requestAnimationFrame(step);
+    };
+    renderCrossfadeCurveGraph(null, 0);
+    overlay._previewRaf = requestAnimationFrame(step);
+  };
+
+  overlay.querySelector('#tss-cf-split').onchange = event => {
+    stopCrossfadePreview(overlay);
+    const nextMode = event.currentTarget.checked ? 'split' : 'linked';
+    const base = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+    state.customCrossfade = sanitizeCrossfadeCurveConfig({
+      mode: nextMode,
+      in: base.in,
+      out: nextMode === 'split'
+        ? base.out
+        : [base.in[0], 1 - base.in[1], base.in[2], 1 - base.in[3]],
+    });
+    state.crossfadePreset = crossfadePresetName(state.customCrossfade);
+    state.crossfadeCurve = 'custom';
+    if (state.crossfadeSeconds > 0 && typeof ensureAutoLevelAudioGraph === 'function') {
+      ensureAutoLevelAudioGraph();
+    }
+    persistCrossfadeCurve({ immediate: true });
+    syncCrossfadeControls();
+  };
+
+  const presets = overlay.querySelector('.tss-cf-presets');
+  const saveRow = overlay.querySelector('#tss-cf-save-row');
+  const saveName = overlay.querySelector('#tss-cf-save-name');
+  const saveError = overlay.querySelector('#tss-cf-save-error');
+  presets.onclick = event => {
+    const remove = event.target.closest('[data-remove-cf-preset]');
+    if (remove) {
+      stopCrossfadePreview(overlay);
+      const name = remove.dataset.removeCfPreset;
+      delete state.customCfPresets[name];
+      if (state.crossfadePreset === name) state.crossfadePreset = crossfadePresetName(state.customCrossfade);
+      persistCrossfadeCurve({ customPresets: true, immediate: true });
+      presets.dataset.signature = '';
+      syncCrossfadeControls();
+      return;
+    }
+    if (event.target.closest('#tss-cf-save-open')) {
+      saveRow.dataset.open = 'true';
+      saveError.textContent = '';
+      saveName.value = Object.prototype.hasOwnProperty.call(state.customCfPresets, state.crossfadePreset)
+        ? state.crossfadePreset : '';
+      saveName.focus();
+      saveName.select?.();
+      return;
+    }
+    const button = event.target.closest('.tss-cf-preset');
+    if (!button) return;
+    const name = button.dataset.preset;
+    const template = Object.prototype.hasOwnProperty.call(CF_TEMPLATES, name) ? CF_TEMPLATES[name]
+      : Object.prototype.hasOwnProperty.call(state.customCfPresets, name) ? state.customCfPresets[name] : null;
+    if (!template) return;
+    stopCrossfadePreview(overlay);
+    state.customCrossfade = sanitizeCrossfadeCurveConfig(template);
+    state.crossfadePreset = name;
+    state.crossfadeCurve = 'custom';
+    if (state.crossfadeSeconds > 0 && typeof ensureAutoLevelAudioGraph === 'function') {
+      ensureAutoLevelAudioGraph();
+    }
+    persistCrossfadeCurve({ immediate: true });
+    syncCrossfadeControls();
+  };
+
+  const closeCfSaveRow = () => {
+    const hadFocus = typeof saveRow.contains === 'function' && saveRow.contains(document.activeElement);
+    saveRow.dataset.open = 'false';
+    saveError.textContent = '';
+    if (hadFocus) overlay.querySelector('#tss-cf-save-open')?.focus?.({ preventScroll: true });
+  };
+
+  const savePreset = () => {
+    const requested = saveName.value.trim().replace(/\s+/g, ' ').slice(0, 24);
+    if (!requested) { saveError.textContent = 'Enter a name'; return; }
+    if (Object.keys(CF_TEMPLATES).some(name => name.toLowerCase() === requested.toLowerCase())
+        || ['smooth', 'clean', 'dj', 'custom'].includes(requested.toLowerCase())) {
+      saveError.textContent = 'Built-in names cannot be replaced';
+      return;
+    }
+    if (BLOCKED_EQ_PRESET_NAMES.has(requested.toLowerCase())) {
+      saveError.textContent = 'Choose a different preset name';
+      return;
+    }
+    const existingName = Object.keys(state.customCfPresets).find(name => name.toLowerCase() === requested.toLowerCase());
+    if (!existingName && Object.keys(state.customCfPresets).length >= 20) {
+      saveError.textContent = 'Maximum 20 custom presets';
+      return;
+    }
+    const name = existingName || requested;
+    state.customCfPresets[name] = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+    state.crossfadePreset = name;
+    state.crossfadeCurve = 'custom';
+    const saved = persistCrossfadeCurve({ customPresets: true, immediate: true });
+    saveRow.dataset.open = saved ? 'false' : 'true';
+    presets.dataset.signature = '';
+    syncCrossfadeControls();
+  };
+  overlay.querySelector('#tss-cf-save-confirm').onclick = savePreset;
+  overlay.querySelector('#tss-cf-save-cancel').onclick = closeCfSaveRow;
+  saveName.onkeydown = event => {
+    if (event.key === 'Enter') { event.preventDefault(); savePreset(); }
+    if (event.key === 'Escape') { event.stopPropagation(); closeCfSaveRow(); }
+  };
+  overlay.querySelector('#tss-cf-reset').onclick = () => {
+    stopCrossfadePreview(overlay);
+    state.customCrossfade = sanitizeCrossfadeCurveConfig(CF_TEMPLATES['S-Curve']);
+    state.crossfadePreset = 'S-Curve';
+    state.crossfadeCurve = 'custom';
+    persistCrossfadeCurve({ immediate: true });
+    syncCrossfadeControls();
+  };
+
+  const svg = overlay.querySelector('#tss-cf-graph');
+  let draggingHandle = null;
+  let draggingPoint = null;
+  let draggingPointerId = null;
+  let dragRect = null;
+  const coordsFromPointer = event => {
+    const rect = dragRect || svg.getBoundingClientRect();
+    const width = rect.width || 520;
+    const height = rect.height || 232;
+    const svgX = (event.clientX - rect.left) * (520 / width);
+    const svgY = (event.clientY - rect.top) * (232 / height);
+    return {
+      x: Math.max(0, Math.min(1, (svgX - 46) / 450)),
+      y: Math.max(0, Math.min(1, (192 - svgY) / 172)),
+    };
+  };
+  const move = event => {
+    if (!draggingHandle) return;
+    if (draggingPointerId !== null && event.pointerId !== undefined && event.pointerId !== draggingPointerId) return;
+    event.preventDefault();
+    const { x, y } = coordsFromPointer(event);
+    setCrossfadeCurveHandle(draggingHandle, x, y);
+  };
+  const up = event => {
+    if (event && event.type !== 'blur' && draggingPointerId !== null
+        && event.pointerId !== undefined && event.pointerId !== draggingPointerId) {
+      return;
+    }
+    if (draggingPoint && draggingPointerId !== null && typeof draggingPoint.releasePointerCapture === 'function') {
+      try { draggingPoint.releasePointerCapture(draggingPointerId); } catch (_) {}
+    }
+    const hadHandle = draggingHandle !== null;
+    draggingHandle = null;
+    draggingPoint = null;
+    draggingPointerId = null;
+    dragRect = null;
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    document.removeEventListener('pointercancel', up);
+    window.removeEventListener('blur', up);
+    if (hadHandle) renderCrossfadeCurveGraph();
+  };
+  overlay._cancelDrag = () => up();
+  overlay.querySelectorAll('.tss-cf-point-hit').forEach(point => {
+    point.onpointerdown = event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      if (draggingHandle !== null && draggingPointerId !== null
+          && event.pointerId !== undefined && event.pointerId !== draggingPointerId) {
+        return;
+      }
+      event.preventDefault();
+      if (draggingHandle !== null) up();
+      if (overlay._tssModalTimer != null) {
+        if (typeof clearTimeout === 'function') clearTimeout(overlay._tssModalTimer);
+        overlay._tssModalTimer = null;
+      }
+      if (overlay.dataset?.modalAnimating) delete overlay.dataset.modalAnimating;
+      if (overlay._tssModalAnim) {
+        overlay._tssModalAnim.onfinish = null;
+        try { overlay._tssModalAnim.cancel(); } catch (_) {}
+        overlay._tssModalAnim = null;
+      }
+      stopCrossfadePreview(overlay);
+      draggingHandle = point.dataset.handle;
+      draggingPoint = point;
+      draggingPointerId = event.pointerId;
+      dragRect = svg.getBoundingClientRect();
+      if (typeof point.setPointerCapture === 'function') {
+        try { point.setPointerCapture(event.pointerId); } catch (_) {}
+      }
+      document.addEventListener('pointermove', move, { passive: false });
+      document.addEventListener('pointerup', up);
+      document.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
+      const { x, y } = coordsFromPointer(event);
+      setCrossfadeCurveHandle(draggingHandle, x, y);
+    };
+    point.ondblclick = event => {
+      event.preventDefault();
+      stopCrossfadePreview(overlay);
+      resetCrossfadeCurveHandle(point.dataset.handle);
+    };
+    point.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      stopCrossfadePreview(overlay);
+      const id = point.dataset.handle;
+      const cfg = sanitizeCrossfadeCurveConfig(state.customCrossfade);
+      const tuple = id.startsWith('out-') ? cfg.out : cfg.in;
+      const baseIdx = id.endsWith('-2') ? 2 : 0;
+      const step = event.shiftKey ? 0.1 : 0.02;
+      let nextX = tuple[baseIdx];
+      let nextY = tuple[baseIdx + 1];
+      if (event.key === 'ArrowLeft') nextX -= step;
+      else if (event.key === 'ArrowRight') nextX += step;
+      else if (event.key === 'ArrowUp') nextY += step;
+      else if (event.key === 'ArrowDown') nextY -= step;
+      else if (event.key === 'Home') nextY = 0;
+      else if (event.key === 'End') nextY = 1;
+      setCrossfadeCurveHandle(id, nextX, nextY);
+    };
+  });
+  overlay._onKeydown = event => {
+    if (event.key !== 'Escape' || event.defaultPrevented) return;
+    event.preventDefault();
+    closeCrossfadeCurveEditor();
+  };
+  document.addEventListener('keydown', overlay._onKeydown);
+  if (typeof animateModalOpen === 'function') animateModalOpen(overlay, backdropCreated ? backdrop : null);
+  updateCrossfadeCurvePopup();
+  overlay.querySelector('#tss-cf-close').focus({ preventScroll: true });
 }
 
 function applyVisualEffects(documentLike = document) {
@@ -10332,6 +21777,27 @@ function applyVisualEffects(documentLike = document) {
   if (state.reduceVisualEffects) {
     if (root.getAttribute(attribute) !== 'true') root.setAttribute(attribute, 'true');
     settleUpdateAttention(documentLike);
+    if (typeof document !== 'undefined' && documentLike === document && typeof syncBrandmarkCrossfade === 'function') {
+      syncBrandmarkCrossfade('sync-reduced');
+    }
+    if (typeof document !== 'undefined' && documentLike === document && typeof stopCrossfadePreview === 'function') {
+      stopCrossfadePreview();
+    }
+    if (typeof settleClosingModals === 'function') settleClosingModals(documentLike);
+    for (const id of ['tss-eq-overlay', 'tss-cf-overlay', 'tss-stats-overlay', 'tss-modal-backdrop']) {
+      const modalEl = documentLike.getElementById(id);
+      if (!modalEl) continue;
+      if (modalEl._tssModalTimer != null) {
+        if (typeof clearTimeout === 'function') clearTimeout(modalEl._tssModalTimer);
+        modalEl._tssModalTimer = null;
+      }
+      if (modalEl.dataset?.modalAnimating) delete modalEl.dataset.modalAnimating;
+      if (modalEl._tssModalAnim) {
+        modalEl._tssModalAnim.onfinish = null;
+        try { modalEl._tssModalAnim.cancel(); } catch (_) {}
+        modalEl._tssModalAnim = null;
+      }
+    }
     // Settle owned finite motion through its real cleanup/render callback.
     for (const element of documentLike.querySelectorAll('[data-surface-open]')) {
       const animation = element._tssMotion;
@@ -10339,6 +21805,7 @@ function applyVisualEffects(documentLike = document) {
       try { animation.finish(); } catch (_) {}
       if (element._tssMotion === animation) animation.onfinish?.();
     }
+    documentLike.getElementById?.('tss-hub')?._tssCollapseSettle?.();
   } else if (root.hasAttribute(attribute)) {
     root.removeAttribute(attribute);
   }
@@ -10390,6 +21857,13 @@ function animateSurface(element, visible, { instant = false, onFinish = null, du
   if (element.dataset.surfaceOpen === open && !restart) return;
   const queue = kind === 'queue';
   const content = queue ? element.querySelector?.('#tss-sidebar-content') : null;
+  const openHeight = queue ? Number(element.dataset.openHeight) : NaN;
+  const closedHeight = queue ? Number(element.dataset.closedHeight) : NaN;
+  const extraTop = queue && element.dataset.layout !== 'narrow'
+    && Number.isFinite(openHeight) && Number.isFinite(closedHeight) && openHeight - closedHeight > 0.5
+    ? Math.round(openHeight - closedHeight)
+    : 0;
+  const innerR = Math.min(16, extraTop);
   const previous = element._tssMotion;
   const previousContent = element._tssContentMotion;
   const current = previous && typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
@@ -10425,45 +21899,51 @@ function animateSurface(element, visible, { instant = false, onFinish = null, du
   }
   element.hidden = false;
   element.dataset.motion = visible ? 'entering' : 'exiting';
-  let closedTransform = kind === 'tab' ? 'translateY(6px)' : 'translateY(8px)';
-  let closedClip = 'inset(0 0 0 0)';
+  let closed;
+  let opened;
   if (queue) {
     const narrow = element.dataset.layout === 'narrow';
     const left = element.dataset.side === 'left';
-    // Keep the attachment edge fixed: translation would pull retracting glass
-    // across the player. Edge-anchored scale and clipping supply the pop-out.
-    closedTransform = narrow ? 'scale(.98,.9)' : 'scale(.975,.9)';
-    closedClip = narrow ? 'inset(0 0 100% 0)'
-      : left ? 'inset(0 0 0 100%)' : 'inset(0 100% 0 0)';
+    // Pure compositor drawer: keep layout box dimensions static (so backdrop-filter
+    // allocates a single fixed texture) and telescope taller queues via translate3d + clipPath.
+    if (narrow) {
+      closed = { transform: 'translate3d(0px, -100%, 0px)', clipPath: 'inset(100% 0px 0px 0px)' };
+      opened = { transform: 'translate3d(0px, 0%, 0px)', clipPath: 'inset(0% 0px 0px 0px)' };
+    } else if (extraTop > 0) {
+      closed = left
+        ? { transform: `translate3d(100%, ${extraTop}px, 0px)`, clipPath: `inset(0px 100% ${extraTop}px 0px round 16px 0px 0px 16px)` }
+        : { transform: `translate3d(-100%, ${extraTop}px, 0px)`, clipPath: `inset(0px 0px ${extraTop}px 100% round 0px 16px 16px 0px)` };
+      opened = left
+        ? { transform: 'translate3d(0%, 0px, 0px)', clipPath: `inset(0px 0% 0px 0px round 16px ${innerR}px 0px 16px)` }
+        : { transform: 'translate3d(0%, 0px, 0px)', clipPath: `inset(0px 0px 0px 0% round ${innerR}px 16px 16px 0px)` };
+    } else {
+      closed = left
+        ? { transform: 'translate3d(100%, 0px, 0px)', clipPath: 'inset(-80px 100% -80px 0px)' }
+        : { transform: 'translate3d(-100%, 0px, 0px)', clipPath: 'inset(-80px 0px -80px 100%)' };
+      opened = left
+        ? { transform: 'translate3d(0%, 0px, 0px)', clipPath: 'inset(-80px 0% -80px -80px)' }
+        : { transform: 'translate3d(0%, 0px, 0px)', clipPath: 'inset(-80px -80px -80px 0%)' };
+    }
+  } else {
+    const closedTransform = kind === 'tab' ? 'translateY(6px)' : 'translateY(8px)';
+    closed = { opacity: 0, transform: closedTransform };
+    opened = { opacity: 1, transform: 'none' };
   }
-  // Never fade the backdrop-bearing root. Exit clears every foreground pixel
-  // before retracting the glass; entry unfolds the glass before revealing text.
-  const closed = queue ? { transform: closedTransform, clipPath: closedClip }
-    : { opacity: 0, transform: closedTransform };
-  const opened = queue ? { transform: 'none', clipPath: 'inset(0 0 0 0)' }
-    : { opacity: 1, transform: 'none' };
-  const easing = 'cubic-bezier(0.23, 1, 0.32, 1)';
+  const easing = queue
+    ? (visible ? 'cubic-bezier(0.16, 1, 0.3, 1)' : 'cubic-bezier(0.32, 0, 0.15, 1)')
+    : 'cubic-bezier(0.23, 1, 0.32, 1)';
   const timing = {
-    duration: duration ?? (kind === 'tab' ? 210 : queue ? (visible ? 260 : 220) : 240),
-    easing: queue ? 'linear' : easing,
+    duration: duration ?? (kind === 'tab' ? 210 : queue ? (visible ? 220 : 165) : 240),
+    easing,
     fill: 'both',
   };
   const start = from || (visible ? closed : opened);
-  const phase = visible ? 190 / 260 : 60 / 220;
-  const frames = queue ? [
-    { ...start, offset: 0, easing: visible ? easing : 'linear' },
-    { ...(visible ? opened : start), offset: phase, easing: visible ? 'linear' : easing },
-    { ...(visible ? opened : closed), offset: 1 },
-  ] : [start, visible ? opened : closed];
-  const animation = element.animate(frames, timing);
-  const contentStart = fromContent || { opacity: visible ? 0 : 1 };
-  const contentAnimation = content ? content.animate([
-    { ...contentStart, offset: 0, easing: visible ? 'linear' : easing },
-    { ...(visible ? contentStart : { opacity: 0 }), offset: phase, easing: visible ? easing : 'linear' },
-    { opacity: visible ? 1 : 0, offset: 1 },
-  ], timing) : null;
+  const animation = element.animate([start, visible ? opened : closed], timing);
+  const contentStart = fromContent || { opacity: visible ? 0.35 : 1 };
+  const contentAnimation = content
+    ? content.animate([contentStart, { opacity: visible ? 1 : 0.2 }], timing)
+    : null;
   // Pin both effects to one timeline instant, including interrupted reversals.
-  // Otherwise separate animate() calls can disagree at the phase boundary.
   const startTime = animation.timeline?.currentTime;
   if (contentAnimation && typeof startTime === 'number') {
     animation.startTime = startTime;
@@ -10485,7 +21965,7 @@ function syncSettingsTabs(instant = true) {
   const hub = document.getElementById('tss-hub');
   if (!hub) return;
   const selected = hub.dataset.settingsTab || 'audio';
-  for (const tab of ['audio', 'session', 'info']) {
+  for (const tab of ['audio', 'dj', 'session', 'info']) {
     const button = document.getElementById(`tss-settings-tab-${tab}`);
     const active = tab === selected;
     if (button) {
@@ -10497,7 +21977,7 @@ function syncSettingsTabs(instant = true) {
 }
 
 function setSettingsTab(tab, focus = false, event = null) {
-  if (!['audio', 'session', 'info'].includes(tab)) return;
+  if (!['audio', 'dj', 'session', 'info'].includes(tab)) return;
   const hub = document.getElementById('tss-hub');
   if (!hub) return;
   const focusedPanel = document.activeElement?.closest?.('.tss-settings-panel');
@@ -10550,6 +22030,9 @@ function setHubView(view, focus = true, event = null) {
   const instant = motionIsInstant(event);
   if (settings && state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') toggleSidebar({ instant });
   hub.dataset.view = settings ? 'settings' : 'main';
+  hub.scrollLeft = 0;
+  const inner = document.getElementById('tss-hub-inner');
+  if (inner) inner.scrollLeft = 0;
   syncHubView(instant);
   syncSidebarToHub();
   if (focus) document.getElementById(settings ? 'tss-settings-title' : 'tss-hub-settings')?.focus({ preventScroll: true });
@@ -10558,54 +22041,350 @@ function setHubView(view, focus = true, event = null) {
 function setHubMini(mini, focus = true, event = null) {
   const hub = document.getElementById('tss-hub');
   if (!hub) return;
-  const instant = motionIsInstant(event);
+  const instant = typeof motionIsInstant === 'function' ? motionIsInstant(event) : false;
+  const nextMini = Boolean(mini);
+  if (nextMini && hub.dataset.collapsed === 'true' && typeof setHubCollapsed === 'function') {
+    setHubCollapsed(false, false, { instant });
+  }
   if (state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') toggleSidebar({ instant });
-  hub.dataset.mini = String(Boolean(mini));
+  hub.dataset.mini = String(nextMini);
+  if (typeof safeStorage !== 'undefined') safeStorage?.setItem?.('tss_hub_mini', String(nextMini));
   const button = document.getElementById('tss-hub-col');
   if (button) {
-    button.setAttribute('aria-expanded', String(!mini));
-    const label = mini ? 'Expand player' : 'Minimize player';
+    button.setAttribute('aria-expanded', String(!nextMini));
+    const label = nextMini ? 'Expand player' : 'Minimize player';
     button.setAttribute('aria-label', label);
     button.title = label;
   }
   setHubView('main', false, { instant });
+  if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
   if (focus) button?.focus({ preventScroll: true });
+}
+
+function setHubCollapsed(collapsed, focus = true, event = null) {
+  const hub = document.getElementById('tss-hub');
+  if (!hub) return;
+  const instant = typeof motionIsInstant === 'function'
+    ? motionIsInstant(event)
+    : Boolean(event?.instant === true || (typeof state !== 'undefined' && state?.reduceVisualEffects));
+  const nextCollapsed = Boolean(collapsed);
+  const hideBtn = document.getElementById('tss-hub-hide');
+  const restoreBtn = document.getElementById('tss-hub-restore');
+  const prevMotion = hub.dataset?.collapseMotion || '';
+  const prevCollapsed = hub.dataset?.collapsed === 'true';
+  const wasVisualPlayer = !prevCollapsed || prevMotion === 'collapsing';
+  const measureRect = () => (typeof hub.getBoundingClientRect === 'function' ? hub.getBoundingClientRect() : null);
+  const hasViewport = typeof window !== 'undefined'
+    && Number.isFinite(window.innerWidth) && window.innerWidth > 0
+    && Number.isFinite(window.innerHeight) && window.innerHeight > 0;
+  const applyParkedPillPos = () => {
+    if (hub.dataset?.collapsed !== 'true' || hub.style?.bottom !== 'auto' || !hub._tssParkedPillPos) return;
+    const pRect = measureRect();
+    const pw = pRect?.width || hub._tssParkedPillPos.width || 0;
+    const ph = pRect?.height || hub._tssParkedPillPos.height || 0;
+    let targetLeft = hub._tssParkedPillPos.left;
+    let targetTop = hub._tssParkedPillPos.top;
+    if (!Number.isFinite(targetLeft) || !Number.isFinite(targetTop)) return;
+    if (hasViewport && pw > 0 && ph > 0) {
+      const mx = Math.min(12, Math.max(0, Math.floor((window.innerWidth - pw) / 2)));
+      const my = Math.min(12, Math.max(0, Math.floor((window.innerHeight - ph) / 2)));
+      targetLeft = Math.max(mx, Math.min(window.innerWidth - pw - mx, targetLeft));
+      targetTop = Math.max(my, Math.min(window.innerHeight - ph - my, targetTop));
+    }
+    hub.style.left = `${Math.round(targetLeft)}px`;
+    hub.style.top = `${Math.round(targetTop)}px`;
+    hub.style.bottom = 'auto';
+    hub.style.right = 'auto';
+  };
+  const computeCollapseOrigin = (playerRect, pillPos) => {
+    const topAnchored = hub.style?.bottom === 'auto';
+    let oxPct = 0;
+    let oyPct = topAnchored ? 0 : 100;
+    if (topAnchored && playerRect && pillPos && Number.isFinite(pillPos.left) && Number.isFinite(pillPos.top)
+      && playerRect.width > 0 && playerRect.height > 0) {
+      const pw = pillPos.width > 0 ? pillPos.width : Math.min(112, playerRect.width);
+      const ph = pillPos.height > 0 ? pillPos.height : Math.min(32, playerRect.height);
+      const dxSpan = playerRect.width - pw;
+      const dySpan = playerRect.height - ph;
+      if (dxSpan > 1) oxPct = Math.round(Math.max(0, Math.min(1, (pillPos.left - playerRect.left) / dxSpan)) * 100);
+      if (dySpan > 1) oyPct = Math.round(Math.max(0, Math.min(1, (pillPos.top - playerRect.top) / dySpan)) * 100);
+    }
+    return { origin: `${oxPct}% ${oyPct}%`, shiftY: oyPct >= 50 ? 1 : -1 };
+  };
+
+  const clearMotionTimer = () => {
+    if (hub._tssCollapseTimer != null) {
+      if (typeof clearTimeout === 'function') clearTimeout(hub._tssCollapseTimer);
+      hub._tssCollapseTimer = null;
+    }
+  };
+  const cancelRunningMotion = () => {
+    clearMotionTimer();
+    const running = hub._tssCollapseAnim;
+    hub._tssCollapseAnim = null;
+    hub._tssCollapseSettle = null;
+    if (running) {
+      running.onfinish = null;
+      try { running.cancel(); } catch (_) {}
+    }
+    if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+  };
+
+  let interruptedFrame = null;
+  if (hub._tssCollapseAnim) {
+    if (!instant && wasVisualPlayer && prevMotion !== 'pill-entering' && typeof getComputedStyle === 'function') {
+      try {
+        const cs = getComputedStyle(hub);
+        if (cs?.transform && cs.transform !== 'none') {
+          const op = Number(cs.opacity);
+          interruptedFrame = { opacity: Number.isFinite(op) ? op : 1, transform: cs.transform };
+        }
+      } catch (_) {}
+    }
+    cancelRunningMotion();
+  } else {
+    clearMotionTimer();
+    hub._tssCollapseSettle = null;
+    if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+  }
+
+  if (nextCollapsed && typeof state !== 'undefined' && state?.sidebarOpen && typeof toggleSidebar === 'function') {
+    toggleSidebar({ instant });
+  }
+  const canAnimate = !instant
+    && typeof hub.animate === 'function'
+    && (prevCollapsed !== nextCollapsed || Boolean(prevMotion))
+    && !(typeof document !== 'undefined' && document.visibilityState === 'hidden');
+  if (nextCollapsed && typeof setHubView === 'function' && (!canAnimate || hub.dataset?.view !== 'settings')) {
+    setHubView('main', false, { instant: true });
+  }
+  if (!nextCollapsed && prevCollapsed && prevMotion !== 'collapsing' && hub.style?.bottom === 'auto') {
+    const preExpandRect = measureRect();
+    if (preExpandRect && preExpandRect.width > 0 && preExpandRect.height > 0) {
+      hub._tssParkedPillPos = {
+        left: preExpandRect.left,
+        top: preExpandRect.top,
+        width: preExpandRect.width,
+        height: preExpandRect.height,
+      };
+    } else if (!hub._tssParkedPillPos) {
+      const parsedLeft = parseFloat(hub.style.left);
+      const parsedTop = parseFloat(hub.style.top);
+      if (Number.isFinite(parsedLeft) && Number.isFinite(parsedTop)) {
+        hub._tssParkedPillPos = { left: parsedLeft, top: parsedTop, width: 0, height: 0 };
+      }
+    }
+  }
+  if (hub.dataset) hub.dataset.collapsed = String(nextCollapsed);
+  if (typeof safeStorage !== 'undefined') safeStorage?.setItem?.('tss_hub_collapsed', String(nextCollapsed));
+  if (hideBtn) {
+    hideBtn.setAttribute('aria-expanded', String(!nextCollapsed));
+    hideBtn.setAttribute('aria-label', 'Hide player');
+    hideBtn.title = 'Hide player';
+  }
+  if (restoreBtn) {
+    restoreBtn.setAttribute('aria-expanded', String(!nextCollapsed));
+  }
+  if (!canAnimate) {
+    if (hub.style) hub.style.transformOrigin = '';
+    if (restoreBtn) restoreBtn.hidden = !nextCollapsed;
+    if (nextCollapsed) applyParkedPillPos();
+    if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+    if (focus) (nextCollapsed ? restoreBtn : hideBtn)?.focus({ preventScroll: true });
+    return;
+  }
+
+  if (nextCollapsed) {
+    // Preserve static player layout box & border-radius while exiting on the compositor
+    // so backdrop-filter never reallocates or re-blurs mid-frame.
+    if (restoreBtn) restoreBtn.hidden = true;
+    if (hub.dataset) hub.dataset.collapseMotion = 'collapsing';
+    if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+    const { origin, shiftY } = computeCollapseOrigin(measureRect(), hub._tssParkedPillPos);
+    if (hub.style) hub.style.transformOrigin = origin;
+
+    const clearPillAnim = () => {
+      clearMotionTimer();
+      const activeAnim = hub._tssCollapseAnim;
+      hub._tssCollapseAnim = null;
+      hub._tssCollapseSettle = null;
+      if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+      if (hub.style) hub.style.transformOrigin = '';
+      if (activeAnim) {
+        activeAnim.onfinish = null;
+        try { activeAnim.cancel(); } catch (_) {}
+      }
+      if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+    };
+
+    const settleCollapsed = (withPillPop = true) => {
+      clearMotionTimer();
+      const stage1 = hub._tssCollapseAnim;
+      hub._tssCollapseAnim = null;
+      hub._tssCollapseSettle = null;
+      if (stage1) {
+        stage1.onfinish = null;
+        try { stage1.cancel(); } catch (_) {}
+      }
+      if (hub.dataset?.collapsed !== 'true') return;
+      if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+      if (hub.style) hub.style.transformOrigin = '';
+      if (hub.dataset?.view === 'settings' && typeof setHubView === 'function') {
+        setHubView('main', false, { instant: true });
+      }
+      if (restoreBtn) restoreBtn.hidden = false;
+      applyParkedPillPos();
+      if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+      if (focus) restoreBtn?.focus({ preventScroll: true });
+      if (withPillPop && typeof hub.animate === 'function') {
+        if (hub.dataset) hub.dataset.collapseMotion = 'pill-entering';
+        if (hub.style) hub.style.transformOrigin = origin;
+        const pillAnim = hub.animate(
+          [
+            { opacity: 0, transform: `translate3d(0px, ${4 * shiftY}px, 0px) scale(0.9)` },
+            { opacity: 1, transform: 'translate3d(0px, 0px, 0px) scale(1)' },
+          ],
+          { duration: 145, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'both' }
+        );
+        if (pillAnim) {
+          hub._tssCollapseAnim = pillAnim;
+          hub._tssCollapseSettle = () => {
+            if (hub._tssCollapseAnim !== pillAnim) return;
+            clearPillAnim();
+          };
+          pillAnim.onfinish = () => {
+            if (hub._tssCollapseAnim !== pillAnim) return;
+            clearPillAnim();
+          };
+          if (typeof setTimeout === 'function') {
+            hub._tssCollapseTimer = setTimeout(() => {
+              if (hub._tssCollapseAnim !== pillAnim) return;
+              clearPillAnim();
+            }, 210);
+          }
+          return;
+        }
+        if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+        if (hub.style) hub.style.transformOrigin = '';
+      }
+    };
+
+    const anim = hub.animate(
+      [
+        interruptedFrame || { opacity: 1, transform: 'translate3d(0px, 0px, 0px) scale(1)' },
+        { opacity: 0, transform: `translate3d(0px, ${6 * shiftY}px, 0px) scale(0.93)` },
+      ],
+      { duration: 150, easing: 'cubic-bezier(0.32, 0, 0.15, 1)', fill: 'both' }
+    );
+    if (!anim) {
+      settleCollapsed(false);
+      return;
+    }
+    hub._tssCollapseAnim = anim;
+    hub._tssCollapseSettle = () => {
+      if (hub._tssCollapseAnim !== anim) return;
+      settleCollapsed(false);
+    };
+    anim.onfinish = () => {
+      if (hub._tssCollapseAnim !== anim) return;
+      settleCollapsed(true);
+    };
+    if (typeof setTimeout === 'function') {
+      hub._tssCollapseTimer = setTimeout(() => {
+        if (hub._tssCollapseAnim !== anim) return;
+        settleCollapsed(false);
+      }, 215);
+    }
+    return;
+  }
+
+  if (restoreBtn) restoreBtn.hidden = true;
+  if (hub.dataset) hub.dataset.collapseMotion = 'expanding';
+  if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+  const { origin, shiftY } = computeCollapseOrigin(measureRect(), hub._tssParkedPillPos);
+  if (hub.style) hub.style.transformOrigin = origin;
+  if (focus) hideBtn?.focus({ preventScroll: true });
+
+  const settleExpanded = () => {
+    clearMotionTimer();
+    const activeAnim = hub._tssCollapseAnim;
+    hub._tssCollapseAnim = null;
+    hub._tssCollapseSettle = null;
+    if (hub.dataset?.collapseMotion) delete hub.dataset.collapseMotion;
+    if (hub.style) hub.style.transformOrigin = '';
+    if (activeAnim) {
+      activeAnim.onfinish = null;
+      try { activeAnim.cancel(); } catch (_) {}
+    }
+    if (typeof syncSidebarToHub === 'function') syncSidebarToHub();
+  };
+
+  const anim = hub.animate(
+    [
+      interruptedFrame || { opacity: 0, transform: `translate3d(0px, ${8 * shiftY}px, 0px) scale(0.94)` },
+      { opacity: 1, transform: 'translate3d(0px, 0px, 0px) scale(1)' },
+    ],
+    { duration: 195, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'both' }
+  );
+  if (!anim) {
+    settleExpanded();
+    return;
+  }
+  hub._tssCollapseAnim = anim;
+  hub._tssCollapseSettle = () => {
+    if (hub._tssCollapseAnim !== anim) return;
+    settleExpanded();
+  };
+  anim.onfinish = () => {
+    if (hub._tssCollapseAnim !== anim) return;
+    settleExpanded();
+  };
+  if (typeof setTimeout === 'function') {
+    hub._tssCollapseTimer = setTimeout(() => {
+      if (hub._tssCollapseAnim !== anim) return;
+      settleExpanded();
+    }, 260);
+  }
 }
 
 function mkHub() {
   if (document.getElementById('tss-hub')) return;
+  state._waveformBars = null;
+  state._waveformBarsRoot = null;
+  state._lastWaveformPlayed = 0;
+  state._lastSidebarLayoutKey = '';
 
   if (!document.getElementById('tss-hub-style')) {
     const s = document.createElement('style');
     s.id = 'tss-hub-style';
     s.textContent = `
-      #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
+      #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
         --tss-a:#aebaf3;--tss-ar:174;--tss-ag:186;--tss-ab:243;
         --tss-glass-base:rgba(9,10,12,.98);
         --tss-glass-surface:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0) 40%),var(--tss-glass-base);
         --tss-glass-inset:rgba(0,0,0,.08);
         --tss-glass-filter:none;
         --tss-glass-rim:rgba(255,255,255,.12);
-        --tss-glass-shadow:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.12),0 20px 54px rgba(0,0,0,.38);
+        --tss-glass-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.18),0 1px 2px rgba(0,0,0,.42),0 4px 10px rgba(0,0,0,.26),0 12px 24px rgba(0,0,0,.22),0 24px 48px rgba(0,0,0,.22);
       }
       @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
-        #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
+        #tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers {
           --tss-glass-base:rgba(9,10,12,.54);
           --tss-glass-filter:blur(20px);
         }
       }
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) {
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) {
         --tss-glass-base:rgba(9,10,12,.98);--tss-glass-filter:none;
       }
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay),
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay) *,
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::before,
-      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-stats-overlay,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::after {
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,.tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay),
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers,#tss-modal-backdrop,.tss-modal-backdrop,#tss-debug-overlay,#tss-debug-help-overlay) *,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::before,
+      :root[data-tss-reduce-visual-effects="true"] :is(#tss-hub,#tss-sidebar,#tss-eq-overlay,#tss-cf-overlay,#tss-stats-overlay,.tss-modal-surface,.tss-stats-surface,#tss-ctx,.tss-debug-dialog,#tss-inline-pip,#tss-merge-toast,#tss-update-providers) *::after {
         transition:none!important;animation:none!important;scroll-behavior:auto!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;
       }
       :root[data-tss-reduce-visual-effects="true"] .tss-hub-btn:active { transform:none!important; }
       /* The header never scrolls; only the active view owns vertical overflow. */
-      #tss-hub-inner { position:relative;display:flex;flex-direction:column;max-height:calc(100dvh - 26px);overflow:hidden; }
+      #tss-hub-inner { position:relative;display:flex;flex-direction:column;width:100%;max-width:100%;min-width:0;max-height:calc(100dvh - 26px);overflow:hidden;overflow:clip; }
 
       .tss-hub-btn {
         border:none; cursor:pointer; flex-shrink:0;
@@ -10663,7 +22442,7 @@ function mkHub() {
       }
 
 
-      #tss-hub-qico[data-open="true"] { color:var(--tss-a,#aebaf3) !important; }
+      #tss-hub-qico[data-open="true"] { color:var(--tss-a,#aebaf3) !important;background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.13) !important; }
       #tss-hub-pip[data-open="true"] { color:var(--tss-a,#aebaf3) !important;border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.44) !important;background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12) !important; }
 
       #tss-hub-reshuffle { color:rgba(255,255,255,.8); }
@@ -10717,7 +22496,7 @@ function mkHub() {
       #tss-hub-sleep:hover { border-color:rgba(255,255,255,0.18); }
       #tss-hub-sleep option { background:#101113; }
 
-      .tss-crossfade-card { padding:0 0 12px; }
+      .tss-crossfade-card { padding:0 0 8px;border-bottom:1px solid rgba(255,255,255,.07); }
       .tss-crossfade-heading { display:flex;align-items:center;justify-content:space-between;color:rgba(255,255,255,.88);font-size:12px;font-weight:600; }
       #tss-hub-crossfade-status { color:rgba(255,255,255,.7);font-size:10px; }
       #tss-hub-crossfade-status[data-status="mixing"] { color:var(--tss-a,#aebaf3); }
@@ -10729,15 +22508,27 @@ function mkHub() {
       }
       #tss-hub-crossfade::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-crossfade-fill,0%),rgba(114,130,165,.18) var(--tss-crossfade-fill,0%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
       #tss-hub-crossfade::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
-      #tss-hub-crossfade:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
+      #tss-hub-crossfade::-moz-range-track { height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18);box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
+      #tss-hub-crossfade::-moz-range-progress { height:3px;border-radius:3px;background:var(--tss-a,#aebaf3); }
+      #tss-hub-crossfade::-moz-range-thumb { box-sizing:border-box;width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-crossfade:focus-visible,#tss-hub-feed-limit:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
+      .tss-feed-limit-card { padding:4px 0 10px;border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:6px; }
+      #tss-hub-feed-limit { width:100%;height:16px;margin:0;appearance:none;background:transparent;cursor:pointer;accent-color:var(--tss-a,#aebaf3); }
+      #tss-hub-feed-limit::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-feed-limit-fill,19.7%),rgba(114,130,165,.18) var(--tss-feed-limit-fill,19.7%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
+      #tss-hub-feed-limit::-webkit-slider-thumb { appearance:none;width:12px;height:12px;margin-top:-4.5px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-feed-limit::-moz-range-track { height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18);box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
+      #tss-hub-feed-limit::-moz-range-progress { height:3px;border-radius:3px;background:var(--tss-a,#aebaf3); }
+      #tss-hub-feed-limit::-moz-range-thumb { box-sizing:border-box;width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
+      #tss-hub-feed-limit-number { -moz-appearance:textfield;appearance:textfield;width:42px;height:22px;padding:0 6px;border:1px solid rgba(204,218,255,.14);border-radius:6px;background:rgba(0,0,0,.2);color:#fff;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;text-align:center;font-variant-numeric:tabular-nums;outline:none; }
+      #tss-hub-feed-limit-number::-webkit-inner-spin-button,#tss-hub-feed-limit-number::-webkit-outer-spin-button { -webkit-appearance:none;margin:0; }
+      #tss-hub-feed-limit-number:focus { border-color:var(--tss-a,#aebaf3); }
       .tss-crossfade-ticks { display:flex;justify-content:space-between;color:rgba(255,255,255,.65);font-size:9px;margin-top:1px; }
-      .tss-crossfade-modes { display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;background:rgba(0,0,0,.04);border-radius:7px;box-shadow:inset 0 1px 3px rgba(0,0,0,.08); }
+      .tss-crossfade-modes { display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:3px;background:rgba(0,0,0,.04);border-radius:7px;box-shadow:inset 0 1px 3px rgba(0,0,0,.08); }
       .tss-crossfade-mode { border:0;border-radius:5px;padding:7px 3px;background:transparent;color:rgba(255,255,255,.7);font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s; }
       .tss-crossfade-mode:hover { color:rgba(255,255,255,.72); }
       .tss-crossfade-mode[data-active="true"] { color:#fff;background:rgba(174,186,243,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 2px 5px rgba(0,0,0,.12); }
       .tss-crossfade-mode:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:1px; }
-      .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:rgba(255,255,255,.7);font-size:10px;cursor:pointer; }
-      .tss-crossfade-manual input { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#aebaf3);cursor:pointer; }
+      .tss-crossfade-manual { display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px;margin-top:8px;color:rgba(255,255,255,.82);font-size:11px;font-weight:500;cursor:pointer; }
       #tss-playback-debug { color:var(--tss-t2,#aaa); }
       #tss-playback-debug:hover { color:var(--tss-t,#eee);background:rgba(255,255,255,.08); }
       #tss-playback-debug:focus-visible { outline:2px solid currentColor;outline-offset:2px; }
@@ -10778,15 +22569,20 @@ function mkHub() {
         --tss-muted:rgba(255,255,255,0.7);
         box-sizing:border-box;
       }
-      #tss-hub-hdr { flex-shrink:0;min-height:34px;cursor:move;padding:11px 13px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px; }
-      .tss-hub-navigation { display:flex;align-items:center;gap:4px;flex-shrink:0; }
-      .tss-hub-navigation .tss-hub-btn-icon { width:32px;min-width:32px;min-height:32px;color:rgba(255,255,255,.88); }
+      #tss-hub *, #tss-hub *::before, #tss-hub *::after { box-sizing:border-box; }
+      #tss-hub-hdr { box-sizing:border-box;width:100%;max-width:100%;min-width:0;margin:0;flex-shrink:0;min-height:53px;cursor:move;touch-action:none;padding:11px 12px 10px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:6px; }
+      .tss-hub-navigation { display:flex;align-items:center;justify-content:flex-end;gap:2px;flex-shrink:0;margin:0;padding:0; }
+      .tss-hub-navigation .tss-hub-btn-icon { box-sizing:border-box;width:32px !important;height:32px !important;min-width:32px !important;max-width:32px !important;min-height:32px !important;max-height:32px !important;margin:0 !important;padding:0 !important;position:static;color:rgba(255,255,255,.88); }
       .tss-hub-navigation .tss-hub-btn-icon svg { width:16px !important;height:16px !important; }
+      #tss-hub-settings .tss-settings-gear-icon,
+      #tss-hub-settings .tss-settings-back-icon { display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0;padding:0;line-height:0; }
       #tss-hub-settings[aria-expanded="false"] .tss-settings-back-icon,
-      #tss-hub-settings[aria-expanded="true"] .tss-settings-gear-icon { display:none; }
-      .tss-deck-brand { display:flex;align-items:center;min-width:0;flex:1; }
-      .tss-deck-brandmark { display:flex;align-items:center;color:rgba(255,255,255,.8); }
-      .tss-deck-brandmark svg { width:17px;height:17px; }
+      #tss-hub-settings[aria-expanded="true"] .tss-settings-gear-icon { display:none !important; }
+      .tss-deck-brand { display:flex;align-items:center;min-width:0;overflow:hidden; }
+      .tss-deck-brandmark { display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex-shrink:0;color:rgba(255,255,255,.86);contain:layout style;transform:translateZ(0);backface-visibility:hidden;transition:color .32s cubic-bezier(.22,1,.36,1); }
+      .tss-deck-brandmark[data-prefade="true"] { color:rgba(255,255,255,.22);transition-duration:.42s; }
+      .tss-deck-brandmark svg { width:16px !important;height:16px !important;display:block;overflow:visible; }
+      #tss-deck-brandmark[data-mixing] #tss-brandmark-paths { stroke:url(#tss-brandmark-grad); }
       .tss-hub-text-button { gap:7px;min-height:32px;padding:0 9px;border-radius:7px;background:rgba(255,255,255,.055);color:rgba(255,255,255,.88);font:600 11px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
       .tss-hub-text-button:hover { background:rgba(255,255,255,.1); }
       #tss-hub-settings[aria-expanded="true"] { color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
@@ -10796,10 +22592,10 @@ function mkHub() {
         color:rgba(255,255,255,0.9);font-size:11px;font-weight:650;
         letter-spacing:0.015em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
       }
-      .tss-deck-brand-slot { display:grid;align-items:center;width:167px;max-width:100%;min-width:0;min-height:32px; }
+      .tss-deck-brand-slot { display:grid;align-items:center;width:100%;max-width:167px;min-width:0;min-height:32px;overflow:hidden; }
       .tss-deck-brand-slot > * { grid-area:1/1; }
       .tss-deck-brand-original { display:flex;align-items:center;gap:8px;min-width:0; }
-      #tss-hub .tss-update-trigger { box-sizing:border-box;display:block;justify-self:start;min-width:0;min-height:30px;max-width:calc(100% - 8px);margin-left:8px;padding:0;border:0;border-radius:0;background:none;color:#d7ddff;font:700 12px/1 -apple-system,'Segoe UI',system-ui,sans-serif;text-align:left;white-space:nowrap;cursor:pointer;visibility:hidden;opacity:0;transform:translateY(100%); }
+      #tss-hub .tss-update-trigger { box-sizing:border-box;display:block;justify-self:start;min-width:0;min-height:30px;max-width:calc(100% - 8px);margin-left:8px;padding:0;border:0;border-radius:0;background:none;color:#d7ddff;font:700 12px/1 -apple-system,'Segoe UI',system-ui,sans-serif;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;visibility:hidden;opacity:0;transform:translateY(100%); }
       #tss-hub .tss-update-trigger:hover { color:#eef0ff; }
       #tss-hub .tss-update-trigger:focus-visible { outline:2px solid #bfc7ff;outline-offset:2px; }
       .tss-deck-brand[data-update] .tss-deck-brand-original { visibility:hidden;opacity:0;transform:translateY(-100%);pointer-events:none; }
@@ -10825,20 +22621,42 @@ function mkHub() {
         display:grid;grid-template-columns:78px minmax(0,1fr);gap:13px;
         align-items:center;padding:5px 14px 12px;
       }
-      #tss-hub-art { width:78px;height:78px;border-radius:13px;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;box-shadow:0 5px 14px rgba(0,0,0,.24); }
+      #tss-hub-art { position:relative;width:78px;height:78px;border-radius:13px;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;box-shadow:0 5px 14px rgba(0,0,0,.24); }
+      .tss-art-track-layer { width:100%;height:100%;display:flex;align-items:center;justify-content:center;transition:opacity .38s cubic-bezier(.22,1,.36,1),transform .38s cubic-bezier(.22,1,.36,1); }
+      .tss-art-dj-layer { position:absolute;inset:0;z-index:2;display:block;opacity:0;transform:scale(.95);pointer-events:none;transition:opacity .38s cubic-bezier(.22,1,.36,1),transform .38s cubic-bezier(.22,1,.36,1); }
+      #tss-hub-art[data-dj-speaking="true"] .tss-art-dj-layer { opacity:1;transform:scale(1); }
+      #tss-hub-art[data-dj-speaking="true"] .tss-art-track-layer { opacity:0;transform:scale(.96); }
+      .tss-art-dj-layer .tss-dj-cover-halo { transform-origin:60px 60px; }
+      .tss-art-dj-layer .tss-dj-cover-bars rect { transform-origin:60px 63px; }
+      @keyframes tssDjSpeakA { 0% { transform:scaleY(.52); } 100% { transform:scaleY(1.18); } }
+      @keyframes tssDjSpeakB { 0% { transform:scaleY(.62); } 100% { transform:scaleY(1.25); } }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-cover-halo { animation:tss-spin 14s linear infinite; }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-bar-1 { animation:tssDjSpeakA .78s ease-in-out infinite alternate; }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-bar-2 { animation:tssDjSpeakB .62s ease-in-out -.18s infinite alternate; }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-bar-3 { animation:tssDjSpeakA .71s ease-in-out -.32s infinite alternate; }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-bar-4 { animation:tssDjSpeakB .56s ease-in-out -.11s infinite alternate; }
+      #tss-hub-art[data-dj-speaking="true"] .tss-dj-bar-5 { animation:tssDjSpeakA .84s ease-in-out -.24s infinite alternate; }
       .tss-deck-track-copy { min-width:0; }
       #tss-hub-title { color:#fff;font-size:15.5px;font-weight:740;letter-spacing:-.02em;line-height:1.2; }
       #tss-hub-artist { font-size:11px;color:rgba(255,255,255,.72);margin-top:5px;line-height:1.3; }
       #tss-hub-title,#tss-hub-artist { overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
       #tss-hub-qpos { margin-left:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:rgba(255,255,255,.72);font-size:10px;font-weight:500;font-variant-numeric:tabular-nums; }
-      .tss-main-queue { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:0 14px 14px; }
+      .tss-main-queue { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:0 14px 14px; }
       #tss-hub-qico { min-width:0;width:100%;flex-shrink:1;justify-content:flex-start;min-height:36px; }
       #tss-hub-reshuffle { min-height:36px; }
+      #tss-hub-dj-toggle[data-active="true"] { color:var(--tss-a,#aebaf3) !important;background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12) !important; }
+      #tss-hub-dj-toggle[data-speaking="true"] { color:#fff !important;background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.24) !important;box-shadow:inset 0 0 0 1px rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.42); }
+      .tss-dj-vibe-btn { display:inline-flex;align-items:center;gap:4px;flex-shrink:0;height:22px;padding:0 8px;border:1px solid rgba(174,186,243,.3);border-radius:999px;background:rgba(174,186,243,.13);color:#f2f5ff;font:650 9.5px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.01em;white-space:nowrap;cursor:pointer;transition:background .15s,border-color .15s,transform .1s; }
+      .tss-dj-vibe-btn:hover:not(:disabled) { background:rgba(174,186,243,.24);border-color:rgba(174,186,243,.5);color:#fff; }
+      .tss-dj-vibe-btn:active:not(:disabled) { transform:scale(.97); }
+      .tss-dj-vibe-btn svg { width:11px!important;height:11px!important;flex-shrink:0; }
+      .tss-dj-vibe-btn[data-switching="true"] svg { animation:tss-spin .8s linear infinite; }
+      :root[data-tss-reduce-visual-effects="true"] .tss-dj-vibe-btn[data-switching="true"] svg { animation:none !important; }
       #tss-hub-actions { padding:0 14px 14px; }
       .tss-deck-timeline { padding:0 14px 1px; }
       #tss-hub-seekbar {
         position:relative;cursor:pointer;margin:0;height:16px;border-radius:2px;
-        background:transparent;overflow:hidden;transform:none;
+        background:transparent;overflow:hidden;transform:none;contain:layout paint style;
       }
       #tss-hub-seekbar:hover { transform:none !important; }
       #tss-hub-prog { position:absolute;left:0;bottom:0;height:1px;background:transparent !important;opacity:0;pointer-events:none; }
@@ -10846,9 +22664,16 @@ function mkHub() {
       .tss-wave-bars i { display:block;flex:1;min-width:1px;height:var(--h);border-radius:2px;background:rgba(255,255,255,.2);transition:background .12s ease,filter .12s ease; }
       .tss-wave-bars i[data-played="true"] { background:var(--tss-a,#aebaf3); }
       .tss-deck-times { display:flex;justify-content:space-between;margin-top:5px;color:rgba(255,255,255,.7);font-size:10px;font-variant-numeric:tabular-nums; }
-      .tss-deck-controls { display:flex;align-items:center;justify-content:center;gap:16px;padding:9px 14px 15px; }
+      .tss-deck-controls { position:relative;display:flex;align-items:center;justify-content:center;gap:16px;padding:9px 14px 15px; }
       .tss-deck-controls .tss-hub-btn-sm { width:40px;height:40px;background:rgba(0,0,0,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 3px 9px rgba(0,0,0,.2);color:rgba(255,255,255,.82); }
       .tss-deck-controls .tss-hub-btn-lg { width:54px;height:54px;box-shadow:0 4px 12px rgba(0,0,0,.25); }
+      #tss-hub-dj-vibe { position:absolute;right:16px;top:50%;transform:translateY(-50%);width:34px;height:34px;border-radius:50%;border:1px solid rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.32);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12);color:var(--tss-a,#aebaf3);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 3px 9px rgba(0,0,0,.2); }
+      #tss-hub-dj-vibe:hover:not(:disabled) { background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.22);border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.55);color:#fff;transform:translateY(-50%) scale(1.04); }
+      #tss-hub-dj-vibe:active:not(:disabled) { transform:translateY(-50%) scale(.96); }
+      #tss-hub-dj-vibe:disabled { opacity:.4;cursor:not-allowed; }
+      #tss-hub-dj-vibe svg { width:14px!important;height:14px!important; }
+      #tss-hub-dj-vibe[data-switching="true"] svg { animation:tss-spin .8s linear infinite; }
+      :root[data-tss-reduce-visual-effects="true"] #tss-hub-dj-vibe[data-switching="true"] svg { animation:none !important; }
       .tss-master-volume { display:grid;grid-template-columns:14px minmax(0,1fr) 31px;align-items:center;gap:9px;margin:-3px 14px 16px;color:rgba(255,255,255,.7); }
       #tss-hub-volume { width:100%;height:18px;margin:0;appearance:none;background:transparent;cursor:pointer; }
       #tss-hub-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-volume-fill,10%),rgba(114,130,165,.18) var(--tss-volume-fill,10%));box-shadow:inset 0 1px 2px rgba(3,4,10,.3); }
@@ -10858,31 +22683,47 @@ function mkHub() {
       #tss-hub-volume::-moz-range-thumb { box-sizing:border-box;width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35);box-shadow:0 1px 5px rgba(0,0,0,.6); }
       #tss-hub-volume:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:4px; }
       #tss-hub-volume-value { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums; }
-      #tss-auto-level { justify-content:space-between; }
-      #tss-auto-level:hover { color:#fff;background:rgba(255,255,255,.1);border-color:#777; }
-      #tss-auto-level[data-active="true"] { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
-      #tss-auto-level:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
-      .tss-hub-btn:focus-visible,#tss-hub-start:focus-visible,#tss-hub-sleep:focus-visible {
-        outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;
+      #tss-auto-level { justify-content:space-between;min-height:34px;padding:6px 0;margin-top:2px;border:0;border-radius:0;background:transparent !important;color:rgba(255,255,255,.82);font-size:11px;font-weight:500; }
+      #tss-auto-level:hover { color:#fff;background:transparent !important; }
+      #tss-auto-level[data-active="true"] { color:#fff;background:transparent !important; }
+      #tss-auto-level .tss-auto-label {
+        display:inline-block;width:31px;height:18px;margin:0;border-radius:999px;
+        background:rgba(0,0,0,.16);border:1px solid rgba(204,218,255,.13);
+        box-shadow:inset 0 1px 3px rgba(2,4,10,.3);position:relative;flex-shrink:0;
+        font-size:0;line-height:0;color:transparent;overflow:hidden;
+        transition:background .18s,border-color .18s;
       }
-      #tss-hub-stop-after {
-        appearance:none;-webkit-appearance:none;width:31px;height:18px;margin:0;
-        border-radius:999px;background:rgba(0,0,0,.12);
-        border:1px solid rgba(204,218,255,.11);box-shadow:inset 0 1px 3px rgba(2,4,10,.3);position:relative;cursor:pointer;
-        transition:background .18s,border-color .18s;vertical-align:middle;
-      }
-      #tss-hub-stop-after::after {
+      #tss-auto-level .tss-auto-label::after {
         content:'';position:absolute;width:12px;height:12px;left:2px;top:2px;border-radius:50%;
         background:rgba(255,255,255,0.72);transition:transform .18s,background .18s;
       }
-      #tss-hub-stop-after:checked {
+      #tss-auto-level[data-active="true"] .tss-auto-label {
         background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.35);
         border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.58);
       }
-      #tss-hub-stop-after:checked::after { transform:translateX(13px);background:#fff; }
-      #tss-hub-stop-after:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
-      #tss-hub [hidden],#tss-sidebar[hidden] { display:none !important; }
-      #tss-hub-body { position:relative;display:flex;flex-direction:column;min-height:0;overflow:hidden; }
+      #tss-auto-level[data-active="true"] .tss-auto-label::after { transform:translateX(13px);background:#fff; }
+      #tss-auto-level:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;border-radius:6px; }
+      .tss-hub-btn:focus-visible,#tss-hub-start:focus-visible,#tss-hub-sleep:focus-visible {
+        outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;
+      }
+      #tss-hub-stop-after,#tss-crossfade-manual,#tss-reduce-visual-effects,#tss-scroll-long-titles,#tss-cf-split,#tss-dj-enabled,#tss-dj-automix,#tss-dj-bass-swap,#tss-dj-cue-trim,#tss-dj-discovery {
+        appearance:none;-webkit-appearance:none;width:31px;height:18px;margin:0;flex-shrink:0;
+        border-radius:999px;background:rgba(0,0,0,.16);
+        border:1px solid rgba(204,218,255,.13);box-shadow:inset 0 1px 3px rgba(2,4,10,.3);position:relative;cursor:pointer;
+        transition:background .18s,border-color .18s;vertical-align:middle;
+      }
+      #tss-hub-stop-after::after,#tss-crossfade-manual::after,#tss-reduce-visual-effects::after,#tss-scroll-long-titles::after,#tss-cf-split::after,#tss-dj-enabled::after,#tss-dj-automix::after,#tss-dj-bass-swap::after,#tss-dj-cue-trim::after,#tss-dj-discovery::after {
+        content:'';position:absolute;width:12px;height:12px;left:2px;top:2px;border-radius:50%;
+        background:rgba(255,255,255,0.72);transition:transform .18s,background .18s;
+      }
+      #tss-hub-stop-after:checked,#tss-crossfade-manual:checked,#tss-reduce-visual-effects:checked,#tss-scroll-long-titles:checked,#tss-cf-split:checked,#tss-dj-enabled:checked,#tss-dj-automix:checked,#tss-dj-bass-swap:checked,#tss-dj-cue-trim:checked,#tss-dj-discovery:checked {
+        background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.35);
+        border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.58);
+      }
+      #tss-hub-stop-after:checked::after,#tss-crossfade-manual:checked::after,#tss-reduce-visual-effects:checked::after,#tss-scroll-long-titles:checked::after,#tss-cf-split:checked::after,#tss-dj-enabled:checked::after,#tss-dj-automix:checked::after,#tss-dj-bass-swap:checked::after,#tss-dj-cue-trim:checked::after,#tss-dj-discovery:checked::after { transform:translateX(13px);background:#fff; }
+      #tss-hub-stop-after:focus-visible,#tss-crossfade-manual:focus-visible,#tss-reduce-visual-effects:focus-visible,#tss-scroll-long-titles:focus-visible,#tss-cf-split:focus-visible,#tss-dj-enabled:focus-visible,#tss-dj-automix:focus-visible,#tss-dj-bass-swap:focus-visible,#tss-dj-cue-trim:focus-visible,#tss-dj-discovery:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      #tss-hub [hidden],#tss-sidebar[hidden],#tss-cf-overlay [hidden],.tss-modal-surface [hidden] { display:none !important; }
+      #tss-hub-body { position:relative;display:flex;flex-direction:column;width:100%;max-width:100%;min-width:0;min-height:0;overflow:hidden;overflow:clip; }
       #tss-hub-main-view,#tss-hub-settings-view {
         min-height:0;flex:0 1 auto;overflow-x:hidden;overflow-y:auto;
         scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:#555b64 transparent;
@@ -10895,8 +22736,63 @@ function mkHub() {
       /* Preserve the tab footprint as viewport space, not artificial scrollable content. */
       #tss-hub-settings-view { box-sizing:border-box;height:384px;padding:2px 14px 14px; }
       #tss-settings-title { margin:0 0 13px;color:#fff;font-size:18px;line-height:1.3;font-weight:650;letter-spacing:-.02em; }
-      .tss-settings-tabs { display:flex;gap:20px;margin-bottom:16px;border-bottom:1px solid rgba(255,255,255,.09); }
-      .tss-settings-tab { display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:0 0 10px;border:0;border-bottom:2px solid transparent;background:transparent;color:rgba(255,255,255,.72);font:600 11px/1.2 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      .tss-settings-tabs { display:flex;gap:14px;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,.09); }
+      .tss-settings-tab { display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:32px;padding:0 0 10px;border:0;border-bottom:2px solid transparent;background:transparent;color:rgba(255,255,255,.72);font:600 11px/1.2 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer; }
+      .tss-settings-tab svg { width:14px;height:14px;flex-shrink:0; }
+      .tss-dj-hero { display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid rgba(204,218,255,.11);border-radius:10px;background:rgba(255,255,255,.028); }
+      .tss-dj-hero-copy { display:grid;gap:2px;min-width:0;cursor:pointer; }
+      .tss-dj-settings-title { display:flex;align-items:center;gap:8px;color:#fff;font-size:12px;font-weight:680; }
+      .tss-dj-hero-sub { margin:0;color:rgba(255,255,255,.58);font-size:9.5px;line-height:1.3; }
+      .tss-dj-hero-right { display:flex;align-items:center;gap:8px;flex-shrink:0; }
+      #tss-dj-status { padding:2px 6px;border-radius:999px;background:rgba(255,255,255,.05);color:rgba(255,255,255,.62);font-size:9.5px;font-weight:650;white-space:nowrap; }
+      #tss-dj-status[data-status="active"] { background:rgba(174,186,243,.14);color:var(--tss-a,#aebaf3); }
+      #tss-dj-status[data-status="loading"] { background:rgba(226,194,117,.14);color:#e2c275; }
+      #tss-dj-status[data-status="fallback"] { background:rgba(211,154,98,.14);color:#d39a62; }
+      #tss-dj-body-wrap { transition:opacity .18s ease; }
+      #tss-dj-body-wrap[data-dj-off="true"] { opacity:.62; }
+      .tss-dj-section-label { display:flex;align-items:center;justify-content:space-between;margin:11px 0 6px;color:rgba(255,255,255,.72);font-size:10px;font-weight:650;letter-spacing:.02em; }
+      .tss-dj-commentary-modes { display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:3px;background:rgba(0,0,0,.14);border:1px solid rgba(204,218,255,.08);border-radius:8px; }
+      .tss-dj-commentary-btn { border:0;border-radius:6px;padding:7px 6px;background:transparent;color:rgba(255,255,255,.72);font:600 10px/1.1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s; }
+      .tss-dj-commentary-btn:hover { color:#fff; }
+      .tss-dj-commentary-btn[data-active="true"] { color:#fff;background:rgba(174,186,243,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 2px 5px rgba(0,0,0,.15); }
+      .tss-dj-voice-card { margin-top:8px;padding:9px 10px;border:1px solid rgba(174,186,243,.14);border-radius:9px;background:rgba(174,186,243,.045); }
+      .tss-dj-voice-row { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center; }
+      .tss-dj-voice-freq-row,.tss-dj-voice-model-row { display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;margin-top:7px;color:rgba(255,255,255,.72);font-size:10px; }
+      #tss-dj-voice-select,#tss-dj-voice-model,#tss-dj-talk-freq { width:100%;min-width:0;height:28px;padding:0 7px;border:1px solid rgba(204,218,255,.14);border-radius:7px;background:rgba(8,10,16,.65);color:#eef2ff;font:600 10.5px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;outline:none; }
+      #tss-dj-voice-select option,#tss-dj-voice-model option,#tss-dj-talk-freq option { background:#101219;color:#eef2ff; }
+      #tss-dj-voice-test { height:28px;padding:0 9px;border:1px solid rgba(174,186,243,.28);border-radius:7px;background:rgba(174,186,243,.12);color:#eef2ff;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;white-space:nowrap;cursor:pointer; }
+      #tss-dj-voice-test:hover:not(:disabled) { background:rgba(174,186,243,.22);border-color:rgba(174,186,243,.45); }
+      .tss-dj-voice-vol-row { display:grid;grid-template-columns:auto minmax(0,1fr) 32px;gap:8px;align-items:center;margin-top:8px;color:rgba(255,255,255,.72);font-size:10px; }
+      #tss-dj-voice-volume { width:100%;height:16px;margin:0;appearance:none;background:transparent;cursor:pointer;accent-color:var(--tss-a,#aebaf3); }
+      #tss-dj-voice-volume::-webkit-slider-runnable-track { height:3px;border-radius:3px;background:linear-gradient(90deg,var(--tss-a,#aebaf3) var(--tss-dj-vol-fill,90%),rgba(114,130,165,.18) var(--tss-dj-vol-fill,90%)); }
+      #tss-dj-voice-volume::-webkit-slider-thumb { appearance:none;width:11px;height:11px;margin-top:-4px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35); }
+      #tss-dj-voice-volume::-moz-range-track { height:3px;border:0;border-radius:3px;background:rgba(114,130,165,.18); }
+      #tss-dj-voice-volume::-moz-range-progress { height:3px;border-radius:3px;background:var(--tss-a,#aebaf3); }
+      #tss-dj-voice-volume::-moz-range-thumb { box-sizing:border-box;width:11px;height:11px;border-radius:50%;background:#fff;border:2px solid rgba(0,0,0,.35); }
+      #tss-dj-voice-volume-value { text-align:right;font-variant-numeric:tabular-nums;color:rgba(255,255,255,.78);font-weight:600; }
+      .tss-dj-progress-wrap { height:4px;margin-top:8px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden; }
+      .tss-dj-progress-fill { height:100%;width:8%;border-radius:999px;background:var(--tss-a,#aebaf3);transition:width .2s ease; }
+      .tss-dj-model-note { margin:6px 0 0;color:rgba(255,255,255,.6);font-size:9.5px;line-height:1.38; }
+      .tss-dj-focus-pills { display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px; }
+      .tss-dj-focus-pill { height:28px;padding:0 6px;border:1px solid rgba(204,218,255,.11);border-radius:7px;background:rgba(0,0,0,.14);color:rgba(255,255,255,.74);font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .15s,border-color .15s,color .15s; }
+      .tss-dj-focus-pill:hover { color:#fff;border-color:rgba(204,218,255,.24); }
+      .tss-dj-focus-pill[data-active="true"] { color:#fff;border-color:rgba(174,186,243,.52);background:rgba(174,186,243,.16); }
+      .tss-dj-advanced { margin-top:10px;border:1px solid rgba(204,218,255,.1);border-radius:9px;background:rgba(0,0,0,.14);overflow:hidden; }
+      .tss-dj-advanced-inline { margin-top:8px;border-color:rgba(174,186,243,.14);background:rgba(0,0,0,.18); }
+      .tss-dj-adv-summary { list-style:none;display:flex;align-items:center;gap:6px;padding:8px 10px;color:rgba(255,255,255,.82);font:600 10.5px/1.2 -apple-system,'Segoe UI',system-ui,sans-serif;cursor:pointer;user-select:none; }
+      .tss-dj-adv-summary::-webkit-details-marker { display:none; }
+      .tss-dj-adv-summary::before { content:'';width:5px;height:5px;border-right:1.5px solid rgba(255,255,255,.55);border-bottom:1.5px solid rgba(255,255,255,.55);transform:rotate(-45deg);transition:transform .16s ease;flex-shrink:0;margin-right:2px; }
+      .tss-dj-advanced[open] > .tss-dj-adv-summary::before { transform:rotate(45deg); }
+      .tss-dj-adv-summary:hover { color:#fff;background:rgba(255,255,255,.03); }
+      .tss-dj-adv-summary:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:-2px;border-radius:8px; }
+      .tss-dj-adv-badge { margin-left:auto;padding:2px 6px;border-radius:999px;background:rgba(174,186,243,.12);color:rgba(226,233,255,.84);font-size:9px;font-weight:650;font-variant-numeric:tabular-nums; }
+      .tss-dj-adv-badge[data-loading="true"] { background:rgba(226,194,117,.16);color:#e2c275; }
+      .tss-dj-adv-body { padding:2px 10px 9px;border-top:1px solid rgba(255,255,255,.06); }
+      .tss-dj-toggle-item { display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer; }
+      .tss-dj-toggle-item:last-child { border-bottom:0;padding-bottom:1px; }
+      .tss-dj-toggle-copy { display:grid;gap:2px;min-width:0; }
+      .tss-dj-toggle-copy strong { color:rgba(255,255,255,.9);font-size:10.5px;font-weight:600;line-height:1.25; }
+      .tss-dj-toggle-copy small { color:rgba(255,255,255,.56);font-size:9.5px;line-height:1.3; }
       .tss-settings-tab:hover { color:#fff; }
       .tss-settings-tab[aria-selected="true"] { color:var(--tss-a,#aebaf3);border-bottom-color:var(--tss-a,#aebaf3); }
       .tss-settings-tab:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:3px;border-radius:2px; }
@@ -10906,7 +22802,6 @@ function mkHub() {
       .tss-settings-action svg { width:16px;height:16px;flex-shrink:0; }
       .tss-settings-action:focus-visible,.tss-settings-row input:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
       .tss-settings-row { display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:36px;color:rgba(255,255,255,.8);font-size:11px;cursor:pointer; }
-      #tss-reduce-visual-effects,#tss-scroll-long-titles { width:13px;height:13px;margin:0;accent-color:var(--tss-a,#aebaf3);cursor:pointer; }
       #tss-visual-effects-help,#tss-scroll-long-titles-help { margin:0 0 10px;color:rgba(255,255,255,.7);font-size:10px;line-height:1.5; }
       #tss-hub-sleep { font-size:11px;padding:6px 8px;max-width:120px; }
       #tss-hub-sleep-display { display:block;color:var(--tss-a,#aebaf3);font-size:10px;text-align:right;font-variant-numeric:tabular-nums; }
@@ -10914,13 +22809,40 @@ function mkHub() {
       #tss-settings-session-action { margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,.09); }
       #tss-hub-start { min-height:42px;border-radius:9px;letter-spacing:0;font-size:11px; }
       #tss-hub-start[data-active="true"]:hover { color:rgba(255,255,255,.9);border-color:rgba(255,255,255,.25); }
+      #tss-hub[data-mini="true"] { width:min(304px,calc(100vw - 24px)) !important;min-width:0; }
+      #tss-hub[data-mini="true"] #tss-hub-hdr { min-height:46px;padding:9px 10px 8px; }
+      #tss-hub[data-mini="true"] .tss-hub-navigation .tss-hub-btn-icon { width:28px !important;height:28px !important;min-width:28px !important;max-width:28px !important;min-height:28px !important;max-height:28px !important; }
       #tss-hub[data-mini="true"][data-view="main"] .tss-deck-track,
       #tss-hub[data-mini="true"][data-view="main"] .tss-deck-timeline,
       #tss-hub[data-mini="true"][data-view="main"] .tss-master-volume { display:none; }
-      #tss-hub[data-mini="true"] .tss-deck-controls { padding:3px 14px 12px;gap:18px; }
-      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-lg { width:42px;height:42px; }
-      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-sm { width:34px;height:34px; }
+      #tss-hub[data-mini="true"][data-idle="true"] .tss-main-queue { display:none; }
+      #tss-hub[data-mini="true"] .tss-deck-controls { padding:3px 12px 10px;gap:14px; }
+      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-lg { width:40px;height:40px; }
+      #tss-hub[data-mini="true"] .tss-deck-controls .tss-hub-btn-sm { width:32px;height:32px; }
+      #tss-hub[data-mini="true"] #tss-hub-dj-vibe { width:28px;height:28px;right:12px; }
       #tss-hub[data-mini="true"] .tss-main-queue { padding-bottom:10px; }
+      #tss-hub[data-collapsed="true"]:not([data-collapse-motion="collapsing"]) { width:auto !important;min-width:0 !important;max-width:none !important;height:auto !important;min-height:0 !important;border-radius:999px !important;padding:0 !important;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 0 0 1px rgba(255,255,255,.025),inset 0 -1px 0 rgba(0,0,0,.16),0 1px 2px rgba(0,0,0,.40),0 4px 9px rgba(0,0,0,.26),0 12px 24px rgba(0,0,0,.24) !important; }
+      #tss-hub[data-collapsed="true"]:not([data-collapse-motion="collapsing"]) #tss-hub-inner { width:auto !important;min-width:0 !important;padding:0 !important;overflow:visible !important; }
+      #tss-hub[data-collapsed="true"]:not([data-collapse-motion="collapsing"]) #tss-hub-hdr { width:auto !important;min-height:0 !important;padding:0 !important;display:flex !important;align-items:center;column-gap:0 !important; }
+      #tss-hub[data-collapsed="true"]:not([data-collapse-motion="collapsing"]) #tss-hub-hdr > :not(#tss-hub-restore),
+      #tss-hub[data-collapsed="true"]:not([data-collapse-motion="collapsing"]) #tss-hub-inner > :not(#tss-hub-hdr) { display:none !important; }
+      #tss-hub-restore { display:none;align-items:center;gap:6px;height:32px;padding:0 11px 0 9px;border:0;border-radius:999px;background:transparent;color:rgba(255,255,255,.92);font:600 11.5px/1 system-ui,-apple-system,sans-serif;letter-spacing:-.01em;cursor:pointer;touch-action:none;white-space:nowrap; }
+      #tss-hub-restore:hover { color:#fff;background:rgba(255,255,255,.08); }
+      #tss-hub-restore:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      #tss-hub[data-collapsed="true"] #tss-hub-restore { display:inline-flex; }
+      #tss-hub[data-collapsed="true"][data-idle="false"] #tss-hub-restore { color:var(--tss-a,#aebaf3); }
+      #tss-hub[data-dragging="true"],#tss-hub[data-dragging="true"] #tss-hub-hdr,#tss-hub[data-dragging="true"] #tss-hub-restore { cursor:grabbing !important; }
+      #tss-hub[data-dragging="true"] #tss-hub-restore { background:rgba(255,255,255,.10); }
+      #tss-hub[data-collapse-motion="collapsing"] { pointer-events:none; }
+      #tss-hub[data-collapse-motion="collapsing"] #tss-hub-restore { display:none !important; }
+      .tss-queue-num[data-editable="true"] { position:relative;cursor:pointer;min-width:34px;min-height:28px;padding:0 7px;margin:-3px -4px -3px 0;border:1px solid transparent;border-radius:7px;transition:background .14s,border-color .14s,color .14s;font-variant-numeric:tabular-nums;box-sizing:border-box; }
+      .tss-queue-num[data-editable="true"]::before { content:'';position:absolute;inset:-10px -8px; }
+      .tss-queue-row:hover .tss-queue-num[data-editable="true"]:not([data-editing="true"]) { background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.11);color:rgba(255,255,255,.92) !important; }
+      .tss-queue-num[data-editable="true"]:not([data-editing="true"]):hover,
+      .tss-queue-num[data-editable="true"]:not([data-editing="true"]):focus-visible { background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.16) !important;border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.46) !important;color:#fff !important;outline:none; }
+      .tss-queue-num[data-editing="true"] { padding:0 !important;background:transparent !important;border-color:transparent !important; }
+      .tss-slot-input { width:40px;height:24px;padding:0 4px;border:1.5px solid var(--tss-a,#aebaf3);border-radius:6px;background:rgba(12,13,18,.96);color:#fff;font:600 11px/1 system-ui,-apple-system,sans-serif;text-align:center;font-variant-numeric:tabular-nums;outline:none;box-sizing:border-box;-webkit-user-select:text !important;user-select:text !important;-moz-appearance:textfield;appearance:textfield; }
+      .tss-slot-input::-webkit-outer-spin-button,.tss-slot-input::-webkit-inner-spin-button { -webkit-appearance:none;margin:0; }
       #tss-hub[data-queue-view="true"] #tss-hub-main-view,
       #tss-hub[data-queue-view="true"] #tss-hub-settings-view { display:none !important; }
       #tss-hub-queue-space { height:min(420px,calc(100dvh - 180px)); }
@@ -10969,17 +22891,30 @@ function mkHub() {
       .tss-side-searchicon { position:absolute;left:11px;top:50%;transform:translateY(-50%);color:rgba(255,255,255,.65);pointer-events:none;display:flex; }
       #tss-search { width:100% !important;box-sizing:border-box !important;background:var(--tss-glass-inset) !important;border:1px solid rgba(204,218,255,.10) !important;border-radius:9px !important;color:#dedede !important;font-size:11px !important;padding:9px 11px !important;outline:none !important;font-family:-apple-system,'Segoe UI',system-ui,sans-serif !important;transition:border-color .18s,background .18s !important; }
       #tss-search:focus { border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.75) !important;background:rgba(255,255,255,.06) !important;outline:2px solid #d9dfe7 !important;outline-offset:2px; }
-      .tss-queue-row { border-bottom:1px solid rgba(255,255,255,.055); }
+      .tss-queue-row { border-bottom:1px solid rgba(255,255,255,.055);contain:layout paint style; }
       .tss-queue-handle { color:rgba(255,255,255,.18);font-size:14px;letter-spacing:-2px;width:10px;overflow:hidden;flex-shrink:0; }
       .tss-queue-status { border-radius:5px;padding:3px 7px;font-size:8px;font-weight:750;letter-spacing:.07em;text-transform:uppercase;flex-shrink:0; }
-      #tss-sidebar[data-side="left"] { border-radius:16px 0 0 16px !important; }
-      #tss-sidebar[data-side="right"] { border-radius:0 16px 16px 0 !important; }
+      #tss-sidebar[data-side="left"] { border-radius:16px 0 0 16px; }
+      #tss-sidebar[data-side="left"][data-taller="true"] { border-radius:16px 16px 0 16px; }
+      #tss-sidebar[data-side="right"] { border-radius:0 16px 16px 0; }
+      #tss-sidebar[data-side="right"][data-taller="true"] { border-radius:16px 16px 16px 0; }
+      #tss-hub:not([data-collapsed="true"]):not([data-collapse-motion]) { transition:border-radius .16s cubic-bezier(.16,1,.3,1); }
+      #tss-hub:is([data-collapsed="true"],[data-collapse-motion]) { transition:none !important; }
+      :root:not([data-tss-reduce-visual-effects="true"]) #tss-hub[data-collapse-motion] { will-change:transform,opacity; }
       #tss-hub[data-sidebar-side="right"] { border-radius:18px 0 0 18px !important; }
       #tss-hub[data-sidebar-side="left"] { border-radius:0 18px 18px 0 !important; }
+      #tss-hub:not([data-collapsed="true"])[data-sidebar-side="right"] { clip-path:polygon(-120px -120px,calc(100% + 120px) -120px,calc(100% + 120px) var(--tss-dock-top,0px),100% var(--tss-dock-top,0px),100% 100%,calc(100% + 120px) 100%,calc(100% + 120px) calc(100% + 120px),-120px calc(100% + 120px)); }
+      #tss-hub:not([data-collapsed="true"])[data-sidebar-side="left"] { clip-path:polygon(-120px -120px,calc(100% + 120px) -120px,calc(100% + 120px) calc(100% + 120px),-120px calc(100% + 120px),-120px 100%,0% 100%,0% var(--tss-dock-top,0px),-120px var(--tss-dock-top,0px)); }
+      #tss-sidebar[data-layout="docked"][data-side="right"]:not([data-motion="entering"]):not([data-motion="exiting"]) { clip-path:polygon(-120px -120px,calc(100% + 120px) -120px,calc(100% + 120px) calc(100% + 120px),-120px calc(100% + 120px),-120px 100%,0% 100%,0% var(--tss-dock-top,0px),-120px var(--tss-dock-top,0px)); }
+      #tss-sidebar[data-layout="docked"][data-side="left"]:not([data-motion="entering"]):not([data-motion="exiting"]) { clip-path:polygon(-120px -120px,calc(100% + 120px) -120px,calc(100% + 120px) var(--tss-dock-top,0px),100% var(--tss-dock-top,0px),100% 100%,calc(100% + 120px) 100%,calc(100% + 120px) calc(100% + 120px),-120px calc(100% + 120px)); }
+      #tss-sidebar[data-layout="docked"][data-side="right"]:not([data-taller="true"]) { border-left-color:transparent !important; }
+      #tss-sidebar[data-layout="docked"][data-side="left"]:not([data-taller="true"]) { border-right-color:transparent !important; }
       #tss-sidebar[data-open="false"] { pointer-events:none; }
       /* Docked glass unfolds behind the player; the narrow replacement stays above it. */
       #tss-sidebar { box-sizing:border-box;z-index:99993; }
-      #tss-sidebar-content { position:relative;display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden; }
+      :root:not([data-tss-reduce-visual-effects="true"]) #tss-sidebar:is([data-motion="entering"],[data-motion="exiting"]) { will-change:transform,clip-path; }
+      :root:not([data-tss-reduce-visual-effects="true"]) #tss-sidebar:is([data-motion="entering"],[data-motion="exiting"]) #tss-sidebar-content { will-change:opacity; }
+      #tss-sidebar-content { position:relative;display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden;contain:layout paint style; }
       #tss-sidebar-list { flex:1;min-height:0; }
       .tss-sidebar-resize {
         position:absolute;top:0;bottom:0;width:10px;padding:0;border:0;background:transparent;
@@ -11006,10 +22941,14 @@ function mkHub() {
         width:54px;background:var(--tss-a,#aebaf3);
       }
 
-      #tss-hub-eq[data-active="true"] { color:#fff !important;border-color:var(--tss-a,#aebaf3) !important;background:rgba(174,186,243,.12) !important; }
-      #tss-modal-backdrop { position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.04);animation:tss-backdrop-in .18s ease-out; }
-      @keyframes tss-backdrop-in { from { opacity:0; } to { opacity:1; } }
-      #tss-eq-overlay {
+      #tss-hub-eq { margin-top:8px;justify-content:center;border:1px solid rgba(204,218,255,.12);border-radius:9px;background:rgba(255,255,255,.04);color:rgba(255,255,255,.86);font-weight:600; }
+      #tss-hub-eq:hover { background:rgba(255,255,255,.085);border-color:rgba(204,218,255,.22);color:#fff; }
+      #tss-hub-eq[data-active="true"] { color:#fff !important;border-color:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.44) !important;background:rgba(174,186,243,.12) !important; }
+      #tss-modal-backdrop,.tss-modal-backdrop { position:fixed;inset:0;z-index:999998;background:rgba(4,6,12,.44);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px); }
+      :root[data-tss-reduce-visual-effects="true"] #tss-modal-backdrop,:root[data-tss-reduce-visual-effects="true"] .tss-modal-backdrop { background:rgba(4,6,12,.64);-webkit-backdrop-filter:none!important;backdrop-filter:none!important; }
+      [data-modal-animating="true"],[data-modal-closing="true"] { will-change:transform,opacity; }
+      :root[data-tss-reduce-visual-effects="true"] :is(.tss-cf-point-visible,.tss-eq-point-visible) { filter:none!important; }
+      #tss-eq-overlay,#tss-cf-overlay,.tss-modal-surface {
         position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;
         width:560px;max-width:calc(100vw - 28px);box-sizing:border-box;color:#eee;
         max-height:calc(100dvh - 28px);overflow-y:auto;
@@ -11022,12 +22961,14 @@ function mkHub() {
       .tss-eq-kicker { color:var(--tss-a,#aebaf3);font-size:8px;font-weight:760;letter-spacing:.13em;text-transform:uppercase; }
       .tss-eq-title { margin-top:4px;color:#f3f3f3;font-size:17px;font-weight:680;letter-spacing:-.02em; }
       .tss-eq-head-actions { display:flex;align-items:center;gap:7px; }
-      #tss-eq-power { height:32px;padding:0 10px;border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.04);color:#c8cdd4;cursor:pointer;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
-      #tss-eq-power[data-active="true"] { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
-      #tss-eq-power:focus-visible,.tss-eq-preset:focus-visible,.tss-eq-point-hit:focus-visible,#tss-eq-reset:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
+      #tss-eq-power,#tss-cf-preview { height:32px;padding:0 11px;border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.04);color:#c8cdd4;cursor:pointer;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-power:hover,#tss-cf-preview:hover { color:#fff;border-color:rgba(255,255,255,.28);background:rgba(255,255,255,.075); }
+      #tss-eq-power[data-active="true"],#tss-cf-preview[data-active="true"] { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.12); }
+      #tss-eq-power:focus-visible,#tss-cf-preview:focus-visible,.tss-eq-preset:focus-visible,.tss-eq-point-hit:focus-visible,.tss-cf-point-hit:focus-visible,#tss-eq-reset:focus-visible,#tss-cf-reset:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px; }
       .tss-eq-body { position:relative;padding:15px 18px 16px; }
       .tss-eq-presets { display:flex;gap:7px;overflow-x:auto;padding:1px 1px 12px;scrollbar-width:none; }
       .tss-eq-presets::-webkit-scrollbar { display:none; }
+      .tss-cf-presets { flex-wrap:wrap;overflow-x:visible;row-gap:6px; }
       .tss-eq-preset { flex:0 0 auto;height:30px;padding:0 11px;border:1px solid rgba(204,218,255,.12);border-radius:8px;background:var(--tss-glass-inset);color:rgba(255,255,255,.75);cursor:pointer;font:600 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;transition:color .18s,border-color .18s,background .18s; }
       .tss-eq-preset:hover { color:#fff;border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.07); }
       .tss-eq-preset[data-active="true"] { color:#fff;border-color:rgba(174,186,243,.7);background:rgba(174,186,243,.12); }
@@ -11035,24 +22976,40 @@ function mkHub() {
       .tss-eq-custom-preset .tss-eq-preset { border-radius:8px 0 0 8px;border-right:0; }
       .tss-eq-preset-remove { width:25px;height:30px;padding:0;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.1);border-radius:0 8px 8px 0;background:rgba(255,255,255,.035);color:rgba(255,255,255,.3);cursor:pointer;transition:color .18s,border-color .18s,background .18s; }
       .tss-eq-preset-remove:hover { color:#ff9292;border-color:rgba(255,74,74,.4);background:rgba(255,74,74,.1); }
-      #tss-eq-save-open { flex:0 0 auto;height:30px;padding:0 11px;border:1px dashed rgba(255,255,255,.2);border-radius:8px;background:transparent;color:rgba(255,255,255,.48);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
-      #tss-eq-save-open:hover { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.08); }
-      #tss-eq-save-row { display:none;grid-template-columns:minmax(0,1fr) auto 30px;align-items:end;gap:7px;margin:-2px 1px 12px;padding:10px;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:var(--tss-glass-inset); }
-      #tss-eq-save-row[data-open="true"] { display:grid; }
+      #tss-eq-save-open,#tss-cf-save-open { flex:0 0 auto;height:30px;padding:0 11px;border:1px dashed rgba(255,255,255,.2);border-radius:8px;background:transparent;color:rgba(255,255,255,.48);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-save-open:hover,#tss-cf-save-open:hover { color:#fff;border-color:var(--tss-a,#aebaf3);background:rgba(174,186,243,.08); }
+      #tss-eq-save-row,#tss-cf-save-row { display:none;grid-template-columns:minmax(0,1fr) auto 30px;align-items:end;gap:7px;margin:-2px 1px 12px;padding:10px;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:var(--tss-glass-inset); }
+      #tss-eq-save-row[data-open="true"],#tss-cf-save-row[data-open="true"] { display:grid; }
       .tss-eq-save-field { display:grid;gap:5px;min-width:0; }
       .tss-eq-save-field span { color:rgba(255,255,255,.72);font-size:10px;font-weight:600;letter-spacing:.02em; }
-      #tss-eq-save-name { width:100%;height:31px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:rgba(0,0,0,.08);color:#eee;outline:none;font:500 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
-      #tss-eq-save-name:focus { border-color:var(--tss-a,#aebaf3);box-shadow:0 0 0 2px rgba(174,186,243,.12); }
-      #tss-eq-save-confirm,#tss-eq-save-cancel { height:31px;border:1px solid rgba(255,255,255,.13);border-radius:7px;cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
-      #tss-eq-save-confirm { padding:0 12px;background:var(--tss-a,#aebaf3);border-color:var(--tss-a,#aebaf3);color:#101522; }
-      #tss-eq-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.045);color:rgba(255,255,255,.5); }
-      #tss-eq-save-error { grid-column:1/-1;min-height:0;color:#ff805f;font-size:8px; }
+      #tss-eq-save-name,#tss-cf-save-name { width:100%;height:31px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:rgba(0,0,0,.08);color:#eee;outline:none;font:500 10px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-eq-save-name:focus,#tss-cf-save-name:focus { border-color:var(--tss-a,#aebaf3);box-shadow:0 0 0 2px rgba(174,186,243,.12); }
+      #tss-eq-save-confirm,#tss-eq-save-cancel,#tss-cf-save-confirm,#tss-cf-save-cancel { height:31px;border:1px solid rgba(255,255,255,.13);border-radius:7px;cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif; }
+      #tss-eq-save-confirm,#tss-cf-save-confirm { padding:0 12px;background:var(--tss-a,#aebaf3);border-color:var(--tss-a,#aebaf3);color:#101522; }
+      #tss-eq-save-cancel,#tss-cf-save-cancel { width:30px;padding:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.045);color:rgba(255,255,255,.5); }
+      #tss-eq-save-error,#tss-cf-save-error { grid-column:1/-1;min-height:0;color:#ff805f;font-size:8px; }
       .tss-eq-graph-wrap { border-top:1px solid rgba(255,255,255,.055);border-bottom:1px solid rgba(255,255,255,.055);padding:4px 0 1px;background:var(--tss-glass-inset); }
+      .tss-cf-legend { display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 2px 9px;font-size:10px;color:rgba(255,255,255,.74); }
+      .tss-cf-legend-items { display:flex;align-items:center;gap:14px;flex-wrap:wrap; }
+      .tss-cf-legend-item { display:inline-flex;align-items:center;gap:6px;font-weight:600;letter-spacing:.01em; }
+      .tss-cf-legend-item i { width:9px;height:3px;border-radius:99px;display:inline-block; }
+      .tss-cf-legend-out i { background:rgba(229,236,251,.78); }
+      .tss-cf-legend-in i { background:var(--tss-a,#aebaf3); }
+      .tss-cf-readout { color:rgba(255,255,255,.68);font-size:9.5px;font-weight:600;font-variant-numeric:tabular-nums; }
+      .tss-cf-tangent { stroke-width:1.35;stroke-dasharray:3 3;pointer-events:none; }
+      .tss-cf-tangent-in { stroke:rgba(174,186,243,.52); }
+      .tss-cf-tangent-out { stroke:rgba(229,236,251,.4); }
+      .tss-cf-point-visible { stroke-width:2.25;filter:drop-shadow(0 2px 4px rgba(0,0,0,.8));pointer-events:none; }
+      .tss-cf-point-in { fill:var(--tss-a,#aebaf3);stroke:#fff; }
+      .tss-cf-point-out { fill:#161a24;stroke:rgba(229,236,251,.92); }
+      .tss-cf-point-hit { fill:transparent;stroke:transparent;cursor:grab;pointer-events:all;touch-action:none; }
+      .tss-cf-point-hit:active { cursor:grabbing; }
+      .tss-cf-point-visible:has(+ .tss-cf-point-hit:hover),.tss-cf-point-visible:has(+ .tss-cf-point-hit:focus-visible) { fill:#fff; }
       .tss-eq-safety { display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px 2px 0;color:#ddd;cursor:pointer; }
       .tss-eq-safety span { display:grid;gap:3px; }
       .tss-eq-safety strong { font-size:10px;font-weight:750; }
       .tss-eq-safety small { color:rgba(255,255,255,.72);font-size:10px;line-height:1.45; }
-      .tss-eq-safety input { width:15px;height:15px;flex:0 0 auto;accent-color:var(--tss-a,#aebaf3); }
+      .tss-eq-safety input:not(#tss-cf-split) { width:15px;height:15px;flex:0 0 auto;accent-color:var(--tss-a,#aebaf3); }
       .tss-eq-graph { display:block;width:100%;height:auto;overflow:visible;touch-action:none; }
       .tss-eq-grid line { stroke:rgba(255,255,255,.105);stroke-width:1;stroke-dasharray:3 4; }
       .tss-eq-grid .tss-eq-zero { stroke:rgba(255,255,255,.28);stroke-dasharray:none; }
@@ -11063,11 +23020,11 @@ function mkHub() {
       .tss-eq-frequency { fill:rgba(255,255,255,.74);font-size:10px;font-weight:600;pointer-events:none; }
       .tss-eq-axis-label { fill:rgba(255,255,255,.7);font-size:9px;font-weight:600;pointer-events:none; }
       .tss-eq-footer { display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:11px;color:rgba(255,255,255,.72);font-size:10px;font-weight:500;letter-spacing:.01em; }
-      #tss-eq-reset { height:30px;padding:0 13px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:transparent;color:rgba(255,255,255,.68);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
-      #tss-eq-reset:hover { color:#fff;border-color:rgba(255,255,255,.34);background:rgba(255,255,255,.055); }
-      @media (max-width:520px) { #tss-eq-overlay { width:calc(100vw - 20px); } .tss-eq-body { padding-inline:10px; } .tss-eq-head { padding-inline:12px; } .tss-eq-preset { padding-inline:9px; } }
+      #tss-eq-reset,#tss-cf-reset { height:30px;padding:0 13px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:transparent;color:rgba(255,255,255,.68);cursor:pointer;font:700 9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s,border-color .18s,background .18s; }
+      #tss-eq-reset:hover,#tss-cf-reset:hover { color:#fff;border-color:rgba(255,255,255,.34);background:rgba(255,255,255,.055); }
+      @media (max-width:520px) { #tss-eq-overlay,#tss-cf-overlay,.tss-modal-surface { width:calc(100vw - 20px); } .tss-eq-body { padding-inline:10px; } .tss-eq-head { padding-inline:12px; } .tss-eq-preset { padding-inline:9px; } }
 
-      #tss-stats-overlay {
+      #tss-stats-overlay,.tss-stats-surface {
         color:#eeeeee;background:var(--tss-glass-surface,#080b12) !important;
         border:1px solid var(--tss-glass-rim) !important;border-radius:16px !important;
         box-shadow:var(--tss-glass-shadow) !important;
@@ -11103,19 +23060,23 @@ function mkHub() {
       .tss-stats-reset { width:100%;margin-top:15px;border:0;background:transparent;color:rgba(255,255,255,.7);padding:7px;cursor:pointer;font-size:10px;font-family:-apple-system,'Segoe UI',system-ui,sans-serif;transition:color .18s; }
       .tss-stats-reset:hover { color:rgba(255,255,255,.62); }
       .tss-stats-reset:focus-visible { outline:2px solid var(--tss-a,#aebaf3);outline-offset:2px;border-radius:6px; }
-      #tss-sidebar button:focus-visible,#tss-eq-overlay button:focus-visible,#tss-stats-overlay button:focus-visible,.tss-debug-dialog button:focus-visible {
+      #tss-sidebar button:focus-visible,#tss-eq-overlay button:focus-visible,#tss-cf-overlay button:focus-visible,#tss-stats-overlay button:focus-visible,.tss-debug-dialog button:focus-visible {
         outline:2px solid #d9dfe7;outline-offset:2px;
       }
-      #tss-hub button:disabled,#tss-sidebar button:disabled,#tss-eq-overlay button:disabled { opacity:.5;cursor:not-allowed; }
-      #tss-search::placeholder,#tss-eq-save-name::placeholder { color:#aeb5bf;opacity:1; }
-      #tss-hub ::selection,#tss-sidebar ::selection,#tss-eq-overlay ::selection { background:rgba(174,186,243,.3);color:#fff; }
+      #tss-hub button:disabled,#tss-sidebar button:disabled,#tss-eq-overlay button:disabled,#tss-cf-overlay button:disabled { opacity:.5;cursor:not-allowed; }
+      #tss-search::placeholder,#tss-eq-save-name::placeholder,#tss-cf-save-name::placeholder { color:#aeb5bf;opacity:1; }
+      #tss-hub ::selection,#tss-sidebar ::selection,#tss-eq-overlay ::selection,#tss-cf-overlay ::selection { background:rgba(174,186,243,.3);color:#fff; }
       #tss-sidebar-list { scrollbar-color:#555b64 transparent; }
       @media (max-width:360px) {
-        #tss-hub-hdr { gap:6px;padding-left:10px;padding-right:10px; }
+        #tss-hub-hdr { column-gap:6px;padding-left:10px;padding-right:10px; }
+        .tss-hub-navigation { gap:2px; }
+        .tss-hub-navigation .tss-hub-btn-icon { width:28px !important;height:28px !important;min-width:28px !important;max-width:28px !important;min-height:28px !important;max-height:28px !important; }
         .tss-deck-brandmark { display:none; }
         .tss-deck-label { font-size:10px; }
         #tss-hub .tss-update-trigger { font-size:11px; }
         .tss-eq-footer { flex-wrap:wrap; }
+        .tss-settings-tabs { gap:10px; }
+        .tss-hub-text-button { padding:0 7px;gap:5px; }
       }
       @media (prefers-reduced-motion:reduce) {
         #tss-hub *,#tss-sidebar * { animation-duration:0.01ms !important;transition-duration:0.01ms !important;scroll-behavior:auto !important; }
@@ -11130,7 +23091,7 @@ function mkHub() {
     position:fixed; bottom:80px; left:20px; width:min(330px,calc(100vw - 24px));
     background:var(--tss-glass-surface,#080b12); border:1px solid var(--tss-glass-rim,rgba(183,199,232,.12));
     border-radius:18px; z-index:99994;
-    overflow:hidden; -webkit-user-select:none; user-select:none;
+    overflow:hidden; overflow:clip; -webkit-user-select:none; user-select:none;
     box-shadow:var(--tss-glass-shadow);
     -webkit-backdrop-filter:var(--tss-glass-filter,none);backdrop-filter:var(--tss-glass-filter,none);
     font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
@@ -11140,15 +23101,20 @@ function mkHub() {
 
   hub.dataset.view = 'main';
   hub.dataset.mini = 'false';
+  hub.dataset.collapsed = 'false';
+  hub.dataset.idle = 'true';
   hub.dataset.settingsTab = 'audio';
   hub.innerHTML = `
     <div id="tss-hub-inner">
       <div id="tss-hub-hdr">
-        <div class="tss-deck-brand"><span class="tss-deck-brand-slot"><span class="tss-deck-brand-original"><span class="tss-deck-brandmark" aria-hidden="true">${SVG.shuffle}</span><span class="tss-deck-label">True Shuffle</span></span><button type="button" class="tss-update-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="tss-update-providers" aria-hidden="true" tabindex="-1">Update available</button></span></div>
+        <button id="tss-hub-restore" type="button" hidden aria-label="Show True Shuffle player" aria-expanded="false" title="Show True Shuffle player · drag to move"><span class="tss-deck-brandmark" aria-hidden="true">${SVG.brandmarkShuffle}</span><span class="tss-deck-restore-label">${state.djMode ? 'True DJ' : 'True Shuffle'}</span></button>
+        <div class="tss-deck-brand"><span class="tss-deck-brand-slot"><span class="tss-deck-brand-original"><span id="tss-deck-brandmark" class="tss-deck-brandmark" aria-hidden="true">${SVG.brandmarkShuffle}</span><span class="tss-deck-label">${state.djMode ? 'True DJ' : 'True Shuffle'}</span></span><button type="button" class="tss-update-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="tss-update-providers" aria-hidden="true" tabindex="-1">Update available</button></span></div>
         <div class="tss-hub-navigation">
           <button id="tss-playback-debug" class="tss-hub-btn tss-hub-btn-icon" type="button" hidden aria-label="Playback issue: open report" title="Playback issue: open report"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6.75"/><circle cx="8" cy="12.5" r="1" fill="currentColor" stroke="none"/></svg></button>
+          <button id="tss-hub-dj-toggle" class="tss-hub-btn tss-hub-btn-icon" type="button" data-active="false" data-speaking="false" aria-label="Turn on True DJ" aria-pressed="false" title="Turn on True DJ">${SVG.djHeadphones}</button>
           <button id="tss-hub-pip" class="tss-hub-btn tss-hub-btn-icon" type="button" data-open="false" aria-label="Open True Shuffle picture in picture" aria-pressed="false" title="Open True Shuffle PiP">${SVG.pip}</button>
-          <button id="tss-hub-col" class="tss-hub-btn tss-hub-btn-icon" type="button" hidden aria-label="Minimize player" aria-expanded="true" title="Minimize player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
+          <button id="tss-hub-col" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Minimize player" aria-expanded="true" title="Minimize player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
+          <button id="tss-hub-hide" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-label="Hide player" aria-expanded="true" title="Hide player"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3.5 8h9"/></svg></button>
           <button id="tss-hub-settings" class="tss-hub-btn tss-hub-btn-icon" type="button" aria-controls="tss-hub-settings-view" aria-expanded="false" aria-label="Settings" title="Settings"><span class="tss-settings-gear-icon">${SVG.gear}</span><span class="tss-settings-back-icon">${SVG.back}</span></button>
         </div>
       </div>
@@ -11156,7 +23122,7 @@ function mkHub() {
         <div id="tss-hub-main-view">
           <div id="tss-hub-active-view" style="display:none;">
             <div class="tss-deck-track">
-              <div id="tss-hub-art">${SVG.note}</div>
+              <div id="tss-hub-art" data-dj-speaking="false"><span id="tss-hub-art-track" class="tss-art-track-layer">${SVG.note}</span><span id="tss-hub-dj-art" class="tss-art-dj-layer" aria-hidden="true">${SVG.trueDjCover}</span></div>
               <div class="tss-deck-track-copy">
                 <div id="tss-hub-title">—</div>
                 <div id="tss-hub-artist">—</div>
@@ -11173,6 +23139,7 @@ function mkHub() {
               <button id="tss-hub-prev" class="tss-hub-btn tss-hub-btn-sm" type="button" aria-label="Previous track">${SVG.prev}</button>
               <button id="tss-hub-play" class="tss-hub-btn tss-hub-btn-lg" type="button" aria-label="Play or pause">${SVG.play}</button>
               <button id="tss-hub-next" class="tss-hub-btn tss-hub-btn-sm" type="button" aria-label="Next track">${SVG.next}</button>
+              <button id="tss-hub-dj-vibe" class="tss-hub-btn" type="button" hidden data-switching="false" aria-label="Switch DJ vibe" title="Switch vibe (new DJ set)">${SVG.djVibe}</button>
             </div>
             <div class="tss-master-volume">
               <span aria-hidden="true">${SVG.volume}</span>
@@ -11190,6 +23157,7 @@ function mkHub() {
           <h2 id="tss-settings-title" tabindex="-1">Settings</h2>
           <div class="tss-settings-tabs" role="tablist" aria-label="Settings">
             <button id="tss-settings-tab-audio" class="tss-settings-tab" type="button" role="tab" aria-selected="true" aria-controls="tss-settings-panel-audio">${SVG.equalizer}<span>Audio</span></button>
+            <button id="tss-settings-tab-dj" class="tss-settings-tab" type="button" role="tab" aria-selected="false" aria-controls="tss-settings-panel-dj" tabindex="-1">${SVG.djHeadphones}<span>DJ</span></button>
             <button id="tss-settings-tab-session" class="tss-settings-tab" type="button" role="tab" aria-selected="false" aria-controls="tss-settings-panel-session" tabindex="-1">${SVG.timer}<span>Session</span></button>
             <button id="tss-settings-tab-info" class="tss-settings-tab" type="button" role="tab" aria-selected="false" aria-controls="tss-settings-panel-info" tabindex="-1">${SVG.info}<span>Info</span></button>
           </div>
@@ -11205,13 +23173,91 @@ function mkHub() {
                 <button type="button" class="tss-crossfade-mode" data-curve="smooth" title="Gentle, rounded handoff">Smooth</button>
                 <button type="button" class="tss-crossfade-mode" data-curve="clean" title="Linear blend with minimal coloration">Clean</button>
                 <button type="button" class="tss-crossfade-mode" data-curve="dj" title="Faster handoff around the midpoint">DJ</button>
+                <button type="button" class="tss-crossfade-mode" id="tss-crossfade-custom" data-curve="custom" aria-haspopup="dialog" title="Custom Bézier curve — click to customize">Custom</button>
               </div>
               <label class="tss-crossfade-manual"><span>Fade manual skips</span><input id="tss-crossfade-manual" type="checkbox"></label>
             </div>
             <button id="tss-auto-level" class="tss-settings-action" type="button" aria-label="Auto Level" aria-pressed="false" title="Automatically reduce louder tracks"><span>Auto Level</span><span class="tss-auto-label">Off</span></button>
             <button id="tss-hub-eq" class="tss-hub-btn tss-settings-action" type="button" data-active="false" aria-label="Open equalizer" aria-pressed="false" title="Open equalizer">${SVG.equalizer}<span>Open equalizer</span></button>
           </section>
+          <section id="tss-settings-panel-dj" class="tss-settings-panel" role="tabpanel" aria-labelledby="tss-settings-tab-dj" hidden>
+            <div class="tss-dj-hero">
+              <label class="tss-dj-hero-copy" for="tss-dj-enabled">
+                <span class="tss-dj-settings-title">True DJ</span>
+                <p class="tss-dj-hero-sub">Curates 3–4 song mini-sets &amp; mixes transitions.</p>
+              </label>
+              <div class="tss-dj-hero-right"><span id="tss-dj-status" data-status="off" aria-live="polite">off</span><input id="tss-dj-enabled" type="checkbox" aria-label="Enable True DJ"></div>
+            </div>
+            <div id="tss-dj-body-wrap" data-dj-off="true">
+              <div class="tss-dj-section-label"><span>Mood</span><button id="tss-dj-vibe-btn" class="tss-dj-vibe-btn" type="button" data-switching="false" aria-label="Switch True DJ vibe" title="Switch to a new True DJ set">${SVG.djVibe}<span>Switch vibe</span></button></div>
+              <div class="tss-dj-focus-pills" role="group" aria-label="True DJ mood">
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="auto" data-active="true" aria-pressed="true">Auto</button>
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="favorites" data-active="false" aria-pressed="false">Favorites</button>
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="discovery" data-active="false" aria-pressed="false">Discovery</button>
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="throwbacks" data-active="false" aria-pressed="false">Throwbacks</button>
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="chill" data-active="false" aria-pressed="false">Chill</button>
+                <button type="button" class="tss-dj-focus-pill" data-dj-focus="energy" data-active="false" aria-pressed="false">Energy</button>
+              </div>
+              <div class="tss-dj-section-label"><span>DJ Voice</span></div>
+              <div class="tss-dj-commentary-modes" role="group" aria-label="True DJ commentary mode">
+                <button type="button" class="tss-dj-commentary-btn" data-dj-commentary="silent" data-active="true" aria-pressed="true" title="Zero download · chapter curation without voice">Silent</button>
+                <button type="button" class="tss-dj-commentary-btn" data-dj-commentary="voice" data-active="false" aria-pressed="false" title="100% local on-device studio neural voice">Local Voice</button>
+              </div>
+              <div id="tss-dj-voice-card" class="tss-dj-voice-card" hidden>
+                <div class="tss-dj-voice-row">
+                  <select id="tss-dj-voice-select" aria-label="True DJ host voice">${(typeof DJ_VOICES !== 'undefined' ? DJ_VOICES : [{ id: 'am_michael', name: 'Xavier', label: 'Xavier · US Laid-back Host' }]).map(v => `<option value="${esc(v.id)}">${esc(v.label || v.name)}</option>`).join('')}</select>
+                  <button id="tss-dj-voice-test" type="button">Preview voice</button>
+                </div>
+                <div class="tss-dj-voice-freq-row">
+                  <label for="tss-dj-talk-freq">How often</label>
+                  <select id="tss-dj-talk-freq" aria-label="How often True DJ speaks">${(typeof DJ_TALK_FREQUENCIES !== 'undefined' ? DJ_TALK_FREQUENCIES : [{ id: 'every', label: 'Every set (3–4 songs)' }, { id: 'relaxed', label: 'Relaxed (every 2–3 sets)' }, { id: 'minimal', label: 'Start & vibe switches only' }]).map(f => `<option value="${esc(f.id)}">${esc(f.label)}</option>`).join('')}</select>
+                </div>
+                <div class="tss-dj-voice-vol-row">
+                  <label for="tss-dj-voice-volume">Volume</label>
+                  <input id="tss-dj-voice-volume" type="range" min="20" max="150" step="1" value="100" aria-label="True DJ voice volume">
+                  <span id="tss-dj-voice-volume-value">100%</span>
+                </div>
+                <div id="tss-dj-voice-progress-wrap" class="tss-dj-progress-wrap" hidden><div id="tss-dj-voice-progress-fill" class="tss-dj-progress-fill"></div></div>
+                <details id="tss-dj-voice-advanced" class="tss-dj-advanced tss-dj-advanced-inline">
+                  <summary class="tss-dj-adv-summary"><span>Voice quality</span><span id="tss-dj-voice-adv-badge" class="tss-dj-adv-badge">Studio HD</span></summary>
+                  <div class="tss-dj-adv-body">
+                    <div class="tss-dj-voice-model-row">
+                      <label for="tss-dj-voice-model">Engine</label>
+                      <select id="tss-dj-voice-model" aria-label="True DJ voice model quality">${(typeof DJ_VOICE_MODELS !== 'undefined' ? DJ_VOICE_MODELS : [{ id: 'hq', label: 'Studio HD · Kokoro 82M (Recommended)' }, { id: 'hq-gpu', label: 'Studio Ultra · Kokoro 82M (WebGPU)' }, { id: 'lite', label: 'Low-Spec · Fast Lite (~26 MB CPU)' }]).map(m => `<option value="${esc(m.id)}">${esc(m.label)}</option>`).join('')}</select>
+                    </div>
+                    <p id="tss-dj-voice-model-status" class="tss-dj-model-note">Studio HD neural voice (~88 MB one-time browser cache, CPU WASM · 0 GPU lag). Opting out unloads memory immediately.</p>
+                  </div>
+                </details>
+              </div>
+              <details id="tss-dj-mix-advanced" class="tss-dj-advanced">
+                <summary class="tss-dj-adv-summary"><span>Mixing &amp; discovery</span><span id="tss-dj-mix-adv-badge" class="tss-dj-adv-badge">2 on</span></summary>
+                <div class="tss-dj-adv-body">
+                  <label class="tss-dj-toggle-item" for="tss-dj-automix">
+                    <span class="tss-dj-toggle-copy"><strong>Auto-mix transitions</strong><small>Adapts fade length, curve &amp; key harmony per song</small></span>
+                    <input id="tss-dj-automix" type="checkbox">
+                  </label>
+                  <label class="tss-dj-toggle-item" for="tss-dj-discovery">
+                    <span class="tss-dj-toggle-copy"><strong>SoundCloud discovery</strong><small>Blends related SoundCloud tracks into discovery sets</small></span>
+                    <input id="tss-dj-discovery" type="checkbox">
+                  </label>
+                  <label class="tss-dj-toggle-item" for="tss-dj-bass-swap">
+                    <span class="tss-dj-toggle-copy"><strong>Clean bass swap</strong><small>Cuts clashing low-end kicks during transitions</small></span>
+                    <input id="tss-dj-bass-swap" type="checkbox">
+                  </label>
+                  <label class="tss-dj-toggle-item" for="tss-dj-cue-trim">
+                    <span class="tss-dj-toggle-copy"><strong>Trim silent intros &amp; outros</strong><small>Skips dead air at the start and end of tracks</small></span>
+                    <input id="tss-dj-cue-trim" type="checkbox">
+                  </label>
+                </div>
+              </details>
+            </div>
+          </section>
           <section id="tss-settings-panel-session" class="tss-settings-panel" role="tabpanel" aria-labelledby="tss-settings-tab-session" hidden>
+            <div class="tss-feed-limit-card">
+              <div class="tss-crossfade-setting-head" style="margin-top:2px;"><label for="tss-hub-feed-limit">Feed track limit</label><input id="tss-hub-feed-limit-number" type="number" min="1" max="250" step="1" value="50" aria-label="Feed track limit count"></div>
+              <input id="tss-hub-feed-limit" type="range" min="1" max="250" step="1" value="50" aria-label="Feed track limit">
+              <div class="tss-crossfade-ticks" aria-hidden="true"><span>1</span><span>50</span><span>125</span><span>200</span><span>250</span></div>
+            </div>
             <label class="tss-settings-row" for="tss-hub-sleep"><span>Sleep timer</span><select id="tss-hub-sleep"><option value="off">Off</option><option value="t15">15 min</option><option value="t30">30 min</option><option value="t60">1 hour</option><option value="n5">5 tracks</option><option value="n10">10 tracks</option><option value="n25">25 tracks</option></select></label>
             <span id="tss-hub-sleep-display" aria-live="polite"></span>
             <label class="tss-settings-row" for="tss-hub-stop-after"><span>Stop after this round</span><input id="tss-hub-stop-after" type="checkbox"></label>
@@ -11267,14 +23313,177 @@ function mkHub() {
   };
 
   document.getElementById('tss-hub-qico').onclick = e => { e.stopPropagation(); toggleSidebar(e); };
+  const hubDjToggle = document.getElementById('tss-hub-dj-toggle');
+  if (hubDjToggle) {
+    hubDjToggle.onclick = e => {
+      e.stopPropagation();
+      const enabling = !state.djMode;
+      if (typeof setDjModeEnabled === 'function') setDjModeEnabled(enabling);
+      else state.djMode = enabling;
+      if (enabling && !state.active && !state.loading) {
+        state._userPaused = false;
+        if (typeof ensureAutoLevelAudioGraph === 'function'
+            && (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+                || state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim)) {
+          ensureAutoLevelAudioGraph();
+          if (state._audioContext?.state === 'suspended') {
+            try { void state._audioContext.resume(); } catch (_) {}
+          }
+        }
+        if (typeof start === 'function') {
+          void Promise.resolve(start()).then(() => {
+            if (!state.active && !state.loading && state.djMode && typeof setDjModeEnabled === 'function') {
+              setDjModeEnabled(false);
+            }
+          });
+        }
+      }
+    };
+  }
+  const hubDjVibeBtn = document.getElementById('tss-dj-vibe-btn');
+  if (hubDjVibeBtn) {
+    hubDjVibeBtn.onclick = e => {
+      e.stopPropagation();
+      if (typeof switchDjVibe === 'function') void switchDjVibe();
+    };
+  }
+  const deckDjVibeBtn = document.getElementById('tss-hub-dj-vibe');
+  if (deckDjVibeBtn) {
+    deckDjVibeBtn.onclick = e => {
+      e.stopPropagation();
+      if (typeof switchDjVibe === 'function') void switchDjVibe();
+    };
+  }
+  const djEnabledInput = document.getElementById('tss-dj-enabled');
+  if (djEnabledInput) {
+    djEnabledInput.checked = Boolean(state.djMode);
+    djEnabledInput.onchange = () => {
+      if (typeof setDjModeEnabled === 'function') setDjModeEnabled(djEnabledInput.checked);
+    };
+  }
+  document.querySelectorAll('.tss-dj-commentary-btn').forEach(btn => {
+    btn.onclick = () => {
+      if (typeof setDjCommentaryMode === 'function') setDjCommentaryMode(btn.dataset.djCommentary);
+    };
+  });
+  const djVoiceSelect = document.getElementById('tss-dj-voice-select');
+  if (djVoiceSelect) {
+    djVoiceSelect.value = state.djVoiceId || 'am_michael';
+    djVoiceSelect.onchange = () => {
+      if (typeof setDjVoiceId === 'function') setDjVoiceId(djVoiceSelect.value);
+    };
+  }
+  const djTalkFreqSelect = document.getElementById('tss-dj-talk-freq');
+  if (djTalkFreqSelect) {
+    djTalkFreqSelect.value = state.djTalkFrequency || 'every';
+    djTalkFreqSelect.onchange = () => {
+      if (typeof setDjTalkFrequency === 'function') setDjTalkFrequency(djTalkFreqSelect.value);
+    };
+  }
+  const djVoiceModelSelect = document.getElementById('tss-dj-voice-model');
+  if (djVoiceModelSelect) {
+    djVoiceModelSelect.value = state.djVoiceModel || 'hq';
+    djVoiceModelSelect.onchange = () => {
+      if (typeof setDjVoiceModel === 'function') setDjVoiceModel(djVoiceModelSelect.value);
+    };
+  }
+  const djVoiceVol = document.getElementById('tss-dj-voice-volume');
+  if (djVoiceVol) {
+    djVoiceVol.oninput = () => {
+      if (typeof setDjVoiceVolume === 'function') setDjVoiceVolume(Number(djVoiceVol.value) / 100);
+    };
+  }
+  const djVoiceTest = document.getElementById('tss-dj-voice-test');
+  if (djVoiceTest) {
+    djVoiceTest.onclick = () => {
+      if (typeof previewDjVoice === 'function') void previewDjVoice();
+    };
+  }
+  document.querySelectorAll('.tss-dj-focus-pill').forEach(btn => {
+    btn.onclick = () => {
+      if (typeof setDjFocus === 'function') setDjFocus(btn.dataset.djFocus, true);
+    };
+  });
+  const djAutoMixInput = document.getElementById('tss-dj-automix');
+  if (djAutoMixInput) {
+    djAutoMixInput.checked = Boolean(state.djAutoMix);
+    djAutoMixInput.onchange = () => {
+      if (typeof setDjAutoMix === 'function') setDjAutoMix(djAutoMixInput.checked);
+    };
+  }
+  const djBassSwapInput = document.getElementById('tss-dj-bass-swap');
+  if (djBassSwapInput) {
+    djBassSwapInput.checked = Boolean(state.djBassSwap);
+    djBassSwapInput.onchange = () => {
+      if (typeof setDjBassSwap === 'function') setDjBassSwap(djBassSwapInput.checked);
+    };
+  }
+  const djCueTrimInput = document.getElementById('tss-dj-cue-trim');
+  if (djCueTrimInput) {
+    djCueTrimInput.checked = Boolean(state.djCueTrim);
+    djCueTrimInput.onchange = () => {
+      if (typeof setDjCueTrim === 'function') setDjCueTrim(djCueTrimInput.checked);
+    };
+  }
+  const djDiscoveryInput = document.getElementById('tss-dj-discovery');
+  if (djDiscoveryInput) {
+    djDiscoveryInput.checked = Boolean(state.djDiscoveryEnabled);
+    djDiscoveryInput.onchange = () => {
+      if (typeof setDjDiscoveryEnabled === 'function') setDjDiscoveryEnabled(djDiscoveryInput.checked);
+    };
+  }
 
   const stopAfterRound = document.getElementById('tss-hub-stop-after');
   stopAfterRound.checked  = state.stopAfterRound;
-  stopAfterRound.onchange = () => { state.stopAfterRound = stopAfterRound.checked; };
+  stopAfterRound.onchange = () => {
+    state.stopAfterRound = stopAfterRound.checked;
+    if (state.stopAfterRound) state._nextRoundQueue = null;
+    if (typeof refreshUpcomingCrossfadePreparation === 'function') refreshUpcomingCrossfadePreparation();
+    if (typeof syncOwnPipWindow === 'function') syncOwnPipWindow();
+  };
+
+  const feedLimitSlider = document.getElementById('tss-hub-feed-limit');
+  const feedLimitNumber = document.getElementById('tss-hub-feed-limit-number');
+  const syncFeed = () => {
+    if (typeof syncFeedLimitControls === 'function') return syncFeedLimitControls();
+    const limit = Math.max(1, Math.min(250, Math.round(Number(state.feedTrackLimit) || 50)));
+    if (feedLimitSlider) {
+      feedLimitSlider.value = String(limit);
+      feedLimitSlider.style?.setProperty?.('--tss-feed-limit-fill', `${((limit - 1) / 249 * 100).toFixed(2)}%`);
+    }
+    if (feedLimitNumber && document.activeElement !== feedLimitNumber) feedLimitNumber.value = String(limit);
+  };
+  const applyFeed = raw => {
+    if (typeof setFeedTrackLimit === 'function') return setFeedTrackLimit(raw);
+    const parsed = Math.round(Number(raw));
+    if (Number.isFinite(parsed)) state.feedTrackLimit = Math.max(1, Math.min(250, parsed));
+    syncFeed();
+  };
+  if (feedLimitSlider) {
+    feedLimitSlider.oninput = e => applyFeed(e.target.value);
+  }
+  if (feedLimitNumber) {
+    feedLimitNumber.oninput = e => {
+      if (e.target.value.trim() !== '') applyFeed(e.target.value);
+    };
+    feedLimitNumber.onchange = e => {
+      applyFeed(e.target.value || state.feedTrackLimit);
+      syncFeed();
+    };
+    feedLimitNumber.onblur = () => syncFeed();
+  }
+  syncFeed();
 
   document.getElementById('tss-hub-start').onclick = () => {
     if (state.active || state.loading) { stop(); return; }
-    if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0) ensureAutoLevelAudioGraph();
+    state._userPaused = false;
+    if (state.autoLevel || state.eqEnabled || state.safetyClipper || state.crossfadeSeconds > 0
+        || (state.djMode && (state.djCommentaryMode === 'voice' || state.djAutoMix || state.djBassSwap || state.djCueTrim))) {
+      ensureAutoLevelAudioGraph();
+      if (state._audioContext?.state === 'suspended') {
+        try { void state._audioContext.resume(); } catch (_) {}
+      }
+    }
     void start();
   };
 
@@ -11294,7 +23503,13 @@ function mkHub() {
     button.onclick = () => {
       state.crossfadeCurve = button.dataset.curve;
       safeStorage.setItem('tss_crossfade_curve', state.crossfadeCurve);
+      if (state.crossfadeSeconds > 0 && typeof ensureAutoLevelAudioGraph === 'function') {
+        ensureAutoLevelAudioGraph();
+      }
       syncCrossfadeControls();
+      if (button.dataset.curve === 'custom' && typeof showCrossfadeCurveEditor === 'function') {
+        showCrossfadeCurveEditor();
+      }
     };
   });
 
@@ -11316,17 +23531,73 @@ function mkHub() {
   syncCrossfadeControls();
   syncPlaybackVolumeControls();
   syncEqualizer();
-  initializePlaybackVolume();
+  if (typeof syncDjControls === 'function') syncDjControls();
+  state._playbackVolumeInitialized = true;
+
+  const nowStamp = () => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now());
+  const persistHubPosition = () => {
+    if (typeof safeStorage === 'undefined' || !safeStorage?.setItem) return;
+    if (hub.style.bottom !== 'auto') return;
+    const left = parseFloat(hub.style.left);
+    const top = parseFloat(hub.style.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+    const payload = { left: Math.round(left), top: Math.round(top) };
+    if (hub._tssParkedPillPos && Number.isFinite(hub._tssParkedPillPos.left) && Number.isFinite(hub._tssParkedPillPos.top)) {
+      payload.pillLeft = Math.round(hub._tssParkedPillPos.left);
+      payload.pillTop = Math.round(hub._tssParkedPillPos.top);
+      if (hub._tssParkedPillPos.width > 0) payload.pillWidth = Math.round(hub._tssParkedPillPos.width);
+      if (hub._tssParkedPillPos.height > 0) payload.pillHeight = Math.round(hub._tssParkedPillPos.height);
+    }
+    try { safeStorage.setItem('tss_hub_pos', JSON.stringify(payload)); } catch (_) {}
+  };
 
   document.getElementById('tss-hub-col').onclick = event => setHubMini(hub.dataset.mini !== 'true', true, event);
+  document.getElementById('tss-hub-hide').onclick = event => setHubCollapsed(true, true, event);
+  document.getElementById('tss-hub-restore').onclick = event => {
+    if (hub._tssSuppressRestoreClickUntil > nowStamp()) {
+      hub._tssSuppressRestoreClickUntil = 0;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      return;
+    }
+    hub._tssSuppressRestoreClickUntil = 0;
+    setHubCollapsed(false, true, event);
+  };
+  if (typeof safeStorage !== 'undefined') {
+    const rawPos = safeStorage?.getItem?.('tss_hub_pos');
+    if (rawPos) {
+      try {
+        const savedPos = JSON.parse(rawPos);
+        if (savedPos && Number.isFinite(savedPos.left) && Number.isFinite(savedPos.top)) {
+          hub.style.left = `${savedPos.left}px`;
+          hub.style.top = `${savedPos.top}px`;
+          hub.style.bottom = 'auto';
+          hub.style.right = 'auto';
+        }
+        if (savedPos && Number.isFinite(savedPos.pillLeft) && Number.isFinite(savedPos.pillTop)) {
+          hub._tssParkedPillPos = {
+            left: savedPos.pillLeft,
+            top: savedPos.pillTop,
+            width: Number.isFinite(savedPos.pillWidth) && savedPos.pillWidth > 0 ? savedPos.pillWidth : 0,
+            height: Number.isFinite(savedPos.pillHeight) && savedPos.pillHeight > 0 ? savedPos.pillHeight : 0,
+          };
+        }
+      } catch (_) {}
+    }
+    if (safeStorage?.getItem?.('tss_hub_mini') === 'true') setHubMini(true, false, { instant: true });
+    if (safeStorage?.getItem?.('tss_hub_collapsed') === 'true') setHubCollapsed(true, false, { instant: true });
+  }
   // Track activation modality, not click.detail: synthetic/forwarded pointer
   // clicks can legitimately have detail=0. Native Enter/Space stays instant.
   hub.addEventListener('pointerdown', () => { motionIsInstant.keyboardTarget = null; }, true);
   hub.addEventListener('keydown', event => {
-    if (event.key === 'Enter' || event.key === ' ') motionIsInstant.keyboardTarget = event.target;
+    if (event.key === 'Enter' || event.key === ' ') {
+      motionIsInstant.keyboardTarget = event.target;
+      hub._tssSuppressRestoreClickUntil = 0;
+    }
   }, true);
   document.getElementById('tss-hub-settings').onclick = event => setHubView(hub.dataset.view === 'settings' ? 'main' : 'settings', true, event);
-  const settingsTabs = ['audio', 'session', 'info'];
+  const settingsTabs = ['audio', 'dj', 'session', 'info'];
   settingsTabs.forEach((tab, index) => {
     const button = document.getElementById(`tss-settings-tab-${tab}`);
     button.onclick = event => setSettingsTab(tab, false, event);
@@ -11338,7 +23609,8 @@ function mkHub() {
       setSettingsTab(settingsTabs[next], true, event);
     };
   });
-  document.addEventListener('keydown', e => {
+  if (state._hubKeydownHandler) document.removeEventListener('keydown', state._hubKeydownHandler);
+  state._hubKeydownHandler = e => {
     if (!hub.isConnected || e.key !== 'Escape' || e.defaultPrevented) return;
     if (document.getElementById('tss-ctx')) {
       e.preventDefault();
@@ -11346,7 +23618,15 @@ function mkHub() {
       state._ctxMenuClose?.();
       return;
     }
-    if (document.querySelector('#tss-eq-overlay,#tss-stats-overlay,#tss-debug-overlay,#tss-debug-help-overlay')) return;
+    const statsOverlay = document.getElementById('tss-stats-overlay');
+    if (statsOverlay) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof statsOverlay._tssClose === 'function') statsOverlay._tssClose();
+      else statsOverlay.remove();
+      return;
+    }
+    if (document.querySelector('#tss-eq-overlay,#tss-cf-overlay,#tss-debug-overlay,#tss-debug-help-overlay')) return;
     if (state.sidebarOpen && document.getElementById('tss-sidebar')?.dataset.layout === 'narrow') {
       e.preventDefault();
       e.stopPropagation();
@@ -11356,26 +23636,92 @@ function mkHub() {
       e.stopPropagation();
       setHubView('main', true, e);
     }
-  });
+  };
+  document.addEventListener('keydown', state._hubKeydownHandler);
 
   const hubHdr = document.getElementById('tss-hub-hdr');
   hubHdr.onmousedown = e => {
-    if (e.button !== 0 || e.target.closest('button,input,select,textarea,a,[role="button"],[contenteditable="true"]')) return;
-    e.preventDefault();
-    const rect = hub.getBoundingClientRect();
-    hub.style.left   = rect.left + 'px';
-    hub.style.top    = rect.top  + 'px';
-    hub.style.bottom = 'auto';
-    hub.style.right  = 'auto';
-    const ox = e.clientX - rect.left, oy = e.clientY - rect.top;
+    if (e.button !== 0) return;
+    hub._tssSuppressRestoreClickUntil = 0;
+    const isCollapsedPill = hub.dataset.collapsed === 'true';
+    const motion = hub.dataset.collapseMotion || '';
+    if (motion === 'collapsing' || motion === 'expanding') return;
+    if (!isCollapsedPill && e.target?.closest?.('button,input,select,textarea,a,[role="button"],[contenteditable="true"]')) return;
+    if (!isCollapsedPill) e.preventDefault?.();
+
+    let rect = hub.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let ox = startX - rect.left;
+    let oy = startY - rect.top;
+    let boxW = rect.width || hub.offsetWidth || 0;
+    let boxH = rect.height || hub.offsetHeight || 0;
+    let finalLeft = rect.left;
+    let finalTop = rect.top;
+    let dragging = false;
+    let finished = false;
+    const prevBodyCursor = document.body ? document.body.style.cursor : '';
+
     const move = ev => {
-      hub.style.left = Math.max(0, Math.min(window.innerWidth  - hub.offsetWidth,  ev.clientX - ox)) + 'px';
-      hub.style.top  = Math.max(0, Math.min(window.innerHeight - hub.offsetHeight, ev.clientY - oy)) + 'px';
-      syncSidebarToHub();
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (!dragging) {
+        if ((dx * dx) + (dy * dy) < 16) return;
+        if (hub.dataset.collapseMotion === 'pill-entering' && typeof hub._tssCollapseSettle === 'function') {
+          hub._tssCollapseSettle();
+        }
+        rect = hub.getBoundingClientRect();
+        ox = startX - rect.left;
+        oy = startY - rect.top;
+        boxW = rect.width || hub.offsetWidth || 0;
+        boxH = rect.height || hub.offsetHeight || 0;
+        finalLeft = rect.left;
+        finalTop = rect.top;
+        dragging = true;
+        hub.dataset.dragging = 'true';
+        hub.style.left = `${rect.left}px`;
+        hub.style.top = `${rect.top}px`;
+        hub.style.bottom = 'auto';
+        hub.style.right = 'auto';
+        if (document.body) document.body.style.cursor = 'grabbing';
+      }
+      ev.preventDefault?.();
+      const marginX = Math.min(12, Math.max(0, Math.floor((window.innerWidth - boxW) / 2)));
+      const marginY = Math.min(12, Math.max(0, Math.floor((window.innerHeight - boxH) / 2)));
+      const maxLeft = Math.max(marginX, window.innerWidth - boxW - marginX);
+      const maxTop = Math.max(marginY, window.innerHeight - boxH - marginY);
+      const nextLeft = Math.round(Math.max(marginX, Math.min(maxLeft, ev.clientX - ox)));
+      const nextTop = Math.round(Math.max(marginY, Math.min(maxTop, ev.clientY - oy)));
+      finalLeft = nextLeft;
+      finalTop = nextTop;
+      hub.style.left = `${nextLeft}px`;
+      hub.style.top = `${nextTop}px`;
+      if (!isCollapsedPill) syncSidebarToHub();
     };
-    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+
+    const up = () => {
+      if (finished) return;
+      finished = true;
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      window.removeEventListener?.('blur', up);
+      if (!dragging) return;
+      dragging = false;
+      delete hub.dataset.dragging;
+      if (document.body) document.body.style.cursor = prevBodyCursor;
+      if (isCollapsedPill) {
+        hub._tssParkedPillPos = { left: finalLeft, top: finalTop, width: boxW, height: boxH };
+        hub._tssSuppressRestoreClickUntil = nowStamp() + 350;
+        syncSidebarToHub();
+      } else {
+        hub._tssParkedPillPos = null;
+      }
+      persistHubPosition();
+    };
+
     document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup',   up);
+    document.addEventListener('mouseup', up);
+    window.addEventListener?.('blur', up);
   };
 
   updateHub();
@@ -11383,13 +23729,16 @@ function mkHub() {
 
 function updateHub() {
   syncBrowserNowPlaying();
+  if (typeof syncOwnPipWindow === 'function' && typeof ownPipIsOpen === 'function' && ownPipIsOpen()) {
+    syncOwnPipWindow();
+  }
   if (!document.getElementById('tss-hub')) return;
   setOwnPipButtonState();
 
   const active  = state.active;
   const loading = state.loading;
-  const minimizeButton = document.getElementById('tss-hub-col');
-  if (minimizeButton && minimizeButton.hidden !== !active) minimizeButton.hidden = !active;
+  const hubStateEl = document.getElementById('tss-hub');
+  if (hubStateEl) hubStateEl.dataset.idle = String(!active);
 
   const onDifferentPlaylist = active && isCollectionPage(location.href)
     && playlistBase(location.href) !== playlistBase(state.playlistUrl);
@@ -11431,9 +23780,21 @@ function updateHub() {
 
   syncCrossfadeControls();
   syncPlaybackVolumeControls();
-  if (state.crossfadeSeconds > 0 && state.crossfadeStatus === 'off') {
+  if (typeof syncDjControls === 'function') syncDjControls();
+  const hubBrandLabel = document.getElementById('tss-hub')?.querySelector?.('.tss-deck-label');
+  if (hubBrandLabel) {
+    const brandText = state.djMode ? 'True DJ' : 'True Shuffle';
+    if (hubBrandLabel.textContent !== brandText) hubBrandLabel.textContent = brandText;
+  }
+  const restoreBrandLabel = document.getElementById('tss-hub-restore')?.querySelector?.('.tss-deck-restore-label');
+  if (restoreBrandLabel) {
+    const brandText = state.djMode ? 'True DJ' : 'True Shuffle';
+    if (restoreBrandLabel.textContent !== brandText) restoreBrandLabel.textContent = brandText;
+  }
+  const fadeActive = state.crossfadeSeconds > 0 || Boolean(state.djMode && (state.djAutoMix || state.djCueTrim));
+  if (fadeActive && state.crossfadeStatus === 'off') {
     setCrossfadeStatus('armed');
-  } else if (state.crossfadeSeconds <= 0 && !currentDeckAudio()) {
+  } else if (!fadeActive && !currentDeckAudio()) {
     setCrossfadeStatus('off');
   } else {
     setCrossfadeStatus(state.crossfadeStatus);
@@ -11455,7 +23816,13 @@ function updateHub() {
     const text = active ? `${inRound} / ${total}` : '0 / 0';
     if (qpos.textContent !== text) qpos.textContent = text;
   }
-  syncSidebarToHub();
+  const hubLayoutEl = document.getElementById('tss-hub');
+  const sidebarLayoutEl = document.getElementById('tss-sidebar');
+  const sidebarLayoutKey = `${active}|${Boolean(state.sidebarOpen)}|${hubLayoutEl?.dataset.view || ''}|${hubLayoutEl?.dataset.mini || ''}|${hubLayoutEl?.dataset.collapsed || ''}|${hubLayoutEl?.dataset.queueView || ''}|${sidebarLayoutEl?.dataset.motion || ''}|${sidebarLayoutEl?.dataset.layout || ''}|${window.innerWidth}x${window.innerHeight}`;
+  if (state._lastSidebarLayoutKey !== sidebarLayoutKey || state.sidebarOpen || sidebarLayoutEl?.dataset.motion === 'exiting') {
+    state._lastSidebarLayoutKey = sidebarLayoutKey;
+    syncSidebarToHub();
+  }
 
   if (!active) {
     const prog  = document.getElementById('tss-hub-prog');
@@ -11482,16 +23849,21 @@ function updateHub() {
   const m = state.meta[currentTi];
   const tEl = document.getElementById('tss-hub-title');
   const aEl = document.getElementById('tss-hub-artist');
-  const title = playerTitle() || m?.title || '—';
+  const openingIntro = Boolean(state.djMode && state._djOpeningIntroActive);
+  const title = openingIntro
+    ? 'True DJ'
+    : (playerTitle() || m?.title || '—');
   const unavailableReasons = {
     'preview-only': 'Only a preview is accessible',
     'preview-limited': 'Full stream unavailable',
     'access-restricted': 'Full stream access restricted',
     'hls-mse-unavailable': 'Custom decoder unavailable',
   };
-  const artist = !currentDeckAudio() && state.suspended
-    ? unavailableReasons[m?.customPlaybackReason] || 'Custom playback unavailable — retrying'
-    : m?.artist || '—';
+  const artist = openingIntro
+    ? (m?.title ? `Up first · ${m.artist && m.artist !== '—' ? `${m.artist} · ` : ''}${m.title}` : 'Setting the vibe')
+    : (!currentDeckAudio() && state.suspended
+      ? unavailableReasons[m?.customPlaybackReason] || 'Custom playback unavailable — retrying'
+      : m?.artist || '—');
   if (tEl && tEl.textContent !== title) tEl.textContent = title;
   if (aEl && aEl.textContent !== artist) aEl.textContent = artist;
 
@@ -11504,18 +23876,20 @@ function updateHub() {
 
   const art = document.getElementById('tss-hub-art');
   if (art) {
+    art.dataset.djSpeaking = String(Boolean(state.djMode && (state._djSpeaking || state._djOpeningIntroActive)));
+    const trackLayer = document.getElementById('tss-hub-art-track') || art;
     if (m?.artwork && art.dataset.src !== m.artwork) {
       art.dataset.src = m.artwork;
-      art.innerHTML   = '';
+      trackLayer.innerHTML = '';
       const img = document.createElement('img');
       img.alt = 'Current track artwork';
       img.src           = m.artwork;
       img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
-      img.onerror       = () => { art.innerHTML = SVG.note; delete art.dataset.src; };
-      art.appendChild(img);
+      img.onerror       = () => { trackLayer.innerHTML = SVG.note; delete art.dataset.src; };
+      trackLayer.appendChild(img);
     } else if (!m?.artwork && art.dataset.src) {
       delete art.dataset.src;
-      art.innerHTML = SVG.note;
+      trackLayer.innerHTML = SVG.note;
     }
   }
 
@@ -11535,15 +23909,18 @@ function syncSidebarToHub() {
   const hub = document.getElementById('tss-hub');
   const sidebar = document.getElementById('tss-sidebar');
   if (!hub) return;
+  if (hub.dataset?.collapseMotion && hub._tssCollapseAnim) return;
   const space = document.getElementById('tss-hub-queue-space');
   let rect = hub.getBoundingClientRect();
   const rightSpace = Math.max(0, window.innerWidth - rect.right - 12);
   const leftSpace = Math.max(0, rect.left - 12);
   const fitsRight = rightSpace >= 220 || rightSpace >= leftSpace;
   const available = fitsRight ? rightSpace : leftSpace;
-  // Keep the narrow queue footprint stable until the outgoing panel is hidden.
+  // Keep the narrow or docked queue footprint/seam stable until the outgoing panel is hidden.
   const closingNarrow = !state.sidebarOpen && sidebar?.dataset.motion === 'exiting'
     && sidebar.dataset.layout === 'narrow' && hub.dataset.view === 'main';
+  const closingDocked = !state.sidebarOpen && sidebar?.dataset.motion === 'exiting'
+    && sidebar.dataset.layout === 'docked';
   const narrow = closingNarrow || Boolean(state.sidebarOpen && sidebar && available < 220);
   const queueView = narrow ? 'true' : 'false';
   const layoutChanged = hub.dataset.queueView !== queueView;
@@ -11556,14 +23933,33 @@ function syncSidebarToHub() {
   if (layoutChanged) rect = hub.getBoundingClientRect();
   const leftBound = Math.max(12, Math.min(rect.left, window.innerWidth - rect.width - 12));
   const topBound = Math.max(12, Math.min(rect.top, window.innerHeight - rect.height - 12));
-  if (rect.width && rect.left !== leftBound) hub.style.left = `${leftBound}px`;
-  if (rect.height && rect.top !== topBound) {
+  const movedLeft = Boolean(rect.width && Math.abs(rect.left - leftBound) > 0.5);
+  const movedTop = Boolean(rect.height && Math.abs(rect.top - topBound) > 0.5);
+  if (movedLeft) hub.style.left = `${leftBound}px`;
+  if (movedTop) {
     hub.style.top = `${topBound}px`;
     hub.style.bottom = 'auto';
   }
-  if (rect.left !== leftBound || rect.top !== topBound) rect = hub.getBoundingClientRect();
-  if (!sidebar || !state.sidebarOpen) {
+  if (movedLeft || movedTop) rect = hub.getBoundingClientRect();
+  if (!sidebar || (!state.sidebarOpen && !closingDocked)) {
     delete hub.dataset.sidebarSide;
+    if (typeof hub.style?.removeProperty === 'function') hub.style.removeProperty('--tss-dock-top');
+    if (typeof sidebar?.style?.removeProperty === 'function') sidebar.style.removeProperty('--tss-dock-top');
+    return;
+  }
+  if (closingDocked) {
+    const dockedSide = sidebar.dataset.side || (fitsRight ? 'right' : 'left');
+    const dockedWidth = parseFloat(sidebar.style.width) || sidebar.getBoundingClientRect().width;
+    const dockedHeight = Number(sidebar.dataset.openHeight) || parseFloat(sidebar.style.height) || sidebar.getBoundingClientRect().height;
+    const dockedLeft = dockedSide === 'right' ? rect.right : rect.left - dockedWidth;
+    const dockedTop = rect.bottom - dockedHeight;
+    if (sidebar.style.left !== `${dockedLeft}px`) sidebar.style.left = `${dockedLeft}px`;
+    if (sidebar.style.top !== `${dockedTop}px`) sidebar.style.top = `${dockedTop}px`;
+    if (hub.dataset.sidebarSide !== dockedSide) hub.dataset.sidebarSide = dockedSide;
+    const closingHubDockTop = `${Math.max(-120, Math.min(0, Math.round(dockedTop - rect.top)))}px`;
+    if (typeof hub.style?.setProperty === 'function' && hub.style.getPropertyValue?.('--tss-dock-top') !== closingHubDockTop) {
+      hub.style.setProperty('--tss-dock-top', closingHubDockTop);
+    }
     return;
   }
 
@@ -11572,26 +23968,45 @@ function syncSidebarToHub() {
   if (sidebar.dataset.layout !== layout) sidebar.dataset.layout = layout;
   const requestedWidth = Math.max(260, Math.min(620, state.sidebarWidth || 320));
   const width = narrow ? rect.width : Math.min(requestedWidth, available);
-  const left = narrow ? rect.left : fitsRight ? rect.right : rect.left - width;
+  const left = narrow ? rect.width && rect.left : fitsRight ? rect.right : rect.left - width;
+  const resolvedLeft = narrow ? rect.left : left;
   const requestedHeight = state.sidebarHeight > 0 ? state.sidebarHeight : Math.max(320, rect.height);
   const maxHeight = Math.max(120, rect.bottom - 12);
   const height = narrow
     ? Math.max(120, document.getElementById('tss-hub-queue-space')?.getBoundingClientRect().height || rect.height - 56)
     : Math.min(Math.max(Math.min(rect.height, maxHeight), requestedHeight), maxHeight);
+  const closedHeight = narrow ? height : Math.min(height, Math.max(120, rect.height));
   const top = rect.bottom - height;
   if (sidebar.style.width !== `${width}px`) sidebar.style.width = `${width}px`;
-  if (sidebar.style.left !== `${left}px`) sidebar.style.left = `${left}px`;
+  if (sidebar.style.left !== `${resolvedLeft}px`) sidebar.style.left = `${resolvedLeft}px`;
   if (sidebar.style.top !== `${top}px`) sidebar.style.top = `${top}px`;
   if (sidebar.style.height !== `${height}px`) sidebar.style.height = `${height}px`;
+  const openHeightStr = String(Math.round(height));
+  const closedHeightStr = String(Math.round(closedHeight));
+  if (sidebar.dataset.openHeight !== openHeightStr) sidebar.dataset.openHeight = openHeightStr;
+  if (sidebar.dataset.closedHeight !== closedHeightStr) sidebar.dataset.closedHeight = closedHeightStr;
   const side = fitsRight ? 'right' : 'left';
   if (sidebar.dataset.side !== side) sidebar.dataset.side = side;
-  // A taller queue unfolds upward from its bottom edge; otherwise it unfolds
-  // downward from its top. Horizontal attachment stays fixed beside the player.
   const opensUp = !narrow && top < rect.top - 0.5;
+  const taller = String(opensUp);
+  if (sidebar.dataset.taller !== taller) sidebar.dataset.taller = taller;
   const origin = `${narrow ? '50%' : side === 'right' ? '0px' : '100%'} ${opensUp ? '100%' : '0px'}`;
   if (sidebar.style.transformOrigin !== origin) sidebar.style.transformOrigin = origin;
-  if (narrow) delete hub.dataset.sidebarSide;
-  else if (hub.dataset.sidebarSide !== side) hub.dataset.sidebarSide = side;
+  if (narrow) {
+    delete hub.dataset.sidebarSide;
+    if (typeof hub.style?.removeProperty === 'function') hub.style.removeProperty('--tss-dock-top');
+    if (typeof sidebar.style?.removeProperty === 'function') sidebar.style.removeProperty('--tss-dock-top');
+  } else {
+    if (hub.dataset.sidebarSide !== side) hub.dataset.sidebarSide = side;
+    const hubDockTop = `${Math.max(-120, Math.min(0, Math.round(top - rect.top)))}px`;
+    const sideDockTop = `${Math.max(0, Math.min(Math.round(height), Math.round(rect.top - top)))}px`;
+    if (typeof hub.style?.setProperty === 'function' && hub.style.getPropertyValue?.('--tss-dock-top') !== hubDockTop) {
+      hub.style.setProperty('--tss-dock-top', hubDockTop);
+    }
+    if (typeof sidebar.style?.setProperty === 'function' && sidebar.style.getPropertyValue?.('--tss-dock-top') !== sideDockTop) {
+      sidebar.style.setProperty('--tss-dock-top', sideDockTop);
+    }
+  }
   const close = document.getElementById('tss-sidebar-close');
   if (close) {
     const label = narrow ? 'Back to player' : 'Close queue';
@@ -11611,7 +24026,7 @@ function setupSidebarResize() {
     const saved = Number(safeStorage.getItem('tss_sidebar_width'));
     if (Number.isFinite(saved) && saved >= 120 && saved <= 620) state.sidebarWidth = saved;
     const savedHeight = Number(safeStorage.getItem('tss_sidebar_height'));
-    if (Number.isFinite(savedHeight) && savedHeight >= 300) state.sidebarHeight = savedHeight;
+    if (Number.isFinite(savedHeight) && savedHeight >= 140) state.sidebarHeight = savedHeight;
   } catch (_) {}
 
   handle.onmousedown = e => {
@@ -11717,7 +24132,7 @@ function mkSidebar() {
     position:fixed; left:-9999px; top:12px;
     width:min(320px,calc(100vw - 24px)); height:380px;
     background:var(--tss-glass-surface,#080b12); border:1px solid var(--tss-glass-rim,rgba(183,199,232,.12));
-    border-radius:0 16px 16px 0; overflow:hidden;
+    overflow:hidden;
     display:flex; flex-direction:column;
     font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
     box-shadow:var(--tss-glass-shadow);
@@ -11793,15 +24208,24 @@ function setSidebarTab(tab, event = null) {
   if (!list) return;
   if (list.contains?.(document.activeElement)) document.getElementById(`tss-tab-${tab}`)?.focus({ preventScroll: true });
   const instant = motionIsInstant(event) || !state.sidebarOpen;
-  // Fade the mounted rows out before rendering the latest requested tab.
+  // Fade the mounted rows out before rendering the latest requested tab, with a
+  // timer failsafe so uncomposited/cancelled VM animations never strand _tssTabSwap.
+  clearTimeout(list._tssTabSwapTimer);
   list._tssTabSwap = true;
+  list._tssTabSwapAt = Date.now();
+  const settleSwap = () => {
+    if (!list._tssTabSwap) return;
+    clearTimeout(list._tssTabSwapTimer);
+    list._tssTabSwapTimer = null;
+    list._tssTabSwap = false;
+    list._tssTabSwapAt = 0;
+    renderList(document.getElementById('tss-search')?.value || '');
+    animateSurface(list, true, { instant, duration: 95 });
+  };
+  list._tssTabSwapTimer = setTimeout(settleSwap, 180);
   animateSurface(list, false, {
     instant, duration: 75, restart: true,
-    onFinish: () => {
-      list._tssTabSwap = false;
-      renderList(document.getElementById('tss-search')?.value || '');
-      animateSurface(list, true, { instant, duration: 95 });
-    },
+    onFinish: settleSwap,
   });
 }
 
@@ -11824,17 +24248,14 @@ function toggleSidebar(event = null) {
   const hub = document.getElementById('tss-hub');
   const closedInNarrow = !state.sidebarOpen && sidebar?.dataset.layout === 'narrow';
   if (sidebar) {
+    const wasHidden = sidebar.hidden;
     sidebar.dataset.open = String(state.sidebarOpen);
     if (state.sidebarOpen) {
-      setHubView('main', false, { instant });
-      if (state._sidebarDirty || !sidebar.dataset.rendered) {
-        renderList();
-        sidebar.dataset.rendered = 'true';
-      }
+      if (hub?.dataset.view === 'settings') setHubView('main', false, { instant });
+      // Layout must know the destination side/anchor before the first painted
+      // entry frame. Closure keeps the existing footprint until finish.
+      syncSidebarToHub();
     }
-    // Layout must know the destination side/anchor before the first painted
-    // entry frame. Closure keeps the existing footprint until finish.
-    if (state.sidebarOpen) syncSidebarToHub();
     animateSurface(sidebar, state.sidebarOpen, {
       instant, kind: 'queue',
       onFinish: () => {
@@ -11845,9 +24266,16 @@ function toggleSidebar(event = null) {
         }
       },
     });
+    if (state.sidebarOpen && (state._sidebarDirty || !sidebar.dataset.rendered)) {
+      renderList();
+      sidebar.dataset.rendered = 'true';
+    } else if (state.sidebarOpen && wasHidden && state.sidebarTab === 'queue' && !document.getElementById('tss-search')?.value) {
+      document.getElementById('tss-sidebar-list')?.querySelector?.('[aria-current="true"]')
+        ?.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    }
   }
   updateHub();
-  syncSidebarToHub();
+  if (!state.sidebarOpen) syncSidebarToHub();
   if (state.sidebarOpen) {
     document.getElementById('tss-sidebar-close')?.focus({ preventScroll: true });
   } else {
@@ -11858,39 +24286,260 @@ function toggleSidebar(event = null) {
 }
 
 
+/**
+ * Move a non-current queue track to the requested 1-based queue slot.
+ * @param {number} ti Track index inside state.meta.
+ * @param {string|number} rawSlot Target displayed slot number.
+ * @param {{basis?: 'queue'|'pip', filter?: string}} [options]
+ * @returns {boolean} True when the queue order changed.
+ */
+function moveQueueTrackToSlot(ti, rawSlot, options = {}) {
+  if (!Array.isArray(state.queue) || !state.queue.length) return false;
+  const src = state.queue.indexOf(ti);
+  const ownerTi = typeof currentPlaybackTrackIndex === 'function'
+    ? currentPlaybackTrackIndex()
+    : state.queue[state.pos];
+  if (src < 0 || src === state.pos || ti === ownerTi) return false;
+  const parsedSlot = Number.parseInt(String(rawSlot ?? '').trim(), 10);
+  if (!Number.isFinite(parsedSlot) || parsedSlot < 1) return false;
+
+  let desiredOffset;
+  if (options.basis === 'pip') {
+    const baseRound = Number(state.roundPlayed) || 0;
+    let leadingNextCount = 0;
+    if (Array.isArray(state.playNext) && state.playNext.length) {
+      const seenNext = new Set();
+      for (const nextTi of state.playNext) {
+        if (nextTi !== ownerTi && !seenNext.has(nextTi)) {
+          seenNext.add(nextTi);
+          leadingNextCount++;
+        }
+      }
+    }
+    desiredOffset = Math.max(1, (parsedSlot - baseRound - 1) - leadingNextCount);
+  } else {
+    const basePlayed = Number(state.stats?.played) || 0;
+    desiredOffset = parsedSlot - basePlayed;
+  }
+
+  let changed = false;
+  if (src > state.pos) {
+    if (state.pos + 1 > state.queue.length - 1) return false;
+    const target = Math.max(
+      state.pos + 1,
+      Math.min(state.queue.length - 1, state.pos + Math.max(1, desiredOffset)),
+    );
+    if (target === src) return false;
+    const [moved] = state.queue.splice(src, 1);
+    state.queue.splice(target, 0, moved);
+    changed = true;
+  } else if (desiredOffset > 0) {
+    const [moved] = state.queue.splice(src, 1);
+    state.pos = Math.max(0, state.pos - 1);
+    const insertAt = Math.max(state.pos + 1, Math.min(state.queue.length, state.pos + desiredOffset));
+    state.queue.splice(insertAt, 0, moved);
+    changed = true;
+  } else {
+    const maxPast = state.pos - 1;
+    if (maxPast < 0) return false;
+    const rawPastTarget = desiredOffset === 0 ? state.pos - 1 : state.pos + desiredOffset;
+    const target = Math.max(0, Math.min(maxPast, rawPastTarget));
+    if (target === src) return false;
+    const [moved] = state.queue.splice(src, 1);
+    state.queue.splice(target, 0, moved);
+    changed = true;
+  }
+
+  if (!changed) return false;
+  if (typeof refreshUpcomingCrossfadePreparation === 'function') refreshUpcomingCrossfadePreparation();
+  if (typeof badges === 'function') badges();
+  const activeFilter = options.filter !== undefined
+    ? options.filter
+    : (document.getElementById('tss-search')?.value || '');
+  if (typeof renderList === 'function') renderList(activeFilter);
+  if (typeof ownPipIsOpen === 'function' && ownPipIsOpen() && typeof syncOwnPipWindow === 'function') {
+    syncOwnPipWindow();
+  }
+  return true;
+}
+
 function bindQueueRowActions(row, qi, ti, cur, past, filter) {
-  const meta = state.meta[ti];
-  const epoch = state._collectionEpoch;
+  row._tssRowState = {
+    qi,
+    ti,
+    cur,
+    past,
+    filter,
+    meta: state.meta[ti],
+    epoch: state._collectionEpoch,
+  };
   row.draggable = !cur;
+  if (row._tssHandlersBound) return;
+  row._tssHandlersBound = true;
+  const num = row.lastElementChild;
+  const editSlot = () => {
+    const rs = row._tssRowState;
+    if (!rs || rs.cur || rs.qi < 0 || !num || num.querySelector?.('input')) return;
+    row.draggable = false;
+    if (num.dataset) num.dataset.editing = 'true';
+    const latestLabel = () => {
+      const curRs = row._tssRowState || rs;
+      return String(state.stats.played + (curRs.qi - state.pos));
+    };
+    const currentLabel = latestLabel();
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'numeric';
+    input.pattern = '[0-9]*';
+    input.maxLength = 5;
+    input.className = 'tss-slot-input';
+    input.value = currentLabel;
+    input.setAttribute?.('aria-label', 'Move track to queue slot');
+    num.textContent = '';
+    num.appendChild(input);
+    input.focus?.({ preventScroll: true });
+    input.select?.();
+    let done = false;
+    const finish = apply => {
+      if (done) return;
+      done = true;
+      const rawValue = input.value;
+      row.draggable = !row._tssRowState?.cur;
+      if (num.dataset) delete num.dataset.editing;
+      const fallbackLabel = latestLabel();
+      num.textContent = fallbackLabel;
+      if (!apply) return;
+      let moved = false;
+      if (typeof moveQueueTrackToSlot === 'function') {
+        moved = moveQueueTrackToSlot(rs.ti, rawValue, { basis: 'queue', filter: rs.filter });
+      } else {
+        const parsedSlot = Number.parseInt(String(rawValue ?? '').trim(), 10);
+        const src = state.queue.indexOf(rs.ti);
+        if (Number.isFinite(parsedSlot) && parsedSlot >= 1 && src >= 0 && src !== state.pos) {
+          const offset = parsedSlot - (Number(state.stats?.played) || 0);
+          if (src > state.pos) {
+            const target = Math.max(state.pos + 1, Math.min(state.queue.length - 1, state.pos + Math.max(1, offset)));
+            if (target !== src) {
+              const [item] = state.queue.splice(src, 1);
+              state.queue.splice(target, 0, item);
+              moved = true;
+            }
+          } else if (offset > 0) {
+            const [item] = state.queue.splice(src, 1);
+            state.pos = Math.max(0, state.pos - 1);
+            state.queue.splice(Math.max(state.pos + 1, Math.min(state.queue.length, state.pos + offset)), 0, item);
+            moved = true;
+          }
+          if (moved) {
+            refreshUpcomingCrossfadePreparation?.();
+            badges?.();
+            renderList?.(rs.filter);
+          }
+        }
+      }
+      if (!moved) num.textContent = latestLabel();
+    };
+    input.oninput = () => {
+      const cleaned = String(input.value ?? '').replace(/\D+/g, '');
+      if (input.value !== cleaned) input.value = cleaned;
+    };
+    input.onclick = e => e?.stopPropagation?.();
+    input.onmousedown = e => e?.stopPropagation?.();
+    input.onpointerdown = e => e?.stopPropagation?.();
+    input.onkeydown = e => {
+      e?.stopPropagation?.();
+      if (e.key === 'Enter') { e.preventDefault?.(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault?.(); finish(false); num.focus?.({ preventScroll: true }); }
+    };
+    input.onblur = () => finish(true);
+  };
+  row._tssEditSlot = editSlot;
+  if (num) {
+    num.onpointerdown = e => {
+      const rs = row._tssRowState;
+      if (!rs || rs.cur || rs.qi < 0) return;
+      e?.stopPropagation?.();
+    };
+    num.onmousedown = e => {
+      const rs = row._tssRowState;
+      if (!rs || rs.cur || rs.qi < 0) return;
+      e?.stopPropagation?.();
+      // Keep the row non-draggable while clicking the number pill so tiny pointer movement never starts drag-and-drop.
+      row.draggable = false;
+      if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        const restore = () => {
+          document.removeEventListener('mouseup', restore, true);
+          if (!num.querySelector?.('input')) row.draggable = !row._tssRowState?.cur;
+        };
+        document.addEventListener('mouseup', restore, true);
+      }
+    };
+    num.onclick = e => {
+      const rs = row._tssRowState;
+      if (!rs || rs.cur || rs.qi < 0) return;
+      e?.stopPropagation?.();
+      editSlot();
+    };
+    num.onkeydown = e => {
+      const rs = row._tssRowState;
+      if (!rs || rs.cur || rs.qi < 0) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault?.();
+        e?.stopPropagation?.();
+        editSlot();
+      }
+    };
+  }
   row.ondragstart = e => {
-    state.dragSrc = { ti, meta, epoch };
+    const rs = row._tssRowState;
+    if (!rs || num?.dataset?.editing === 'true' || e?.target?.closest?.('.tss-queue-num, .tss-slot-input')) {
+      e?.preventDefault?.();
+      return;
+    }
+    state.dragSrc = { ti: rs.ti, meta: rs.meta, epoch: rs.epoch };
     e.dataTransfer.effectAllowed = 'move';
     row.style.opacity = '0.35';
   };
-  row.ondragend = () => { state.dragSrc = null; row.style.opacity = past ? '0.3' : '1'; };
+  row.ondragend = () => {
+    const rs = row._tssRowState;
+    state.dragSrc = null;
+    row.style.opacity = rs?.past ? '0.3' : '1';
+  };
   row.ondragover = e => { e.preventDefault(); row.style.background = 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)'; };
-  row.ondragleave = () => { row.style.background = cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)' : 'transparent'; };
+  row.ondragleave = () => {
+    const rs = row._tssRowState;
+    row.style.background = rs?.cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.07)' : 'transparent';
+  };
   row.ondrop = e => {
     e.preventDefault();
+    const rs = row._tssRowState;
+    row.style.background = rs?.cur ? 'rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),0.09)' : 'transparent';
     const drag = state.dragSrc;
     state.dragSrc = null;
-    if (!drag || drag.epoch !== state._collectionEpoch || epoch !== state._collectionEpoch
-        || state.meta[drag.ti] !== drag.meta || state.meta[ti] !== meta) return;
+    if (!rs || !drag || drag.epoch !== state._collectionEpoch || rs.epoch !== state._collectionEpoch
+        || state.meta[drag.ti] !== drag.meta || state.meta[rs.ti] !== rs.meta) return;
     const src = state.queue.indexOf(drag.ti);
-    const target = state.queue.indexOf(ti);
+    const target = state.queue.indexOf(rs.ti);
     if (src < 0 || target < 0 || src === target || src === state.pos || target === state.pos) return;
     const ownerTi = currentPlaybackTrackIndex();
-    if (drag.ti === ownerTi || ti === ownerTi) return;
+    if (drag.ti === ownerTi || rs.ti === ownerTi) return;
     const [moved] = state.queue.splice(src, 1);
     state.queue.splice(target, 0, moved);
     if (src < state.pos && target >= state.pos) state.pos--;
     else if (src > state.pos && target <= state.pos) state.pos++;
     refreshUpcomingCrossfadePreparation();
     badges();
-    renderList(filter);
+    renderList(rs.filter);
   };
-  row.onclick = () => jumpTo(qi, ti);
-  row.oncontextmenu = e => showCtxMenu(e, qi, ti);
+  row.onclick = e => {
+    if (e?.target?.closest?.('.tss-queue-num, .tss-slot-input')) return;
+    const rs = row._tssRowState;
+    if (rs) return jumpTo(rs.qi, rs.ti);
+  };
+  row.oncontextmenu = e => {
+    const rs = row._tssRowState;
+    if (rs) showCtxMenu(e, rs.qi, rs.ti);
+  };
 }
 
 function bindPlayNextRowAction(row, index) {
@@ -11903,9 +24552,33 @@ function bindPlayNextRowAction(row, index) {
   };
 }
 
-function renderList(filter) {
-  if (!state.sidebarOpen || document.getElementById('tss-sidebar-list')?._tssTabSwap) {
+function renderList(filter, { prewarm = false } = {}) {
+  const swapList = document.getElementById('tss-sidebar-list');
+  if (swapList?._tssTabSwap && Date.now() - (Number(swapList._tssTabSwapAt) || 0) > 250) {
+    clearTimeout(swapList._tssTabSwapTimer);
+    swapList._tssTabSwapTimer = null;
+    swapList._tssTabSwap = false;
+    swapList._tssTabSwapAt = 0;
+    swapList.hidden = false;
+  }
+  if ((!state.sidebarOpen && !prewarm) || swapList?._tssTabSwap) {
     state._sidebarDirty = true;
+    if (!state.sidebarOpen && state.active && !state._sidebarPrewarmQueued
+        && !state.reduceVisualEffects && state.queue.length <= 200
+        && typeof requestIdleCallback === 'function') {
+      const sb = document.getElementById('tss-sidebar');
+      if (sb && !sb.dataset.rendered) {
+        state._sidebarPrewarmQueued = true;
+        requestIdleCallback(() => {
+          state._sidebarPrewarmQueued = false;
+          if (state.active && !state.sidebarOpen && !state.reduceVisualEffects
+              && state.queue.length <= 200 && !sb.dataset.rendered) {
+            renderList(undefined, { prewarm: true });
+            sb.dataset.rendered = 'true';
+          }
+        });
+      }
+    }
     return;
   }
   state._sidebarDirty = false;
@@ -12007,23 +24680,42 @@ function renderList(filter) {
     const text = previous?.children[2];
     const image = previous?.children[1]?.querySelector('img');
     const number = previous?.lastElementChild;
+    const expectedNumber = String(state.stats.played + (qi - state.pos));
+    const activeSlotEdit = !cur && Boolean(number?.dataset?.editing === 'true' || number?.querySelector?.('input'));
+    const numberIsIcon = number?.childNodes.length === 1
+      && number.firstElementChild?.querySelector('path')?.getAttribute('d') === 'M3 2.5v11l10-5.5z';
     const numberMatches = cur
-      ? number?.childNodes.length === 1
-        && number.firstElementChild?.querySelector('path')?.getAttribute('d') === 'M3 2.5v11l10-5.5z'
-      : number?.textContent === String(state.stats.played + (qi - state.pos));
+      ? numberIsIcon
+      : Boolean(number && (!number.firstElementChild || activeSlotEdit));
+    const expectedStatus = cur
+      ? 'playing'
+      : waiting
+        ? 'waiting'
+        : (state.djMode && !past && qi >= 0 ? (m.isDjDiscovery ? 'discovery' : (m._djChapterShort || '')) : '');
     const reusable = previous && previous._tssQueueFlags === flags
       && previous.children.length === 5
       && text?.children[0]?.textContent === String(m.title ?? '')
       && text?.children[1]?.textContent === String(m.artist ?? '')
       && (image?.getAttribute('src') || '') === (m.artwork || '')
-      && previous.children[3]?.textContent === (cur ? 'playing' : waiting ? 'waiting' : '')
+      && previous.children[3]?.textContent === expectedStatus
       && previous.style.opacity === (past ? '0.3' : '1')
       && numberMatches;
+    if (reusable && !cur && !activeSlotEdit && number.textContent !== expectedNumber) {
+      number.textContent = expectedNumber;
+      if (number.dataset?.editable === 'true') {
+        number.setAttribute?.('aria-label', `Queue slot ${expectedNumber} for ${m.title || 'track'}, click to change position`);
+      }
+    }
     const row = reusable ? previous : mkRow(m, qi, ti, cur, past, waiting);
     previousRows.delete(ti);
     row._tssQueueTi = ti;
     row._tssQueueFlags = flags;
-    if (cur) currentRow = row;
+    if (cur) {
+      row.setAttribute('aria-current', 'true');
+      currentRow = row;
+    } else {
+      row.removeAttribute?.('aria-current');
+    }
 
     bindQueueRowActions(row, qi, ti, cur, past, filter);
     children.push(row);
@@ -12048,8 +24740,9 @@ function renderList(filter) {
 
   // Background refreshes must not pull the reader back to the playing track.
   list.scrollTop = preserveScroll ? scrollTop : 0;
-  if (!preserveScroll && !q) {
-    currentRow?.scrollIntoView({ block: 'nearest', behavior: motionIsInstant() ? 'instant' : 'smooth' });
+  if (!prewarm && !preserveScroll && !q) {
+    const opening = document.getElementById('tss-sidebar')?.dataset.motion === 'entering';
+    currentRow?.scrollIntoView({ block: 'nearest', behavior: opening || motionIsInstant() ? 'instant' : 'smooth' });
   }
 
   refreshPlayBtn();
@@ -12093,6 +24786,8 @@ function renderHistory(filter = '') {
     artEl.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);';
     if (m.artwork) {
       const img = document.createElement('img');
+      if (i >= 8) img.loading = 'lazy';
+      img.decoding      = 'async';
       img.src           = m.artwork;
       img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
       img.onerror       = () => { artEl.innerHTML = SVG.note; };
@@ -12107,10 +24802,13 @@ function renderHistory(filter = '') {
 
     const txt = document.createElement('div');
     txt.style.cssText = 'overflow:hidden;flex:1;';
-    txt.innerHTML = `
-      <div style="font-size:12px;color:#b8b8b8;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;">${esc(m.title)}</div>
-      <div style="font-size:11px;color:#b1b8c2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(m.artist)}</div>
-    `;
+    const titleEl = document.createElement('div');
+    titleEl.style.cssText = 'font-size:12px;color:#b8b8b8;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;';
+    titleEl.textContent = String(m.title ?? '');
+    const artistEl = document.createElement('div');
+    artistEl.style.cssText = 'font-size:11px;color:#b1b8c2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;';
+    artistEl.textContent = String(m.artist ?? '');
+    txt.append(titleEl, artistEl);
 
     row.append(artEl, num, txt);
     fragment.appendChild(row);
@@ -12126,6 +24824,7 @@ function renderHistory(filter = '') {
 function mkRow(m, qi, ti, cur, past, waiting = false) {
   const row = document.createElement('div');
   row.className = 'tss-queue-row';
+  if (cur) row.setAttribute('aria-current', 'true');
   row.style.cssText = `
       display:flex; align-items:center; gap:9px; padding:7px 12px;
     cursor:pointer;
@@ -12142,26 +24841,43 @@ function mkRow(m, qi, ti, cur, past, waiting = false) {
   art.style.cssText = 'width:42px;height:42px;border-radius:8px;flex-shrink:0;background:rgba(255,255,255,.045);overflow:hidden;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);box-shadow:0 5px 14px rgba(0,0,0,.28);';
   if (m.artwork) {
     const img = document.createElement('img');
+    const nearViewport = cur || (qi >= 0 ? Math.abs(qi - state.pos) <= 8 : state.playNext.indexOf(ti) < 8);
+    if (!nearViewport) img.loading = 'lazy';
+    img.decoding      = 'async';
     img.src           = m.artwork;
     img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
     img.onerror       = () => { art.innerHTML = SVG.note; };
+    if (nearViewport) img.decode?.()?.catch?.(() => {});
     art.appendChild(img);
   } else {
     art.innerHTML = SVG.note;
   }
 
   const num = document.createElement('div');
-  num.style.cssText = `font-size:10px;color:${cur ? 'var(--tss-a,#aebaf3)' : '#aeb5bf'};font-weight:${cur ? '700' : '600'};min-width:20px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center;`;
+  num.className = 'tss-queue-num';
+  num.style.cssText = `font-size:11px;color:${cur ? 'var(--tss-a,#aebaf3)' : '#aeb5bf'};font-weight:${cur ? '700' : '600'};min-width:24px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center;`;
   const displayNum  = qi >= 0 ? state.stats.played + (qi - state.pos) : '↑';
   if (cur) num.innerHTML = SVG.play;
-  else num.textContent = String(displayNum);
+  else {
+    num.textContent = String(displayNum);
+    if (qi >= 0) {
+      if (num.dataset) num.dataset.editable = 'true';
+      num.tabIndex = 0;
+      num.setAttribute?.('role', 'button');
+      num.setAttribute?.('aria-label', `Queue slot ${displayNum} for ${m.title || 'track'}, click to change position`);
+      num.title = 'Click to type new queue position';
+    }
+  }
 
   const txt = document.createElement('div');
   txt.style.cssText = 'overflow:hidden;flex:1;';
-  txt.innerHTML = `
-    <div style="font-size:12px;color:${cur ? '#f4f4f4' : '#c8c8c8'};font-weight:${cur ? '680' : '520'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.35;">${esc(m.title)}</div>
-    <div style="font-size:11px;color:rgba(255,255,255,.72);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;">${esc(m.artist)}</div>
-  `;
+  const titleEl = document.createElement('div');
+  titleEl.style.cssText = `font-size:12px;color:${cur ? '#f4f4f4' : '#c8c8c8'};font-weight:${cur ? '680' : '520'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.35;`;
+  titleEl.textContent = String(m.title ?? '');
+  const artistEl = document.createElement('div');
+  artistEl.style.cssText = 'font-size:11px;color:rgba(255,255,255,.72);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;';
+  artistEl.textContent = String(m.artist ?? '');
+  txt.append(titleEl, artistEl);
 
   const handle = document.createElement('span');
   handle.className = 'tss-queue-handle';
@@ -12169,12 +24885,19 @@ function mkRow(m, qi, ti, cur, past, waiting = false) {
 
   const status = document.createElement('span');
   status.className = 'tss-queue-status';
-  status.textContent = cur ? 'playing' : waiting ? 'waiting' : qi < 0 ? 'next' : '';
+  const djQueueBadge = state.djMode && !cur && !waiting && !past && qi >= 0
+    ? (m.isDjDiscovery ? 'discovery' : (m._djChapterShort || ''))
+    : '';
+  status.textContent = cur ? 'playing' : waiting ? 'waiting' : qi < 0 ? 'next' : djQueueBadge;
   status.style.cssText = cur || waiting
     ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.12);'
     : qi < 0
       ? 'color:var(--tss-a,#aebaf3);background:rgba(var(--tss-ar,174),var(--tss-ag,186),var(--tss-ab,243),.1);'
-      : 'display:none;';
+      : djQueueBadge
+        ? (m.isDjDiscovery
+          ? 'color:#9fe3c4;background:rgba(116,214,170,.12);border:1px solid rgba(116,214,170,.22);'
+          : 'color:rgba(214,223,252,.82);background:rgba(174,186,243,.08);')
+        : 'display:none;';
 
   row.append(handle, art, txt, status, num);
   return row;
@@ -12315,10 +25038,21 @@ async function onNav() {
   const wasActive = state.active;
   const registered = state._liveSyncSources.has(pageUrl) || pageUrl === playlistBase(state.playlistUrl || '');
   if (wasActive) {
+    if (Array.isArray(state.els) && state.els.length) {
+      for (let ti = 0; ti < state.els.length; ti++) {
+        const el = state.els[ti];
+        if (el && el.nodeType === 1 && !document.body.contains(el)) state.els[ti] = null;
+      }
+    }
     state.suspended = !validPage() || (!registered && !isPassiveBrowsePage(location.href));
+    if (!state._userPaused) {
+      pauseSoundCloudTransport();
+      pauseSoundCloud();
+    }
+    updateHub();
+  } else if (state._nativePlayUnlocked === false) {
     pauseSoundCloudTransport();
     pauseSoundCloud();
-    updateHub();
   }
   try {
     await wait(1500);
@@ -12329,24 +25063,26 @@ async function onNav() {
       if (!state.active) return;
       if (registered) {
         if (state._collectionRequest) return;
-        const request = beginCollectionRequest(pageUrl, false, false);
-        try {
-          const freshEls = await loadTracks(request);
-          if (!current() || !state.active || !collectionRequestCurrent(request)) return;
-          if (freshEls.length) bindCurrentPageElements(freshEls);
-        } finally {
-          finishCollectionRequest(request);
+        if (typeof collectPageCollectionSilently === 'function') {
+          const freshEls = currentPageTrackElements();
+          if (freshEls.length) {
+            bindCurrentPageElements(freshEls);
+            badges();
+          }
+        } else {
+          const request = beginCollectionRequest(pageUrl, false, false);
+          try {
+            const freshEls = await loadTracks(request);
+            if (!current() || !state.active || !collectionRequestCurrent(request)) return;
+            if (freshEls.length) bindCurrentPageElements(freshEls);
+          } finally {
+            finishCollectionRequest(request);
+          }
         }
       }
       if (current() && state.active && !state.suspended) void syncLiveQueue({ force: true });
       return;
     }
-    try {
-      const raw = sessionStorage.getItem('tss_queue_cache');
-      const cache = raw ? JSON.parse(raw) : null;
-      if (cache && Date.now() - (cache.ts || 0) < 30 * 60 * 1000
-          && playlistBase(cache.playlistUrl || '') === pageUrl && !state.active && !state.loading) await start();
-    } catch (_) {}
   } catch (_) {
     // A route or playback-session change cancels the obsolete DOM crawl.
   } finally {
@@ -12390,7 +25126,7 @@ function scheduleLiveQueueSync(delay = 250) {
   if (state._liveSyncTimer) clearTimeout(state._liveSyncTimer);
   state._liveSyncTimer = setTimeout(() => {
     state._liveSyncTimer = null;
-    if (state.loading || state.busy || state._liveSyncInFlight) {
+    if (state.loading || state.busy || state._crossfading || state._liveSyncInFlight) {
       scheduleLiveQueueSync(300);
       return;
     }
@@ -12399,21 +25135,54 @@ function scheduleLiveQueueSync(delay = 250) {
 }
 
 function mutationChangesPlaylistTracks(records) {
-  const selector = '.trackList__item, .soundList__item, li.sc-list-item';
+  const selector = '.trackList__item, .soundList__item, li.sc-list-item, [role="listitem"]';
+  const metaSelector = '.trackItem__trackTitle, .soundTitle__title, .playbackSoundBadge__titleLink, .trackItem__username, .soundTitle__username, .playbackSoundBadge__lightLink, .sc-artwork';
   for (const record of records) {
+    if (record.type === 'characterData') {
+      const holder = record.target?.nodeType === 1
+        ? record.target
+        : (record.target?.parentElement || record.target?.parentNode);
+      if (holder?.closest?.(metaSelector)) return true;
+    }
+    const targetEl = record.target?.nodeType === 1
+      ? record.target
+      : (record.target?.parentElement || record.target?.parentNode);
+    if (targetEl?.closest?.(metaSelector)) return true;
     for (const node of record.addedNodes) {
-      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))) return true;
+      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector)
+          || node.matches?.(metaSelector) || node.querySelector?.(metaSelector))) return true;
     }
     for (const node of record.removedNodes) {
-      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))) return true;
+      if (node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector)
+          || node.matches?.(metaSelector) || node.querySelector?.(metaSelector))) return true;
     }
   }
   return false;
 }
 
+const TSS_OWNED_MUTATION_IDS = new Set([
+  'tss-hub', 'tss-sidebar', 'tss-stats-overlay', 'tss-eq-overlay', 'tss-cf-overlay',
+  'tss-modal-backdrop', 'tss-inline-pip', 'tss-pip-host', 'tss-ctx',
+  'tss-update-providers', 'tss-debug-overlay', 'tss-debug-help-overlay', 'tss-merge-toast',
+]);
+const TSS_OWNED_MUTATION_SELECTOR = '#tss-hub, #tss-sidebar, #tss-stats-overlay, .tss-stats-surface, #tss-eq-overlay, #tss-cf-overlay, .tss-modal-surface, #tss-modal-backdrop, .tss-modal-backdrop, #tss-inline-pip, #tss-pip-host, #tss-ctx, #tss-update-providers, #tss-debug-overlay, #tss-debug-help-overlay, #tss-merge-toast';
+
+function nodeInsideTrueShuffleOwnedSurface(target) {
+  if (!target) return false;
+  const startNode = target.nodeType === 1 ? target : (target.parentElement || target.parentNode);
+  if (!startNode) return false;
+  for (let node = startNode; node && node.nodeType === 1; node = node.parentNode) {
+    if (node.id && TSS_OWNED_MUTATION_IDS.has(node.id)) return true;
+    const cls = typeof node.className === 'string' ? node.className : '';
+    if (cls && (cls.includes('tss-stats-surface') || cls.includes('tss-modal-surface') || cls.includes('tss-modal-backdrop'))) {
+      return true;
+    }
+  }
+  return Boolean(startNode.nodeType === 1 && startNode.closest?.(TSS_OWNED_MUTATION_SELECTOR));
+}
+
 function mutationsAreTrueShuffleOnly(records) {
-  return records.length > 0 && records.every(record =>
-    record.target?.closest?.('#tss-hub, #tss-sidebar, #tss-stats-overlay, #tss-eq-overlay'));
+  return records.length > 0 && records.every(record => nodeInsideTrueShuffleOwnedSurface(record.target));
 }
 
 function scheduleLiveQueueSyncFromMutation(records) {
@@ -12439,7 +25208,7 @@ function initializePage() {
       }, 250);
     }
     scheduleLiveQueueSyncFromMutation(records);
-  }).observe(document, { subtree: true, childList: true });
+  }).observe(document, { subtree: true, childList: true, characterData: true });
 
   // SoundCloud can change routes without a DOM mutation.
   installNavigationTracking();
@@ -12452,10 +25221,22 @@ window.addEventListener('pagehide', () => {
   tickPlayTime();
   saveLifetimeStats();
   if (equalizerPersistTimer || customPresetsPending) flushEqualizerPersistence();
+  if ((state._cfPersistTimer || state._cfCustomPresetsPending) && typeof flushCrossfadePersistence === 'function') {
+    flushCrossfadePersistence();
+  }
+  if (state._djTelemetryDirty && typeof flushDjTelemetry === 'function') flushDjTelemetry();
+  if (state._djWorker && typeof terminateDjVoiceWorker === 'function') {
+    terminateDjVoiceWorker();
+  }
 });
 
 document.addEventListener('visibilitychange', () => {
   checkSleepTimerDeadline();
+  syncBrandmarkCrossfade('visibility');
+  if (document.visibilityState === 'hidden') {
+    if (typeof stopCrossfadePreview === 'function') stopCrossfadePreview();
+    if (typeof settleClosingModals === 'function') settleClosingModals();
+  }
   if (document.visibilityState === 'visible') scheduleLiveQueueSync(250);
   const deck = currentDeckAudio();
   if (document.visibilityState === 'visible' && state.active && deck && !deck.paused
@@ -12469,6 +25250,14 @@ window.addEventListener('pageshow', () => {
   scheduleLiveQueueSync(250);
 });
 
+window.addEventListener('focus', () => {
+  checkSleepTimerDeadline();
+  if (Date.now() - (Number(state._liveSyncLastCheck) || 0) >= 10_000) {
+    scheduleLiveQueueSync(250);
+  }
+});
+
+installSoundCloudClientIdObserver();
 installNativePlaybackGuard();
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initializePage, { once: true });
