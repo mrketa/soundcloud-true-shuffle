@@ -8,9 +8,9 @@ A userscript for SoundCloud with collection-wide shuffle, an optional **True DJ*
 
 **[Install from GitHub](https://raw.githubusercontent.com/mrketa/soundcloud-true-shuffle/main/dist/SC%20Trueshuffle.user.js)** · [Install from Greasy Fork](https://greasyfork.org/en/scripts/568821-soundcloud-true-shuffle) · [Release notes](CHANGELOG.md) · [Report an issue](https://github.com/mrketa/soundcloud-true-shuffle/issues)
 
-![True Shuffle queue with demo tracks](screenshots/6.3.0/03-queue.png)
+![True Shuffle 6.4.0 player and queue with demo tracks](screenshots/6.4.0/01-player-queue.png)
 
-*Version 6.3.0 interface shown with demo data, not a live SoundCloud listening session.*
+*Version 6.4.0 interface shown with demo data, not a live SoundCloud listening session.*
 
 ## Install
 
@@ -23,7 +23,7 @@ The GitHub link points to the public build on `main`. Choose one installation ch
 ## What it does
 
 - **Collection-wide shuffle:** collects available tracks from playlists, likes, profile tracks, reposts and the Feed silently in the background (with a configurable Feed track limit) before shuffling with Fisher–Yates. New rounds continue when the current round finishes.
-- **True DJ:** an optional Spotify-style DJ (header headphones icon beside PiP—always starting off on page load while keeping your saved DJ preferences, resetting cleanly when a session ends so starting **True DJ** is always a single click with zero background downloads while off, and switching the header brand to **True DJ**—or **Settings → DJ**) that sequences 3–4 track chapters across fresh opening sets (with cross-session opener rotation), favorites, genre pockets, throwbacks, artist spotlights, underground cuts, time-of-day energy flows and live SoundCloud `/related` discovery sets, with smooth tempo, energy, and **Camelot harmonic key** flow ordering (including Open Key and `0.5x`/`2x` BPM matching), a one-click **Switch vibe** crossfade button right in the main player & PiP controls, automatic chapter recalibration on consecutive early skips, smart waveform-aware auto-mixing (`1.5s–9.5s` dynamic lengths & Bézier curves with automatic short-bumper tightening), opt-in **EQ bass swap** (`135 Hz` low-shelf kick/sub swap) and **Waveform cue-in / cue-out** trimming, and **Local Voice** (*Studio HD · Kokoro 82M* `~88 MB` cached CPU WASM default with off-main-thread vocal DSP and zero GPU/UI lag, plus *Studio Ultra* WebGPU and *Low-Spec · Fast Lite* `~26 MB` options, adjustable talk frequency, SoundCloud handle/leetspeak artist cleanup, vocal-aware pre-transition commentary, `48 kHz` broadcast vocal EQ, an instant 2-clause **cold-open welcome intro** before Track #1, smooth music ducking, and a speaking **True DJ** cover crossfade) or **Silent** curation (one-click voice opt-out).
+- **True DJ:** an optional Spotify-style DJ (header headphones icon beside PiP or **Settings → DJ**; always starts off on page load while keeping saved preferences and resets cleanly at session end for one-click restarts with zero background downloads while off). Sequences 3–4 track sets across 8 archetypes (including cross-session opener rotation and live SoundCloud `/related` discovery) with **Camelot harmonic key** & BPM flow, one-click **Switch vibe**, smart waveform auto-mixing, optional **Local Voice** (*Studio HD · Kokoro 82M* CPU WASM default with off-main-thread vocal DSP, *Studio Ultra* WebGPU, or *Low-Spec · Fast Lite*), or one-click **Silent** curation.
 - **Queue control:** search, reorder upcoming tracks by drag-and-drop or by typing a target queue slot number directly (in the Queue or PiP Queue, including filtered search results), use Play Next, review listening history, and merge playlists into the session. Merged sources automatically sync new tracks, metadata/artwork/collaborator updates, and replaced audio files without reloading.
 - **Floating player:** artwork, waveform, volume and playback controls, always-available shrink mode, a draggable **Hide player** pill, and picture-in-picture options where supported.
 - **Audio tools:** a two-deck player, adjustable crossfade with Smooth, Clean, DJ and Custom Bézier curve profiles (with built-in and saved custom transition presets plus live transition preview), a five-band equalizer with saved custom presets, and Auto Level to reduce volume differences between tracks.
@@ -47,30 +47,38 @@ True Shuffle plays shuffle tracks through its own two-deck audio engine and paus
 | Tab | Controls |
 | --- | --- |
 | **Audio** | Crossfade duration and profile (Smooth, Clean, DJ, and Custom Bézier curve editor), Fade manual skips, Auto Level, and Open equalizer |
-| **DJ** | **True DJ** toggle, **Mood** (*Auto*, *Favorites*, *Discovery*, *Throwbacks*, *Chill*, *Energy*) & **Switch vibe**, **DJ Voice** (**Silent** vs. **Local Voice** with 7 host voices, **How often** commentary frequency, `20–150%` volume and live preview), plus collapsible **Voice quality** (*Studio HD · Kokoro 82M* `~88 MB` CPU WASM default, *Studio Ultra · Kokoro 82M* WebGPU `fp32`, or *Low-Spec · Fast Lite* `~26 MB` CPU WASM) and **Mixing & discovery** (**Auto-mix transitions**, **Discover related tracks**, **Bass swap**, **Skip silent intros & outros**) sections |
+| **DJ** | **True DJ** toggle, **Mood** (*Auto*, *Favorites*, *Discovery*, *Throwbacks*, *Chill*, *Energy*) & **Switch vibe**, **DJ Voice** (**Silent** vs. **Local Voice** with 7 host voices, **How often** commentary frequency, `20–150%` volume and live preview), plus collapsible **Voice quality** (*Studio HD · Kokoro 82M* `~88 MB` CPU WASM default, *Studio Ultra · Kokoro 82M* WebGPU `fp32`, or *Low-Spec · Fast Lite* `~26 MB` CPU WASM) and **Mixing & discovery** (**Auto-mix transitions**, **SoundCloud discovery**, **Clean bass swap**, **Trim silent intros & outros**) sections |
 | **Session** | Sleep timer, Feed track limit (1–250, default 50), Stop after this round, and End shuffle session |
 | **Info** | Listening statistics, Reduce visual effects, and Scroll long titles |
 
 **Reduce visual effects** is a manual appearance preference, not an audio-quality or hardware-detection mode. **Scroll long titles** is independent; the system's reduced-motion preference also prevents title animation. Preferences and custom crossfade and EQ presets are stored locally where browser or userscript storage is available. Blocked storage can prevent settings from surviving a reload.
 
 <details>
-<summary>More screenshots — version 6.3.0, demo data</summary>
+<summary>More screenshots — version 6.4.0, demo data</summary>
+
+### True DJ
+
+![True DJ settings with demo configuration](screenshots/6.4.0/02-true-dj.png)
+
+### Custom crossfade curve editor
+
+![Custom Bézier crossfade curve editor with demo curve](screenshots/6.4.0/03-crossfade-editor.png)
+
+### Audio settings
+
+![Audio settings with demo data](screenshots/6.4.0/04-settings-audio.png)
 
 ### Mini-player
 
-![Mini-player with demo track](screenshots/6.3.0/01-mini-player.png)
-
-### Settings
-
-![Audio settings with demo data](screenshots/6.3.0/02-settings.png)
-
-### Listening statistics
-
-![Listening statistics with demo data](screenshots/6.3.0/04-listening-stats.png)
+![Mini-player with demo track](screenshots/6.4.0/05-mini-player.png)
 
 ### Equalizer
 
-![Five-band equalizer with demo data](screenshots/6.3.0/05-equalizer.png)
+![Five-band equalizer with demo data](screenshots/6.4.0/06-equalizer.png)
+
+### Listening statistics
+
+![Listening statistics with demo data](screenshots/6.4.0/07-listening-stats.png)
 
 </details>
 
@@ -88,7 +96,7 @@ The compatibility targets are current Chrome, Edge, Brave, Opera, Firefox and Sa
 
 Settings, queue caches, DJ taste profiles and learned audio levels use local browser/userscript storage. Playback makes requests to SoundCloud and its media services; the userscript manager also loads the declared [hls.js dependency](https://www.jsdelivr.com/package/npm/hls.js), and **Local Voice** loads the selected studio neural TTS model (*Studio HD · Kokoro 82M* `~88 MB` CPU WASM default, *Studio Ultra · Kokoro 82M* `~310 MB` WebGPU, or *Low-Spec · Fast Lite* `~26 MB` CPU WASM) inside a background Web Worker when **True DJ** is enabled (**Silent** mode and leaving **True DJ** off download nothing). The script does not automatically upload diagnostic reports or send analytics telemetry.
 
-If playback stalls, try **Cancel loading** or **Settings → Session → End shuffle session**, then start a new session. A classified playback fault can reveal a **red exclamation mark next to PiP** in the header. Open it and choose **Copy report**; optional full technical details have a separate copy action. Copy the report before reloading.
+If playback stalls, try **Cancel loading** or **Settings → Session → End shuffle session**, then start a new session. A classified playback fault can reveal a **red exclamation mark beside the True DJ icon** in the header. Open it and choose **Copy report**; optional full technical details have a separate copy action. Copy the report before reloading.
 
 Reports include browser/manager information and sanitized playback diagnostics. They exclude track titles, account names, page paths, stream URLs, credentials and full exception text. **Review anything you post:** GitHub issues and Greasy Fork feedback are public.
 
@@ -123,7 +131,7 @@ This generates `dist/SC Trueshuffle Diagnostic.user.js`, an ignored local artifa
 | [`SC Trueshuffle.js`](SC%20Trueshuffle.js) | Canonical userscript source |
 | [`dist/SC Trueshuffle.user.js`](dist/SC%20Trueshuffle.user.js) | Public installable build |
 | [`build.py`](build.py) | Standard and diagnostic build commands |
-| [`screenshots/6.3.0/`](screenshots/6.3.0/) | Interface screenshots using demo data |
+| [`screenshots/6.4.0/`](screenshots/6.4.0/) | Interface screenshots using demo data |
 | [`CHANGELOG.md`](CHANGELOG.md) | User-facing release notes |
 | [`LICENSE`](LICENSE) | MIT license |
 
